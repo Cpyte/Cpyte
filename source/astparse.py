@@ -36,10 +36,11 @@ def _loc(node):
 
 
 class Number:
-    __slots__ = ('value', '_token')
+    __slots__ = ('value', '_token', 'inferred_type')
     def __init__(self, value: str, token=None):
         self.value = value
         self._token = token
+        self.inferred_type = None
     def __repr__(self):
         return f'Number({self.value})'
 

@@ -1,14 +1,14 @@
-from llvmlite import binding
 import ctypes
 import ctypes.util
 import subprocess
 import os
+import sys
 import tempfile
 
-_RUNTIME_C = os.path.join(os.path.dirname(__file__), 'runtime.c')
-
-binding.initialize_native_target()
-binding.initialize_native_asmprinter()
+if getattr(sys, 'frozen', False):
+    _RUNTIME_C = os.path.join(sys._MEIPASS, 'runtime.c')
+else:
+    _RUNTIME_C = os.path.join(os.path.dirname(__file__), 'runtime.c')
 
 _print_fn = None
 _input_fn = None
@@ -30,6 +30,13 @@ def _runtime_print_int64(n: int):
     print(n)
 
 
+def _runtime_print_uint64(n: int):
+    if n < 0:
+        # Handle unsigned interpretation
+        n = n & ((1 << 64) - 1)
+    print(n)
+
+
 def _runtime_print_double(d: float):
     print(f"{d:.6f}")
 
@@ -43,6 +50,9 @@ def _runtime_input() -> int:
 
 
 def optimize(mod, opt_level=3):
+    from llvmlite import binding
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
     if opt_level <= 0:
         return
     target = binding.Target.from_default_triple()
@@ -75,6 +85,9 @@ def _remove_probe_stack_ir(llvm_ir):
 
 def run_jit(module, opt_level=3, src_files=None):
     global _print_fn, _input_fn
+    from llvmlite import binding
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
 
     llvm_ir = str(module)
     mod = binding.parse_assembly(llvm_ir)
@@ -120,6 +133,15 @@ def run_jit(module, opt_level=3, src_files=None):
         engine.add_global_mapping(
             mod.get_function("print_int64"),
             ctypes.cast(_print_int64_fn, ctypes.c_void_p).value,
+        )
+    except NameError:
+        pass
+
+    _print_uint64_fn = ctypes.CFUNCTYPE(None, ctypes.c_ulonglong)(_runtime_print_uint64)
+    try:
+        engine.add_global_mapping(
+            mod.get_function("print_uint64"),
+            ctypes.cast(_print_uint64_fn, ctypes.c_void_p).value,
         )
     except NameError:
         pass
@@ -184,6 +206,9 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
 
 def run_aot(module, output="program.o", opt_level=3, src_files=None):
     llvm_ir = str(module)
+    import llvmlite.binding as binding
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(llvm_ir)
     mod.verify()

@@ -119,6 +119,7 @@ class SemanticAnalyzer:
     def _infer_type(self, node):
         if isinstance(node, Number):
             if '.' in node.value or 'e' in node.value or 'E' in node.value:
+                node.inferred_type = 'float'
                 return 'float'
             # Check for hexadecimal literals (0x prefix)
             if node.value.startswith('0x') or node.value.startswith('0X'):
@@ -128,10 +129,13 @@ class SemanticAnalyzer:
                     if val > 2**31 - 1 or val < -2**31:
                         # Prefer int64 for values that fit in signed range
                         if val <= 2**63 - 1:
+                            node.inferred_type = 'int64'
                             return 'int64'
+                        node.inferred_type = 'uint64'
                         return 'uint64'
                 except ValueError:
                     pass
+                node.inferred_type = 'int64'
                 return 'int64'
             # Check for large decimal values that might need 64-bit
             try:
@@ -139,11 +143,14 @@ class SemanticAnalyzer:
                 if val > 2**31 - 1 or val < -2**31:
                     # Prefer int64 for values that fit in signed range
                     if val <= 2**63 - 1 and val >= -2**63:
+                        node.inferred_type = 'int64'
                         return 'int64'
+                    node.inferred_type = 'uint64'
                     return 'uint64'
             except ValueError:
                 pass
             # For small integers, return 'int' but allow implicit conversion to int64
+            node.inferred_type = 'int'
             return 'int'
 
         if isinstance(node, String):

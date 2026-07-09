@@ -68,15 +68,22 @@ class LLVM:
         self.string_id = 0
         self.string_pool = {}
         self.ssa_values = {}
+        self.ssa_types = {}  # Track types of SSA values
         self.structs = {}
         self.struct_fields = {}
         self.import_src_files = []
+        self._malloc_fn = None
+        self._strlen_fn = None
+        self._memcpy_fn = None
         print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
         print_fn = ir.Function(self.module, print_ty, "print_int")
         self.functions["print_int"] = print_fn
         print_i64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
         print_i64_fn = ir.Function(self.module, print_i64_ty, "print_int64")
         self.functions["print_int64"] = print_i64_fn
+        print_u64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
+        print_u64_fn = ir.Function(self.module, print_u64_ty, "print_uint64")
+        self.functions["print_uint64"] = print_u64_fn
         print_f_ty = ir.FunctionType(ir.VoidType(), [ir.DoubleType()])
         print_f_fn = ir.Function(self.module, print_f_ty, "print_double")
         self.functions["print_double"] = print_f_fn
@@ -210,11 +217,17 @@ class LLVM:
         return ptr
 
     def _get_malloc_fn(self):
+        fn = self._malloc_fn
+        if fn is not None:
+            return fn
         for f in self.module.functions:
             if f.name == 'malloc':
+                self._malloc_fn = f
                 return f
         fnty = ir.FunctionType(_i8ptr, [_i64])
-        return ir.Function(self.module, fnty, 'malloc')
+        fn = ir.Function(self.module, fnty, 'malloc')
+        self._malloc_fn = fn
+        return fn
 
     def _type_abi_info(self, ty):
         if isinstance(ty, ir.IntType):
@@ -294,13 +307,19 @@ class LLVM:
         if struct_type and hasattr(struct_type, 'elements') and struct_type.elements is not None:
             elem_tys = struct_type.elements
             if field_idx < len(elem_tys):
-                actual = elem_tys[field_idx]
-                for n, t in self._all_named_types():
-                    if t == actual:
-                        return n
+                return self._named_type_repr(elem_tys[field_idx])
         return None
 
-    def _all_named_types(self):
+    def _named_type_repr(self, ty):
+        if not hasattr(self, '_type_names'):
+            self._type_names = {}
+        if self._type_names:
+            return self._type_names.get(ty)
+        for name, t in self._iter_named_types():
+            self._type_names[t] = name
+        return self._type_names.get(ty)
+
+    def _iter_named_types(self):
         yield 'int', ir.IntType(32)
         yield 'double', ir.DoubleType()
         yield 'str', ir.PointerType(ir.IntType(8))
@@ -604,7 +623,7 @@ class LLVM:
         right_len = self.builder.call(strlen_fn, [right])
         total_len = self.builder.add(left_len, right_len)
         plus_one = self.builder.add(total_len, ir.Constant(_i32, 1))
-        new_str = self.builder.call(malloc_fn, [plus_one])
+        new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
         self.builder.call(memcpy_fn, [new_str, left, left_len])
         dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
         self.builder.call(memcpy_fn, [dest_plus, right, right_len])
@@ -613,18 +632,30 @@ class LLVM:
         return new_str
 
     def _get_strlen_fn(self):
+        fn = self._strlen_fn
+        if fn is not None:
+            return fn
         for f in self.module.functions:
             if f.name == 'strlen':
+                self._strlen_fn = f
                 return f
         fnty = ir.FunctionType(_i32, [_i8ptr])
-        return ir.Function(self.module, fnty, 'strlen')
+        fn = ir.Function(self.module, fnty, 'strlen')
+        self._strlen_fn = fn
+        return fn
 
     def _get_memcpy_fn(self):
+        fn = self._memcpy_fn
+        if fn is not None:
+            return fn
         for f in self.module.functions:
             if f.name == 'memcpy':
+                self._memcpy_fn = f
                 return f
         fnty = ir.FunctionType(_i8ptr, [_i8ptr, _i8ptr, _i32])
-        return ir.Function(self.module, fnty, 'memcpy')
+        fn = ir.Function(self.module, fnty, 'memcpy')
+        self._memcpy_fn = fn
+        return fn
 
     def emit_unary(self, node: UnaryOp):
         match node.op:
@@ -666,6 +697,8 @@ class LLVM:
                     value = self.builder.zext(value, ir.IntType(64))
                 # Handle implicit int64/uint64 conversions (no-op since both are i64)
                 self.builder.store(value, ptr)
+                # Track SSA type for later use in print
+                self.ssa_types[name] = var_type
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
@@ -718,9 +751,34 @@ class LLVM:
                 and isinstance(value.type.pointee, ir.IntType)
                 and value.type.pointee.width == 8):
             return self.builder.call(self.functions["print_str"], [value])
-        # Handle int64 values by truncating to int32 for printing
+        # Handle 64-bit integers
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
-            value = self.builder.trunc(value, ir.IntType(32))
+            # Check if the value is from a uint64 variable or literal
+            is_uint64 = False
+            if isinstance(node.value, Variable):
+                var_type = self.local_types.get(node.value.name)
+                if var_type == 'uint64':
+                    is_uint64 = True
+            elif hasattr(node.value, 'inferred_type') and node.value.inferred_type == 'uint64':
+                is_uint64 = True
+            elif isinstance(node.value, BinOp):
+                # Check if either operand is uint64
+                left_type = None
+                right_type = None
+                if isinstance(node.value.left, Variable):
+                    left_type = self.local_types.get(node.value.left.name)
+                elif hasattr(node.value.left, 'inferred_type'):
+                    left_type = node.value.left.inferred_type
+                if isinstance(node.value.right, Variable):
+                    right_type = self.local_types.get(node.value.right.name)
+                elif hasattr(node.value.right, 'inferred_type'):
+                    right_type = node.value.right.inferred_type
+                if left_type == 'uint64' or right_type == 'uint64':
+                    is_uint64 = True
+            
+            if is_uint64:
+                return self.builder.call(self.functions["print_uint64"], [value])
+            return self.builder.call(self.functions["print_int64"], [value])
         return self.builder.call(self.functions["print_int"], [value])
 
     def emit_input(self, node):

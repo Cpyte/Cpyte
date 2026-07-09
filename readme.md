@@ -1,0 +1,1 @@
+Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpy_language_documentation.md)

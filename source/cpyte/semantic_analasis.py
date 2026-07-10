@@ -4,7 +4,7 @@ from .lexar import Lexer, LexerError
 from .astparse import (
     _loc, Number, String, Variable, Call, Index, Attr,
     UnaryOp, BinOp, Assign, Return, If, FuncDef, Print, ExprStmt,
-    VarDecl, Break, Continue, Switch, Import,
+    VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
     InputStr, Signed67,
     parse_file, ParseError,
@@ -13,12 +13,13 @@ from .clib import resolve_library, parse_header_file, parse_c_source
 
 
 class Diagnostic:
-    __slots__ = ('message', 'token', 'note')
+    __slots__ = ('message', 'token', 'note', 'level')
 
-    def __init__(self, message: str, token=None, note: str | None = None):
+    def __init__(self, message: str, token=None, note: str | None = None, level: str = 'error'):
         self.message = message
         self.token = token
         self.note = note
+        self.level = level
 
 
 class Reporter:
@@ -28,10 +29,16 @@ class Reporter:
         self.diagnostics: list[Diagnostic] = []
 
     def error(self, message: str, token=None, note: str | None = None):
-        self.diagnostics.append(Diagnostic(message, token, note))
+        self.diagnostics.append(Diagnostic(message, token, note, level='error'))
+
+    def strict_error(self, message: str, token=None, note: str | None = None):
+        self.diagnostics.append(Diagnostic(message, token, note, level='strict-error'))
+
+    def strict_warning(self, message: str, token=None, note: str | None = None):
+        self.diagnostics.append(Diagnostic(message, token, note, level='strict-warning'))
 
     def has_errors(self) -> bool:
-        return len(self.diagnostics) > 0
+        return any(d.level in ('error', 'strict-error') for d in self.diagnostics)
 
     def display(self) -> str:
         if not self.diagnostics:
@@ -41,14 +48,23 @@ class Reporter:
         for diag in self.diagnostics:
             parts.append(self._format(diag))
 
-        plural = 's' if len(self.diagnostics) > 1 else ''
-        parts.append(f'error: {len(self.diagnostics)} semantic error{plural} found.')
+        err_count = sum(1 for d in self.diagnostics if d.level in ('error', 'strict-error'))
+        warn_count = sum(1 for d in self.diagnostics if d.level == 'strict-warning')
+        summary_parts = []
+        if err_count:
+            plural = 's' if err_count > 1 else ''
+            summary_parts.append(f'{err_count} semantic error{plural}')
+        if warn_count:
+            plural = 's' if warn_count > 1 else ''
+            summary_parts.append(f'{warn_count} strict warning{plural}')
+        if summary_parts:
+            parts.append('found: ' + ', '.join(summary_parts) + '.')
         return '\n'.join(parts)
 
     def _format(self, diag: Diagnostic) -> str:
         token = diag.token
         if token is None:
-            return f'error: {diag.message}'
+            return f'{diag.level}: {diag.message}'
 
         line = token.line
         col = token.column
@@ -59,7 +75,7 @@ class Reporter:
         pad = ' ' * (len(line_str) + 1)
 
         parts = [
-            f'error[{line}:{col}]: {diag.message}',
+            f'{diag.level}[{line}:{col}]: {diag.message}',
             f'{pad}|',
             f' {line_str} | {source_line}',
             f'{pad}| {" " * (col - 1)}^',
@@ -101,7 +117,7 @@ class Scope:
 
 class SemanticAnalyzer:
     def __init__(self, source: str, filepath: str | None = None,
-                 workspace_root: str | None = None):
+                 workspace_root: str | None = None, strict: bool = False):
         self.reporter = Reporter(source)
         self.globals = Scope()
         self.current_func: FuncDef | None = None
@@ -109,6 +125,8 @@ class SemanticAnalyzer:
         self.filepath = filepath
         self._filedir = os.path.dirname(filepath) if filepath else None
         self._workspace_root = workspace_root
+        self._loop_depth = 0
+        self.strict = strict
 
     def _tok(self, node):
         if isinstance(node, dict):
@@ -117,6 +135,39 @@ class SemanticAnalyzer:
 
     def error(self, message: str, node=None, note: str | None = None):
         self.reporter.error(message, self._tok(node), note)
+
+    def _strict_error(self, message: str, node=None, note: str | None = None):
+        if self.strict:
+            self.reporter.strict_error(message, self._tok(node), note)
+
+    def _strict_warning(self, message: str, node=None, note: str | None = None):
+        if self.strict:
+            self.reporter.strict_warning(message, self._tok(node), note)
+
+    def _is_literal_zero(self, node) -> bool:
+        if not isinstance(node, Number):
+            return False
+        if node.inferred_type == 'float':
+            return False
+        try:
+            return int(node.value, 0) == 0
+        except (ValueError, TypeError):
+            return False
+
+    def _is_compile_time_false(self, node) -> bool:
+        if isinstance(node, Number):
+            try:
+                v = int(node.value, 0)
+                return v == 0
+            except (ValueError, TypeError):
+                try:
+                    return float(node.value) == 0.0
+                except (ValueError, TypeError):
+                    return False
+        return False
+
+    def _is_compile_time_true(self, node) -> bool:
+        return isinstance(node, Number) and not self._is_compile_time_false(node)
 
     def analyze(self, nodes: list) -> bool:
         for node in nodes:
@@ -150,12 +201,19 @@ class SemanticAnalyzer:
             try:
                 val = int(node.value)
                 if val > 2**31 - 1 or val < -2**31:
-                    # Prefer int64 for values that fit in signed range
                     if val <= 2**63 - 1 and val >= -2**63:
                         node.inferred_type = 'int64'
                         return 'int64'
-                    node.inferred_type = 'uint64'
-                    return 'uint64'
+                    if val <= 2**64 - 1:
+                        node.inferred_type = 'uint64'
+                        return 'uint64'
+                    self.error(
+                        f'integer literal `{node.value}` exceeds maximum value',
+                        node,
+                        note=f'value too large for any integer type (max 2^64-1)'
+                    )
+                    node.inferred_type = 'int64'
+                    return 'int64'
             except ValueError:
                 pass
             # For small integers, return 'int' but allow implicit conversion to int64
@@ -175,6 +233,15 @@ class SemanticAnalyzer:
 
         if isinstance(node, BinOp):
             left_t = self._infer_type(node.left)
+
+            if node.op.name in ('AND', 'OR'):
+                if node.op.name == 'AND' and self._is_compile_time_false(node.left):
+                    return 'bool'
+                if node.op.name == 'OR' and self._is_compile_time_true(node.left):
+                    return 'bool'
+                right_t = self._infer_type(node.right)
+                return 'bool'
+
             right_t = self._infer_type(node.right)
 
             if node.op.name in ('EQ_EQ', 'NOT_EQ', 'LESS', 'GREATER', 'LESS_EQ', 'GREATER_EQ'):
@@ -205,6 +272,12 @@ class SemanticAnalyzer:
                         node,
                         note=f'got `{left_t}` and `{right_t}`'
                     )
+                if node.op.name in ('PERCENT', 'SLASH_SLASH') and self._is_literal_zero(node.right):
+                    self.error(
+                        f'division by zero in `{node.op.name}`',
+                        node,
+                        note=f'cannot divide or mod by zero'
+                    )
                 # Type promotion for mixed integer types
                 if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
                     return 'int64'  # Simplified: promote to int64 for mixed operations
@@ -213,6 +286,14 @@ class SemanticAnalyzer:
             if node.op.name in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'POW'):
                 if left_t == 'str' and right_t == 'str' and node.op.name == 'PLUS':
                     return 'str'
+                if node.op.name == 'SLASH':
+                    int_types = ('int', 'int64', 'uint64')
+                    if left_t in int_types and right_t in int_types and self._is_literal_zero(node.right):
+                        self.error(
+                            f'division by zero',
+                            node,
+                            note=f'cannot divide integer by zero'
+                        )
                 if left_t is not None and right_t is not None and left_t != right_t:
                     # Allow mixed integer types with promotion
                     valid_int_types = ('int', 'int64', 'uint64')
@@ -364,6 +445,8 @@ class SemanticAnalyzer:
             self._visit_break(node)
         elif isinstance(node, Continue):
             self._visit_continue(node)
+        elif isinstance(node, While):
+            self._visit_while(node, scope)
         elif isinstance(node, Switch):
             self._visit_switch(node, scope)
         elif isinstance(node, ExprStmt):
@@ -541,6 +624,7 @@ class SemanticAnalyzer:
         self.locals = old_locals
 
     def _visit_if(self, node: If, scope: Scope | None = None):
+        self._infer_type(node.cond)
         for stmt in node.body:
             self._visit(stmt, scope)
         if node.orelse:
@@ -580,8 +664,13 @@ class SemanticAnalyzer:
                 # Allow int literal 0 as null for any pointer type
                 # Allow float/double interchange (same LLVM type)
                 # Allow str/char* interchange (same LLVM type)
+                narrowing = {
+                    ('int64', 'int'), ('uint64', 'int'),
+                    ('double', 'float'),
+                }
                 valid_conversions = [
                     ('int', 'int64'), ('int', 'uint64'),
+                    ('int64', 'int'), ('uint64', 'int'),
                     ('int64', 'uint64'), ('uint64', 'int64'),
                     ('float', 'double'), ('double', 'float'),
                     ('str', 'char'), ('char', 'str'),
@@ -590,6 +679,17 @@ class SemanticAnalyzer:
                 ok = ok or (val_type == 'int' and existing.type.endswith('*'))
                 ok = ok or (val_type == 'str' and (existing.type.endswith('*') or existing.type == 'char'))
                 ok = ok or (existing.type == 'str' and (val_type.endswith('*') or val_type == 'char'))
+                if ok and (val_type, existing.type) in narrowing:
+                    self._strict_error(
+                        f'narrowing conversion from `{val_type}` to `{existing.type}` in assignment',
+                        node
+                    )
+                if ok and (val_type == 'int' and existing.type.endswith('*')):
+                    self._strict_warning(
+                        f'implicit int-to-pointer conversion in assignment to `{existing.type}`',
+                        node,
+                        note='use 0 literal for null pointer'
+                    )
                 if not ok:
                     self.error(
                         f'cannot assign `{val_type}` to variable `{name}` of type `{existing.type}`',
@@ -636,16 +736,34 @@ class SemanticAnalyzer:
                 # Allow int literal 0 as null for any pointer type
                 # Allow float/double interchange
                 # Allow str/char* interchange
+                # Allow char to int (widening)
+                narrowing = {
+                    ('int64', 'int'), ('uint64', 'int'),
+                    ('double', 'float'),
+                }
                 valid_conversions = [
                     ('int', 'int64'), ('int', 'uint64'),
+                    ('int64', 'int'), ('uint64', 'int'),
                     ('int64', 'uint64'), ('uint64', 'int64'),
                     ('float', 'double'), ('double', 'float'),
                     ('str', 'char'), ('char', 'str'),
+                    ('char', 'int'),
                 ]
                 ok = (init_type, val_type) in valid_conversions
                 ok = ok or (init_type == 'int' and val_type.endswith('*'))
                 ok = ok or (init_type == 'str' and (val_type.endswith('*') or val_type == 'char'))
                 ok = ok or (val_type == 'str' and (init_type.endswith('*') or init_type == 'char'))
+                if ok and (init_type, val_type) in narrowing:
+                    self._strict_error(
+                        f'narrowing conversion from `{init_type}` to `{val_type}` in variable declaration',
+                        node
+                    )
+                if ok and (init_type == 'int' and val_type.endswith('*')):
+                    self._strict_warning(
+                        f'implicit int-to-pointer conversion in declaration of `{val_type}`',
+                        node,
+                        note='use 0 literal for null pointer'
+                    )
                 if not ok:
                     self.error(
                         f'cannot initialize `{val_type}` variable with value of type `{init_type}`',
@@ -654,10 +772,12 @@ class SemanticAnalyzer:
         s.define(node.name, Symbol('variable', val_type, node))
 
     def _visit_break(self, node: Break):
-        pass
+        if self._loop_depth == 0:
+            self.error('break outside loop', node)
 
     def _visit_continue(self, node: Continue):
-        pass
+        if self._loop_depth == 0:
+            self.error('continue outside loop', node)
 
     def _visit_switch(self, node: Switch, scope: Scope | None = None):
         self._infer_type(node.value)
@@ -691,20 +811,37 @@ class SemanticAnalyzer:
         for field in node.fields:
             struct_scope.define(field.name, Symbol('field', field.type_expr, node))
 
-    def _visit_while(self, node: dict, scope: Scope | None = None):
-        for stmt in node.get('body', []):
-            self._visit(stmt, scope)
+    def _visit_while(self, node, scope: Scope | None = None):
+        if isinstance(node, While):
+            self._infer_type(node.cond)
+            self._loop_depth += 1
+            for stmt in node.body:
+                self._visit(stmt, scope)
+            self._loop_depth -= 1
+        elif isinstance(node, dict):
+            cond = node.get('cond')
+            if cond is not None:
+                self._infer_type(cond)
+            self._loop_depth += 1
+            for stmt in node.get('body', []):
+                self._visit(stmt, scope)
+            self._loop_depth -= 1
 
     def _visit_for(self, node: dict, scope: Scope | None = None):
         s = scope or self.current_scope
         loop_scope = Scope(s)
         loop_scope.define(node['var'], Symbol('variable', None, node))
+        iterable = node.get('iter')
+        if iterable is not None:
+            self._infer_type(iterable)
+        self._loop_depth += 1
         for stmt in node.get('body', []):
             self._visit(stmt, loop_scope)
+        self._loop_depth -= 1
 
 
-def analyze(source: str, nodes: list) -> str | None:
-    analyzer = SemanticAnalyzer(source)
+def analyze(source: str, nodes: list, strict: bool = False) -> str | None:
+    analyzer = SemanticAnalyzer(source, strict=strict)
     if analyzer.analyze(nodes):
         return None
     return analyzer.reporter.display()

@@ -154,10 +154,13 @@ def main():
     mode = 'jit'
     args = sys.argv[1:]
 
+    strict = False
     while args and args[0].startswith('--'):
         flag = args.pop(0)
         if flag == '--tab-size':
             tab_size = int(args.pop(0))
+        elif flag == '--strict':
+            strict = True
         elif flag == '--ast':
             mode = 'ast'
         elif flag == '--emit-llvm':
@@ -171,7 +174,7 @@ def main():
             sys.exit(1)
 
     if not args:
-        print('Usage: cpy [--tab-size N] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
+        print('Usage: cpy [--tab-size N] [--strict] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
         sys.exit(1)
 
     with open(args[0]) as f:
@@ -186,7 +189,7 @@ def main():
         print(f'parse error: {e}', file=sys.stderr)
         sys.exit(1)
 
-    result = analyze(source, parsed)
+    result = analyze(source, parsed, strict=strict)
     if result:
         print(result, file=sys.stderr)
         sys.exit(1)

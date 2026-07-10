@@ -62,6 +62,13 @@ class LLVM:
             t = t[:idx]
         return t
 
+    def _is_ir_constant_zero(self, val):
+        if isinstance(val, ir.Constant) and val.constant == 0:
+            return True
+        if isinstance(val, ir.Constant) and isinstance(val.type, ir.PointerType) and val.constant is None:
+            return True
+        return False
+
     def __init__(self):
         self.module = ir.Module("main")
         self.builder = None
@@ -584,10 +591,16 @@ class LLVM:
             case TokenType.STAR:
                 return self.builder.mul(left, right)
             case TokenType.SLASH:
+                if self._is_ir_constant_zero(right):
+                    raise ZeroDivisionError('division by zero')
                 return self.builder.sdiv(left, right)
             case TokenType.SLASH_SLASH:
+                if self._is_ir_constant_zero(right):
+                    raise ZeroDivisionError('division by zero')
                 return self.builder.sdiv(left, right)
             case TokenType.PERCENT:
+                if self._is_ir_constant_zero(right):
+                    raise ZeroDivisionError('division by zero')
                 return self.builder.srem(left, right)
             case TokenType.SHL:
                 return self.builder.shl(left, right)

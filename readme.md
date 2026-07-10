@@ -1,4 +1,4 @@
-Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpy_language_documentation.md)
+Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/commit/f11c87dc17517156b3f6bd276b4c0d78cd82370c/source/cpyte/cpy_language_documentation.md)
 
 VERSION 1.6 had a codegen problem related to null pointers.
 

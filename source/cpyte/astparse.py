@@ -216,8 +216,13 @@ def _parse_atom(tokens: list[Token], pos: int):
     if tok.type == TokenType.IDENTIFIER:
         return Variable(tok.value, token=tok), pos + 1
 
-    if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'null'):
-        val = '1' if tok.value == 'true' else '0'
+    if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'True', 'False', 'null'):
+        if tok.value in ('true', 'True'):
+            val = '1'
+        elif tok.value in ('false', 'False'):
+            val = '0'
+        else:
+            val = '0'
         return Number(val, token=tok), pos + 1
 
     if tok.type == TokenType.KEYWORD and tok.value == 'input':

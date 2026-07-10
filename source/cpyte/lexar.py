@@ -59,7 +59,7 @@ KEYWORDS = {
     'def', 'class', 'return', 'if', 'else', 'elif',
     'while', 'for', 'in', 'break', 'continue',
     'public', 'private', 'static', 'virtual', 'override',
-    'import', 'true', 'false', 'null',
+    'import', 'true', 'false', 'null', 'True', 'False',
     'and', 'or', 'not',
     'print',
     'input', 'input_str',

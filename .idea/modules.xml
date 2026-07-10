@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/WEW.iml" filepath="$PROJECT_DIR$/.idea/WEW.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/cpyte.iml" filepath="$PROJECT_DIR$/.idea/cpyte.iml" />
     </modules>
   </component>
 </project>

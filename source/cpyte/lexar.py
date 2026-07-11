@@ -217,6 +217,9 @@ class _LineLexer:
             self.advance()
             return Token(op_map_3[three_char], three_char, self.line_number, col)
 
+        if two_char == '--' and self.pos + 1 < len(self.line) and self.peek(1).isdigit():
+            return Token(TokenType.MINUS, '-', self.line_number, col)
+
         if two_char in op_map_2:
             self.advance()
             return Token(op_map_2[two_char], two_char, self.line_number, col)

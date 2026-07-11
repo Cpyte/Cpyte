@@ -1,4 +1,4 @@
-# Cpy Language Reference: A Comprehensive Guide to Syntax and Semantics
+# Cpy Language Reference
 
 ## Status Notice
 
@@ -6,9 +6,9 @@
 
 Features marked as **"Planned"** or **"In Development"** are not yet available in the current implementation but are part of the language design roadmap.
 
-## Executive Summary
+## Overview
 
-Cpy is a sophisticated compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, manual memory management, direct C interoperability, and compilation to native machine code via LLVM. The language is designed for developers who require both productivity and low-level control.
+Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, manual memory management, direct C interoperability, and compilation to native machine code via LLVM.
 
 ## Table of Contents
 
@@ -29,13 +29,13 @@ Cpy is a sophisticated compiled programming language that combines Python-like s
 
 ## Language Overview
 
-Cpy represents a unique fusion of high-level language ergonomics with low-level system programming capabilities. The language targets developers who need:
+Cpy combines high-level language syntax with low-level system programming capabilities. The language targets developers who need:
 
 - **Performance**: Native compilation via LLVM with optimization levels
 - **Control**: Manual memory management with pointer operations
-- **Interoperability**: Seamless C library integration
+- **Interoperability**: C library integration
 - **Safety**: Static type checking with semantic analysis
-- **Productivity**: Python-inspired syntax for rapid development
+- **Productivity**: Python-inspired syntax
 
 ### Design Philosophy
 
@@ -43,7 +43,7 @@ The language follows these core principles:
 
 1. **Explicit is better than implicit**: Memory operations and type conversions are explicit
 2. **Systems programming first**: Designed for scenarios where C would traditionally be used
-3. **Modern syntax**: Leverages familiar Python-like patterns while maintaining systems semantics
+3. **Modern syntax**: Uses Python-like patterns while maintaining systems semantics
 4. **Zero-cost abstractions**: High-level features compile to efficient machine code
 
 ---
@@ -183,7 +183,7 @@ empty_value = null
 
 ## Type System
 
-Cpy employs a static type system with type inference and explicit type annotations. The type system is designed to catch errors at compile time while maintaining flexibility.
+Cpy employs a static type system with type inference and explicit type annotations. The type system catches errors at compile time while maintaining flexibility.
 
 ### Primitive Types
 
@@ -297,7 +297,7 @@ result = x + y  # Type inferred based on operation
 
 ## 64-bit Support
 
-Cpy provides comprehensive 64-bit support for modern computing platforms, enabling developers to work with large datasets, high-precision calculations, and memory-intensive applications.
+Cpy provides 64-bit support for modern computing platforms, enabling developers to work with large datasets, high-precision calculations, and memory-intensive applications.
 
 ### Platform Architecture
 
@@ -350,21 +350,21 @@ uint64 shifted = hash_value >> 16
 
 ### Type Conversions
 
-#### Safe Conversions
+#### Type Conversions
 
 ```cpy
-# 32-bit to 64-bit conversion (always safe)
+# 32-bit to 64-bit conversion
 int x = 42
 int64 large_x = x  # Automatic promotion
 
-# 64-bit to 32-bit conversion (potential overflow)
+# 64-bit to 32-bit conversion
 int64 large_value = 9223372036854775807
 int reduced = (int)large_value  # Explicit cast required
 ```
 
-#### Implicit Type Promotion
+#### Type Promotion
 
-The compiler automatically promotes types in mixed expressions:
+The compiler promotes types in mixed expressions:
 
 ```cpy
 # int to int64 promotion
@@ -372,36 +372,35 @@ int small = 42
 int64 large = 1000000000000
 int64 result = small + large  # small is automatically promoted to int64
 
-# int64 to uint64 conversion (allowed)
+# int64 to uint64 conversion
 int64 signed_val = -100
-uint64 unsigned_val = signed_val  # Implicit conversion allowed
+uint64 unsigned_val = signed_val  # Implicit conversion
 ```
 
-#### Overflow Handling
+#### Overflow
 
 ```cpy
 # 64-bit arithmetic overflow
 int64 max_int64 = 9223372036854775807
 int64 overflow_result = max_int64 + 1  # Implementation-defined behavior
 
-# Unsigned overflow (wraps around)
+# Unsigned overflow
 uint64 max_uint64 = 18446744073709551615
 uint64 wrapped = max_uint64 + 1  # Wraps to 0
 ```
 
-### Memory Operations with 64-bit Types
+### Memory Operations
 
 #### 64-bit Pointers
 
 ```cpy
-# 64-bit pointer operations
 int64* ptr_to_large = new int64
 *ptr_to_large = 9223372036854775807
 
 uint64* ptr_to_unsigned = new uint64
 *ptr_to_unsigned = 0xFFFFFFFFFFFFFFFF
 
-# Pointer arithmetic on 64-bit types
+# Pointer arithmetic
 int64* array_start = new int64[1000]
 int64* fifth_element = array_start + 4
 ```
@@ -409,7 +408,6 @@ int64* fifth_element = array_start + 4
 #### 64-bit Array Allocation
 
 ```cpy
-# Large array allocation with 64-bit indexing
 int64[] large_array = new int64[1000000]
 uint64[] huge_array = new uint64[10000000]
 
@@ -432,12 +430,11 @@ Cpy follows the LP64 data model on 64-bit platforms:
 
 #### Endianness
 
-Cpy supports both little-endian and big-endian architectures, with automatic handling based on the target platform:
+Cpy supports both little-endian and big-endian architectures:
 
 ```cpy
-# Platform-independent byte order handling
 uint64 value = 0x123456789ABCDEF0
-# Compiler handles endianness conversion automatically
+# Compiler handles endianness conversion
 ```
 
 ### Performance Considerations
@@ -447,7 +444,6 @@ uint64 value = 0x123456789ABCDEF0
 Modern 64-bit processors provide native support for 64-bit operations:
 
 ```cpy
-# 64-bit operations are typically single CPU instructions
 int64 a = 9223372036854775807
 int64 b = 1000000000
 int64 result = a + b  # Single instruction on 64-bit CPUs
@@ -455,10 +451,9 @@ int64 result = a + b  # Single instruction on 64-bit CPUs
 
 #### Memory Bandwidth
 
-64-bit types can improve memory bandwidth utilization:
+64-bit types improve memory bandwidth utilization:
 
 ```cpy
-# Processing 64-bit values can be more efficient
 int64[] data = new int64[1000]
 # Each memory operation transfers 8 bytes
 ```
@@ -521,7 +516,6 @@ Cpy's 64-bit support is consistent across platforms:
 Cpy maintains ABI compatibility with C 64-bit types:
 
 ```cpy
-# Compatible with C long long and unsigned long long
 import "c_library.c"
 int64 result = c_function_64bit(9223372036854775807)
 ```
@@ -538,7 +532,6 @@ int64 result = c_function_64bit(9223372036854775807)
 #### Overflow Prevention
 
 ```cpy
-# Check for potential overflow before operations
 public safe_add_64(a: int64, b: int64) -> int64:
     if a > 0 and b > (9223372036854775807 - a):
         print("Overflow detected")
@@ -549,7 +542,6 @@ public safe_add_64(a: int64, b: int64) -> int64:
 #### Memory Alignment
 
 ```cpy
-# 64-bit types should be properly aligned
 struct AlignedData:
     int32 small_value
     int32 padding  # Ensure 64-bit alignment
@@ -573,7 +565,7 @@ uint64 hex_unsigned_max = 0xFFFFFFFFFFFFFFFF
 int64 hex_value = 0x123456789ABCDEF0
 ```
 
-#### Binary Literals (if supported)
+#### Binary Literals
 
 ```cpy
 int64 binary_max = 0b0111111111111111111111111111111111111111111111111111111111111111
@@ -610,7 +602,6 @@ int64 maximum = max_64(a, b)
 #### Debugging Techniques
 
 ```cpy
-# Use printf-style debugging for 64-bit values
 int64 value = 9223372036854775807
 print("Value: %lld", value)  # Platform-specific format specifier
 
@@ -729,33 +720,29 @@ print(**pptr)    # Prints 99
 ### String Operations
 
 ```cpy
-# String concatenation
 str greeting = "Hello"
 str target = "World"
-str message = greeting + ", " + target  # "Hello, World"
+str message = greeting + ", " + target
 
-# String indexing (returns char)
+# String indexing
 first_char = message[0]  # 'H'
 ```
 
 ### Sizeof Operator
 
 ```cpy
-# Get size of types
-int_size = sizeof(int)       # Size of integer type
-struct_size = sizeof(Point)  # Size of custom structure
+int_size = sizeof(int)
+struct_size = sizeof(Point)
 ```
 
 ### New Expression (Memory Allocation)
 
 ```cpy
-# Allocate single object
-int* ptr = new int           # Allocate memory for one integer
-Point* p = new Point         # Allocate memory for Point structure
+int* ptr = new int
+Point* p = new Point
 
-# Allocate array
-int[] arr = new int[10]      # Allocate array of 10 integers
-Point[] points = new Point[5]  # Allocate array of 5 Points
+int[] arr = new int[10]
+Point[] points = new Point[5]
 ```
 
 ---
@@ -855,7 +842,7 @@ for item in collection:
 ```cpy
 while true:
     if condition:
-        break    # Exit the loop
+        break
 ```
 
 #### Continue Statement
@@ -863,7 +850,7 @@ while true:
 ```cpy
 for i in range(10):
     if i % 2 == 0:
-        continue    # Skip even numbers
+        continue
     print(i)
 ```
 
@@ -921,11 +908,9 @@ static static_function() -> int:
 ### Function Parameters
 
 ```cpy
-# Parameters with type annotations
 public process_numbers(a: int, b: int, c: float) -> float:
     return a + b + c
 
-# Default parameters (if supported)
 public greet(name: str = "World") -> str:
     return "Hello, " + name
 ```
@@ -933,11 +918,9 @@ public greet(name: str = "World") -> str:
 ### Return Types
 
 ```cpy
-# Explicit return type
 public add(a: int, b: int) -> int:
     return a + b
 
-# Void return (if supported)
 public print_message(msg: str):
     print(msg)
 ```
@@ -945,13 +928,8 @@ public print_message(msg: str):
 ### Function Calls
 
 ```cpy
-# Basic function call
 result = add(10, 20)
-
-# Call with named parameters (if supported)
 result = process_numbers(a=5, b=10, c=2.5)
-
-# Method call on object
 object.method(arg1, arg2)
 ```
 
@@ -1002,8 +980,6 @@ line.end.y = 100
 
 ### Generic Structures
 
-Cpy supports generic programming with parameterized types:
-
 ```cpy
 struct Pair<T, U>:
     T first
@@ -1053,14 +1029,10 @@ p.y = 20
 
 ### Heap Allocation
 
-Use the `new` operator for heap allocation:
-
 ```cpy
-# Single object allocation
 int* ptr = new int
 *ptr = 42
 
-# Array allocation
 int[] arr = new int[10]
 arr[0] = 1
 arr[9] = 10
@@ -1069,24 +1041,21 @@ arr[9] = 10
 ### Memory Operations
 
 ```cpy
-# Address-of operator
 int x = 42
 int* ptr = &x
 
-# Dereference operator
-print(*ptr)      # 42
-*ptr = 99        # Modify value through pointer
+print(*ptr)
+*ptr = 99
 
-# Pointer arithmetic (if supported)
 int* arr = new int[10]
-int* second = arr + 1  # Point to second element
+int* second = arr + 1
 ```
 
 ### Memory Safety Considerations
 
-Cpy provides manual memory management, which requires careful attention to:
+Cpy provides manual memory management:
 
-- **Memory leaks**: Always free allocated memory when no longer needed
+- **Memory leaks**: Free allocated memory when no longer needed
 - **Dangling pointers**: Avoid using pointers to freed memory
 - **Buffer overflows**: Ensure array accesses are within bounds
 - **Null pointer dereferences**: Check pointers before dereferencing
@@ -1097,14 +1066,14 @@ Cpy provides manual memory management, which requires careful attention to:
 
 ### Importing Cpy Module Files
 
-Cpy files can import other `.cpy` files, making all `public` functions and struct definitions available to the importer:
+Cpy files can import other `.cpy` files:
 
 ```cpy
 import "math_utils.cpy"
 import "data_structs.cpy"
 ```
 
-Only functions marked with the `public` keyword are exported. Imported functions and structs are inlined into the same LLVM module, ensuring cross-module optimization is preserved.
+Only functions marked with the `public` keyword are exported. Imported functions and structs are inlined into the same LLVM module.
 
 ```cpy
 # math_utils.cpy
@@ -1136,7 +1105,6 @@ import "string_operations.c"
 ### Calling C Functions
 
 ```cpy
-# After importing a C library
 result = c_function(arg1, arg2)
 ```
 
@@ -1177,10 +1145,10 @@ Cpy source code goes through several compilation stages:
 
 1. **Lexical Analysis**: Source code is tokenized
 2. **Syntax Analysis**: Tokens are parsed into an Abstract Syntax Tree (AST)
-3. **Semantic Analysis**: Type checking and scope validation, including 64-bit type safety
-4. **LLVM IR Generation**: AST is converted to LLVM Intermediate Representation with 64-bit support
-5. **Optimization**: LLVM optimization passes improve performance, including 64-bit specific optimizations
-6. **Code Generation**: Native machine code is generated for 64-bit architectures
+3. **Semantic Analysis**: Type checking and scope validation
+4. **LLVM IR Generation**: AST is converted to LLVM Intermediate Representation
+5. **Optimization**: LLVM optimization passes improve performance
+6. **Code Generation**: Native machine code is generated
 
 ### Compiler Invocation
 
@@ -1218,10 +1186,10 @@ run_aot(module, output="program.o", opt_level=3)
 
 ### Optimization Levels
 
-- `-O0`: No optimization (fast compilation, slow execution)
+- `-O0`: No optimization
 - `-O1`: Basic optimization
-- `-O2`: Standard optimization (recommended)
-- `-O3`: Aggressive optimization (slowest compilation, fastest execution)
+- `-O2`: Standard optimization
+- `-O3`: Aggressive optimization
 
 ---
 
@@ -1232,29 +1200,26 @@ run_aot(module, output="program.o", opt_level=3)
 #### Print Function
 
 ```cpy
-print(42)              # Print integer
-print(3.14)            # Print float
-print("Hello")         # Print string
-print(x + y)           # Print expression result
+print(42)
+print(3.14)
+print("Hello")
+print(x + y)
 ```
 
 #### Input Function
 
 ```cpy
-int value = input()    # Read integer from standard input
+int value = input()
 ```
 
 ### Mathematical Operations
 
-The language supports basic mathematical operations through operators and potentially standard library functions.
+The language supports basic mathematical operations through operators.
 
 ### String Operations
 
 ```cpy
-# String concatenation
 str result = "Hello" + " " + "World"
-
-# String length (through C library)
 int len = strlen(string_ptr)
 ```
 
@@ -1265,35 +1230,28 @@ int len = strlen(string_ptr)
 ### Access Control
 
 ```cpy
-# Public members accessible from anywhere
 public public_var = 42
-
-# Private members accessible only within the same scope
 private private_var = 10
 ```
 
 ### Static Members
 
 ```cpy
-# Static members belong to the type rather than instances
 static class_variable = 100
 ```
 
 ### Virtual Functions
 
 ```cpy
-# Virtual functions enable runtime polymorphism
 virtual override function_name() -> int:
     return 0
 ```
 
 ### References
 
-The `ref` keyword may be used for reference semantics (implementation-specific):
-
 ```cpy
 def process(ref value: int):
-    value = 42  # Modifies original
+    value = 42
 ```
 
 ---
@@ -1302,31 +1260,31 @@ def process(ref value: int):
 
 ### Memory Management
 
-1. **Always initialize pointers**: Uninitialized pointers can cause undefined behavior
-2. **Free allocated memory**: Prevent memory leaks by releasing heap allocations
-3. **Check for null**: Validate pointers before dereferencing
-4. **Use stack allocation when possible**: Stack allocation is faster and automatic
+1. **Always initialize pointers**
+2. **Free allocated memory**
+3. **Check for null**
+4. **Use stack allocation when possible**
 
 ### Type Safety
 
-1. **Use type annotations**: Explicit types improve code clarity and safety
-2. **Enable strict type checking**: Catch type errors at compile time
-3. **Avoid implicit conversions**: Use explicit type conversions when needed
+1. **Use type annotations**
+2. **Enable strict type checking**
+3. **Avoid implicit conversions**
 
 ### Performance
 
-1. **Prefer stack allocation**: Stack allocation is faster than heap allocation
-2. **Use appropriate optimization levels**: Balance compilation time and runtime performance
-3. **Minimize pointer indirection**: Direct access is faster than pointer dereferencing
-4. **Leverage 64-bit operations**: Use 64-bit types when appropriate for better memory bandwidth utilization
-5. **Consider alignment**: Ensure 64-bit types are properly aligned for optimal performance
+1. **Prefer stack allocation**
+2. **Use appropriate optimization levels**
+3. **Minimize pointer indirection**
+4. **Leverage 64-bit operations**
+5. **Consider alignment**
 
 ### Code Organization
 
-1. **Use meaningful names**: Improve code readability with descriptive identifiers
-2. **Keep functions small**: Single responsibility functions are easier to maintain
-3. **Organize structures logically**: Group related data in structures
-4. **Document complex logic**: Use comments to explain non-obvious code
+1. **Use meaningful names**
+2. **Keep functions small**
+3. **Organize structures logically**
+4. **Document complex logic**
 
 ---
 
@@ -1394,7 +1352,7 @@ public sum_list(head: ListNode*) -> int:
 public main() -> int:
     ListNode* list = create_list(5)
     int total = sum_list(list)
-    print(total)  # 100 (0 + 10 + 20 + 30 + 40)
+    print(total)
     return 0
 ```
 
@@ -1415,7 +1373,7 @@ public create_matrix(rows: int, cols: int) -> Matrix:
 
 public matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
     if a.cols != b.rows:
-        return 0  # Error: incompatible dimensions
+        return 0
     
     Matrix result = create_matrix(a.rows, b.cols)
     
@@ -1440,12 +1398,11 @@ public matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
 ```cpy
 public process_large_file(filename: str) -> int64:
     int64 total_bytes = 0
-    int64 buffer_size = 65536  # 64KB buffer
+    int64 buffer_size = 65536
     int64[] buffer = new int64[buffer_size / 8]
     
-    # Simulate file processing
     int64 chunk = 0
-    while chunk < 1000000:  # Simulate 1GB file
+    while chunk < 1000000:
         total_bytes = total_bytes + buffer_size
         chunk = chunk + 1
     
@@ -1486,11 +1443,11 @@ public main() -> int:
 
 ```cpy
 public timestamp_to_days(timestamp_ns: int64) -> int64:
-    int64 ns_per_day = 86400000000000  # 24 * 60 * 60 * 1e9
+    int64 ns_per_day = 86400000000000
     return timestamp_ns / ns_per_day
 
 public main() -> int:
-    int64 current_time = 1699999999999999999  # Example timestamp
+    int64 current_time = 1699999999999999999
     int64 days = timestamp_to_days(current_time)
     print("Days since epoch: ")
     print(days)
@@ -1525,16 +1482,14 @@ public main() -> int:
 
 ## Conclusion
 
-Cpy represents a thoughtful balance between high-level language ergonomics and low-level system control. Its Python-inspired syntax makes it accessible to developers familiar with modern scripting languages, while its C-like capabilities provide the performance and control needed for systems programming.
+Cpy balances high-level language syntax with low-level system control. Its Python-inspired syntax makes it accessible to developers familiar with modern scripting languages, while its C-like capabilities provide the performance and control needed for systems programming.
 
-The language is particularly well-suited for:
+The language is suited for:
 
 - **Systems programming**: Operating systems, drivers, embedded systems
 - **Performance-critical applications**: Game engines, scientific computing
 - **C library integration**: Wrapping existing C libraries with modern syntax
 - **Education**: Teaching systems programming concepts with approachable syntax
-
-As the language continues to evolve, it has the potential to become a compelling alternative to traditional systems programming languages while maintaining the productivity that modern developers expect.
 
 ---
 
@@ -1582,7 +1537,3 @@ IDENTIFIER     ::= [a-zA-Z_] [a-zA-Z0-9_]*
 
 **Planned additions:**
 - `HEX_NUMBER ::= "0x" [0-9A-Fa-f]+` (for 64-bit hexadecimal literals)
-
----
-
-*This documentation covers the Cpy language as implemented in the current codebase. Features may vary based on the specific version and implementation details.*

@@ -51,7 +51,10 @@ def _runtime_print_double(d: float):
 
 
 def _runtime_print_str(s: bytes):
-    print(s.decode('utf-8'))
+    if s is None:
+        print("(null)")
+    else:
+        print(s.decode('utf-8'))
 
 
 def _runtime_input() -> int:

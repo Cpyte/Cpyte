@@ -178,25 +178,26 @@ class SemanticAnalyzer:
 
     def _infer_type(self, node):
         if isinstance(node, Number):
-            if '.' in node.value or 'e' in node.value or 'E' in node.value:
-                node.inferred_type = 'float'
-                return 'float'
-            # Check for hexadecimal literals (0x prefix)
+            # Check for hexadecimal literals (0x prefix) BEFORE float 'e' check,
+            # since hex values legitimately contain the letter 'e' as a digit (0-9a-f)
             if node.value.startswith('0x') or node.value.startswith('0X'):
-                # For large hex values, infer int64 or uint64 based on size
                 try:
                     val = int(node.value, 16)
                     if val > 2**31 - 1 or val < -2**31:
-                        # Prefer int64 for values that fit in signed range
                         if val <= 2**63 - 1:
                             node.inferred_type = 'int64'
                             return 'int64'
                         node.inferred_type = 'uint64'
                         return 'uint64'
+                    node.inferred_type = 'int'
+                    return 'int'
                 except ValueError:
                     pass
                 node.inferred_type = 'int64'
                 return 'int64'
+            if '.' in node.value or 'e' in node.value or 'E' in node.value:
+                node.inferred_type = 'float'
+                return 'float'
             # Check for large decimal values that might need 64-bit
             try:
                 val = int(node.value)
@@ -255,6 +256,8 @@ class SemanticAnalyzer:
                         ('int', 'int64'), ('int', 'uint64'),
                         ('int64', 'uint64'), ('uint64', 'int64'),
                         ('str', 'char'), ('char', 'str'),
+                        ('char', 'int'), ('int', 'char'),
+                        ('char', 'int64'), ('int64', 'char'),
                     )
                     if not ok:
                         self.error(
@@ -286,6 +289,13 @@ class SemanticAnalyzer:
             if node.op.name in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'POW'):
                 if left_t == 'str' and right_t == 'str' and node.op.name == 'PLUS':
                     return 'str'
+                if left_t == 'str' or right_t == 'str':
+                    self.error(
+                        f'operator `{node.op.name}` not supported for string operands',
+                        node,
+                        note=f'strings only support `+` (concatenation)'
+                    )
+                    return left_t if left_t is not None else right_t
                 if node.op.name == 'SLASH':
                     int_types = ('int', 'int64', 'uint64')
                     if left_t in int_types and right_t in int_types and self._is_literal_zero(node.right):
@@ -347,10 +357,17 @@ class SemanticAnalyzer:
 
         if isinstance(node, Index):
             obj_t = self._infer_type(node.obj)
+            self._infer_type(node.index)
             if obj_t and obj_t.endswith('[]'):
                 return obj_t[:-2]
             if obj_t == 'str':
                 return 'char'
+            if obj_t is not None:
+                self.error(
+                    f'cannot index value of type `{obj_t}`',
+                    node,
+                    note='indexing requires a string or array type'
+                )
             return None
 
         if isinstance(node, Attr):
@@ -361,14 +378,26 @@ class SemanticAnalyzer:
                     for field in struct_sym.node.fields:
                         if field.name == node.name:
                             return field.type_expr
+                    self.error(
+                        f'type `{obj_t}` has no field `{node.name}`',
+                        node
+                    )
+                    return None
+                self.error(
+                    f'cannot access field `{node.name}` on non-struct type `{obj_t}`',
+                    node
+                )
+                return None
             return None
 
         if isinstance(node, Deref):
             operand_t = self._infer_type(node.operand)
-            if operand_t and operand_t.endswith('*'):
+            if operand_t is not None and operand_t.endswith('*'):
                 return operand_t[:-1]
-            if operand_t:
+            if operand_t is not None:
                 self.error(f'cannot dereference non-pointer type `{operand_t}`', node)
+            elif operand_t is None and hasattr(node.operand, '_token'):
+                self.error('cannot dereference value of unknown type', node)
             return operand_t
 
         if isinstance(node, AddrOf):
@@ -379,6 +408,7 @@ class SemanticAnalyzer:
 
         if isinstance(node, NewExpr):
             if node.size is not None:
+                self._infer_type(node.size)
                 return node.type_expr + '[]'
             return node.type_expr + '*'
 
@@ -625,11 +655,17 @@ class SemanticAnalyzer:
 
     def _visit_if(self, node: If, scope: Scope | None = None):
         self._infer_type(node.cond)
+        old_locals = self.locals
+        body_scope = Scope(scope or self.current_scope)
+        self.locals = body_scope
         for stmt in node.body:
-            self._visit(stmt, scope)
+            self._visit(stmt, body_scope)
         if node.orelse:
+            else_scope = Scope(scope or self.current_scope)
+            self.locals = else_scope
             for stmt in node.orelse:
-                self._visit(stmt, scope)
+                self._visit(stmt, else_scope)
+        self.locals = old_locals
 
     def _visit_return(self, node: Return):
         if node.value is not None:
@@ -830,14 +866,17 @@ class SemanticAnalyzer:
     def _visit_for(self, node: dict, scope: Scope | None = None):
         s = scope or self.current_scope
         loop_scope = Scope(s)
-        loop_scope.define(node['var'], Symbol('variable', None, node))
+        loop_scope.define(node['var'], Symbol('variable', 'char', node))
         iterable = node.get('iter')
         if iterable is not None:
             self._infer_type(iterable)
+        old_locals = self.locals
+        self.locals = loop_scope
         self._loop_depth += 1
         for stmt in node.get('body', []):
             self._visit(stmt, loop_scope)
         self._loop_depth -= 1
+        self.locals = old_locals
 
 
 def analyze(source: str, nodes: list, strict: bool = False) -> str | None:

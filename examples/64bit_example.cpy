@@ -140,7 +140,7 @@ public main() -> int:
     int len = strlen(message)
     int c = 0
     while c < len:
-        uint64 byte_val = message[c]
+        int byte_val = message[c]
         hash = hash ^ byte_val
         hash = hash * 0x100000001B3
         c = c + 1

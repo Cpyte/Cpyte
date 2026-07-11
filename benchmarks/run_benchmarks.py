@@ -11,8 +11,8 @@ RUNTIME_C = os.path.join(HERE, "runtime.c")
 
 C_CC = "clang"
 C_CFLAGS = ["-O3", "-lm"]
-CPY_COMPILE = [sys.executable, os.path.join(PROJECT, "mainpie.py"), "--aot"]
-CPY_LINK = [C_CC, "program.o", RUNTIME_C, "-o", "{name}", "-lm"]
+CPY_COMPILE = [sys.executable, os.path.join(PROJECT, "source", "mainpie.py"), "--aot"]
+
 
 ALL_BENCHMARKS = [
     {"name": "fib_recursive",  "has_cpy": True},
@@ -32,7 +32,7 @@ def log(msg):
 
 def compile_c(name):
     src = os.path.join(HERE, f"{name}.c")
-    out = os.path.join(HERE, name)
+    out = os.path.join(HERE, f"{name}_c")
     subprocess.run(
         [C_CC, *C_CFLAGS, "-o", out, src],
         capture_output=True, text=True,
@@ -48,7 +48,7 @@ def compile_cpy(name):
     if r.returncode != 0:
         print(f"    cpy compile failed: {r.stderr.strip()}")
         return False
-    exe = os.path.join(HERE, name)
+    exe = os.path.join(HERE, f"{name}_cpy")
     r2 = subprocess.run(
         [C_CC, "program.o", RUNTIME_C, "-o", exe, "-lm"],
         capture_output=True, text=True, cwd=HERE,
@@ -83,8 +83,8 @@ def fmt_ns(ns):
 def main():
     os.chdir(HERE)
 
-    src_runtime = os.path.join(PROJECT, "runtime.c")
-    if not os.path.exists(RUNTIME_C) and os.path.exists(src_runtime):
+    src_runtime = os.path.join(PROJECT, "source", "runtime.c")
+    if os.path.exists(src_runtime):
         shutil.copy2(src_runtime, RUNTIME_C)
 
     print(f"\n{'='*70}")
@@ -98,9 +98,10 @@ def main():
         compile_c(name)
         log("C OK")
 
+        bm["cpy_ok"] = False
         if bm["has_cpy"]:
-            ok = compile_cpy(name)
-            log("cpy OK" if ok else "cpy SKIPPED")
+            bm["cpy_ok"] = compile_cpy(name)
+            log("cpy OK" if bm["cpy_ok"] else "cpy SKIPPED")
         else:
             log("cpy N/A")
 
@@ -118,7 +119,7 @@ def main():
         print(f"  [{name}]")
 
         for lang, cmd, key in [
-            ("C",     [os.path.join(HERE, name)], "C"),
+            ("C",     [os.path.join(HERE, f"{name}_c")], "C"),
             ("Python", [sys.executable, os.path.join(HERE, f"{name}.py")], "Python"),
         ]:
             trials = []
@@ -137,9 +138,9 @@ def main():
                 parts = ", ".join(fmt_ns(t) for t in trials)
                 log(f"{lang:8s} {parts}  [{out}]")
 
-        if bm["has_cpy"]:
+        if bm.get("cpy_ok"):
             lang = "cpy"
-            cmd = [os.path.join(HERE, name)]
+            cmd = [os.path.join(HERE, f"{name}_cpy")]
             trials = []
             out = None
             for trial in range(3):
@@ -183,7 +184,7 @@ def main():
 
         c_s = fmt(c_trials)
         py_s = fmt(py_trials)
-        cpy_s = fmt(cpy_trials) if bm["has_cpy"] and cpy_trials and cpy_trials[0] is not None else "N/A"
+        cpy_s = fmt(cpy_trials) if bm.get("cpy_ok") and cpy_trials and cpy_trials[0] is not None else "N/A"
 
         r = ""
         c_best = best(c_trials)
@@ -206,9 +207,10 @@ def main():
 
     # Cleanup
     for bm in ALL_BENCHMARKS:
-        exe = os.path.join(HERE, bm["name"])
-        if os.path.exists(exe):
-            os.remove(exe)
+        for suffix in ("_c", "_cpy"):
+            exe = os.path.join(HERE, bm["name"] + suffix)
+            if os.path.exists(exe):
+                os.remove(exe)
     obj = os.path.join(HERE, "program.o")
     if os.path.exists(obj):
         os.remove(obj)

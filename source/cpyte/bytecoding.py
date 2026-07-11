@@ -82,6 +82,7 @@ class LLVM:
         self.structs = {}
         self.struct_fields = {}
         self.import_src_files = []
+        self.loop_stack = []
         self._malloc_fn = None
         self._strlen_fn = None
         self._memcpy_fn = None
@@ -106,6 +107,77 @@ class LLVM:
         input_str_ty = ir.FunctionType(_i8ptr, [])
         input_str_fn = ir.Function(self.module, input_str_ty, "input_str")
         self.functions["input_str"] = input_str_fn
+
+    def emit_switch(self, node):
+        value = self.emit(node.value)
+        if not isinstance(value.type, ir.IntType):
+            value = self._is_true(value)
+
+        end_blk = self.builder.append_basic_block(name="sw_end")
+
+        case_irs = []
+        case_blks = [None] * len(node.cases)
+        default_blk = end_blk
+
+        for i, (case_val, body) in enumerate(node.cases):
+            if case_val is None:
+                default_blk = self.builder.append_basic_block(name="sw_default")
+                case_irs.append(None)
+                case_blks[i] = default_blk
+            else:
+                val_ir = self.emit(case_val)
+                case_irs.append(val_ir)
+
+        if any(not isinstance(c, ir.Constant) for c in case_irs if c is not None):
+            body_blk = self.builder.append_basic_block(name="sw_entry")
+            self.builder.branch(body_blk)
+            self.builder.position_at_start(body_blk)
+            for i, (case_val, body) in enumerate(node.cases):
+                if case_val is not None:
+                    val_ir = case_irs[i]
+                    eq = self.builder.icmp_signed('==', value, val_ir)
+                    then_blk = self.builder.append_basic_block(name="sw_case")
+                    nxt_blk = self.builder.append_basic_block(name="sw_next")
+                    self.builder.cbranch(eq, then_blk, nxt_blk)
+                    self.builder.position_at_start(then_blk)
+                    for stmt in body:
+                        self.emit(stmt)
+                    if not self.builder.block.is_terminated:
+                        self.builder.branch(end_blk)
+                    self.builder.position_at_start(nxt_blk)
+                else:
+                    self.builder.branch(default_blk)
+                    self.builder.position_at_start(default_blk)
+                    for stmt in body:
+                        self.emit(stmt)
+                    if not self.builder.block.is_terminated:
+                        self.builder.branch(end_blk)
+            self.builder.position_at_start(end_blk)
+            return
+
+        for i, (case_val, body) in enumerate(node.cases):
+            if case_val is not None:
+                blk = self.builder.append_basic_block(name="sw_case")
+                case_blks[i] = blk
+
+        body_blk = self.builder.append_basic_block(name="sw_body")
+        self.builder.branch(body_blk)
+        self.builder.position_at_start(body_blk)
+
+        sw = self.builder.switch(value, default_blk)
+        for i, (case_val, _) in enumerate(node.cases):
+            if case_val is not None:
+                sw.add_case(case_irs[i], case_blks[i])
+
+        for i, (case_val, body) in enumerate(node.cases):
+            blk = case_blks[i]
+            self.builder.position_at_start(blk)
+            for stmt in body:
+                self.emit(stmt)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(end_blk)
+
+        self.builder.position_at_start(end_blk)
 
     def emit_program(self, ast):
         structs = []
@@ -141,13 +213,29 @@ class LLVM:
         for node in imports:
             self.emit(node)
 
+        user_main = None
+        for node in funcdefs:
+            if getattr(node, 'name', None) == 'main':
+                user_main = node
+                break
+
+        if toplevel and user_main is not None:
+            user_main.body = toplevel + user_main.body
+            toplevel = []
+
+        wrapper_builder = None
+        if toplevel:
+            main = ir.Function(
+                self.module, ir.FunctionType(ir.IntType(32), []), "main"
+            )
+            entry = main.append_basic_block("entry")
+            wrapper_builder = ir.IRBuilder(entry)
+
         for node in funcdefs:
             self.emit(node)
 
-        if toplevel:
-            main = ir.Function(self.module, ir.FunctionType(ir.IntType(32), []), "main")
-            entry = main.append_basic_block("entry")
-            self.builder = ir.IRBuilder(entry)
+        if wrapper_builder is not None:
+            self.builder = wrapper_builder
             for node in toplevel:
                 self.emit(node)
             self.builder.ret(ir.Constant(ir.IntType(32), 0))
@@ -205,6 +293,14 @@ class LLVM:
             return self.emit_index(node)
         if isinstance(node, Attr):
             return self.emit_attr(node)
+        if isinstance(node, Switch):
+            return self.emit_switch(node)
+        if isinstance(node, Break):
+            return self.emit_break(node)
+        if isinstance(node, Continue):
+            return self.emit_continue(node)
+        if isinstance(node, dict) and node.get('type') == 'for':
+            return self.emit_for(node)
         return None
 
     def emit_struct(self, node: StructDef):
@@ -221,9 +317,10 @@ class LLVM:
         self.struct_fields[node.name] = node.fields
 
     def emit_new_expr(self, node: NewExpr):
+        if node.type_expr == 'str':
+            return self._string_const('')
         if node.size is not None:
             count = self.emit(node.size)
-            # Convert count to i64 if needed
             if count.type != _i64:
                 count = self.builder.zext(count, _i64)
         else:
@@ -233,6 +330,8 @@ class LLVM:
             elem_ty = self.llvm_type(node.type_expr[:-2])
         malloc_ty = ir.PointerType(elem_ty)
         elem_size = self._sizeof_type(elem_ty)
+        if elem_size.type != count.type:
+            elem_size = self.builder.zext(elem_size, count.type)
         total_size = self.builder.mul(count, elem_size)
         malloc_fn = self._get_malloc_fn()
         ptr = self.builder.call(malloc_fn, [total_size])
@@ -282,7 +381,7 @@ class LLVM:
 
     def _sizeof_type(self, ty):
         sz, _ = self._type_abi_info(ty)
-        return ir.Constant(_i64, sz)
+        return ir.Constant(ir.IntType(32), sz)
 
     def emit_deref(self, node: Deref):
         ptr = self.emit(node.operand)
@@ -296,7 +395,7 @@ class LLVM:
                 return ptr
             ssa = self.ssa_values.pop(name, None)
             if ssa is not None:
-                ptr = self.builder.alloca(ssa.type, name=name)
+                ptr = self._alloca(ssa.type, name)
                 self.builder.store(ssa, ptr)
                 self.locals[name] = ptr
                 return ptr
@@ -310,6 +409,13 @@ class LLVM:
     def emit_index(self, node: Index):
         ptr = self._emit_lvalue(node)
         return self.builder.load(ptr)
+
+    def _emit_lvalue_index(self, node: Index):
+        obj = self.emit(node.obj)
+        idx = self.emit(node.index)
+        if isinstance(idx.type, ir.PointerType):
+            idx = self.builder.ptrtoint(idx, _i64)
+        return self.builder.gep(obj, [idx], inbounds=True)
 
     def emit_attr(self, node: Attr):
         ptr = self._emit_lvalue_attr(node)
@@ -389,15 +495,13 @@ class LLVM:
                 return ptr
             ssa = self.ssa_values.pop(name, None)
             if ssa is not None:
-                ptr = self.builder.alloca(ssa.type, name=name)
+                ptr = self._alloca(ssa.type, name)
                 self.builder.store(ssa, ptr)
                 self.locals[name] = ptr
                 return ptr
             raise Exception(f"Undefined variable '{name}'")
         if isinstance(node, Index):
-            obj = self.emit(node.obj)
-            idx = self.emit(node.index)
-            return self.builder.gep(obj, [idx], inbounds=True)
+            return self._emit_lvalue_index(node)
         if isinstance(node, Attr):
             return self._emit_lvalue_attr(node)
         if isinstance(node, Deref):
@@ -435,6 +539,7 @@ class LLVM:
 
         entry = func.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
+        self.builder.position_at_end(entry)
 
         old_locals = self.locals
         old_local_types = self.local_types
@@ -447,7 +552,8 @@ class LLVM:
             self.local_types[name] = ptype
 
         for stmt in node.body:
-            self.emit(stmt)
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
 
         if not self.builder.block.is_terminated:
             if isinstance(ret_ty, ir.VoidType):
@@ -462,17 +568,65 @@ class LLVM:
         return None
 
     def emit_return(self, node: Return):
+        if self.builder.block.is_terminated:
+            return None
         if node.value is not None:
             value = self.emit(node.value)
+            ret_ty = self.builder.function.ftype.return_type
+            if value.type != ret_ty:
+                if isinstance(value.type, ir.IntType) and isinstance(ret_ty, ir.IntType):
+                    if value.type.width < ret_ty.width:
+                        value = self.builder.zext(value, ret_ty)
+                    elif value.type.width > ret_ty.width:
+                        value = self.builder.trunc(value, ret_ty)
+                elif isinstance(value.type, ir.PointerType) and isinstance(ret_ty, ir.IntType):
+                    value = self.builder.ptrtoint(value, ret_ty)
+                elif isinstance(value.type, ir.IntType) and isinstance(ret_ty, ir.PointerType):
+                    value = self.builder.inttoptr(value, ret_ty)
             self.builder.ret(value)
         else:
             self.builder.ret_void()
         return None
 
+    @staticmethod
+    def _switchable_if(node):
+        cases = []
+        var_name = None
+
+        def extract(n):
+            nonlocal var_name
+            if not isinstance(n, If):
+                return False
+            if not isinstance(n.cond, BinOp) or n.cond.op != TokenType.EQ_EQ:
+                return False
+            if not isinstance(n.cond.left, Variable) or not isinstance(n.cond.right, Number):
+                return False
+            if var_name is None:
+                var_name = n.cond.left.name
+            elif n.cond.left.name != var_name:
+                return False
+            cases.append((n.cond.right, n.body))
+            if isinstance(n.orelse, list) and len(n.orelse) == 1 and isinstance(n.orelse[0], If):
+                return extract(n.orelse[0])
+            else:
+                if n.orelse:
+                    cases.append((None, n.orelse))
+                return True
+
+        if not extract(node):
+            return None
+        if len(cases) < 2:
+            return None
+        return Switch(Variable(var_name), cases)
+
     def emit_if(self, node: If):
+        sw = self._switchable_if(node)
+        if sw is not None:
+            self.emit_switch(sw)
+            return
         cond = self.emit(node.cond)
         if cond.type != ir.IntType(1):
-            cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
+            cond = self._is_true(cond)
         then_bb = self.builder.append_basic_block("then")
 
         if node.orelse:
@@ -487,14 +641,16 @@ class LLVM:
 
         self.builder.position_at_end(then_bb)
         for stmt in node.body:
-            self.emit(stmt)
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
         if not self.builder.block.is_terminated:
             self.builder.branch(end_bb)
 
         if node.orelse:
             self.builder.position_at_end(else_bb)
             for stmt in node.orelse:
-                self.emit(stmt)
+                if not self.builder.block.is_terminated:
+                    self.emit(stmt)
             if not self.builder.block.is_terminated:
                 self.builder.branch(end_bb)
 
@@ -503,15 +659,52 @@ class LLVM:
     def _promote(self, left, right):
         if isinstance(left.type, ir.DoubleType) and not isinstance(right.type, ir.DoubleType):
             right = self.builder.sitofp(right, ir.DoubleType())
-        elif isinstance(right.type, ir.DoubleType) and not isinstance(left.type, ir.DoubleType):
+            return left, right
+        if isinstance(right.type, ir.DoubleType) and not isinstance(left.type, ir.DoubleType):
             left = self.builder.sitofp(left, ir.DoubleType())
-        # Handle int64 promotion
-        elif isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-            if left.type.width == 64 and right.type.width == 32:
-                right = self.builder.zext(right, ir.IntType(64))
-            elif right.type.width == 64 and left.type.width == 32:
-                left = self.builder.zext(left, ir.IntType(64))
+            return left, right
+
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
+            left = self.builder.ptrtoint(left, _i64)
+            right = self._promote_int(right, _i64)
+            return left, right
+        if isinstance(right.type, ir.PointerType) and isinstance(left.type, ir.IntType):
+            right = self.builder.ptrtoint(right, _i64)
+            left = self._promote_int(left, _i64)
+            return left, right
+
+        if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
+            max_width = max(left.type.width, right.type.width)
+            left = self._promote_int(left, ir.IntType(max_width))
+            right = self._promote_int(right, ir.IntType(max_width))
         return left, right
+
+    def _bitwise_promote(self, left, right):
+        if isinstance(left.type, (ir.FloatType, ir.DoubleType)):
+            int_ty = ir.IntType(32) if isinstance(left.type, ir.FloatType) else ir.IntType(64)
+            left = self.builder.bitcast(left, int_ty)
+            right = self.builder.bitcast(right, int_ty)
+        return left, right
+
+    def _promote_int(self, val, target_ty):
+        if val.type == target_ty:
+            return val
+        if val.type.width < target_ty.width:
+            if val.type.width == 32:
+                return self.builder.sext(val, target_ty)
+            return self.builder.zext(val, target_ty)
+        if val.type.width > target_ty.width:
+            return self.builder.trunc(val, target_ty)
+        return val
+
+    def _is_true(self, val):
+        if val.type == ir.IntType(1):
+            return val
+        if isinstance(val.type, ir.PointerType):
+            return self.builder.icmp_unsigned('!=', val, ir.Constant(val.type, None))
+        if isinstance(val.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fcmp_unordered('!=', val, ir.Constant(val.type, 0.0))
+        return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
 
     def emit_binop(self, node):
         if node.op == TokenType.PLUS and self._is_string_concat(node):
@@ -524,15 +717,18 @@ class LLVM:
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("and.rhs")
                 end_bb = self.builder.append_basic_block("and.end")
-                is_true = self.builder.icmp_signed('!=', lhs, ir.Constant(res_ty, 0))
+                is_true = self._is_true(lhs)
                 self.builder.cbranch(is_true, rhs_bb, end_bb)
                 self.builder.position_at_end(rhs_bb)
                 rhs = self.emit(node.right)
+                if rhs.type != res_ty:
+                    rhs = self._coerce_store(rhs, res_ty)
+                actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
                 phi = self.builder.phi(res_ty)
                 phi.add_incoming(lhs, entry_bb)
-                phi.add_incoming(rhs, rhs_bb)
+                phi.add_incoming(rhs, actual_rhs_bb)
                 return phi
 
             case TokenType.OR:
@@ -541,15 +737,18 @@ class LLVM:
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("or.rhs")
                 end_bb = self.builder.append_basic_block("or.end")
-                is_true = self.builder.icmp_signed('!=', lhs, ir.Constant(res_ty, 0))
+                is_true = self._is_true(lhs)
                 self.builder.cbranch(is_true, end_bb, rhs_bb)
                 self.builder.position_at_end(rhs_bb)
                 rhs = self.emit(node.right)
+                if rhs.type != res_ty:
+                    rhs = self._coerce_store(rhs, res_ty)
+                actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
                 phi = self.builder.phi(res_ty)
                 phi.add_incoming(lhs, entry_bb)
-                phi.add_incoming(rhs, rhs_bb)
+                phi.add_incoming(rhs, actual_rhs_bb)
                 return phi
 
         left = self.emit(node.left)
@@ -603,14 +802,19 @@ class LLVM:
                     raise ZeroDivisionError('division by zero')
                 return self.builder.srem(left, right)
             case TokenType.SHL:
+                left, right = self._bitwise_promote(left, right)
                 return self.builder.shl(left, right)
             case TokenType.SHR:
+                left, right = self._bitwise_promote(left, right)
                 return self.builder.ashr(left, right)
             case TokenType.AMPERSAND:
+                left, right = self._bitwise_promote(left, right)
                 return self.builder.and_(left, right)
             case TokenType.PIPE:
+                left, right = self._bitwise_promote(left, right)
                 return self.builder.or_(left, right)
             case TokenType.CARET:
+                left, right = self._bitwise_promote(left, right)
                 return self.builder.xor(left, right)
             case TokenType.GREATER:
                 left, right = self._normalize_ptr_cmp(left, right)
@@ -719,12 +923,33 @@ class LLVM:
                 if isinstance(value.type, ir.DoubleType):
                     return self.builder.fsub(zero, value)
                 return self.builder.sub(zero, value)
+            case TokenType.MINUS_MINUS:
+                value = self.emit(node.operand)
+                if isinstance(value.type, ir.PointerType):
+                    neg_one = ir.Constant(_i32, -1)
+                    return self.builder.gep(value, [neg_one], inbounds=True)
+                one = ir.Constant(value.type, 1.0 if isinstance(value.type, ir.DoubleType) else 1)
+                if isinstance(value.type, ir.DoubleType):
+                    return self.builder.fsub(value, one)
+                return self.builder.sub(value, one)
             case TokenType.TILDE:
                 value = self.emit(node.operand)
+                if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+                    int_ty = ir.IntType(32) if isinstance(value.type, ir.FloatType) else ir.IntType(64)
+                    as_int = self.builder.bitcast(value, int_ty)
+                    all_ones = ir.Constant(int_ty, -1)
+                    xored = self.builder.xor(as_int, all_ones)
+                    return self.builder.bitcast(xored, value.type)
                 all_ones = ir.Constant(value.type, -1)
                 return self.builder.xor(value, all_ones)
             case TokenType.NOT:
                 value = self.emit(node.operand)
+                if isinstance(value.type, ir.PointerType):
+                    zero = ir.Constant(value.type, None)
+                    return self.builder.icmp_unsigned('==', value, zero)
+                if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+                    zero = ir.Constant(value.type, 0.0)
+                    return self.builder.fcmp_unordered('==', value, zero)
                 zero = ir.Constant(value.type, 0)
                 return self.builder.icmp_unsigned('==', value, zero)
 
@@ -737,12 +962,72 @@ class LLVM:
             return ssa
         raise Exception(f"Undefined variable '{node.name}' at L{node._token.line}:{node._token.column}")
 
+    def _trunc_or_ext(self, value, target_type):
+        ty = target_type
+        if isinstance(ty, ir.IntType) and isinstance(value.type, ir.IntType):
+            if value.type.width < ty.width:
+                if value.type.width == 32:
+                    return self.builder.sext(value, ty)
+                return self.builder.zext(value, ty)
+            if value.type.width > ty.width:
+                return self.builder.trunc(value, ty)
+        return value
+
+    def _coerce_store(self, value, pointee):
+        if isinstance(pointee, ir.IntType) and isinstance(value.type, ir.IntType):
+            return self._trunc_or_ext(value, pointee)
+        if isinstance(pointee, ir.PointerType) and isinstance(value.type, ir.IntType):
+            i64_ty = ir.IntType(64)
+            if value.type.width < 64:
+                if value.type.width == 32:
+                    value = self.builder.sext(value, i64_ty)
+                else:
+                    value = self.builder.zext(value, i64_ty)
+            return self.builder.inttoptr(value, pointee)
+        if isinstance(pointee, ir.PointerType) and isinstance(value.type, ir.PointerType):
+            return self.builder.bitcast(value, pointee)
+        if isinstance(pointee, ir.IntType) and isinstance(value.type, ir.PointerType):
+            if pointee.width == 8 and isinstance(value.type.pointee, ir.IntType) and value.type.pointee.width == 8:
+                loaded = self.builder.load(value)
+                if loaded.type != pointee:
+                    loaded = self._trunc_or_ext(loaded, pointee)
+                return loaded
+            i64_ty = ir.IntType(64)
+            ptr_val = self.builder.ptrtoint(value, i64_ty)
+            if pointee.width < 64:
+                return self.builder.trunc(ptr_val, pointee)
+            return ptr_val
+        if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, ir.IntType):
+            return self.builder.sitofp(value, pointee)
+        if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fpext(value, pointee) if value.type.width < pointee.width else self.builder.fptrunc(value, pointee)
+        if isinstance(pointee, ir.IntType) and isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fptosi(value, pointee)
+        if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, ir.PointerType):
+            i64_ty = ir.IntType(64)
+            ptr_val = self.builder.ptrtoint(value, i64_ty)
+            return self.builder.sitofp(ptr_val, pointee)
+        if isinstance(pointee, ir.PointerType) and isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+            i64_ty = ir.IntType(64)
+            int_val = self.builder.fptosi(value, i64_ty)
+            return self.builder.inttoptr(int_val, pointee)
+        return value
+
+    def _pointee_type(self, ptr):
+        try:
+            return ptr.type.pointee
+        except Exception:
+            return None
+
     def emit_assign(self, node):
         if isinstance(node.target, Variable):
             name = node.target.name
             ptr = self.locals.get(name)
             if ptr is not None:
                 value = self.emit(node.value)
+                pointee = self._pointee_type(ptr)
+                if pointee and value.type != pointee:
+                    value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ('int64', 'uint64'):
                     value = self._extend_to_i64(value)
@@ -751,10 +1036,9 @@ class LLVM:
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
-            ptr = self.builder.alloca(value.type, name=name)
+            ptr = self._alloca(value.type, name)
             self.locals[name] = ptr
-            if ssa is not None:
-                self.builder.store(ssa, ptr)
+            self.local_types[name] = str(value.type)
             self.builder.store(value, ptr)
             return None
         if isinstance(node.target, str):
@@ -762,6 +1046,9 @@ class LLVM:
             ptr = self.locals.get(name)
             if ptr is not None:
                 value = self.emit(node.value)
+                pointee = self._pointee_type(ptr)
+                if pointee and value.type != pointee:
+                    value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ('int64', 'uint64'):
                     value = self._extend_to_i64(value)
@@ -769,18 +1056,17 @@ class LLVM:
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
-            ptr = self.builder.alloca(value.type, name=name)
+            ptr = self._alloca(value.type, name)
             self.locals[name] = ptr
             self.local_types[name] = str(value.type)
-            if ssa is not None:
-                self.builder.store(ssa, ptr)
             self.builder.store(value, ptr)
             return None
 
         target_ptr = self._emit_lvalue(node.target)
         value = self.emit(node.value)
-        if isinstance(target_ptr.type.pointee, ir.PointerType) and isinstance(value.type, ir.IntType):
-            value = ir.Constant(target_ptr.type.pointee, None)
+        pointee = self._pointee_type(target_ptr)
+        if pointee and value.type != pointee:
+            value = self._coerce_store(value, pointee)
         self.builder.store(value, target_ptr)
         return None
 
@@ -801,7 +1087,6 @@ class LLVM:
             return self.builder.call(self.functions["print_str"], [value])
         # Handle 64-bit integers
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
-            # Check if the value is from a uint64 variable or literal
             is_uint64 = False
             if isinstance(node.value, Variable):
                 var_type = self.local_types.get(node.value.name)
@@ -810,7 +1095,6 @@ class LLVM:
             elif hasattr(node.value, 'inferred_type') and node.value.inferred_type == 'uint64':
                 is_uint64 = True
             elif isinstance(node.value, BinOp):
-                # Check if either operand is uint64
                 left_type = None
                 right_type = None
                 if isinstance(node.value.left, Variable):
@@ -823,10 +1107,22 @@ class LLVM:
                     right_type = node.value.right.inferred_type
                 if left_type == 'uint64' or right_type == 'uint64':
                     is_uint64 = True
-            
             if is_uint64:
                 return self.builder.call(self.functions["print_uint64"], [value])
             return self.builder.call(self.functions["print_int64"], [value])
+        # Handle bool (i1) by zero-extending to i32
+        if isinstance(value.type, ir.IntType) and value.type.width == 1:
+            value = self.builder.zext(value, _i32)
+            return self.builder.call(self.functions["print_int"], [value])
+        # Handle small int types (i8, i16, i32) by extending to i32 for print_int
+        if isinstance(value.type, ir.IntType) and value.type.width < 32:
+            value = self.builder.zext(value, _i32)
+            return self.builder.call(self.functions["print_int"], [value])
+        # Handle non-string pointers: convert to int64 and print
+        if isinstance(value.type, ir.PointerType):
+            value = self.builder.ptrtoint(value, _i64)
+            return self.builder.call(self.functions["print_int64"], [value])
+        # Handle i32 — call print_int directly
         return self.builder.call(self.functions["print_int"], [value])
 
     def emit_input(self, node):
@@ -852,15 +1148,90 @@ class LLVM:
 
         cond = self.emit(node.cond)
         if cond.type != ir.IntType(1):
-            cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
+            cond = self._is_true(cond)
         self.builder.cbranch(cond, body_bb, end_bb)
         self.builder.position_at_end(body_bb)
 
+        self.loop_stack.append((cond_bb, end_bb))
         for stmt in node.body:
-            self.emit(stmt)
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
+        self.loop_stack.pop()
 
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(end_bb)
+
+    def emit_break(self, node):
+        if not self.loop_stack:
+            return None
+        _, end_bb = self.loop_stack[-1]
+        self.builder.branch(end_bb)
+
+    def emit_continue(self, node):
+        if not self.loop_stack:
+            return None
+        cond_bb, _ = self.loop_stack[-1]
+        self.builder.branch(cond_bb)
+
+    def emit_for(self, node):
+        var_name = node['var']
+        iterable = node['iter']
+        body = node['body']
+
+        iter_ptr = self.emit(iterable)
+
+        char_ptr_ty = ir.PointerType(_i8)
+        if iter_ptr.type != char_ptr_ty:
+            iter_ptr = self.builder.bitcast(iter_ptr, char_ptr_ty)
+
+        len_fn = self._get_strlen_fn()
+        length = self.builder.call(len_fn, [iter_ptr])
+
+        idx_ptr = self._alloca(_i32, name=f"{var_name}.idx")
+        self.builder.store(ir.Constant(_i32, 0), idx_ptr)
+
+        if var_name in self.locals:
+            var_ptr = self.locals[var_name]
+        else:
+            var_ptr = self._alloca(_i8, name=var_name)
+
+        cond_bb = self.builder.append_basic_block(f"for.{var_name}.cond")
+        body_bb = self.builder.append_basic_block(f"for.{var_name}.body")
+        inc_bb = self.builder.append_basic_block(f"for.{var_name}.inc")
+        end_bb = self.builder.append_basic_block(f"for.{var_name}.end")
+
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+
+        idx = self.builder.load(idx_ptr)
+        cmp = self.builder.icmp_signed('<', idx, length)
+        self.builder.cbranch(cmp, body_bb, end_bb)
+
+        self.builder.position_at_end(body_bb)
+        idx_body = self.builder.load(idx_ptr)
+        char_ptr = self.builder.gep(iter_ptr, [idx_body], inbounds=True)
+        char_val = self.builder.load(char_ptr)
+        self.builder.store(char_val, var_ptr)
+
+        self.locals[var_name] = var_ptr
+        self.local_types[var_name] = 'char'
+
+        self.loop_stack.append((inc_bb, end_bb))
+        for stmt in body:
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
+        self.loop_stack.pop()
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(inc_bb)
+
+        self.builder.position_at_end(inc_bb)
+        idx_inc = self.builder.load(idx_ptr)
+        idx_next = self.builder.add(idx_inc, ir.Constant(_i32, 1))
+        self.builder.store(idx_next, idx_ptr)
+        self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
 
@@ -903,14 +1274,22 @@ class LLVM:
 
     def _extend_to_i64(self, value):
         if value.type == ir.IntType(32):
-            return self.builder.zext(value, ir.IntType(64))
+            return self.builder.sext(value, ir.IntType(64))
         if value.type == ir.IntType(8):
             return self.builder.zext(value, ir.IntType(64))
         return value
 
+    def _alloca(self, ty, name=''):
+        entry_block = self.builder.function.entry_basic_block
+        saved_block = self.builder.block
+        self.builder.position_at_start(entry_block)
+        result = self.builder.alloca(ty, name=name)
+        self.builder.position_at_end(saved_block)
+        return result
+
     def emit_var_decl(self, node):
         ty = self.llvm_type(node.var_type)
-        ptr = self.builder.alloca(ty, name=node.name)
+        ptr = self._alloca(ty, name=node.name)
         self.locals[node.name] = ptr
         self.local_types[node.name] = node.var_type
         if node.init:
@@ -919,15 +1298,34 @@ class LLVM:
                 value = self._extend_to_i64(value)
             if value.type != ty:
                 if isinstance(value.type, ir.IntType) and isinstance(ty, ir.PointerType):
-                    value = ir.Constant(ty, None)
+                    i64_ty = ir.IntType(64)
+                    if value.type.width < 64:
+                        value = self.builder.zext(value, i64_ty)
+                    value = self.builder.inttoptr(value, ty)
                 elif isinstance(value.type, ir.IntType) and isinstance(ty, ir.IntType):
                     if value.type.width < ty.width:
                         value = self.builder.zext(value, ty)
                     elif value.type.width > ty.width:
                         value = self.builder.trunc(value, ty)
+                elif isinstance(value.type, ir.PointerType) and isinstance(ty, ir.IntType):
+                    value = self.builder.load(value)
+                    if value.type != ty:
+                        value = self.builder.trunc(value, ty)
+                elif isinstance(value.type, ir.PointerType) and isinstance(ty, ir.PointerType):
+                    value = self.builder.bitcast(value, ty)
+                elif isinstance(value.type, ir.IntType) and isinstance(ty, (ir.FloatType, ir.DoubleType)):
+                    value = self.builder.sitofp(value, ty)
+                elif isinstance(value.type, (ir.FloatType, ir.DoubleType)) and isinstance(ty, ir.PointerType):
+                    i64_ty = ir.IntType(64)
+                    int_val = self.builder.fptosi(value, i64_ty)
+                    value = self.builder.inttoptr(int_val, ty)
+                elif isinstance(value.type, (ir.FloatType, ir.DoubleType)) and isinstance(ty, ir.IntType):
+                    value = self.builder.fptosi(value, ty)
             self.builder.store(value, ptr)
         elif isinstance(ty, ir.PointerType):
             self.builder.store(ir.Constant(ty, None), ptr)
+        elif isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):
+            self.builder.store(ir.Constant(ty, 0), ptr)
 
     def emit_import(self, node):
         for fname, (ret_type, params, vararg) in node.symbols:

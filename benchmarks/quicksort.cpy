@@ -1,6 +1,4 @@
-import stdlib
-
-def qsort(arr: int[], left: int, right: int):
+def quicksort(arr: int[], left: int, right: int):
     int i = left
     int j = right
     int pivot = arr[(left + right) / 2]
@@ -16,18 +14,18 @@ def qsort(arr: int[], left: int, right: int):
             i = i + 1
             j = j - 1
     if left < j:
-        qsort(arr, left, j)
+        quicksort(arr, left, j)
     if i < right:
-        qsort(arr, i, right)
+        quicksort(arr, i, right)
 
 public main() -> int:
-    int n = 10000
+    int n = 100000
     int[] arr = new int[n]
     int i = 0
     while i < n:
-        arr[i] = rand()
+        arr[i] = i * 12345 + 67890
         i = i + 1
-    qsort(arr, 0, n - 1)
+    quicksort(arr, 0, n - 1)
     print(arr[0])
     print(arr[n - 1])
     return 0

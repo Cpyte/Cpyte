@@ -1,5 +1,5 @@
 public main() -> int:
-    int n = 100
+    int n = 200
     double[] a = new double[n * n]
     double[] b = new double[n * n]
     double[] c = new double[n * n]

@@ -4,5 +4,5 @@ public main() -> int:
         int[] p = new int[16]
         p[0] = i
         i = i + 1
-    print(0)
+    print("done")
     return 0

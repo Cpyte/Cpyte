@@ -1,10 +1,10 @@
-Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md)
+Check out the official documentation [here](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md).
 
-VERSION 1.6.1 had a critical division by 0 error that goes un-catched.
+**Note:** Version 1.6.1 had a critical division by zero error that wasn't caught.
 
 ## Examples
 
-Comprehensive examples demonstrating C imports, header imports, 64-bit support, and standard library usage are available in the `examples/` directory:
+You'll find comprehensive examples in the `examples/` directory that cover C imports, header imports, 64-bit support, and standard library usage:
 
 | File | Description |
 |------|-------------|
@@ -17,9 +17,14 @@ Comprehensive examples demonstrating C imports, header imports, 64-bit support, 
 | `examples/mixed_features.cpy` | Combines C imports, H imports, 64-bit, structs, pointers, linked lists |
 | `examples/mixed_helpers.c` / `mixed_helpers.h` | Supporting C/header files for the mixed features example |
 
-You can also import `.cpy` files — see `examples/` for examples of `import "other.cpy"` importing public functions and structs from other Cpy files.
+You can also import `.cpy` files — the examples show how to use `import "other.cpy"` to bring in public functions and structs from other Cpy files.
 
 Run any example with:
 ```bash
 python source/mainpie.py --jit examples/<filename>.cpy
 ```
+
+## Note
+Cpyte is experimental software. The compiler is continuously tested with fuzzing, and we're still discovering and fixing correctness bugs. While many programs compile and run correctly, I can't make any guarantees about correctness or stability.
+
+If you decide to use Cpyte, always use the latest version — older versions have bugs that are pretty easy to run into.

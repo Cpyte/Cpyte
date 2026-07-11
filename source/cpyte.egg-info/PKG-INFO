@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cpyte
-Version: 1.6.1
+Version: 1.6.2
 Summary: The Cpyte programming language compiler
 Author: Hoang Duy Tung
 License: MIT
@@ -9,9 +9,9 @@ Description-Content-Type: text/markdown
 Requires-Dist: llvmlite>=0.45
 Requires-Dist: lsprotocol>=2025.0.0
 
-Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpy_language_documentation.md)
+Please go to the official documentation at ['cpy_languages_syntax'](https://gitea.5gnew.io.vn/duytung/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md)
 
-VERSION 1.6 had a codegen problem related to null pointers.
+VERSION 1.6.1 had a critical division by 0 error that goes un-catched.
 
 ## Examples
 

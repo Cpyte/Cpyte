@@ -187,8 +187,11 @@ class SemanticAnalyzer:
                         if val <= 2**63 - 1:
                             node.inferred_type = 'int64'
                             return 'int64'
-                        node.inferred_type = 'uint64'
-                        return 'uint64'
+                        if val <= 2**64 - 1:
+                            node.inferred_type = 'uint64'
+                            return 'uint64'
+                        node.inferred_type = 'big'
+                        return 'big'
                     node.inferred_type = 'int'
                     return 'int'
                 except ValueError:
@@ -208,13 +211,8 @@ class SemanticAnalyzer:
                     if val <= 2**64 - 1:
                         node.inferred_type = 'uint64'
                         return 'uint64'
-                    self.error(
-                        f'integer literal `{node.value}` exceeds maximum value',
-                        node,
-                        note=f'value too large for any integer type (max 2^64-1)'
-                    )
-                    node.inferred_type = 'int64'
-                    return 'int64'
+                    node.inferred_type = 'big'
+                    return 'big'
             except ValueError:
                 pass
             # For small integers, return 'int' but allow implicit conversion to int64
@@ -237,10 +235,15 @@ class SemanticAnalyzer:
 
             if node.op.name in ('AND', 'OR'):
                 if node.op.name == 'AND' and self._is_compile_time_false(node.left):
+                    self._infer_type(node.right)
+                    node.inferred_type = 'bool'
                     return 'bool'
                 if node.op.name == 'OR' and self._is_compile_time_true(node.left):
+                    self._infer_type(node.right)
+                    node.inferred_type = 'bool'
                     return 'bool'
                 right_t = self._infer_type(node.right)
+                node.inferred_type = 'bool'
                 return 'bool'
 
             right_t = self._infer_type(node.right)
@@ -259,35 +262,68 @@ class SemanticAnalyzer:
                         ('char', 'int'), ('int', 'char'),
                         ('char', 'int64'), ('int64', 'char'),
                     )
+                    ok = ok or left_t == 'big' and right_t in ('int', 'int64', 'uint64', 'big')
+                    ok = ok or right_t == 'big' and left_t in ('int', 'int64', 'uint64', 'big')
                     if not ok:
                         self.error(
                             f'incompatible types in comparison: `{left_t}` vs `{right_t}`',
                             node,
                             note=f'both sides of `{node.op.name}` must be the same type'
                         )
+                if left_t == 'big' or right_t == 'big':
+                    node.inferred_type = 'bool'
+                    return 'bool'
+                node.inferred_type = 'bool'
                 return 'bool'
 
             if node.op.name in ('SHL', 'SHR', 'AMPERSAND', 'PIPE', 'CARET', 'PERCENT', 'SLASH_SLASH'):
-                valid_int_types = ('int', 'int64', 'uint64')
+                if node.op.name in ('SHL', 'SHR', 'AMPERSAND', 'PIPE', 'CARET'):
+                    # Bitwise operations not supported for big
+                    valid_int_types = ('int', 'int64', 'uint64')
+                    if left_t == 'big' or right_t == 'big':
+                        self.error(
+                            f'bitwise operator `{node.op.name}` not supported for `big` operands',
+                            node,
+                            note=f'got `{left_t}` and `{right_t}`'
+                        )
+                    elif (left_t is not None and left_t not in valid_int_types) or (right_t is not None and right_t not in valid_int_types):
+                        self.error(
+                            f'bitwise operator `{node.op.name}` requires integer operands',
+                            node,
+                            note=f'got `{left_t}` and `{right_t}`'
+                        )
+                    if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
+                        node.inferred_type = 'int64'
+                        return 'int64'
+                    node.inferred_type = 'int'
+                    return 'int'
+                # PERCENT, SLASH_SLASH
+                valid_int_types = ('int', 'int64', 'uint64', 'big')
                 if (left_t is not None and left_t not in valid_int_types) or (right_t is not None and right_t not in valid_int_types):
                     self.error(
-                        f'bitwise operator `{node.op.name}` requires integer operands',
+                        f'operator `{node.op.name}` requires integer operands',
                         node,
                         note=f'got `{left_t}` and `{right_t}`'
                     )
-                if node.op.name in ('PERCENT', 'SLASH_SLASH') and self._is_literal_zero(node.right):
+                if self._is_literal_zero(node.right):
                     self.error(
                         f'division by zero in `{node.op.name}`',
                         node,
                         note=f'cannot divide or mod by zero'
                     )
                 # Type promotion for mixed integer types
+                if left_t == 'big' or right_t == 'big':
+                    node.inferred_type = 'big'
+                    return 'big'
                 if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
+                    node.inferred_type = 'int64'
                     return 'int64'  # Simplified: promote to int64 for mixed operations
+                node.inferred_type = 'int'
                 return 'int'
 
             if node.op.name in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'POW'):
                 if left_t == 'str' and right_t == 'str' and node.op.name == 'PLUS':
+                    node.inferred_type = 'str'
                     return 'str'
                 if left_t == 'str' or right_t == 'str':
                     self.error(
@@ -295,7 +331,9 @@ class SemanticAnalyzer:
                         node,
                         note=f'strings only support `+` (concatenation)'
                     )
-                    return left_t if left_t is not None else right_t
+                    result = left_t if left_t is not None else right_t
+                    node.inferred_type = result
+                    return result
                 if node.op.name == 'SLASH':
                     int_types = ('int', 'int64', 'uint64')
                     if left_t in int_types and right_t in int_types and self._is_literal_zero(node.right):
@@ -306,11 +344,16 @@ class SemanticAnalyzer:
                         )
                 if left_t is not None and right_t is not None and left_t != right_t:
                     # Allow mixed integer types with promotion
-                    valid_int_types = ('int', 'int64', 'uint64')
+                    valid_int_types = ('int', 'int64', 'uint64', 'big')
                     if left_t in valid_int_types and right_t in valid_int_types:
                         # Promote to larger type
+                        if left_t == 'big' or right_t == 'big':
+                            node.inferred_type = 'big'
+                            return 'big'
                         if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
+                            node.inferred_type = 'int64'
                             return 'int64'
+                        node.inferred_type = 'int'
                         return 'int'  # Both are int
                     else:
                         self.error(
@@ -319,24 +362,35 @@ class SemanticAnalyzer:
                             note=f'cannot apply `{node.op.name}` to different types'
                         )
                 if left_t == 'float' or right_t == 'float':
+                    node.inferred_type = 'float'
                     return 'float'
                 # Return the larger integer type
+                if left_t == 'big' or right_t == 'big':
+                    node.inferred_type = 'big'
+                    return 'big'
                 if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
+                    node.inferred_type = 'int64'
                     return 'int64'
+                node.inferred_type = 'int'
                 return 'int'
 
+            node.inferred_type = left_t
             return left_t
 
         if isinstance(node, UnaryOp):
             operand_t = self._infer_type(node.operand)
+            if node.op.name == 'NOT':
+                node.inferred_type = 'int'
+                return 'int'
             if node.op.name == 'MINUS':
-                valid_types = ('int', 'float', 'int64', 'uint64')
+                valid_types = ('int', 'float', 'int64', 'uint64', 'big')
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f'cannot apply unary minus to `{operand_t}`',
                         node,
                         note='unary minus expects numeric type'
                     )
+            node.inferred_type = operand_t
             return operand_t
 
         if isinstance(node, Call):
@@ -693,6 +747,8 @@ class SemanticAnalyzer:
             s = scope or self.current_scope
             existing = s.lookup_local(name)
             if existing is None:
+                existing = s.lookup(name)
+            if existing is None:
                 s.define(name, Symbol('variable', val_type, node))
             elif val_type is not None and existing.type is not None and val_type != existing.type:
                 # Allow implicit conversion from int to int64/uint64
@@ -710,6 +766,8 @@ class SemanticAnalyzer:
                     ('int64', 'uint64'), ('uint64', 'int64'),
                     ('float', 'double'), ('double', 'float'),
                     ('str', 'char'), ('char', 'str'),
+                    ('int', 'big'), ('int64', 'big'), ('uint64', 'big'),
+                    ('big', 'big'),
                 ]
                 ok = (val_type, existing.type) in valid_conversions
                 ok = ok or (val_type == 'int' and existing.type.endswith('*'))
@@ -784,6 +842,8 @@ class SemanticAnalyzer:
                     ('float', 'double'), ('double', 'float'),
                     ('str', 'char'), ('char', 'str'),
                     ('char', 'int'),
+                    ('int', 'big'), ('int64', 'big'), ('uint64', 'big'),
+                    ('big', 'big'),
                 ]
                 ok = (init_type, val_type) in valid_conversions
                 ok = ok or (init_type == 'int' and val_type.endswith('*'))

@@ -7,6 +7,8 @@ import sys
 import tempfile
 import warnings
 
+from ._bignum_bc import load_bignum_bc
+
 # ctypes warns "memory leak in callback function" when a CFUNCTYPE wrapper
 # is garbage collected, even if no C code will ever call it again.  We keep
 # all runtime callbacks alive in _callbacks for the program's lifetime, but
@@ -123,6 +125,9 @@ def run_jit(module, opt_level=3, src_files=None):
             src_ir = _remove_probe_stack_ir(src_ir)
             src_mod = binding.parse_assembly(src_ir)
             binding.link_modules(mod, src_mod)
+
+    bignum_mod = load_bignum_bc()
+    binding.link_modules(mod, bignum_mod)
 
     mod.verify()
     optimize(mod, opt_level)
@@ -247,6 +252,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None):
     binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(llvm_ir)
+    bignum_mod = load_bignum_bc()
+    binding.link_modules(mod, bignum_mod)
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()

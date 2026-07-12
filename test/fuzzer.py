@@ -22,6 +22,7 @@ TIMEOUT_S = 30
 
 CRASH_DIR = os.path.join(os.path.dirname(__file__), 'crashes')
 os.makedirs(CRASH_DIR, exist_ok=True)
+_crash_counter = 0  # bump on each save_crash to give unique filenames
 
 
 # ---------------------------------------------------------------------------
@@ -37,10 +38,25 @@ EDGE_INTS = [
     '999999999999999999999999999999',
 ]
 
+BIG_EDGE = [
+    '18446744073709551616',        # 2^64 — exactly at big boundary
+    '18446744073709551617',        # 2^64 + 1
+    '340282366920938463463374607431768211456',  # 2^128
+    '100000000000000000000000000000000000000',
+    '123456789012345678901234567890',
+]
+
 EDGE_HEX = [
     '0x0', '0x1', '0x7fffffff', '0x80000000', '0xffffffff',
     '0x7fffffffffffffff', '0x8000000000000000', '0xffffffffffffffff',
     '0x8d3963ea15c50adb',
+]
+
+BIG_EDGE_HEX = [
+    '0x10000000000000000',          # 2^64
+    '0x10000000000000001',          # 2^64 + 1
+    '0xffffffffffffffffffffffffffffffff',  # 2^128 - 1
+    '0xdeadbeefcafebabedeadbeef',
 ]
 
 EDGE_FLOATS = [
@@ -49,8 +65,8 @@ EDGE_FLOATS = [
     '0.0000000001', '9999999999999999.0',
 ]
 
-TYPES = ['int', 'int64', 'uint64', 'float', 'double', 'char', 'str']
-NUMERIC_TYPES = ['int', 'int64', 'uint64']
+TYPES = ['int', 'int64', 'uint64', 'big', 'float', 'double', 'char', 'str']
+NUMERIC_TYPES = ['int', 'int64', 'uint64', 'big']
 FLOAT_TYPES = ['float', 'double']
 ALL_SCALAR = TYPES + ['bool']
 FIELD_NAMES = ['x', 'y', 'z', 'data', 'next', 'prev', 'left', 'right',
@@ -177,6 +193,12 @@ def gen_literal(state: FuzzerState, target_type: str | None = None) -> tuple[str
         if kind == 'edge':  return rng.choice(EDGE_INTS), 'int'
         if kind == 'hex':   return rng.choice(EDGE_HEX), 'int'
         return str(rng.randint(-10**9, 10**9)), 'int'
+
+    if ty == 'big':
+        kind = rng.choices(['dec', 'hex'], weights=[60, 40])[0]
+        if kind == 'dec':
+            return rng.choice(BIG_EDGE), 'big'
+        return rng.choice(BIG_EDGE_HEX), 'big'
 
     if ty == 'int64':
         return rng.choice(EDGE_INTS), 'int64'
@@ -774,7 +796,9 @@ def run_test(source, label=''):
 
 
 def save_crash(source, error):
-    crash_id = len([f for f in os.listdir(CRASH_DIR) if f.startswith('crash_')])
+    global _crash_counter
+    crash_id = _crash_counter
+    _crash_counter += 1
     path = os.path.join(CRASH_DIR, f'crash_{crash_id:04d}.cpy')
     with open(path, 'w') as f:
         f.write(source)

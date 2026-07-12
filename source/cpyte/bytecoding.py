@@ -36,6 +36,8 @@ class LLVM:
             return ir.IntType(8)
         if t == 'void*':
             return ir.PointerType(ir.IntType(8))
+        if t == 'big':
+            return ir.PointerType(ir.IntType(8))
         if t.endswith('[]'):
             base = self.llvm_type(t[:-2])
             return ir.PointerType(base)
@@ -68,6 +70,24 @@ class LLVM:
         if isinstance(val, ir.Constant) and isinstance(val.type, ir.PointerType) and val.constant is None:
             return True
         return False
+
+    def _is_big(self, node):
+        if getattr(node, 'inferred_type', '') == 'big':
+            return True
+        if isinstance(node, Variable):
+            return self.local_types.get(node.name, '') == 'big'
+        return False
+
+    def _promote_to_big(self, val):
+        if isinstance(val.type, ir.IntType) and val.type.width < 64:
+            val = self.builder.zext(val, _i64)
+        if isinstance(val.type, ir.IntType) and 'i64' in str(val.type):
+            fn = self.functions['bigint_from_uint64']
+        elif isinstance(val.type, ir.IntType):
+            fn = self.functions['bigint_from_int']
+        else:
+            return val
+        return self.builder.call(fn, [val])
 
     def __init__(self):
         self.module = ir.Module("main")
@@ -107,6 +127,26 @@ class LLVM:
         input_str_ty = ir.FunctionType(_i8ptr, [])
         input_str_fn = ir.Function(self.module, input_str_ty, "input_str")
         self.functions["input_str"] = input_str_fn
+
+        # BigNum runtime functions
+        bignum_fns = [
+            ('bigint_new', _i8ptr, []),
+            ('bigint_free', _void, [_i8ptr]),
+            ('bigint_from_int', _i8ptr, [_i64]),
+            ('bigint_from_uint64', _i8ptr, [_i64]),
+            ('bigint_from_str', _i8ptr, [_i8ptr]),
+            ('bigint_add', _i8ptr, [_i8ptr, _i8ptr]),
+            ('bigint_sub', _i8ptr, [_i8ptr, _i8ptr]),
+            ('bigint_mul', _i8ptr, [_i8ptr, _i8ptr]),
+            ('bigint_div', _i8ptr, [_i8ptr, _i8ptr]),
+            ('bigint_mod', _i8ptr, [_i8ptr, _i8ptr]),
+            ('bigint_neg', _i8ptr, [_i8ptr]),
+            ('bigint_cmp', _i64, [_i8ptr, _i8ptr]),
+            ('bigint_print', _void, [_i8ptr]),
+        ]
+        for name, ret, args in bignum_fns:
+            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+            self.functions[name] = fn
 
     def emit_switch(self, node):
         value = self.emit(node.value)
@@ -321,7 +361,9 @@ class LLVM:
             return self._string_const('')
         if node.size is not None:
             count = self.emit(node.size)
-            if count.type != _i64:
+            if isinstance(count.type, ir.PointerType):
+                count = self.builder.ptrtoint(count, _i64)
+            elif count.type != _i64:
                 count = self.builder.zext(count, _i64)
         else:
             count = ir.Constant(_i64, 1)
@@ -664,11 +706,11 @@ class LLVM:
             left = self.builder.sitofp(left, ir.DoubleType())
             return left, right
 
-        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
+        if isinstance(left.type, ir.PointerType) and not (isinstance(left.type.pointee, ir.IntType) and left.type.pointee.width == 8) and isinstance(right.type, ir.IntType):
             left = self.builder.ptrtoint(left, _i64)
             right = self._promote_int(right, _i64)
             return left, right
-        if isinstance(right.type, ir.PointerType) and isinstance(left.type, ir.IntType):
+        if isinstance(right.type, ir.PointerType) and not (isinstance(right.type.pointee, ir.IntType) and right.type.pointee.width == 8) and isinstance(left.type, ir.IntType):
             right = self.builder.ptrtoint(right, _i64)
             left = self._promote_int(left, _i64)
             return left, right
@@ -753,6 +795,43 @@ class LLVM:
 
         left = self.emit(node.left)
         right = self.emit(node.right)
+
+        # Handle big arithmetic before _promote (which would corrupt i8* big values)
+        if self._is_big(node.left) or self._is_big(node.right):
+            if not isinstance(left.type, ir.PointerType):
+                left = self._promote_to_big(left)
+            if not isinstance(right.type, ir.PointerType):
+                right = self._promote_to_big(right)
+            match node.op:
+                case TokenType.PLUS:
+                    return self.builder.call(self.functions['bigint_add'], [left, right])
+                case TokenType.MINUS:
+                    return self.builder.call(self.functions['bigint_sub'], [left, right])
+                case TokenType.STAR:
+                    return self.builder.call(self.functions['bigint_mul'], [left, right])
+                case TokenType.SLASH | TokenType.SLASH_SLASH:
+                    return self.builder.call(self.functions['bigint_div'], [left, right])
+                case TokenType.PERCENT:
+                    return self.builder.call(self.functions['bigint_mod'], [left, right])
+                case TokenType.EQ_EQ:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('==', cmp, ir.Constant(_i64, 0))
+                case TokenType.NOT_EQ:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('!=', cmp, ir.Constant(_i64, 0))
+                case TokenType.LESS:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('<', cmp, ir.Constant(_i64, 0))
+                case TokenType.GREATER:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('>', cmp, ir.Constant(_i64, 0))
+                case TokenType.LESS_EQ:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('<=', cmp, ir.Constant(_i64, 0))
+                case TokenType.GREATER_EQ:
+                    cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
+                    return self.builder.icmp_signed('>=', cmp, ir.Constant(_i64, 0))
+
         left, right = self._promote(left, right)
         is_float = isinstance(left.type, ir.DoubleType) or isinstance(right.type, ir.DoubleType)
         if is_float:
@@ -919,6 +998,13 @@ class LLVM:
                 return self.emit(node.operand)
             case TokenType.MINUS:
                 value = self.emit(node.operand)
+                if self._is_big(node.operand) and isinstance(value.type, ir.PointerType):
+                    return self.builder.call(self.functions['bigint_neg'], [value])
+                if isinstance(value.type, ir.PointerType):
+                    int_ty = ir.IntType(64)
+                    as_int = self.builder.ptrtoint(value, int_ty)
+                    neg = self.builder.sub(ir.Constant(int_ty, 0), as_int)
+                    return self.builder.inttoptr(neg, value.type)
                 zero = ir.Constant(value.type, 0.0 if isinstance(value.type, ir.DoubleType) else 0)
                 if isinstance(value.type, ir.DoubleType):
                     return self.builder.fsub(zero, value)
@@ -934,6 +1020,12 @@ class LLVM:
                 return self.builder.sub(value, one)
             case TokenType.TILDE:
                 value = self.emit(node.operand)
+                if isinstance(value.type, ir.PointerType):
+                    int_ty = ir.IntType(64)
+                    as_int = self.builder.ptrtoint(value, int_ty)
+                    all_ones = ir.Constant(int_ty, -1)
+                    xored = self.builder.xor(as_int, all_ones)
+                    return self.builder.inttoptr(xored, value.type)
                 if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
                     int_ty = ir.IntType(32) if isinstance(value.type, ir.FloatType) else ir.IntType(64)
                     as_int = self.builder.bitcast(value, int_ty)
@@ -1027,7 +1119,10 @@ class LLVM:
                 value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
-                    value = self._coerce_store(value, pointee)
+                    if self.local_types.get(name) == 'big' and not self._is_big(node.value):
+                        value = self._promote_to_big(value)
+                    else:
+                        value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ('int64', 'uint64'):
                     value = self._extend_to_i64(value)
@@ -1048,7 +1143,10 @@ class LLVM:
                 value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
-                    value = self._coerce_store(value, pointee)
+                    if self.local_types.get(name) == 'big' and not self._is_big(node.value):
+                        value = self._promote_to_big(value)
+                    else:
+                        value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ('int64', 'uint64'):
                     value = self._extend_to_i64(value)
@@ -1079,6 +1177,8 @@ class LLVM:
 
     def emit_print(self, node):
         value = self.emit(node.value)
+        if self._is_big(node.value):
+            return self.builder.call(self.functions["bigint_print"], [value])
         if isinstance(value.type, ir.DoubleType):
             return self.builder.call(self.functions["print_double"], [value])
         if (isinstance(value.type, ir.PointerType)
@@ -1236,6 +1336,15 @@ class LLVM:
         self.builder.position_at_end(end_bb)
 
     def emit_number(self, node):
+        if getattr(node, 'inferred_type', '') == 'big':
+            s = node.value + '\0'
+            arr_ty = ir.ArrayType(_i8, len(s))
+            g = ir.GlobalVariable(self.module, arr_ty, f'.biglit.{id(node)}')
+            g.initializer = ir.Constant(arr_ty, bytearray(s.encode()))
+            g.global_constant = True
+            ptr = self.builder.bitcast(g, _i8ptr)
+            return self.builder.call(self.functions['bigint_from_str'], [ptr])
+
         if '.' in node.value:
             return ir.Constant(ir.DoubleType(), float(node.value))
         
@@ -1294,7 +1403,11 @@ class LLVM:
         self.local_types[node.name] = node.var_type
         if node.init:
             value = self.emit(node.init)
-            if node.var_type in ('int64', 'uint64'):
+            if node.var_type == 'big' and not self._is_big(node.init):
+                value = self._promote_to_big(value)
+            elif self._is_big(node.init) and node.var_type != 'big':
+                pass
+            elif node.var_type in ('int64', 'uint64'):
                 value = self._extend_to_i64(value)
             if value.type != ty:
                 if isinstance(value.type, ir.IntType) and isinstance(ty, ir.PointerType):

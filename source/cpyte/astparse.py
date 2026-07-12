@@ -88,21 +88,23 @@ class Attr:
         return f'Attr({self.obj}, {self.name})'
 
 class UnaryOp:
-    __slots__ = ('op', 'operand', '_token')
+    __slots__ = ('op', 'operand', '_token', 'inferred_type')
     def __init__(self, op: TokenType, operand, token=None):
         self.op = op
         self.operand = operand
         self._token = token
+        self.inferred_type = None
     def __repr__(self):
         return f'UnaryOp({self.op.name}, {self.operand})'
 
 class BinOp:
-    __slots__ = ('left', 'op', 'right', '_token')
+    __slots__ = ('left', 'op', 'right', '_token', 'inferred_type')
     def __init__(self, left, op: TokenType, right, token=None):
         self.left = left
         self.op = op
         self.right = right
         self._token = token
+        self.inferred_type = None
     def __repr__(self):
         return f'BinOp({self.left}, {self.op.name}, {self.right})'
 

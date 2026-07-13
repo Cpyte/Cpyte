@@ -80,7 +80,10 @@ class LLVM:
 
     def _promote_to_big(self, val):
         if isinstance(val.type, ir.IntType) and val.type.width < 64:
-            val = self.builder.zext(val, _i64)
+            if val.type.width == 32:
+                val = self.builder.sext(val, _i64)
+            else:
+                val = self.builder.zext(val, _i64)
         if isinstance(val.type, ir.IntType) and 'i64' in str(val.type):
             fn = self.functions['bigint_from_uint64']
         elif isinstance(val.type, ir.IntType):
@@ -706,6 +709,14 @@ class LLVM:
             left = self.builder.sitofp(left, ir.DoubleType())
             return left, right
 
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.PointerType):
+            return self.builder.ptrtoint(left, _i64), self.builder.ptrtoint(right, _i64)
+
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.ptrtoint(left, _i64), self.builder.fptosi(right, _i64)
+        if isinstance(right.type, ir.PointerType) and isinstance(left.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fptosi(left, _i64), self.builder.ptrtoint(right, _i64)
+
         if isinstance(left.type, ir.PointerType) and not (isinstance(left.type.pointee, ir.IntType) and left.type.pointee.width == 8) and isinstance(right.type, ir.IntType):
             left = self.builder.ptrtoint(left, _i64)
             right = self._promote_int(right, _i64)
@@ -731,12 +742,15 @@ class LLVM:
     def _promote_int(self, val, target_ty):
         if val.type == target_ty:
             return val
-        if val.type.width < target_ty.width:
-            if val.type.width == 32:
-                return self.builder.sext(val, target_ty)
-            return self.builder.zext(val, target_ty)
-        if val.type.width > target_ty.width:
-            return self.builder.trunc(val, target_ty)
+        if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
+            if val.type.width < target_ty.width:
+                if val.type.width == 32:
+                    return self.builder.sext(val, target_ty)
+                return self.builder.zext(val, target_ty)
+            if val.type.width > target_ty.width:
+                return self.builder.trunc(val, target_ty)
+        elif isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_ty, ir.IntType):
+            return self.builder.fptosi(val, target_ty)
         return val
 
     def _is_true(self, val):
@@ -755,39 +769,39 @@ class LLVM:
         match node.op:
             case TokenType.AND:
                 lhs = self.emit(node.left)
-                res_ty = lhs.type
+                lhs_true = self._is_true(lhs)
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("and.rhs")
                 end_bb = self.builder.append_basic_block("and.end")
-                is_true = self._is_true(lhs)
-                self.builder.cbranch(is_true, rhs_bb, end_bb)
+                self.builder.cbranch(lhs_true, rhs_bb, end_bb)
                 self.builder.position_at_end(rhs_bb)
                 rhs = self.emit(node.right)
-                if rhs.type != res_ty:
-                    rhs = self._coerce_store(rhs, res_ty)
+                rhs_true = self._is_true(rhs)
                 actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
-                phi = self.builder.phi(res_ty)
-                phi.add_incoming(lhs, entry_bb)
-                phi.add_incoming(rhs, actual_rhs_bb)
+                phi = self.builder.phi(_i1)
+                phi.add_incoming(ir.Constant(_i1, 0), entry_bb)
+                phi.add_incoming(rhs_true, actual_rhs_bb)
                 return phi
 
             case TokenType.OR:
                 lhs = self.emit(node.left)
-                res_ty = lhs.type
+                lhs_true = self._is_true(lhs)
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("or.rhs")
                 end_bb = self.builder.append_basic_block("or.end")
-                is_true = self._is_true(lhs)
-                self.builder.cbranch(is_true, end_bb, rhs_bb)
+                self.builder.cbranch(lhs_true, end_bb, rhs_bb)
                 self.builder.position_at_end(rhs_bb)
                 rhs = self.emit(node.right)
-                if rhs.type != res_ty:
-                    rhs = self._coerce_store(rhs, res_ty)
+                rhs_true = self._is_true(rhs)
                 actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
+                phi = self.builder.phi(_i1)
+                phi.add_incoming(ir.Constant(_i1, 1), entry_bb)
+                phi.add_incoming(rhs_true, actual_rhs_bb)
+                return phi
                 phi = self.builder.phi(res_ty)
                 phi.add_incoming(lhs, entry_bb)
                 phi.add_incoming(rhs, actual_rhs_bb)
@@ -937,6 +951,12 @@ class LLVM:
             return left, ir.Constant(left.type, None)
         if isinstance(right.type, ir.PointerType) and isinstance(left.type, ir.IntType):
             return ir.Constant(right.type, None), right
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.PointerType):
+            return self.builder.ptrtoint(left, _i64), self.builder.ptrtoint(right, _i64)
+        if isinstance(left.type, ir.PointerType) and isinstance(right.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.ptrtoint(left, _i64), self.builder.fptosi(right, _i64)
+        if isinstance(right.type, ir.PointerType) and isinstance(left.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fptosi(left, _i64), self.builder.ptrtoint(right, _i64)
         return left, right
 
     def _is_string_concat(self, node):
@@ -1223,7 +1243,14 @@ class LLVM:
             value = self.builder.ptrtoint(value, _i64)
             return self.builder.call(self.functions["print_int64"], [value])
         # Handle i32 — call print_int directly
-        return self.builder.call(self.functions["print_int"], [value])
+        if isinstance(value.type, ir.IntType):
+            return self.builder.call(self.functions["print_int"], [value])
+        # Fallback: convert to int64 and print
+        if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.call(self.functions["print_double"], [value])
+        if isinstance(value.type, ir.PointerType):
+            return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
+        return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
 
     def emit_input(self, node):
         func = self.functions["input"]
@@ -1382,10 +1409,12 @@ class LLVM:
         return self.builder.gep(gv, [zero, zero], inbounds=True)
 
     def _extend_to_i64(self, value):
-        if value.type == ir.IntType(32):
-            return self.builder.sext(value, ir.IntType(64))
-        if value.type == ir.IntType(8):
+        if isinstance(value.type, ir.IntType) and value.type.width < 64:
+            if value.type.width == 32:
+                return self.builder.sext(value, ir.IntType(64))
             return self.builder.zext(value, ir.IntType(64))
+        if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
+            return self.builder.fptosi(value, ir.IntType(64))
         return value
 
     def _alloca(self, ty, name=''):

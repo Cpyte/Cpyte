@@ -1,10 +1,23 @@
 import sys
 import os
-from .lexar import Lexer, LexerError
-from .astparse import parse_file, ParseError
-from .semantic_analasis import analyze
-from .bytecoding import LLVM
-from .compiling import run_jit, run_aot
+
+if __package__:
+    from .lexar import Lexer, LexerError
+    from .astparse import parse_file, ParseError
+    from .semantic_analasis import analyze
+    from .bytecoding import LLVM
+    from .compiling import run_jit, run_aot, _RUNTIME_C
+    from .linker import Linker, find_linker, LinkerNotFoundError
+    from ._bignum_bc import load_bignum_bc
+else:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from cpyte.lexar import Lexer, LexerError
+    from cpyte.astparse import parse_file, ParseError
+    from cpyte.semantic_analasis import analyze
+    from cpyte.bytecoding import LLVM
+    from cpyte.compiling import run_jit, run_aot, _RUNTIME_C
+    from cpyte.linker import Linker, find_linker, LinkerNotFoundError
+    from cpyte._bignum_bc import load_bignum_bc
 
 
 def pretty_ast(node, indent=0):
@@ -149,6 +162,108 @@ def pretty_ast(node, indent=0):
     return f'{pad}{node}'
 
 
+def _compile(source, tab_size=4, strict=False):
+    lex = Lexer(source, tab_size=tab_size)
+    tokens = lex.get_tokens()
+    try:
+        parsed, _ = parse_file(tokens)
+    except (LexerError, ParseError) as e:
+        print(f'parse error: {e}', file=sys.stderr)
+        sys.exit(1)
+    result = analyze(source, parsed, strict=strict)
+    if result:
+        print(result, file=sys.stderr)
+        sys.exit(1)
+    return parsed
+
+
+def _emit(parsed):
+    c = LLVM()
+    try:
+        prog, src_files = c.emit_program(parsed)
+    except Exception as e:
+        print(f'codegen error: {e}', file=sys.stderr)
+        sys.exit(1)
+    return prog, src_files
+
+
+def cmd_build(args, tab_size=4, strict=False):
+    if not args:
+        print('Usage: cpy build [--output O] [--debug] [--opt N] <source.cpy>', file=sys.stderr)
+        sys.exit(1)
+
+    output = None
+    debug = False
+    opt = 3
+    src_file = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '-o' or a == '--output':
+            if i + 1 < len(args):
+                output = args[i + 1]
+                i += 2
+            else:
+                print(f'{a} requires an argument', file=sys.stderr)
+                sys.exit(1)
+        elif a == '-g' or a == '--debug':
+            debug = True
+            i += 1
+        elif a == '--opt' and i + 1 < len(args):
+            opt = int(args[i + 1])
+            i += 2
+        elif not a.startswith('-'):
+            src_file = a
+            i += 1
+        else:
+            print(f'Unknown flag: {a}', file=sys.stderr)
+            sys.exit(1)
+
+    if not src_file:
+        print('Usage: cpy build [--output O] [--debug] [--opt N] <source.cpy>', file=sys.stderr)
+        sys.exit(1)
+
+    with open(src_file) as f:
+        source = f.read()
+
+    parsed = _compile(source, tab_size=tab_size, strict=strict)
+    prog, src_files = _emit(parsed)
+
+    out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
+    obj_file = out_base + '.o'
+
+    import llvmlite.binding as binding
+
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
+
+    mod = binding.parse_assembly(str(prog))
+    bignum_mod = load_bignum_bc()
+    binding.link_modules(mod, bignum_mod)
+    mod.verify()
+
+    target = binding.Target.from_default_triple()
+    target_machine = target.create_target_machine()
+    obj = target_machine.emit_object(mod)
+    with open(obj_file, 'wb') as f:
+        f.write(obj)
+
+    l = Linker()
+    objs = [obj_file]
+    for src in (src_files or []):
+        src_obj = src.rsplit('.', 1)[0] + '.o'
+        l.compile_c(src, output=src_obj, opt_level=opt, debug=debug)
+        objs.append(src_obj)
+
+    runtime_obj = out_base + '.runtime.o'
+    l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug)
+    objs.append(runtime_obj)
+
+    executable = output or out_base
+    l.link(objs, executable, opt_level=opt, debug=debug)
+    print(f'Wrote {executable}')
+
+
 def main():
     tab_size = 4
     mode = 'jit'
@@ -175,35 +290,23 @@ def main():
 
     if not args:
         print('Usage: cpy [--tab-size N] [--strict] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
+        print('       cpy build [--output O] [--debug] [--opt N] <source.cpy>', file=sys.stderr)
         sys.exit(1)
+
+    if args[0] == 'build':
+        cmd_build(args[1:], tab_size=tab_size, strict=strict)
+        return
 
     with open(args[0]) as f:
         source = f.read()
 
-    lex = Lexer(source, tab_size=tab_size)
-    tokens = lex.get_tokens()
-
-    try:
-        parsed, _ = parse_file(tokens)
-    except (LexerError, ParseError) as e:
-        print(f'parse error: {e}', file=sys.stderr)
-        sys.exit(1)
-
-    result = analyze(source, parsed, strict=strict)
-    if result:
-        print(result, file=sys.stderr)
-        sys.exit(1)
+    parsed = _compile(source, tab_size=tab_size, strict=strict)
 
     if mode == 'ast':
         print(pretty_ast(parsed))
         sys.exit(0)
 
-    c = LLVM()
-    try:
-        prog, src_files = c.emit_program(parsed)
-    except Exception as e:
-        print(f'codegen error: {e}', file=sys.stderr)
-        sys.exit(1)
+    prog, src_files = _emit(parsed)
 
     if mode == 'emit-llvm':
         print(prog)

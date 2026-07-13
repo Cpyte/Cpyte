@@ -56,7 +56,10 @@ def _runtime_print_str(s: bytes):
     if s is None:
         print("(null)")
     else:
-        print(s.decode('utf-8'))
+        try:
+            print(s.decode('utf-8'))
+        except UnicodeDecodeError:
+            print(repr(s))
 
 
 def _runtime_input() -> int:

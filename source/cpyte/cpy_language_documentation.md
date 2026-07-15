@@ -2,9 +2,7 @@
 
 ## Status Notice
 
-**This documentation describes both currently implemented features and planned future enhancements.** 
-
-Features marked as **"Planned"** or **"In Development"** are not yet available in the current implementation but are part of the language design roadmap.
+**This documentation describes the implemented features of the Cpy language compiler.**
 
 ## Overview
 
@@ -168,7 +166,7 @@ empty_value = null
 
 #### Assignment Operators
 - `=` (simple assignment)
-- `+=`, `-=`, `*=`, `/=`, `//=`, `:=` (compound assignment)
+- `+=`, `-=`, `*=`, `/=`, `//=` (compound assignment)
 
 #### Memory Operators
 - `*` (dereference), `&` (address-of)
@@ -250,7 +248,7 @@ void* generic_ptr  # Generic pointer
 **Additional Pointer Types:**
 ```cpy
 int64* large_ptr   # Pointer to 64-bit integer
-uint64* ulong_ptr  # Pointer to unsigned 64-bit integer
+uint64* uint64_ptr  # Pointer to unsigned 64-bit integer
 ```
 
 ### Array Types
@@ -268,12 +266,12 @@ Point[] points     # Array of Point structures
 Type annotations use the `->` syntax for functions and `:` syntax for variables:
 
 ```cpy
-public function_name(param1: int, param2: str) -> int:
+public def function_name(param1: int, param2: str) -> int:
     # Function body
     return 0
 
-int x: int = 42
-str name: str = "example"
+int x = 42
+str name = "example"
 ```
 
 ### Type Inference
@@ -423,7 +421,6 @@ int64 value = large_array[index]
 Cpy follows the LP64 data model on 64-bit platforms:
 
 - `int`: 32 bits
-- `long`: 64 bits (when available)
 - `pointer`: 64 bits
 - `int64`: 64 bits
 - `uint64`: 64 bits
@@ -532,7 +529,7 @@ int64 result = c_function_64bit(9223372036854775807)
 #### Overflow Prevention
 
 ```cpy
-public safe_add_64(a: int64, b: int64) -> int64:
+public def safe_add_64(a: int64, b: int64) -> int64:
     if a > 0 and b > (9223372036854775807 - a):
         print("Overflow detected")
         return 0
@@ -563,12 +560,6 @@ uint64 unsigned_decimal = 18446744073709551615
 int64 hex_max = 0x7FFFFFFFFFFFFFFF
 uint64 hex_unsigned_max = 0xFFFFFFFFFFFFFFFF
 int64 hex_value = 0x123456789ABCDEF0
-```
-
-#### Binary Literals
-
-```cpy
-int64 binary_max = 0b0111111111111111111111111111111111111111111111111111111111111111
 ```
 
 ### 64-bit in Standard Library
@@ -603,13 +594,13 @@ int64 maximum = max_64(a, b)
 
 ```cpy
 int64 value = 9223372036854775807
-print("Value: %lld", value)  # Platform-specific format specifier
+print(value)
 
 # Boundary testing
 int64 test_max = 9223372036854775807
 int64 test_min = -9223372036854775808
-print("Max int64: ", test_max)
-print("Min int64: ", test_min)
+print(test_max)
+print(test_min)
 ```
 
 ---
@@ -690,15 +681,15 @@ if not condition:
 
 ```cpy
 # Bitwise operations
-a = 0b1010  # Binary literal
-b = 0b1100
+a = 10   # 0b1010
+b = 12   # 0b1100
 
-result = a & b   # Bitwise AND: 0b1000
-result = a | b   # Bitwise OR: 0b1110
-result = a ^ b   # Bitwise XOR: 0b0110
-result = ~a      # Bitwise NOT: 0b0101
-result = a << 2  # Left shift: 0b101000
-result = a >> 1  # Right shift: 0b101
+result = a & b   # Bitwise AND: 8  (0b1000)
+result = a | b   # Bitwise OR:  14 (0b1110)
+result = a ^ b   # Bitwise XOR: 6  (0b0110)
+result = ~a      # Bitwise NOT: -11
+result = a << 2  # Left shift: 40  (0b101000)
+result = a >> 1  # Right shift: 5  (0b101)
 ```
 
 ### Memory Operations
@@ -857,7 +848,7 @@ for i in range(10):
 #### Return Statement
 
 ```cpy
-public calculate(x: int, y: int) -> int:
+public def calculate(x: int, y: int) -> int:
     return x + y
 ```
 
@@ -866,7 +857,7 @@ public calculate(x: int, y: int) -> int:
 Blocks are defined by indentation:
 
 ```cpy
-public example():
+public def example():
     int x = 10
     # This is a block
     if x > 5:
@@ -884,7 +875,7 @@ public example():
 Functions are declared using the `def` keyword with optional access modifiers:
 
 ```cpy
-public function_name(param1: int, param2: str) -> int:
+public def function_name(param1: int, param2: str) -> int:
     # Function body
     return 0
 ```
@@ -893,35 +884,35 @@ public function_name(param1: int, param2: str) -> int:
 
 ```cpy
 # Public function (can be called from outside)
-public public_function() -> int:
+public def public_function() -> int:
     return 42
 
 # Private function (internal use only)
-private helper_function() -> int:
+private def helper_function() -> int:
     return 0
 
 # Static function (class-level)
-static static_function() -> int:
+static def static_function() -> int:
     return 1
 ```
 
 ### Function Parameters
 
 ```cpy
-public process_numbers(a: int, b: int, c: float) -> float:
+public def process_numbers(a: int, b: int, c: float) -> float:
     return a + b + c
 
-public greet(name: str = "World") -> str:
+public def greet(name: str = "World") -> str:
     return "Hello, " + name
 ```
 
 ### Return Types
 
 ```cpy
-public add(a: int, b: int) -> int:
+public def add(a: int, b: int) -> int:
     return a + b
 
-public print_message(msg: str):
+public def print_message(msg: str):
     print(msg)
 ```
 
@@ -936,7 +927,7 @@ object.method(arg1, arg2)
 ### Recursive Functions
 
 ```cpy
-public factorial(n: int) -> int:
+public def factorial(n: int) -> int:
     if n <= 1:
         return 1
     return n * factorial(n - 1)
@@ -997,7 +988,7 @@ struct Point:
     int x
     int y
     
-    public add(other: Point) -> Point:
+    public def add(other: Point) -> Point:
         Point result
         result.x = self.x + other.x
         result.y = self.y + other.y
@@ -1112,14 +1103,14 @@ result = c_function(arg1, arg2)
 
 Cpy types map to C types as follows:
 
-- `int` → `int` or `long` (platform-dependent)
-- `int64` (Planned) → `long long` or `int64_t`
-- `uint64` (Planned) → `unsigned long long` or `uint64_t`
+- `int` → `int` (32-bit signed)
+- `int64` → `long long` or `int64_t`
+- `uint64` → `unsigned long long` or `uint64_t`
 - `float` → `double`
 - `str` → `char*`
 - `int*` → `int*`
-- `int64*` (Planned) → `long long*` or `int64_t*`
-- `uint64*` (Planned) → `unsigned long long*` or `uint64_t*`
+- `int64*` → `long long*` or `int64_t*`
+- `uint64*` → `unsigned long long*` or `uint64_t*`
 - `void*` → `void*`
 
 ### Example: C Library Integration
@@ -1243,7 +1234,7 @@ static class_variable = 100
 ### Virtual Functions
 
 ```cpy
-virtual override function_name() -> int:
+virtual override def function_name() -> int:
     return 0
 ```
 
@@ -1293,7 +1284,7 @@ def process(ref value: int):
 ### Hello World
 
 ```cpy
-public main() -> int:
+public def main() -> int:
     print("Hello, World!")
     return 0
 ```
@@ -1301,12 +1292,12 @@ public main() -> int:
 ### Factorial Calculation
 
 ```cpy
-public factorial(n: int) -> int:
+public def factorial(n: int) -> int:
     if n <= 1:
         return 1
     return n * factorial(n - 1)
 
-public main() -> int:
+public def main() -> int:
     int result = factorial(5)
     print(result)  # 120
     return 0
@@ -1319,7 +1310,7 @@ struct ListNode:
     int value
     ListNode* next
 
-public create_list(n: int) -> ListNode*:
+public def create_list(n: int) -> ListNode*:
     ListNode* head = 0
     ListNode* current = 0
     int i = 0
@@ -1339,7 +1330,7 @@ public create_list(n: int) -> ListNode*:
     
     return head
 
-public sum_list(head: ListNode*) -> int:
+public def sum_list(head: ListNode*) -> int:
     int total = 0
     ListNode* current = head
     
@@ -1349,7 +1340,7 @@ public sum_list(head: ListNode*) -> int:
     
     return total
 
-public main() -> int:
+public def main() -> int:
     ListNode* list = create_list(5)
     int total = sum_list(list)
     print(total)
@@ -1364,14 +1355,14 @@ struct Matrix:
     int rows
     int cols
 
-public create_matrix(rows: int, cols: int) -> Matrix:
+public def create_matrix(rows: int, cols: int) -> Matrix:
     Matrix m
     m.rows = rows
     m.cols = cols
     m.data = new int[rows][cols]
     return m
 
-public matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
+public def matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
     if a.cols != b.rows:
         return 0
     
@@ -1393,10 +1384,10 @@ public matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
     return result
 ```
 
-### 64-bit File Processing (Planned)
+### 64-bit File Processing
 
 ```cpy
-public process_large_file(filename: str) -> int64:
+public def process_large_file(filename: str) -> int64:
     int64 total_bytes = 0
     int64 buffer_size = 65536
     int64[] buffer = new int64[buffer_size / 8]
@@ -1408,17 +1399,16 @@ public process_large_file(filename: str) -> int64:
     
     return total_bytes
 
-public main() -> int:
+public def main() -> int:
     int64 file_size = process_large_file("large_file.dat")
-    print("Total bytes processed: ")
     print(file_size)
     return 0
 ```
 
-### 64-bit Cryptographic Hash Example (Planned)
+### 64-bit Cryptographic Hash Example
 
 ```cpy
-public simple_hash_64(data: str) -> uint64:
+public def simple_hash_64(data: str) -> uint64:
     uint64 hash = 0xFFFFFFFFFFFFFFFF
     int64 length = strlen(data)
     int64 i = 0
@@ -1431,25 +1421,23 @@ public simple_hash_64(data: str) -> uint64:
     
     return hash
 
-public main() -> int:
+public def main() -> int:
     str message = "Hello, World!"
     uint64 hash_value = simple_hash_64(message)
-    print("Hash value: ")
     print(hash_value)
     return 0
 ```
 
-### 64-bit Timestamp Processing (Planned)
+### 64-bit Timestamp Processing
 
 ```cpy
-public timestamp_to_days(timestamp_ns: int64) -> int64:
+public def timestamp_to_days(timestamp_ns: int64) -> int64:
     int64 ns_per_day = 86400000000000
     return timestamp_ns / ns_per_day
 
-public main() -> int:
+public def main() -> int:
     int64 current_time = 1699999999999999999
     int64 days = timestamp_to_days(current_time)
-    print("Days since epoch: ")
     print(days)
     return 0
 ```
@@ -1465,7 +1453,7 @@ public main() -> int:
 3. **No exception handling**: Error handling through return codes
 4. **Limited generics**: Basic generic type support
 5. **No modules system**: All code in single file or C imports
-6. **64-bit support**: 64-bit integer types (`int64`, `uint64`) are planned but not yet implemented
+6. **No 64-bit operations in standard library**: 64-bit types are supported but utility functions are limited
 
 ### Potential Future Enhancements
 
@@ -1476,7 +1464,6 @@ public main() -> int:
 5. **Module system**: Better code organization and reuse
 6. **Concurrency primitives**: Threads, async/await, etc.
 7. **Standard library containers**: Lists, dictionaries, sets, etc.
-8. **64-bit integer support**: Implementation of `int64` and `uint64` types
 
 ---
 
@@ -1498,12 +1485,12 @@ The language is suited for:
 ### Formal Grammar (Simplified)
 
 ```
-program        ::= {declaration | function | struct_def}
+program        ::= {statement | struct_def}
 declaration    ::= type IDENTIFIER ["=" expression]
 function       ::= ACCESS_MODIFIER? "def" IDENTIFIER "(" parameters ")" ["->" type] block
 struct_def     ::= "struct" IDENTIFIER [generic_params] ":" {member_decl}
 block          ::= NEWLINE INDENT statement DEDENT
-statement      ::= expression_stmt | if_stmt | while_stmt | for_stmt | return_stmt
+statement      ::= expression_stmt | if_stmt | while_stmt | for_stmt | return_stmt | break_stmt | continue_stmt | print_stmt | import_stmt | declaration | function
 expression_stmt ::= expression
 if_stmt        ::= "if" expression block {"elif" expression block} ["else" block]
 while_stmt     ::= "while" expression block
@@ -1522,18 +1509,14 @@ power          ::= unary ["**" power]
 unary          ::= ("+" | "-" | "not" | "~" | "*" | "&") unary | postfix
 postfix        ::= primary {("()" | "[]" | "." IDENTIFIER)}
 primary        ::= NUMBER | STRING | IDENTIFIER | "(" expression ")" | "new" type | "sizeof" "(" type ")"
-type           ::= "int" | "float" | "str" | "bool" | type "*" | type "[]"
+type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void" | type "*" | type "[]"
 ```
-
-**Note:** The grammar shown above represents the currently implemented language. 64-bit types (`int64`, `uint64`) and hexadecimal literals are planned additions.
 
 ### Token Specifications
 
-```
+```python
 NUMBER         ::= [0-9]+ ("." [0-9]+)? ([eE][+-]?[0-9]+)?
+HEX_NUMBER     ::= "0x" [0-9A-Fa-f]+
 STRING         ::= '"' ([^"\\] | "\\" .)* '"'
 IDENTIFIER     ::= [a-zA-Z_] [a-zA-Z0-9_]*
 ```
-
-**Planned additions:**
-- `HEX_NUMBER ::= "0x" [0-9A-Fa-f]+` (for 64-bit hexadecimal literals)

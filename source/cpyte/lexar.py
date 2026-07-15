@@ -271,6 +271,12 @@ class _LineLexer:
             if ch == '#':
                 break
 
+            if ch == '\\':
+                self.advance()
+                while not self.at_end() and self.peek() in ' \t\r':
+                    self.advance()
+                break
+
             if ch.isdigit():
                 tokens.append(self.scan_number())
                 continue
@@ -349,6 +355,7 @@ class Lexer:
         indent_stack = [0]
         last_non_blank = 0
 
+        continuation = False
         for i, norm_line in enumerate(norm_lines):
             line_number = i + 1
             stripped = norm_line.lstrip(' \t')
@@ -356,20 +363,28 @@ class Lexer:
             if not stripped or stripped.startswith('#'):
                 continue
 
+            trimmed = stripped.rstrip()
+            ends_with_bs = trimmed.endswith('\\')
+
             indent = len(norm_line) - len(stripped)
 
-            while indent < indent_stack[-1]:
-                indent_stack.pop()
-                self.tokens.append(Token(TokenType.DEDENT, None, line_number, 1))
+            if not continuation:
+                while indent < indent_stack[-1]:
+                    indent_stack.pop()
+                    self.tokens.append(Token(TokenType.DEDENT, None, line_number, 1))
 
-            if indent > indent_stack[-1]:
-                indent_stack.append(indent)
-                self.tokens.append(Token(TokenType.INDENT, None, line_number, 1))
+                if indent > indent_stack[-1]:
+                    indent_stack.append(indent)
+                    self.tokens.append(Token(TokenType.INDENT, None, line_number, 1))
 
             line_lexer = _LineLexer(norm_line, line_number)
             self.tokens.extend(line_lexer.tokenize())
-            self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_line) + 1))
-            last_non_blank = line_number
+
+            if not ends_with_bs:
+                self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_line) + 1))
+                last_non_blank = line_number
+
+            continuation = ends_with_bs
 
         while len(indent_stack) > 1:
             indent_stack.pop()

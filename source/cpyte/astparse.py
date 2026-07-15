@@ -156,6 +156,8 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
 
 
 def _parse_unary(tokens: list[Token], pos: int):
+    while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+        pos += 1
     if pos >= len(tokens):
         raise ParseError('Unexpected end of expression')
 
@@ -407,10 +409,12 @@ def _parse_func_params(tokens: list[Token], pos: int):
         pos += 1
         if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
             pos += 1
-        if pos < len(tokens):
+        if pos < len(tokens) and tokens[pos].type not in (TokenType.COMMA, TokenType.RPAREN):
             param_type, pos = parse_type(tokens, pos)
             param_type_str = _type_to_str(param_type) if isinstance(param_type, tuple) else param_type
             params[param_name] = param_type_str
+        else:
+            params[param_name] = 'int'
         if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:

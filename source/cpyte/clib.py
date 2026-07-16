@@ -165,11 +165,18 @@ def _add_symbol(symbols, m):
                 ptype = _c_type_to_lang(tokens[0])
                 pname = ''
             else:
-                ptype = _c_type_to_lang(' '.join(tokens[:-1]))
+                # Handle * attached to param name (e.g., "void *ptr" -> tokens=['void', '*ptr'])
+                type_tokens = tokens[:-1]
                 pname = tokens[-1]
+                while pname.startswith('*'):
+                    type_tokens.append('*')
+                    pname = pname[1:]
+                ptype = _c_type_to_lang(' '.join(type_tokens))
+                if not pname:
+                    pname = f'p{len(params)}'
             if ptype is None:
                 continue
-            params.append((pname or f'p{len(params)}', ptype))
+            params.append((pname, ptype))
     if ret_type is not None:
         symbols[fname] = (ret_type, params, vararg)
 

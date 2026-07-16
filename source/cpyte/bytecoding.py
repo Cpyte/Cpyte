@@ -570,7 +570,7 @@ class LLVM:
         return None
 
     def funcdo(self, node: FuncDef):
-        ret_ty = self.llvm_type(getattr(node, 'rettype', None) or 'void')
+        ret_ty = self.llvm_type(getattr(node, 'rettype', None) or 'int')
         param_tys = [self.llvm_type(t) for t in node.params.values()]
 
         if node.name in self.functions:
@@ -1205,6 +1205,18 @@ class LLVM:
         return None
 
     def emit_call(self, node):
+        # Handle known macro functions by inlining
+        if node.callee.name == 'CGEventMaskBit':
+            arg = self.emit(node.args[0])
+            if isinstance(arg.type, ir.IntType):
+                one = ir.Constant(arg.type, 1)
+                shifted = self.builder.shl(one, arg)
+                # Extend to i64 for CGEventMask (uint64_t)
+                if shifted.type.width < 64:
+                    shifted = self.builder.zext(shifted, ir.IntType(64))
+                return shifted
+            return ir.Constant(ir.IntType(64), 0)
+
         func = self.functions.get(node.callee.name)
         if func is None:
             raise Exception(f"Undefined function '{node.callee.name}' at L{node._token.line}:{node._token.column}")

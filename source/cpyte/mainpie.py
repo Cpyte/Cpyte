@@ -3,7 +3,7 @@ import os
 
 if __package__:
     from .lexar import Lexer, LexerError
-    from .astparse import parse_file, ParseError
+    from .astparse import parse_file, ParseError, Import
     from .semantic_analasis import analyze
     from .bytecoding import LLVM
     from .compiling import run_jit, run_aot, _RUNTIME_C
@@ -12,7 +12,7 @@ if __package__:
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     from cpyte.lexar import Lexer, LexerError
-    from cpyte.astparse import parse_file, ParseError
+    from cpyte.astparse import parse_file, ParseError, Import
     from cpyte.semantic_analasis import analyze
     from cpyte.bytecoding import LLVM
     from cpyte.compiling import run_jit, run_aot, _RUNTIME_C
@@ -187,6 +187,23 @@ def _emit(parsed):
     return prog, src_files
 
 
+def _collect_frameworks(nodes):
+    frameworks = []
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Import):
+            frameworks.extend(node.frameworks)
+        if isinstance(node, list):
+            stack.extend(node)
+        else:
+            for attr in ('body', 'orelse', 'items', 'handlers', 'args'):
+                val = getattr(node, attr, None)
+                if isinstance(val, list):
+                    stack.extend(val)
+    return list(set(frameworks))
+
+
 def cmd_build(args, tab_size=4, strict=False):
     if not args:
         print('Usage: cpy build [--output O] [--debug] [--opt N] <source.cpy>', file=sys.stderr)
@@ -227,6 +244,9 @@ def cmd_build(args, tab_size=4, strict=False):
         source = f.read()
 
     parsed = _compile(source, tab_size=tab_size, strict=strict)
+
+    frameworks = _collect_frameworks(parsed)
+
     prog, src_files = _emit(parsed)
 
     out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
@@ -260,7 +280,7 @@ def cmd_build(args, tab_size=4, strict=False):
     objs.append(runtime_obj)
 
     executable = output or out_base
-    l.link(objs, executable, opt_level=opt, debug=debug)
+    l.link(objs, executable, opt_level=opt, debug=debug, frameworks=frameworks)
     print(f'Wrote {executable}')
 
 

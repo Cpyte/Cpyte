@@ -12,8 +12,9 @@ import re
 import subprocess
 import sys
 import tempfile
-import zlib
 from pathlib import Path
+
+import zlib
 from llvmlite import binding
 
 

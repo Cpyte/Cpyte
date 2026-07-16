@@ -53,10 +53,11 @@ class String:
         return f'String({self.value})'
 
 class Variable:
-    __slots__ = ('name', '_token')
+    __slots__ = ('name', '_token', 'const_value')
     def __init__(self, name: str, token=None):
         self.name = name
         self._token = token
+        self.const_value = None
     def __repr__(self):
         return f'Variable({self.name})'
 
@@ -148,6 +149,8 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
     while pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= min_prec:
         op = tokens[pos]
         pos += 1
+        while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            pos += 1
         next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
         right, pos = _parse_binary(tokens, pos, next_prec)
         left = BinOp(left, op.type, right, token=op)
@@ -156,7 +159,7 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
 
 
 def _parse_unary(tokens: list[Token], pos: int):
-    while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
         pos += 1
     if pos >= len(tokens):
         raise ParseError('Unexpected end of expression')
@@ -538,7 +541,24 @@ def parse_import(tokens: list[Token], pos: int):
         pos += 1
     else:
         raise ParseError('Expected module name or quoted header path', t)
-    return Import(module, token=tok), pos
+
+    sdk_path = None
+    if pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER and tokens[pos].value == 'sdk':
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+            raise ParseError('Expected "(" after sdk', tokens[pos] if pos < len(tokens) else None)
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+            raise ParseError('Expected SDK path string', tokens[pos] if pos < len(tokens) else None)
+        sdk_path = tokens[pos].value
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+            raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else None)
+        pos += 1
+
+    node = Import(module, token=tok)
+    node.sdk_path = sdk_path
+    return node, pos
 
 
 def parse_expression_list(tokens: list[Token], pos: int = 0, end_type: TokenType = TokenType.NEWLINE):
@@ -651,13 +671,17 @@ class VarDecl:
         return f'VarDecl({self.name}: {self.var_type} = {self.init})'
 
 class Import:
-    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast')
+    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names')
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
         self.symbols = symbols or []
         self.src_file = None
         self._token = token
         self.sub_ast = None
+        self.frameworks = []
+        self.constants = {}
+        self.sdk_path = None
+        self.var_names = set()
     def __repr__(self):
         return f'Import({self.module})'
 
@@ -1081,6 +1105,11 @@ def _is_assignable(expr):
 
 def parse_expr_stmt(tokens: list[Token], pos: int):
     tok = tokens[pos]
+    if tok.type == TokenType.KEYWORD and tok.value == 'let':
+        pos += 1
+        if pos >= len(tokens):
+            raise ParseError('Expected variable name after let', tok)
+        tok = tokens[pos]
     expr, pos = parse_expression(tokens, pos)
 
     if pos < len(tokens) and tokens[pos].type == TokenType.EQUAL:

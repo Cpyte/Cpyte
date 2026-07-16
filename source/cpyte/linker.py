@@ -52,7 +52,7 @@ class Linker:
         return output
 
     def link(self, objects, output, libraries=None, library_paths=None,
-             shared=False, debug=False, opt_level=3):
+             shared=False, debug=False, opt_level=3, frameworks=None):
         cmd = [self._cc]
         if shared:
             cmd.append('-shared')
@@ -65,6 +65,8 @@ class Linker:
             cmd.extend(['-l', lib])
         for path in (library_paths or []):
             cmd.extend(['-L', path])
+        for fw in (frameworks or []):
+            cmd.extend(['-framework', fw])
         if not shared:
             cmd.append('-lm')
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -75,7 +77,7 @@ class Linker:
 
 
 def build(objects, output=None, libraries=None, library_paths=None,
-          shared=False, debug=False, opt_level=3, cc=None):
+          shared=False, debug=False, opt_level=3, cc=None, frameworks=None):
     linker = Linker(cc)
 
     final_objects = []
@@ -97,5 +99,6 @@ def build(objects, output=None, libraries=None, library_paths=None,
         final_objects, output,
         libraries=libraries, library_paths=library_paths,
         shared=shared,
-        debug=debug, opt_level=opt_level
+        debug=debug, opt_level=opt_level,
+        frameworks=frameworks,
     )

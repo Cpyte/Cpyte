@@ -96,6 +96,7 @@ class LLVM:
         self.module = ir.Module("main")
         self.builder = None
         self.functions = {}
+        self.global_vars = {}
         self.locals = {}
         self.local_types = {}
         self.string_id = 0
@@ -1066,12 +1067,27 @@ class LLVM:
                 return self.builder.icmp_unsigned('==', value, zero)
 
     def emit_variable(self, node):
+        if node.const_value is not None:
+            val = node.const_value
+            # Use i32 for small values, i64 for large ones
+            if -2**31 <= val < 2**31:
+                return ir.Constant(ir.IntType(32), val)
+            return ir.Constant(ir.IntType(64), val)
         ptr = self.locals.get(node.name)
         if ptr is not None:
             return self.builder.load(ptr, node.name)
+        gv = self.global_vars.get(node.name)
+        if gv is not None:
+            return self.builder.load(gv, node.name)
         ssa = self.ssa_values.get(node.name)
         if ssa is not None:
             return ssa
+        # Check if it's a defined function (to pass as function pointer)
+        func = self.functions.get(node.name)
+        if func is not None:
+            # Return a pointer to the function (for use as callback arg)
+            ptr_ty = ir.PointerType(ir.IntType(8))
+            return self.builder.bitcast(func, ptr_ty)
         raise Exception(f"Undefined variable '{node.name}' at L{node._token.line}:{node._token.column}")
 
     def _trunc_or_ext(self, value, target_type):
@@ -1192,7 +1208,19 @@ class LLVM:
         func = self.functions.get(node.callee.name)
         if func is None:
             raise Exception(f"Undefined function '{node.callee.name}' at L{node._token.line}:{node._token.column}")
-        args = [self.emit(arg) for arg in node.args]
+        args = []
+        for i, arg in enumerate(node.args):
+            val = self.emit(arg)
+            if i < len(func.function_type.args):
+                expected = func.function_type.args[i]
+                if isinstance(val, ir.Constant) and val.constant == 0 and isinstance(val.type, ir.IntType):
+                    if isinstance(expected, ir.PointerType):
+                        val = ir.Constant(expected, None)
+                if isinstance(val.type, ir.IntType) and isinstance(expected, ir.PointerType):
+                    val = self.builder.inttoptr(val, expected)
+                if isinstance(val.type, ir.PointerType) and isinstance(expected, ir.IntType):
+                    val = self.builder.ptrtoint(val, expected)
+            args.append(val)
         return self.builder.call(func, args)
 
     def emit_print(self, node):
@@ -1470,13 +1498,26 @@ class LLVM:
             self.builder.store(ir.Constant(ty, 0), ptr)
 
     def emit_import(self, node):
+        var_names = getattr(node, 'var_names', set()) or set()
         for fname, (ret_type, params, vararg) in node.symbols:
-            if fname in self.functions:
+            if fname in self.functions or fname in self.global_vars:
                 continue
-            ret_ty = self.llvm_type(ret_type)
-            param_tys = [self.llvm_type(t) for _, t in params]
-            fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
-            func = ir.Function(self.module, fnty, name=fname)
-            self.functions[fname] = func
+            if fname in var_names:
+                # Variable declaration (e.g., CF_EXPORT const ...)
+                var_ty = self.llvm_type(ret_type)
+                if isinstance(var_ty, ir.VoidType):
+                    continue
+                gv = ir.GlobalVariable(self.module, var_ty, name=fname)
+                gv.linkage = 'extern_weak'
+                self.global_vars[fname] = gv
+            else:
+                ret_ty = self.llvm_type(ret_type)
+                if isinstance(ret_ty, ir.VoidType) and not params and not vararg:
+                    param_tys = []
+                else:
+                    param_tys = [self.llvm_type(t) for _, t in params]
+                fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
+                func = ir.Function(self.module, fnty, name=fname)
+                self.functions[fname] = func
         if node.src_file:
             self.import_src_files.append(node.src_file)

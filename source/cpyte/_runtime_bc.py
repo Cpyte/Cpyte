@@ -1,6 +1,7 @@
-import base64, zlib
-from llvmlite import binding
+import base64
+import zlib
 
+from llvmlite import binding
 
 _B64 = (
     'eJztWn98E8eVn9UKrTDyagFDZCyJFTicIQHWNhjJllPJCsRJ6CeC0JQ26UmysWMa28iy8a+06coSXjdx'

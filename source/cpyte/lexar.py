@@ -66,6 +66,7 @@ KEYWORDS = {
     'switch', 'case', 'default',
     'new', 'struct', 'sizeof', 'ref',
     'int64', 'uint64',
+    'let',
 }
 
 
@@ -355,6 +356,7 @@ class Lexer:
         indent_stack = [0]
         last_non_blank = 0
 
+        bracket_depth = 0
         continuation = False
         for i, norm_line in enumerate(norm_lines):
             line_number = i + 1
@@ -368,7 +370,8 @@ class Lexer:
 
             indent = len(norm_line) - len(stripped)
 
-            if not continuation:
+            is_continuation = continuation or bracket_depth > 0
+            if not is_continuation:
                 while indent < indent_stack[-1]:
                     indent_stack.pop()
                     self.tokens.append(Token(TokenType.DEDENT, None, line_number, 1))
@@ -378,9 +381,17 @@ class Lexer:
                     self.tokens.append(Token(TokenType.INDENT, None, line_number, 1))
 
             line_lexer = _LineLexer(norm_line, line_number)
-            self.tokens.extend(line_lexer.tokenize())
+            line_tokens = line_lexer.tokenize()
 
-            if not ends_with_bs:
+            for t in line_tokens:
+                if t.type in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.LBRACE):
+                    bracket_depth += 1
+                elif t.type in (TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE):
+                    bracket_depth -= 1
+
+            self.tokens.extend(line_tokens)
+
+            if not (ends_with_bs or bracket_depth > 0):
                 self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_line) + 1))
                 last_non_blank = line_number
 

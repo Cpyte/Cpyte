@@ -1,4 +1,22 @@
 import os
+import subprocess
+
+def _get_sdk_paths():
+    paths = []
+    try:
+        sdk = subprocess.run(['xcrun', '--show-sdk-path'], capture_output=True, text=True, timeout=5)
+        if sdk.returncode == 0 and sdk.stdout.strip():
+            paths.append(sdk.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    base = '/Library/Developer/CommandLineTools/SDKs'
+    if os.path.isdir(base):
+        for entry in sorted(os.listdir(base), reverse=True):
+            full = os.path.join(base, entry)
+            if os.path.isdir(full) and entry.startswith('MacOSX'):
+                if full not in paths:
+                    paths.append(full)
+    return paths
 
 from .lexar import Lexer, LexerError
 from .astparse import (
@@ -88,12 +106,13 @@ class Reporter:
 
 
 class Symbol:
-    __slots__ = ('kind', 'type', 'node')
+    __slots__ = ('kind', 'type', 'node', 'const_value')
 
     def __init__(self, kind: str, type_: str | None = None, node=None):
         self.kind = kind
         self.type = type_
         self.node = node
+        self.const_value = None
 
 
 class Scope:
@@ -228,6 +247,8 @@ class SemanticAnalyzer:
                 self.error(f'use of undeclared identifier `{node.name}`', node,
                            note=f'no definition found in this scope')
                 return None
+            if sym.const_value is not None:
+                node.const_value = sym.const_value
             return sym.type
 
         if isinstance(node, BinOp):
@@ -396,6 +417,8 @@ class SemanticAnalyzer:
         if isinstance(node, Call):
             sym = self._resolve_callee(node.callee)
             if sym is not None:
+                for arg in node.args:
+                    self._infer_type(arg)
                 self._check_call_args(node, sym)
                 return sym.type
             return None
@@ -559,12 +582,26 @@ class SemanticAnalyzer:
             for n in node:
                 self._visit(n, scope)
 
-    def _resolve_module_path(self, module: str) -> str | None:
+    def _resolve_module_path(self, module: str, sdk_path: str | None = None) -> str | None:
         candidates = [module]
         if self._filedir:
             candidates.append(os.path.normpath(os.path.join(self._filedir, module)))
         if self._workspace_root:
             candidates.append(os.path.normpath(os.path.join(self._workspace_root, module)))
+        if module.endswith('.h') and '/' in module:
+            parts = module.split('/')
+            framework_name = parts[0]
+            header_path = '/'.join(parts[1:])
+            sdk_paths = [sdk_path] if sdk_path else []
+            sdk_paths.extend(_get_sdk_paths())
+            for sdk in sdk_paths:
+                for framework_dir in (
+                    os.path.join(sdk, 'System/Library/Frameworks', f'{framework_name}.framework', 'Headers'),
+                    os.path.join(sdk, 'System/Library/Frameworks', f'{framework_name}.framework', 'Versions/A/Headers'),
+                ):
+                    candidate = os.path.join(framework_dir, header_path)
+                    if candidate not in candidates:
+                        candidates.append(candidate)
         for candidate in candidates:
             if os.path.exists(candidate):
                 return candidate
@@ -572,7 +609,7 @@ class SemanticAnalyzer:
 
     def _visit_import(self, node: Import):
         module = node.module
-        resolved = self._resolve_module_path(module)
+        resolved = self._resolve_module_path(module, node.sdk_path)
 
         is_file_import = (module.endswith('.c') or module.endswith('.cc')
                           or module.endswith('.h') or module.endswith('.cpy')
@@ -584,46 +621,78 @@ class SemanticAnalyzer:
                 self.error(f'unknown library `{module}`', node)
             else:
                 symbols, kind = result
-                s = self.globals
-                for fname, (ret_type, params, vararg) in symbols.items():
-                    existing = s.lookup_local(fname)
-                    if not existing:
-                        s.define(fname, Symbol('function', ret_type, node))
-                node.symbols = list(symbols.items())
+                self._register_import_symbols(symbols, node)
             return
 
         if resolved is None:
             self.error(f'file not found: `{module}`', node)
             return
 
+        search_paths = [node.sdk_path] if node.sdk_path else []
+        search_paths.extend(_get_sdk_paths())
+
         if module.endswith('.c') or module.endswith('.cc'):
             result = parse_c_source(resolved)
+            if result:
+                self._register_import_symbols(result[0], node)
             node.src_file = resolved
         elif module.endswith('.h'):
-            result = parse_header_file(resolved)
+            result = parse_header_file(resolved, search_paths)
+            symbols, _kind, constants, framework, var_names = result
+            node.constants = constants
+            if framework:
+                node.frameworks.append(framework)
+            self._register_import_symbols(symbols, node, var_names)
+            self._register_import_constants(constants, node)
+            return
         elif module.endswith('.cpy'):
             result = self._import_cpy(resolved, node)
+            if result:
+                self._register_import_symbols(result[0], node)
         elif '/' in module:
             ext = module.rsplit('.', 1)[-1] if '.' in module else ''
             if ext in ('c', 'cc'):
                 result = parse_c_source(resolved)
+                if result:
+                    self._register_import_symbols(result[0], node)
                 node.src_file = resolved
             elif ext == 'cpy':
                 result = self._import_cpy(resolved, node)
+                if result:
+                    self._register_import_symbols(result[0], node)
             else:
-                result = parse_header_file(resolved)
+                result = parse_header_file(resolved, search_paths)
+                symbols, _kind, constants, framework, var_names = result
+                node.constants = constants
+                if framework:
+                    node.frameworks.append(framework)
+                self._register_import_symbols(symbols, node, var_names)
+                return
+        else:
+            result = None
 
         if result is None:
             self.error(f'unknown library `{module}`', node)
-            return
 
-        symbols, kind = result
+    def _register_import_symbols(self, symbols, node, var_names=None):
         s = self.globals
+        var_names = var_names or set()
+        node.var_names = var_names
         for fname, (ret_type, params, vararg) in symbols.items():
             existing = s.lookup_local(fname)
             if not existing:
-                s.define(fname, Symbol('function', ret_type, node))
+                kind = 'variable' if fname in var_names else 'function'
+                s.define(fname, Symbol(kind, ret_type, node))
         node.symbols = list(symbols.items())
+
+    def _register_import_constants(self, constants, node):
+        s = self.globals
+        for name, val in constants.items():
+            existing = s.lookup_local(name)
+            if not existing:
+                sym = Symbol('variable', 'int', node)
+                sym.const_value = val
+                s.define(name, sym)
 
     def _import_cpy(self, module: str, node: Import | None = None):
         try:

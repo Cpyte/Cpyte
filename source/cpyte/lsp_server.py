@@ -8,8 +8,8 @@ from lsprotocol import types as lsp
 from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
-from .lexar import Lexer, LexerError
 from .astparse import parse_file, ParseError, FuncDef, StructDef
+from .lexar import Lexer, LexerError
 from .semantic_analasis import SemanticAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")

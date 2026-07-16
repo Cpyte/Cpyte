@@ -1,10 +1,8 @@
-import atexit
 import ctypes
 import ctypes.util
-import subprocess
 import os
+import subprocess
 import sys
-import tempfile
 import warnings
 
 from ._bignum_bc import load_bignum_bc

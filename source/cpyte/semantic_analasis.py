@@ -411,6 +411,21 @@ class SemanticAnalyzer:
                         node,
                         note='unary minus expects numeric type'
                     )
+            if node.op.name == 'TILDE':
+                valid_types = ('int', 'int64', 'uint64')
+                if operand_t is not None and operand_t not in valid_types:
+                    self.error(
+                        f'bitwise NOT (`~`) not supported for `{operand_t}`',
+                        node,
+                        note='bitwise NOT expects int, int64, or uint64 operand'
+                    )
+            if node.op.name == 'MINUS_MINUS':
+                if operand_t == 'big':
+                    self.error(
+                        'decrement (`--`) not supported for `big`',
+                        node,
+                        note='big integers do not support decrement'
+                    )
             node.inferred_type = operand_t
             return operand_t
 

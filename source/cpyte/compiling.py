@@ -102,7 +102,18 @@ def _remove_probe_stack_ir(llvm_ir):
     return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
 
 
+def _maybe_compile(module):
+    if isinstance(module, list):
+        from .bytecoding import LLVM
+        c = LLVM()
+        prog, src_files = c.emit_program(module)
+        return prog, src_files
+    return module, None
+
 def run_jit(module, opt_level=3, src_files=None):
+    module, src_files_auto = _maybe_compile(module)
+    if src_files_auto is not None:
+        src_files = src_files_auto
     global _print_fn, _input_fn
     from llvmlite import binding
     binding.initialize_native_target()

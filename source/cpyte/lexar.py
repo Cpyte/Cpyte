@@ -48,6 +48,7 @@ class TokenType(Enum):
     COMMA = auto()
     COLON = auto()
     DOT = auto()
+    AT_SIGN = auto()
 
     INDENT = auto()
     DEDENT = auto()
@@ -253,6 +254,7 @@ class _LineLexer:
             ',': TokenType.COMMA,
             ':': TokenType.COLON,
             '.': TokenType.DOT,
+            '@': TokenType.AT_SIGN,
         }
 
         if ch in punct_map:

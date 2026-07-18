@@ -624,6 +624,11 @@ class SemanticAnalyzer:
 
     def _visit_import(self, node: Import):
         module = node.module
+
+        if node.is_package:
+            self._visit_package_import(node, module)
+            return
+
         resolved = self._resolve_module_path(module, node.sdk_path)
 
         is_file_import = (module.endswith('.c') or module.endswith('.cc')
@@ -709,6 +714,37 @@ class SemanticAnalyzer:
                 sym.const_value = val
                 s.define(name, sym)
 
+    def _find_package_entry(self, search_dir: str, pkg_name: str) -> str | None:
+        for dir_candidate in (search_dir, os.path.join(search_dir, 'src')):
+            if not os.path.isdir(dir_candidate):
+                continue
+            for entry_name in (f'{pkg_name}.cpy', 'package.cpy'):
+                entry_path = os.path.join(dir_candidate, entry_name)
+                if os.path.isfile(entry_path):
+                    return entry_path
+        return None
+
+    def _visit_package_import(self, node: Import, module: str):
+        cpm_root = None
+        if self._workspace_root:
+            cpm_root = os.path.join(self._workspace_root, '.cpm', 'modules')
+        elif self._filedir:
+            cpm_root = os.path.join(self._filedir, '..', '.cpm', 'modules')
+        if cpm_root and os.path.isdir(cpm_root):
+            pkg_dir = os.path.join(cpm_root, module)
+            if os.path.isdir(pkg_dir):
+                versions = sorted([d for d in os.listdir(pkg_dir) if os.path.isdir(os.path.join(pkg_dir, d))], reverse=True)
+                if versions:
+                    pkg_name = module.rsplit('/', 1)[-1]
+                    version_dir = os.path.join(pkg_dir, versions[0])
+                    cpy_file = self._find_package_entry(version_dir, pkg_name)
+                    if cpy_file:
+                        result = self._import_cpy(cpy_file, node)
+                        if result:
+                            self._register_import_symbols(result[0], node)
+                        return
+        self.error(f"package `{module}` not installed — run 'cpm install'", node)
+
     def _import_cpy(self, module: str, node: Import | None = None):
         try:
             with open(module) as f:
@@ -751,7 +787,10 @@ class SemanticAnalyzer:
                 if not existing:
                     self.globals.define(ast_node.name, Symbol('struct', None, ast_node))
             elif isinstance(ast_node, Import):
-                pass
+                if getattr(ast_node, 'is_package', False):
+                    for fname, (ret_type, params, vararg) in ast_node.symbols:
+                        if fname not in symbols:
+                            symbols[fname] = (ret_type, params, vararg)
 
         if node is not None:
             node.sub_ast = sub_ast
@@ -1023,8 +1062,8 @@ class SemanticAnalyzer:
         self.locals = old_locals
 
 
-def analyze(source: str, nodes: list, strict: bool = False) -> str | None:
-    analyzer = SemanticAnalyzer(source, strict=strict)
+def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None) -> str | None:
+    analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root)
     if analyzer.analyze(nodes):
         return None
     return analyzer.reporter.display()

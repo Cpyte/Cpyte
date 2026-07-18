@@ -536,6 +536,22 @@ def parse_import(tokens: list[Token], pos: int):
     if t.type == TokenType.STRING:
         module = t.value
         pos += 1
+    elif t.type == TokenType.AT_SIGN:
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError('Expected package name after @', tokens[pos] if pos < len(tokens) else None)
+        parts = [tokens[pos].value]
+        pos += 1
+        while pos < len(tokens) and tokens[pos].type == TokenType.DOT:
+            pos += 1
+            if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+                raise ParseError('Expected identifier after . in package name', tokens[pos] if pos < len(tokens) else None)
+            parts.append(tokens[pos].value)
+            pos += 1
+        module = '@' + '/'.join(parts)
+        node = Import(module, token=tok)
+        node.is_package = True
+        return node, pos
     elif t.type == TokenType.IDENTIFIER:
         module = t.value
         pos += 1
@@ -671,7 +687,7 @@ class VarDecl:
         return f'VarDecl({self.name}: {self.var_type} = {self.init})'
 
 class Import:
-    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names')
+    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names', 'is_package')
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
         self.symbols = symbols or []
@@ -682,6 +698,7 @@ class Import:
         self.constants = {}
         self.sdk_path = None
         self.var_names = set()
+        self.is_package = False
     def __repr__(self):
         return f'Import({self.module})'
 

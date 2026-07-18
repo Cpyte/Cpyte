@@ -170,7 +170,7 @@ def _compile(source, tab_size=4, strict=False):
     except (LexerError, ParseError) as e:
         print(f'parse error: {e}', file=sys.stderr)
         sys.exit(1)
-    result = analyze(source, parsed, strict=strict)
+    result = analyze(source, parsed, strict=strict, workspace_root=os.getcwd())
     if result:
         print(result, file=sys.stderr)
         sys.exit(1)

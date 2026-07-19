@@ -1562,3 +1562,5 @@ class LLVM:
                 self.functions[fname] = func
         if node.src_file:
             self.import_src_files.append(node.src_file)
+        if getattr(node, 'prebuilt_ll_files', None):
+            self.import_src_files.extend(node.prebuilt_ll_files)

@@ -71,6 +71,14 @@ class LLVM:
             return True
         return False
 
+    def _clamp_shift_amount(self, val, bitwidth):
+        zero = ir.Constant(val.type, 0)
+        max_shift = ir.Constant(val.type, bitwidth - 1)
+        lt_zero = self.builder.icmp_signed('<', val, zero)
+        gt_max = self.builder.icmp_signed('>', val, max_shift)
+        clamped_to_max = self.builder.select(gt_max, max_shift, val)
+        return self.builder.select(lt_zero, zero, clamped_to_max)
+
     def _is_big(self, node):
         if getattr(node, 'inferred_type', '') == 'big':
             return True
@@ -367,6 +375,8 @@ class LLVM:
             count = self.emit(node.size)
             if isinstance(count.type, ir.PointerType):
                 count = self.builder.ptrtoint(count, _i64)
+            elif isinstance(count.type, (ir.DoubleType, ir.FloatType)):
+                count = self.builder.fptosi(count, _i64)
             elif count.type != _i64:
                 count = self.builder.zext(count, _i64)
         else:
@@ -886,20 +896,39 @@ class LLVM:
             case TokenType.SLASH:
                 if self._is_ir_constant_zero(right):
                     raise ZeroDivisionError('division by zero')
+                if not isinstance(right, ir.Constant):
+                    z = ir.Constant(right.type, 0)
+                    o = ir.Constant(right.type, 1)
+                    is_zero = self.builder.icmp_signed('==', right, z)
+                    right = self.builder.select(is_zero, o, right)
                 return self.builder.sdiv(left, right)
             case TokenType.SLASH_SLASH:
                 if self._is_ir_constant_zero(right):
                     raise ZeroDivisionError('division by zero')
+                if not isinstance(right, ir.Constant):
+                    z = ir.Constant(right.type, 0)
+                    o = ir.Constant(right.type, 1)
+                    is_zero = self.builder.icmp_signed('==', right, z)
+                    right = self.builder.select(is_zero, o, right)
                 return self.builder.sdiv(left, right)
             case TokenType.PERCENT:
                 if self._is_ir_constant_zero(right):
                     raise ZeroDivisionError('division by zero')
+                if not isinstance(right, ir.Constant):
+                    z = ir.Constant(right.type, 0)
+                    o = ir.Constant(right.type, 1)
+                    is_zero = self.builder.icmp_signed('==', right, z)
+                    right = self.builder.select(is_zero, o, right)
                 return self.builder.srem(left, right)
             case TokenType.SHL:
                 left, right = self._bitwise_promote(left, right)
+                bitwidth = left.type.width
+                right = self._clamp_shift_amount(right, bitwidth)
                 return self.builder.shl(left, right)
             case TokenType.SHR:
                 left, right = self._bitwise_promote(left, right)
+                bitwidth = left.type.width
+                right = self._clamp_shift_amount(right, bitwidth)
                 return self.builder.ashr(left, right)
             case TokenType.AMPERSAND:
                 left, right = self._bitwise_promote(left, right)
@@ -1533,3 +1562,5 @@ class LLVM:
                 self.functions[fname] = func
         if node.src_file:
             self.import_src_files.append(node.src_file)
+        if getattr(node, 'prebuilt_ll_files', None):
+            self.import_src_files.extend(node.prebuilt_ll_files)

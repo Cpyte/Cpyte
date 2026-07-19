@@ -687,7 +687,7 @@ class VarDecl:
         return f'VarDecl({self.name}: {self.var_type} = {self.init})'
 
 class Import:
-    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names', 'is_package')
+    __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names', 'is_package', 'prebuilt_ll_files')
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
         self.symbols = symbols or []
@@ -699,6 +699,7 @@ class Import:
         self.sdk_path = None
         self.var_names = set()
         self.is_package = False
+        self.prebuilt_ll_files = None
     def __repr__(self):
         return f'Import({self.module})'
 

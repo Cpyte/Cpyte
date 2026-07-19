@@ -124,16 +124,20 @@ def run_jit(module, opt_level=3, src_files=None):
     if src_files:
         target = binding.Target.from_default_triple()
         for src in src_files:
-            ll = src.rsplit('.', 1)[0] + '.ll'
-            r = subprocess.run(
-                ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
-                 '-fno-stack-protector', '-o', ll, src],
-                capture_output=True, text=True
-            )
-            if r.returncode != 0:
-                print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
-                raise SystemExit(1)
-            src_ir = open(ll).read()
+            if src.endswith('.ll'):
+                with open(src) as f:
+                    src_ir = f.read()
+            else:
+                ll = src.rsplit('.', 1)[0] + '.ll'
+                r = subprocess.run(
+                    ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
+                     '-fno-stack-protector', '-o', ll, src],
+                    capture_output=True, text=True
+                )
+                if r.returncode != 0:
+                    print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
+                    raise SystemExit(1)
+                src_ir = open(ll).read()
             src_ir = _remove_probe_stack_ir(src_ir)
             src_mod = binding.parse_assembly(src_ir)
             binding.link_modules(mod, src_mod)

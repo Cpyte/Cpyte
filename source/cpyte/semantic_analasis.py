@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 
 def _get_sdk_paths():
@@ -724,6 +725,29 @@ class SemanticAnalyzer:
                     return entry_path
         return None
 
+    def _import_prebuilt(self, ll_dir: str, node: Import):
+        ll_files = []
+        symbols = {}
+        for root, _dirs, files in os.walk(ll_dir):
+            for f in sorted(files):
+                if not f.endswith('.ll'):
+                    continue
+                path = os.path.join(root, f)
+                with open(path) as fh:
+                    content = fh.read()
+                for m in re.finditer(r'^\s*(?:define|declare)\s+.*?@(\w+)\s*\(([^)]*)\)', content, re.MULTILINE):
+                    func_name = m.group(1)
+                    params_str = m.group(2).strip()
+                    param_count = len([p for p in params_str.split(',') if p.strip()]) if params_str else 0
+                    if func_name not in symbols:
+                        symbols[func_name] = ('int', [(f'p{i}', 'int') for i in range(param_count)], False)
+                ll_files.append(path)
+        if symbols:
+            node.prebuilt_ll_files = ll_files
+            self._register_import_symbols(symbols, node)
+            return symbols, 'prebuilt'
+        return None
+
     def _visit_package_import(self, node: Import, module: str):
         cpm_root = None
         if self._workspace_root:
@@ -742,6 +766,9 @@ class SemanticAnalyzer:
                         result = self._import_cpy(cpy_file, node)
                         if result:
                             self._register_import_symbols(result[0], node)
+                        return
+                    result = self._import_prebuilt(version_dir, node)
+                    if result:
                         return
         self.error(f"package `{module}` not installed — run 'cpm install'", node)
 

@@ -102,7 +102,18 @@ def _remove_probe_stack_ir(llvm_ir):
     return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
 
 
+def _maybe_compile(module):
+    if isinstance(module, list):
+        from .bytecoding import LLVM
+        c = LLVM()
+        prog, src_files = c.emit_program(module)
+        return prog, src_files
+    return module, None
+
 def run_jit(module, opt_level=3, src_files=None):
+    module, src_files_auto = _maybe_compile(module)
+    if src_files_auto is not None:
+        src_files = src_files_auto
     global _print_fn, _input_fn
     from llvmlite import binding
     binding.initialize_native_target()
@@ -113,16 +124,20 @@ def run_jit(module, opt_level=3, src_files=None):
     if src_files:
         target = binding.Target.from_default_triple()
         for src in src_files:
-            ll = src.rsplit('.', 1)[0] + '.ll'
-            r = subprocess.run(
-                ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
-                 '-fno-stack-protector', '-o', ll, src],
-                capture_output=True, text=True
-            )
-            if r.returncode != 0:
-                print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
-                raise SystemExit(1)
-            src_ir = open(ll).read()
+            if src.endswith('.ll'):
+                with open(src) as f:
+                    src_ir = f.read()
+            else:
+                ll = src.rsplit('.', 1)[0] + '.ll'
+                r = subprocess.run(
+                    ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
+                     '-fno-stack-protector', '-o', ll, src],
+                    capture_output=True, text=True
+                )
+                if r.returncode != 0:
+                    print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
+                    raise SystemExit(1)
+                src_ir = open(ll).read()
             src_ir = _remove_probe_stack_ir(src_ir)
             src_mod = binding.parse_assembly(src_ir)
             binding.link_modules(mod, src_mod)

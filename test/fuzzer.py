@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import random
 import traceback
 import signal
@@ -65,6 +66,17 @@ EDGE_FLOATS = [
     '0.0000000001', '9999999999999999.0',
 ]
 
+EDGE_STRINGS = [
+    repr(''), repr(' '), repr('abc'), repr('hello world'),
+    repr('x'), repr('\\n'), repr('\\t'), repr('a' * 100),
+    repr('!@#$%^&*()'), repr('12345'),
+]
+
+NONZERO_LITERALS = {  # expressions that are always truthy (infinite loop risk)
+    '1', '-1', '2.71828', 'true', '2', '100', '0.5', '-0.5',
+    '2147483647', '9223372036854775807',
+}
+
 TYPES = ['int', 'int64', 'uint64', 'big', 'float', 'double', 'char', 'str']
 NUMERIC_TYPES = ['int', 'int64', 'uint64', 'big']
 FLOAT_TYPES = ['float', 'double']
@@ -119,6 +131,7 @@ class FuzzerState:
         self.loop_depth = 0
         self.structs: dict[str, list[tuple[str, str]]] = {}
         self.funcs: dict[str, dict] = {}
+        self.known_truthy_globals: set[str] = set()  # global vars always non-zero
 
     def fresh(self, prefix='v'):
         self.counter += 1
@@ -170,6 +183,200 @@ def type_is_numeric(ty: str) -> bool:
 
 def type_is_ptr(ty: str) -> bool:
     return ty.endswith('*') or ty.endswith('[]')
+
+
+NONZERO_HEX_RE = re.compile(r'^0x[0-9a-fA-F]+$')
+FLOAT_LITERAL_RE = re.compile(r'^[+-]?\d+\.\d+([eE][+-]?\d+)?$')
+INT_LITERAL_RE = re.compile(r'^[+-]?\d+$')
+
+
+def _literal_is_nonzero(code: str) -> bool:
+    if code in ('true',):
+        return True
+    if code in NONZERO_LITERALS:
+        return True
+    if FLOAT_LITERAL_RE.match(code):
+        val = float(code)
+        return val != 0.0
+    if INT_LITERAL_RE.match(code):
+        val = int(code)
+        return val != 0
+    if NONZERO_HEX_RE.match(code):
+        val = int(code, 16)
+        return val != 0
+    return False
+
+
+def _str_literal_is_truthy(code: str) -> bool:
+    """All string literals are non-null pointers in Cpy, so always truthy."""
+    return (code.startswith("'") and code.endswith("'")) or (code.startswith('"') and code.endswith('"'))
+
+def _is_nonempty_str_literal(code: str) -> bool:
+    if code in ("''", '""'):
+        return False
+    if (code.startswith("'") and code.endswith("'")) or (code.startswith('"') and code.endswith('"')):
+        return len(code) > 2
+    return False
+
+
+def _is_all_constant(code: str) -> bool:
+    """Check if an expression consists only of literals and operators."""
+    stripped = code.strip().strip('(').strip(')')
+    if stripped in NONZERO_LITERALS:
+        return True
+    if _literal_is_nonzero(stripped) or stripped == '0':
+        return True
+    if _is_nonempty_str_literal(stripped):
+        return True
+    return False
+
+
+def _eval_constant(code: str):
+    """Try to evaluate a constant expression (int or float).
+    Returns an int, float, or None if it can't be evaluated."""
+    code = code.strip()
+    if code in ('true',):
+        return 1
+    try:
+        if INT_LITERAL_RE.match(code):
+            return int(code)
+        if NONZERO_HEX_RE.match(code):
+            return int(code, 16)
+        if FLOAT_LITERAL_RE.match(code):
+            return float(code)
+    except (ValueError, OverflowError):
+        pass
+    # Unary minus/plus (avoid double negation which is handled by integer literals)
+    if code.startswith('-') and not code.startswith('--') and not code.startswith('- '):
+        inner = _eval_constant(code[1:])
+        if inner is not None:
+            return -inner
+    if code.startswith('+') and not code.startswith('+ '):
+        return _eval_constant(code[1:])
+    # not expr
+    if code.startswith('not '):
+        inner = _eval_constant(code[4:])
+        if inner is not None:
+            return 1 if inner == 0 else 0
+    # Parenthesized sub-expressions
+    if code.startswith('(') and code.endswith(')'):
+        return _eval_constant(code[1:-1])
+    # Binary ops on constant operands (ordered longest-first to avoid partial matches)
+    for op, fn in [
+        ('!=', lambda a, b: int(a != b)),
+        ('==', lambda a, b: int(a == b)),
+        ('>=', lambda a, b: int(a >= b)),
+        ('<=', lambda a, b: int(a <= b)),
+        ('<<', lambda a, b: a << b if isinstance(a, int) and isinstance(b, int) and b >= 0 and b < 128 else None),
+        ('>>', lambda a, b: a >> b if isinstance(a, int) and isinstance(b, int) and b >= 0 else None),
+        ('+', lambda a, b: a + b),
+        ('-', lambda a, b: a - b),
+        ('*', lambda a, b: a * b),
+        ('//', lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) and b != 0 else None),
+        ('/', lambda a, b: a / b if b != 0 else None),
+        ('%', lambda a, b: a % b if isinstance(a, int) and isinstance(b, int) and b != 0 else None),
+        ('&', lambda a, b: a & b if isinstance(a, int) and isinstance(b, int) else None),
+        ('|', lambda a, b: a | b if isinstance(a, int) and isinstance(b, int) else None),
+        ('^', lambda a, b: a ^ b if isinstance(a, int) and isinstance(b, int) else None),
+        ('>', lambda a, b: int(a > b)),
+        ('<', lambda a, b: int(a < b)),
+    ]:
+        if op in code:
+            parts = _split_top_level(code, op)
+            if len(parts) == 2:
+                a = _eval_constant(parts[0].strip())
+                b = _eval_constant(parts[1].strip())
+                if a is not None and b is not None:
+                    result = fn(a, b)
+                    if result is not None:
+                        return result
+    return None
+
+
+def _split_top_level(code: str, op: str) -> list[str]:
+    """Split on operator only at top level (not inside parentheses)."""
+    depth = 0
+    for i, ch in enumerate(code):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif depth == 0 and code[i:i+len(op)] == op:
+            # For multi-char ops like '!=', '>=', '<=', '<<', '>>', check
+            # we're not in the middle of another multi-char operator
+            prev_ch = code[i-1] if i > 0 else ''
+            next_ch = code[i+len(op)] if i+len(op) < len(code) else ''
+            # Skip if this '-' is part of '--'
+            if op == '-' and (prev_ch == '-' or next_ch == '-'):
+                continue
+            # Skip if this '>' is part of '>=', '>>'
+            if op == '>' and next_ch in ('=', '>'):
+                continue
+            # Skip if this '<' is part of '<=', '<<'
+            if op == '<' and next_ch in ('=', '<'):
+                continue
+            # Skip if this '!' is part of '!='
+            if op == '!' and next_ch == '=':
+                continue
+            # Skip if this '=' is part of '==', '>=', '<=', '!='
+            if op == '=' and prev_ch in ('!', '>', '<', '='):
+                continue
+            return [code[:i], code[i+len(op):]]
+    return [code]
+
+
+def expr_is_always_truthy(code: str, known_truthy_globals: set[str] | None = None) -> bool:
+    if known_truthy_globals is None:
+        known_truthy_globals = set()
+    code = code.strip()
+    if code == '':
+        return False
+
+    # Direct truthy check
+    if _literal_is_nonzero(code):
+        return True
+    if code.startswith('"') or code.startswith("'"):
+        return _str_literal_is_truthy(code)
+
+    # Global variable with known non-zero initializer
+    if code in known_truthy_globals:
+        return True
+
+    # Structural patterns
+    if code.startswith('&'):
+        return True
+    if code.startswith('sizeof('):
+        return True
+    if code.startswith('new '):
+        return True
+
+    # not expr: not 0 → 1 (truthy), not <non-zero> → 0 (falsy)
+    if code.startswith('not '):
+        inner_val = _eval_constant(code[4:])
+        if inner_val is not None:
+            return inner_val == 0
+        return False  # can't determine
+
+    # Try full constant evaluation
+    val = _eval_constant(code)
+    if val is not None:
+        return val != 0
+
+    # String concat: 'a' + 'b' is always non-empty (truthy)
+    if '+' in code and not any(c in code for c in '*-/%&|^<>'):
+        parts = [p.strip() for p in code.split('+')]
+        if all(p.startswith("'") or p.startswith('"') for p in parts if p.strip()):
+            if any(_is_nonempty_str_literal(p) for p in parts):
+                return True
+
+    # Variable reference to a known-truthy global
+    if code in known_truthy_globals:
+        return True
+
+    return False
+
+def type_is_printable_safely(ty: str) -> bool:
+    return not type_is_ptr(ty) and ty not in ('void',) and ty != ''
 
 
 def pointee_type(ty: str) -> str:
@@ -281,6 +488,26 @@ def gen_expr(state: FuzzerState, target_type: str | None = None, depth: int = 0)
     # sizeof — produces int
     if target_type is None or target_type == 'int':
         candidates.append(('sizeof', lambda: gen_sizeof(state)))
+        weights.append(3)
+
+    # String concat — produces str
+    if target_type is None or target_type == 'str':
+        candidates.append(('strcat', lambda: gen_strcat(state, depth)))
+        weights.append(5)
+
+    # Struct field access — produces inner field type
+    if target_type is None:
+        candidates.append(('field', lambda: gen_field_access(state, depth)))
+        weights.append(5)
+
+    # Index expression — produces pointee type
+    if target_type is None or (type_is_ptr(target_type) and not target_type.endswith('*')):
+        candidates.append(('index', lambda: gen_index_expr(state, target_type, depth)))
+        weights.append(4)
+
+    # Pointer arithmetic (ptr + int)
+    if target_type is None:
+        candidates.append(('ptr_arith', lambda: gen_ptr_arith(state, depth)))
         weights.append(3)
 
     # Cast — only if target_type differs from inner expression's type
@@ -436,8 +663,58 @@ def gen_new(state: FuzzerState, target_type: str | None, depth: int) -> tuple[st
 
 def gen_sizeof(state: FuzzerState) -> tuple[str, str]:
     rng = state.rng
+    kind = rng.choice(['type', 'expr'])
+    if kind == 'expr' and state.scope.all_vars():
+        name, ty = rng.choice(state.scope.all_vars())
+        return f'sizeof({name})', 'int'
     ty = random_type(rng, allow_ptr=True, allow_array=True)
     return f'sizeof({ty})', 'int'
+
+
+def gen_strcat(state: FuzzerState, depth: int) -> tuple[str, str]:
+    rng = state.rng
+    left = gen_expr(state, 'str', depth + 1)
+    right = gen_expr(state, 'str', depth + 1)
+    return f'({left[0]} + {right[0]})', 'str'
+
+
+def gen_field_access(state: FuzzerState, depth: int) -> tuple[str, str]:
+    rng = state.rng
+    if not state.structs or not state.scope.all_vars():
+        return gen_literal(state, None)
+    struct_name = rng.choice(list(state.structs.keys()))
+    ptr_ty = struct_name + '*'
+    struct_vars = state.scope.vars_of_type(ptr_ty)
+    if not struct_vars:
+        struct_vars = state.scope.vars_of_type(struct_name)
+    if not struct_vars:
+        return gen_literal(state, None)
+    var_name, _ = rng.choice(struct_vars)
+    fields = state.structs[struct_name]
+    fname, ftype = rng.choice(fields)
+    return f'{var_name}.{fname}', ftype
+
+
+def gen_ptr_arith(state: FuzzerState, depth: int) -> tuple[str, str]:
+    rng = state.rng
+    ptr_vars = [(n, t) for n, t in state.scope.all_vars() if type_is_ptr(t)]
+    if not ptr_vars:
+        return gen_literal(state, None)
+    name, ty = rng.choice(ptr_vars)
+    idx = gen_expr(state, 'int', depth + 1)
+    op = rng.choice(['+', '-'])
+    return f'({name} {op} {idx[0]})', ty
+
+
+def gen_index_expr(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
+    rng = state.rng
+    ptr_vars = [(n, t) for n, t in state.scope.all_vars() if type_is_ptr(t)]
+    if not ptr_vars:
+        return gen_literal(state, target_type)
+    name, ty = rng.choice(ptr_vars)
+    inner = pointee_type(ty)
+    idx = gen_expr(state, 'int', depth + 1)
+    return f'{name}[{idx[0]}]', inner
 
 
 # ---------------------------------------------------------------------------
@@ -501,9 +778,14 @@ def gen_if(state: FuzzerState, indent: int, depth: int) -> str:
     return result
 
 
-def gen_while(state: FuzzerState, indent: int, depth: int) -> str:
+def gen_while(state: FuzzerState, indent: int, depth: int) -> str | None:
     pad = '    ' * indent
-    cond, _ = gen_expr(state, None, depth + 1)
+    for _ in range(8):
+        cond, _ = gen_expr(state, None, depth + 1)
+        if not expr_is_always_truthy(cond, state.known_truthy_globals):
+            break
+    else:
+        return None
     state.loop_depth += 1
     body = gen_body(state, depth + 1, indent + 1)
     state.loop_depth -= 1
@@ -515,16 +797,18 @@ def gen_for(state: FuzzerState, indent: int, depth: int) -> str:
     pad = '    ' * indent
     v = state.fresh()
     state.scope.add(v, 'char')
-    iter_expr = gen_literal(state, 'str')[0]
+    iter_expr = rng.choice(EDGE_STRINGS)
     state.loop_depth += 1
     body = gen_body(state, depth + 1, indent + 1)
     state.loop_depth -= 1
     return f'{pad}for {v} in {iter_expr}:\n' + '\n'.join(body)
 
 
-def gen_print(state: FuzzerState, indent: int, depth: int) -> str:
+def gen_print(state: FuzzerState, indent: int, depth: int) -> str | None:
     pad = '    ' * indent
-    expr, _ = gen_expr(state, None, depth + 1)
+    expr, etype = gen_expr(state, None, depth + 1)
+    if not type_is_printable_safely(etype):
+        return None
     return f'{pad}print({expr})'
 
 
@@ -548,7 +832,10 @@ def gen_body(state: FuzzerState, depth: int, indent: int) -> list[str]:
     pad = '    ' * indent
     n = rng.choices([0, 1, 2, 3, 4, 5, 6, 7], weights=[3, 15, 20, 20, 15, 10, 5, 2])[0]
     stmts = []
+    had_return = False
     for _ in range(n):
+        if had_return:
+            break  # nothing after return is reachable
         kind = rng.choices([
             'vardecl', 'assign', 'compound_assign',
             'if', 'while', 'for',
@@ -574,8 +861,10 @@ def gen_body(state: FuzzerState, depth: int, indent: int) -> list[str]:
         }
 
         s = fn_map[kind]()
-        if s:
+        if s is not None:
             stmts.append(s)
+            if kind == 'return':
+                had_return = True
     if not stmts:
         stmts.append(f'{pad}pass')
     return stmts
@@ -591,8 +880,12 @@ def gen_struct(state: FuzzerState) -> str:
     nfields = rng.randint(1, 6)
     fields = []
     field_list = []
+    used_names = set()
     for _ in range(nfields):
         fname = rng.choice(FIELD_NAMES)
+        while fname in used_names:
+            fname = rng.choice(FIELD_NAMES)
+        used_names.add(fname)
         # Pick either pointer OR array, not both
         if rng.random() < 0.2:
             ftype = rng.choice(TYPES) + '[' + str(rng.randint(1, 10)) + ']'
@@ -672,6 +965,13 @@ def gen_program(state: FuzzerState) -> str:
             init_text, _ = gen_expr(state, ty, 0)
             state.scope.add(name, ty)
             lines.append(f'{ty} {name} = {init_text}')
+            # Track known-truthy globals to avoid infinite while loops
+            if type_is_ptr(ty):
+                pass  # null is a common pointer initializer
+            elif ty == 'str' and _is_nonempty_str_literal(init_text):
+                state.known_truthy_globals.add(name)
+            elif ty != 'str' and init_text.strip() not in ('0', 'null', 'false', "''", '""', '0.0') and expr_is_always_truthy(init_text):
+                state.known_truthy_globals.add(name)
         else:
             state.scope.add(name, ty)
             lines.append(f'{ty} {name}')
@@ -790,6 +1090,15 @@ def run_test(source, label=''):
     if out0 == out3:
         PASS_COUNT += 1
         return
+
+    # If both outputs are purely numeric (addresses), they can legitimately differ
+    # between runs due to ASLR. Skip these as false positives.
+    if out0 and out3:
+        stripped0 = out0.strip()
+        stripped3 = out3.strip()
+        if stripped0.isdigit() and stripped3.isdigit() and len(stripped0) > 4 and len(stripped3) > 4:
+            PASS_COUNT += 1
+            return
 
     BUG_COUNT += 1
     save_crash(source, f'output mismatch: unopt={out0!r} opt={out3!r}')

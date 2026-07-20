@@ -68,6 +68,7 @@ KEYWORDS = {
     'new', 'struct', 'sizeof', 'ref',
     'int64', 'uint64',
     'let',
+    'try', 'except', 'raise',
 }
 
 

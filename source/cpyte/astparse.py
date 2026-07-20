@@ -357,6 +357,10 @@ def parse_file(tokens: list[Token], pos: int = 0):
             node, pos = parse_continue(tokens, pos)
         elif tok.type == TokenType.KEYWORD and tok.value == 'switch':
             node, pos = parse_switch(tokens, pos)
+        elif tok.type == TokenType.KEYWORD and tok.value == 'try':
+            node, pos = parse_try(tokens, pos)
+        elif tok.type == TokenType.KEYWORD and tok.value == 'raise':
+            node, pos = parse_raise(tokens, pos)
         elif tok.type == TokenType.IDENTIFIER and pos + 1 < len(tokens):
             if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
                 try:
@@ -451,8 +455,62 @@ def parse_class(tokens: list[Token], pos: int):
         raise ParseError('Expected class name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
     pos += 1
+    base = None
+    if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError('Expected base class name', tokens[pos] if pos < len(tokens) else None)
+        base = tokens[pos].value
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+            raise ParseError('Expected ")" after base class name', tokens[pos] if pos < len(tokens) else None)
+        pos += 1
     body, pos = parse_suite(tokens, pos)
-    return {'type': 'class', 'name': name, 'body': body, '_token': tok}, pos
+    return {'type': 'class', 'name': name, 'base': base, 'body': body, '_token': tok}, pos
+
+
+def parse_try(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    pos += 1
+    body, pos = parse_suite(tokens, pos)
+    handlers = []
+    while pos < len(tokens):
+        while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+            pos += 1
+        if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'except':
+            etok = tokens[pos]
+            pos += 1
+            type_name = None
+            if pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER:
+                type_name = tokens[pos].value
+                pos += 1
+            if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+                raise ParseError('Expected ":" after except', tokens[pos] if pos < len(tokens) else None)
+            ebody, pos = parse_suite(tokens, pos)
+            handlers.append(ExceptHandler(type_name, ebody, token=etok))
+        else:
+            break
+    if not handlers:
+        raise ParseError('Expected at least one except clause', tok)
+    return Try(body, handlers, token=tok), pos
+
+
+def parse_raise(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        raise ParseError('Expected exception class name after raise', tokens[pos] if pos < len(tokens) else None)
+    exc_type = tokens[pos].value
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+        raise ParseError('Expected "(" after exception class name', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+    message, pos = parse_expression(tokens, pos)
+    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+        raise ParseError('Expected ")" after message', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+    _expect_newline(tokens, pos, tok)
+    return Raise(exc_type, message, token=tok), pos
 
 
 def parse_struct_def(tokens: list[Token], pos: int):
@@ -550,7 +608,6 @@ def parse_import(tokens: list[Token], pos: int):
             pos += 1
         module = '@' + '/'.join(parts)
         node = Import(module, token=tok)
-        node.is_package = True
         return node, pos
     elif t.type == TokenType.IDENTIFIER:
         module = t.value
@@ -700,9 +757,39 @@ class Import:
         self.var_names = set()
         self.is_package = False
         self.prebuilt_ll_files = None
+
     def __repr__(self):
         return f'Import({self.module})'
 
+
+class ExceptHandler:
+    __slots__ = ('type_name', 'body', '_token')
+    def __init__(self, type_name: str | None, body: list, token=None):
+        self.type_name = type_name
+        self.body = body
+        self._token = token
+    def __repr__(self):
+        return f'ExceptHandler({self.type_name})'
+
+
+class Try:
+    __slots__ = ('body', 'handlers', '_token')
+    def __init__(self, body: list, handlers: list[ExceptHandler], token=None):
+        self.body = body
+        self.handlers = handlers
+        self._token = token
+    def __repr__(self):
+        return f'Try({self.body}, handlers={self.handlers})'
+
+
+class Raise:
+    __slots__ = ('exc_type', 'message', '_token')
+    def __init__(self, exc_type: str, message, token=None):
+        self.exc_type = exc_type
+        self.message = message
+        self._token = token
+    def __repr__(self):
+        return f'Raise({self.exc_type}, {self.message})'
 
 class NewExpr:
     __slots__ = ('type_expr', 'size', '_token')
@@ -928,6 +1015,12 @@ def parse_statement(tokens: list[Token], pos: int):
     if tok.type == TokenType.KEYWORD and tok.value in ('while', 'for', 'class', 'struct', 'import'):
         handler = {'while': parse_while, 'for': parse_for, 'class': parse_class, 'struct': parse_struct_def, 'import': parse_import}[tok.value]
         return handler(tokens, pos)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'try':
+        return parse_try(tokens, pos)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'raise':
+        return parse_raise(tokens, pos)
 
     if tok.type == TokenType.IDENTIFIER:
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):

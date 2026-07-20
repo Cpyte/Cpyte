@@ -11,7 +11,7 @@ RUNTIME_C = os.path.join(HERE, "runtime.c")
 
 C_CC = "clang"
 C_CFLAGS = ["-O3", "-lm"]
-CPY_COMPILE = [sys.executable, os.path.join(PROJECT, "source", "mainpie.py"), "--aot"]
+CPY_COMPILE = [sys.executable, os.path.join(PROJECT, "source", "cpyte", "mainpie.py"), "--aot"]
 
 
 ALL_BENCHMARKS = [

@@ -129,7 +129,7 @@ public main() -> int:
     int is_prime = 1
     int64 k = 2
     while k * k <= prime_candidate:
-        if prime_candidate % k == 0:
+        if prime_candidate % k == int64(0):
             is_prime = 0
         k = k + 1
     print(is_prime)

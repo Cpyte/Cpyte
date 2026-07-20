@@ -1,13 +1,11 @@
-struct S2:
-    uint64 data
-    double* key
-    str* head
-struct S3:
-    float* y
-int64 g1 = 18446744073709551615
-str* g2
-float g3
+struct S1:
+    int prev
+
+big g2
+str g3
+int g4 = not -2147483649
+int64* g5 = null
 
 def main() -> int:
-    print(new big)
+    print(g5[g4])
     return 0

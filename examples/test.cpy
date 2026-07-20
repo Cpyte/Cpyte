@@ -13,7 +13,6 @@ def callback(proxy void*, type: int, event void*, user_data void*):
 
     return event         # Pass everything else through
 
-
 def main():
     mask = \
         CGEventMaskBit(kCGEventKeyDown) | \

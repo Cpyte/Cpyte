@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import sys
 
 def _get_sdk_paths():
     paths = []
@@ -25,7 +26,7 @@ from .astparse import (
     UnaryOp, BinOp, Assign, Return, If, FuncDef, Print, ExprStmt,
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
-    InputStr, Signed67,
+    InputStr, Signed67, Try, Raise, ExceptHandler,
     parse_file, ParseError,
 )
 from .clib import resolve_library, parse_header_file, parse_c_source
@@ -123,6 +124,9 @@ class Scope:
 
     def define(self, name: str, symbol: Symbol):
         self.symbols[name] = symbol
+
+    def undefine(self, name: str):
+        self.symbols.pop(name, None)
 
     def lookup(self, name: str) -> Symbol | None:
         if name in self.symbols:
@@ -278,7 +282,8 @@ class SemanticAnalyzer:
                     ok = ok or (right_t == 'str' and (left_t.endswith('*') or left_t == 'char'))
                     ok = ok or (left_t, right_t) in (
                         ('float', 'double'), ('double', 'float'),
-                        ('int', 'int64'), ('int', 'uint64'),
+                        ('int', 'int64'), ('int64', 'int'),
+                        ('int', 'uint64'), ('uint64', 'int'),
                         ('int64', 'uint64'), ('uint64', 'int64'),
                         ('str', 'char'), ('char', 'str'),
                         ('char', 'int'), ('int', 'char'),
@@ -455,6 +460,8 @@ class SemanticAnalyzer:
                 return obj_t[:-2]
             if obj_t == 'str':
                 return 'char'
+            if obj_t and obj_t.endswith('*'):
+                return obj_t[:-1]
             if obj_t is not None:
                 self.error(
                     f'cannot index value of type `{obj_t}`',
@@ -466,7 +473,8 @@ class SemanticAnalyzer:
         if isinstance(node, Attr):
             obj_t = self._infer_type(node.obj)
             if obj_t:
-                struct_sym = self.current_scope.lookup(obj_t)
+                lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
+                struct_sym = self.current_scope.lookup(lookup_t)
                 if struct_sym and struct_sym.kind == 'struct' and struct_sym.node:
                     for field in struct_sym.node.fields:
                         if field.name == node.name:
@@ -578,6 +586,10 @@ class SemanticAnalyzer:
             self._visit_import(node)
         elif isinstance(node, StructDef):
             self._visit_struct(node, scope)
+        elif isinstance(node, Try):
+            self._visit_try(node, scope)
+        elif isinstance(node, Raise):
+            self._visit_raise(node)
         elif isinstance(node, Deref):
             self._infer_type(node)
         elif isinstance(node, AddrOf):
@@ -626,15 +638,19 @@ class SemanticAnalyzer:
     def _visit_import(self, node: Import):
         module = node.module
 
-        if node.is_package:
-            self._visit_package_import(node, module)
+        is_file_import = (module.endswith('.c') or module.endswith('.cc')
+                          or module.endswith('.h') or module.endswith('.cpy')
+                          or module.startswith('"'))
+
+        if not is_file_import:
+            if self._try_cpm_import(node, module):
+                return
+
+        if module.startswith('@'):
+            self.error(f"package `{module}` not installed — run 'cpm install'", node)
             return
 
         resolved = self._resolve_module_path(module, node.sdk_path)
-
-        is_file_import = (module.endswith('.c') or module.endswith('.cc')
-                          or module.endswith('.h') or module.endswith('.cpy')
-                          or '/' in module)
 
         if not is_file_import:
             result = resolve_library(module)
@@ -725,7 +741,34 @@ class SemanticAnalyzer:
                     return entry_path
         return None
 
+    def _check_llvm_version(self, pkg_dir: str) -> None:
+        pkg_toml = os.path.join(pkg_dir, 'package.toml')
+        if not os.path.isfile(pkg_toml):
+            return
+        try:
+            import tomllib
+            with open(pkg_toml, 'rb') as f:
+                data = tomllib.load(f)
+        except Exception:
+            return
+        meta = data.get('package', {})
+        if not meta.get('prebuilt', False):
+            return
+        expected = meta.get('llvm_version', '')
+        if not expected:
+            return
+        import llvmlite.binding as llvm
+        v = llvm.llvm_version_info
+        actual = f'{v[0]}.{v[1]}.{v[2]}'
+        if actual != expected:
+            print(
+                f"WARNING: package `{meta.get('name', '?')}` was prebuilt with LLVM {expected}, "
+                f"current LLVM is {actual} — mismatch may cause errors",
+                file=sys.stderr
+            )
+
     def _import_prebuilt(self, ll_dir: str, node: Import):
+        self._check_llvm_version(ll_dir)
         ll_files = []
         symbols = {}
         for root, _dirs, files in os.walk(ll_dir):
@@ -735,9 +778,9 @@ class SemanticAnalyzer:
                 path = os.path.join(root, f)
                 with open(path) as fh:
                     content = fh.read()
-                for m in re.finditer(r'^\s*(?:define|declare)\s+.*?@(\w+)\s*\(([^)]*)\)', content, re.MULTILINE):
-                    func_name = m.group(1)
-                    params_str = m.group(2).strip()
+                for m in re.finditer(r'^\s*define\s+.*?@(?:"(\w+)"|(\w+))\s*\(([^)]*)\)', content, re.MULTILINE):
+                    func_name = m.group(1) or m.group(2)
+                    params_str = m.group(3).strip()
                     param_count = len([p for p in params_str.split(',') if p.strip()]) if params_str else 0
                     if func_name not in symbols:
                         symbols[func_name] = ('int', [(f'p{i}', 'int') for i in range(param_count)], False)
@@ -748,7 +791,7 @@ class SemanticAnalyzer:
             return symbols, 'prebuilt'
         return None
 
-    def _visit_package_import(self, node: Import, module: str):
+    def _try_cpm_import(self, node: Import, module: str) -> bool:
         cpm_root = None
         if self._workspace_root:
             cpm_root = os.path.join(self._workspace_root, '.cpm', 'modules')
@@ -766,11 +809,11 @@ class SemanticAnalyzer:
                         result = self._import_cpy(cpy_file, node)
                         if result:
                             self._register_import_symbols(result[0], node)
-                        return
+                        return True
                     result = self._import_prebuilt(version_dir, node)
                     if result:
-                        return
-        self.error(f"package `{module}` not installed — run 'cpm install'", node)
+                        return True
+        return False
 
     def _import_cpy(self, module: str, node: Import | None = None):
         try:
@@ -814,10 +857,9 @@ class SemanticAnalyzer:
                 if not existing:
                     self.globals.define(ast_node.name, Symbol('struct', None, ast_node))
             elif isinstance(ast_node, Import):
-                if getattr(ast_node, 'is_package', False):
-                    for fname, (ret_type, params, vararg) in ast_node.symbols:
-                        if fname not in symbols:
-                            symbols[fname] = (ret_type, params, vararg)
+                for fname, (ret_type, params, vararg) in ast_node.symbols:
+                    if fname not in symbols:
+                        symbols[fname] = (ret_type, params, vararg)
 
         if node is not None:
             node.sub_ast = sub_ast
@@ -877,11 +919,14 @@ class SemanticAnalyzer:
             if self.current_func:
                 expected = self.current_func.rettype
                 if expected and val_type and expected != val_type:
-                    self.error(
-                        f'return type `{val_type}` does not match declared return type `{expected}`',
-                        node,
-                        note=f'in function `{self.current_func.name}`'
-                    )
+                    ok = expected == 'str' and val_type == 'char*'
+                    ok = ok or expected == 'char*' and val_type == 'str'
+                    if not ok:
+                        self.error(
+                            f'return type `{val_type}` does not match declared return type `{expected}`',
+                            node,
+                            note=f'in function `{self.current_func.name}`'
+                        )
         else:
             if self.current_func and self.current_func.rettype and self.current_func.rettype != 'void':
                 self.error(
@@ -942,11 +987,14 @@ class SemanticAnalyzer:
         elif isinstance(node.target, Attr):
             obj_t = self._infer_type(node.target.obj)
             if obj_t:
-                struct_sym = scope.lookup(obj_t) if scope else self.current_scope.lookup(obj_t)
+                lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
+                struct_sym = scope.lookup(lookup_t) if scope else self.current_scope.lookup(lookup_t)
                 if struct_sym and struct_sym.kind == 'struct' and struct_sym.node:
                     for field in struct_sym.node.fields:
                         if field.name == node.target.name and val_type is not None and field.type_expr != val_type:
                             ok = (val_type == 'int' and field.type_expr.endswith('*'))
+                            ok = ok or (val_type == 'void*' and field.type_expr.endswith('*'))
+                            ok = ok or (field.type_expr == 'void*' and val_type.endswith('*'))
                             ok = ok or (val_type == 'str' and (field.type_expr.endswith('*') or field.type_expr == 'char'))
                             ok = ok or (field.type_expr == 'str' and (val_type.endswith('*') or val_type == 'char'))
                             ok = ok or (val_type, field.type_expr) in (
@@ -1041,8 +1089,39 @@ class SemanticAnalyzer:
         class_sym = Symbol('class', None, node)
         s.define(node['name'], class_sym)
         class_scope = Scope(s)
+        base = node.get('base')
+        if base:
+            base_sym = s.lookup(base)
+            if base_sym is None or base_sym.kind != 'class':
+                self.error(f'base class `{base}` not found', node)
+            elif base_sym.node:
+                for stmt in base_sym.node.get('body', []):
+                    if isinstance(stmt, FuncDef):
+                        existing = class_scope.lookup_local(stmt.name)
+                        if not existing:
+                            sym = Symbol(stmt.visibility or 'public', stmt.rettype or 'void', stmt)
+                            class_scope.define(stmt.name, sym)
         for stmt in node.get('body', []):
+            if isinstance(stmt, FuncDef) and class_scope.lookup_local(stmt.name):
+                class_scope.undefine(stmt.name)
             self._visit(stmt, class_scope)
+
+    def _visit_try(self, node: Try, scope: Scope | None = None):
+        for stmt in node.body:
+            self._visit(stmt, scope)
+        for handler in node.handlers:
+            if handler.type_name:
+                handler_sym = self.current_scope.lookup(handler.type_name)
+                if handler_sym is None:
+                    self.error(f'undefined exception type `{handler.type_name}`', handler)
+            for stmt in handler.body:
+                self._visit(stmt, scope)
+
+    def _visit_raise(self, node: Raise):
+        sym = self.current_scope.lookup(node.exc_type)
+        if sym is None:
+            self.error(f'undefined exception class `{node.exc_type}`', node)
+        self._infer_type(node.message)
 
     def _visit_struct(self, node: StructDef, scope: Scope | None = None):
         s = scope or self.globals

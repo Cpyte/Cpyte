@@ -1,15 +1,8 @@
-struct S7:
-    str* data
-    big y
-struct S2:
-    double* next
-    uint64 value
-    big* data
-    double* next
-char* g1 = null
-str g2
-
 def main() -> int:
-    g1
-    char v3 = g2
+    while (0x7fffffff << (-9223372036854775808 / 4294967296)):
+        uint64 v1 = -9223372036854775808
+        v1 = (-9223372036854775809 - -v1)
+    v1 = v1
+    -2147483648
+    v1 = v1
     return 0

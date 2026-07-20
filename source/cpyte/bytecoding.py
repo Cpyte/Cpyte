@@ -59,6 +59,10 @@ class LLVM:
             t = t[:-2]
         while t.endswith('*') or t.endswith('&'):
             t = t[:-1]
+        if '"struct.' in t:
+            start = t.index('"struct.') + len('"struct.')
+            end = t.index('"', start)
+            t = t[start:end]
         idx = t.find('<')
         if idx != -1:
             t = t[:idx]
@@ -116,6 +120,7 @@ class LLVM:
         self.import_src_files = []
         self.loop_stack = []
         self._malloc_fn = None
+        self._free_fn = None
         self._strlen_fn = None
         self._memcpy_fn = None
         print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -159,6 +164,33 @@ class LLVM:
         for name, ret, args in bignum_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
+
+        # Exception handling globals
+        self._exc_buf_ptr = ir.GlobalVariable(self.module, _i8ptr, "_exc_buf_ptr")
+        self._exc_buf_ptr.initializer = ir.Constant(_i8ptr, None)
+        self._exc_type = ir.GlobalVariable(self.module, _i8ptr, "_exc_type")
+        self._exc_type.initializer = ir.Constant(_i8ptr, None)
+        self._exc_msg = ir.GlobalVariable(self.module, _i8ptr, "_exc_msg")
+        self._exc_msg.initializer = ir.Constant(_i8ptr, None)
+
+        # setjmp/longjmp for try/except
+        setjmp_ty = ir.FunctionType(_i32, [_i8ptr])
+        self._setjmp_fn = ir.Function(self.module, setjmp_ty, "setjmp")
+        self._setjmp_fn.attributes.add('returns_twice')
+        longjmp_ty = ir.FunctionType(_void, [_i8ptr, _i32])
+        self._longjmp_fn = ir.Function(self.module, longjmp_ty, "longjmp")
+        self._longjmp_fn.attributes.add('noreturn')
+
+        # strcmp for exception type matching
+        strcmp_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
+        if not self.module.scope.is_used('strcmp'):
+            self._strcmp_fn = ir.Function(self.module, strcmp_ty, "strcmp")
+        else:
+            for g in self.module.globals:
+                if isinstance(g, ir.Function) and g.name == 'strcmp':
+                    self._strcmp_fn = g
+                    break
+        self.functions['strcmp'] = self._strcmp_fn
 
     def emit_switch(self, node):
         value = self.emit(node.value)
@@ -231,6 +263,76 @@ class LLVM:
 
         self.builder.position_at_start(end_blk)
 
+    _JMP_BUF_SIZE = 200
+
+    def emit_try(self, node):
+        buf = self._alloca(ir.ArrayType(_i8, self._JMP_BUF_SIZE), "exc_buf")
+        buf_ptr = self.builder.gep(buf, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)])
+        old_buf = self.builder.load(self._exc_buf_ptr)
+        self.builder.store(buf_ptr, self._exc_buf_ptr)
+        result = self.builder.call(self._setjmp_fn, [buf_ptr])
+        is_exception = self.builder.icmp_signed('!=', result, ir.Constant(_i32, 0))
+        try_blk = self.builder.append_basic_block("try.body")
+        handler_blk = self.builder.append_basic_block("try.handler")
+        after_blk = self.builder.append_basic_block("try.after")
+        self.builder.cbranch(is_exception, handler_blk, try_blk)
+
+        self.builder.position_at_end(try_blk)
+        for stmt in node.body:
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
+        if not self.builder.block.is_terminated:
+            self.builder.store(old_buf, self._exc_buf_ptr)
+            self.builder.branch(after_blk)
+
+        self.builder.position_at_end(handler_blk)
+        exc_type_val = self.builder.load(self._exc_type)
+        last_blk = handler_blk
+        for i, handler in enumerate(node.handlers):
+            if handler.type_name:
+                htype = self._string_const(handler.type_name)
+                cmp_res = self.builder.call(self._strcmp_fn, [exc_type_val, htype])
+                is_match = self.builder.icmp_signed('==', cmp_res, ir.Constant(_i32, 0))
+                match_blk = self.builder.append_basic_block(f"try.match.{i}")
+                next_blk = self.builder.append_basic_block(f"try.next.{i}")
+                self.builder.cbranch(is_match, match_blk, next_blk)
+
+                self.builder.position_at_end(match_blk)
+                self.builder.store(old_buf, self._exc_buf_ptr)
+                for stmt in handler.body:
+                    if not self.builder.block.is_terminated:
+                        self.emit(stmt)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(after_blk)
+
+                self.builder.position_at_end(next_blk)
+                last_blk = next_blk
+            else:
+                self.builder.store(old_buf, self._exc_buf_ptr)
+                for stmt in handler.body:
+                    if not self.builder.block.is_terminated:
+                        self.emit(stmt)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(after_blk)
+                last_blk = self.builder.block
+
+        if not self.builder.block.is_terminated:
+            self.builder.store(old_buf, self._exc_buf_ptr)
+            self.builder.branch(after_blk)
+
+        self.builder.position_at_end(after_blk)
+        return None
+
+    def emit_raise(self, node):
+        exc_type_str = self._string_const(node.exc_type)
+        self.builder.store(exc_type_str, self._exc_type)
+        msg = self.emit(node.message)
+        self.builder.store(msg, self._exc_msg)
+        buf = self.builder.load(self._exc_buf_ptr)
+        self.builder.call(self._longjmp_fn, [buf, ir.Constant(_i32, 1)])
+        self.builder.unreachable()
+        return None
+
     def emit_program(self, ast):
         structs = []
         imports = []
@@ -261,6 +363,8 @@ class LLVM:
 
         for node in structs:
             self.emit(node)
+
+
 
         for node in imports:
             self.emit(node)
@@ -347,6 +451,10 @@ class LLVM:
             return self.emit_attr(node)
         if isinstance(node, Switch):
             return self.emit_switch(node)
+        if isinstance(node, Try):
+            return self.emit_try(node)
+        if isinstance(node, Raise):
+            return self.emit_raise(node)
         if isinstance(node, Break):
             return self.emit_break(node)
         if isinstance(node, Continue):
@@ -370,7 +478,13 @@ class LLVM:
 
     def emit_new_expr(self, node: NewExpr):
         if node.type_expr == 'str':
-            return self._string_const('')
+            malloc_fn = self._get_malloc_fn()
+            empty_str = self._string_const('')
+            ptr = self.builder.call(malloc_fn, [ir.Constant(_i64, 8)])
+            i8pp = ir.PointerType(_i8ptr)
+            ptr = self.builder.bitcast(ptr, i8pp)
+            self.builder.store(empty_str, ptr)
+            return ptr
         if node.size is not None:
             count = self.emit(node.size)
             if isinstance(count.type, ir.PointerType):
@@ -405,6 +519,19 @@ class LLVM:
         fnty = ir.FunctionType(_i8ptr, [_i64])
         fn = ir.Function(self.module, fnty, 'malloc')
         self._malloc_fn = fn
+        return fn
+
+    def _get_free_fn(self):
+        fn = self._free_fn
+        if fn is not None:
+            return fn
+        for f in self.module.functions:
+            if f.name == 'free':
+                self._free_fn = f
+                return f
+        fnty = ir.FunctionType(ir.VoidType(), [_i8ptr])
+        fn = ir.Function(self.module, fnty, 'free')
+        self._free_fn = fn
         return fn
 
     def _type_abi_info(self, ty):
@@ -471,6 +598,8 @@ class LLVM:
         idx = self.emit(node.index)
         if isinstance(idx.type, ir.PointerType):
             idx = self.builder.ptrtoint(idx, _i64)
+        elif isinstance(idx.type, (ir.DoubleType, ir.FloatType)):
+            idx = self.builder.fptosi(idx, _i64)
         return self.builder.gep(obj, [idx], inbounds=True)
 
     def emit_attr(self, node: Attr):
@@ -537,6 +666,10 @@ class LLVM:
         obj_ptr = self._emit_lvalue(node.obj)
         struct_name = self._struct_name_from_node(node.obj)
         if struct_name and struct_name in self.struct_fields:
+            var_name = getattr(node.obj, 'name', '')
+            declared = self.local_types.get(var_name, '')
+            if declared == struct_name + '*' or ('struct.' in declared and self._base_type_name(declared) == struct_name):
+                obj_ptr = self.builder.load(obj_ptr)
             fields = self.struct_fields[struct_name]
             for i, f in enumerate(fields):
                 if f.name == node.name:
@@ -641,7 +774,13 @@ class LLVM:
                     value = self.builder.inttoptr(value, ret_ty)
             self.builder.ret(value)
         else:
-            self.builder.ret_void()
+            ret_ty = self.builder.function.ftype.return_type
+            if isinstance(ret_ty, ir.VoidType):
+                self.builder.ret_void()
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(ir.Constant(ret_ty, None))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
         return None
 
     @staticmethod
@@ -1261,6 +1400,8 @@ class LLVM:
                     val = self.builder.inttoptr(val, expected)
                 if isinstance(val.type, ir.PointerType) and isinstance(expected, ir.IntType):
                     val = self.builder.ptrtoint(val, expected)
+                if isinstance(val.type, ir.PointerType) and isinstance(expected, ir.PointerType) and val.type != expected:
+                    val = self.builder.bitcast(val, expected)
             args.append(val)
         return self.builder.call(func, args)
 

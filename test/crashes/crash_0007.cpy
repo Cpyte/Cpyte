@@ -1,17 +1,21 @@
-struct S4:
-    uint64 data
-    str* key
-    int64 data
-    int64* tail
 struct S1:
-    uint64 value
-    uint64* value
-    float name
-int g1
-big g2
+    int next
+
+struct S2:
+    int prev
+    big key
+
+struct S3:
+    float* ptr
+    big left
+    double value
+
+str g4 = '\t\tf\teggega'
+int64 g5
+int64 g6
 
 def main() -> int:
-    g2 = 0x1
-    g1 = (0x100000000 % g1)
-    print((g1 and g1))
+    if 0xdeadbeefcafebabedeadbeef:
+        while '':
+            str v7 = 'baad\n h\tgeb\t'
     return 0

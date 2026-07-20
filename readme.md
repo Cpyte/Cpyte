@@ -16,6 +16,7 @@ You'll find comprehensive examples in the `examples/` directory that cover C imp
 | `examples/c_library_imports.cpy` | Using built-in C libraries (stdio, stdlib, math, string, time) |
 | `examples/mixed_features.cpy` | Combines C imports, H imports, 64-bit, structs, pointers, linked lists |
 | `examples/mixed_helpers.c` / `mixed_helpers.h` | Supporting C/header files for the mixed features example |
+| `examples/test.cpy` | macOS event tap example that intercepts keyboard events using ApplicationServices framework |
 
 You can also import `.cpy` files — the examples show how to use `import "other.cpy"` to bring in public functions and structs from other Cpy files.
 

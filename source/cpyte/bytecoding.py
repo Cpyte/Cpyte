@@ -5,6 +5,7 @@ from llvmlite import ir
 
 from .lexar import Token, TokenType
 from .astparse import *
+from .extension_hooks import get_global_hook_registry
 
 
 _i8 = ir.IntType(8)
@@ -104,7 +105,7 @@ class LLVM:
             return val
         return self.builder.call(fn, [val])
 
-    def __init__(self):
+    def __init__(self, no_userspace=False, enable_extensions=True):
         self.module = ir.Module("main")
         self.builder = None
         self.functions = {}
@@ -123,27 +124,32 @@ class LLVM:
         self._free_fn = None
         self._strlen_fn = None
         self._memcpy_fn = None
-        print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
-        print_fn = ir.Function(self.module, print_ty, "print_int")
-        self.functions["print_int"] = print_fn
-        print_i64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
-        print_i64_fn = ir.Function(self.module, print_i64_ty, "print_int64")
-        self.functions["print_int64"] = print_i64_fn
-        print_u64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
-        print_u64_fn = ir.Function(self.module, print_u64_ty, "print_uint64")
-        self.functions["print_uint64"] = print_u64_fn
-        print_f_ty = ir.FunctionType(ir.VoidType(), [ir.DoubleType()])
-        print_f_fn = ir.Function(self.module, print_f_ty, "print_double")
-        self.functions["print_double"] = print_f_fn
-        print_s_ty = ir.FunctionType(ir.VoidType(), [ir.PointerType(ir.IntType(8))])
-        print_s_fn = ir.Function(self.module, print_s_ty, "print_str")
-        self.functions["print_str"] = print_s_fn
-        input_ty = ir.FunctionType(ir.IntType(32), [])
-        input_fn = ir.Function(self.module, input_ty, "input_int")
-        self.functions["input"] = input_fn
-        input_str_ty = ir.FunctionType(_i8ptr, [])
-        input_str_fn = ir.Function(self.module, input_str_ty, "input_str")
-        self.functions["input_str"] = input_str_fn
+        self.no_userspace = no_userspace
+        self.enable_extensions = enable_extensions
+        self._hook_registry = get_global_hook_registry()
+        
+        if not no_userspace:
+            print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
+            print_fn = ir.Function(self.module, print_ty, "print_int")
+            self.functions["print_int"] = print_fn
+            print_i64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
+            print_i64_fn = ir.Function(self.module, print_i64_ty, "print_int64")
+            self.functions["print_int64"] = print_i64_fn
+            print_u64_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
+            print_u64_fn = ir.Function(self.module, print_u64_ty, "print_uint64")
+            self.functions["print_uint64"] = print_u64_fn
+            print_f_ty = ir.FunctionType(ir.VoidType(), [ir.DoubleType()])
+            print_f_fn = ir.Function(self.module, print_f_ty, "print_double")
+            self.functions["print_double"] = print_f_fn
+            print_s_ty = ir.FunctionType(ir.VoidType(), [ir.PointerType(ir.IntType(8))])
+            print_s_fn = ir.Function(self.module, print_s_ty, "print_str")
+            self.functions["print_str"] = print_s_fn
+            input_ty = ir.FunctionType(ir.IntType(32), [])
+            input_fn = ir.Function(self.module, input_ty, "input_int")
+            self.functions["input"] = input_fn
+            input_str_ty = ir.FunctionType(_i8ptr, [])
+            input_str_fn = ir.Function(self.module, input_str_ty, "input_str")
+            self.functions["input_str"] = input_str_fn
 
         # BigNum runtime functions
         bignum_fns = [
@@ -353,6 +359,21 @@ class LLVM:
                     toplevel.append(node)
 
         _collect_nodes(ast)
+        
+        # Collect runtime code from extension hooks
+        if self.enable_extensions:
+            import tempfile
+            import os
+            for hook in self._hook_registry.get_runtime_hooks():
+                try:
+                    runtime_code = hook.get_runtime_code()
+                    if runtime_code:
+                        fd, tmp_path = tempfile.mkstemp(suffix='.c', prefix='hook_runtime_')
+                        with os.fdopen(fd, 'w') as f:
+                            f.write(runtime_code)
+                        self.import_src_files.append(tmp_path)
+                except Exception:
+                    pass
 
         for node in structs:
             st = ir.IdentifiedStructType(
@@ -399,6 +420,21 @@ class LLVM:
         return self.module, self.import_src_files
 
     def emit(self, node: list[Token]):
+        # Try codegen hooks if extensions are enabled
+        if self.enable_extensions:
+            for hook in self._hook_registry.get_codegen_hooks():
+                try:
+                    if hook.should_emit_node(node):
+                        return hook.emit_node(node, self.builder, {
+                            'llvm': self,
+                            'module': self.module,
+                            'builder': self.builder,
+                        })
+                except Exception as e:
+                    # If hook fails, continue with standard codegen
+                    pass
+        
+        # Standard codegen
         if isinstance(node, FuncDef):
             return self.funcdo(node)
         if isinstance(node, Return):
@@ -445,6 +481,8 @@ class LLVM:
             return self.emit_addr_of(node)
         if isinstance(node, SizeOf):
             return self.emit_sizeof(node)
+        if isinstance(node, InlineAsm):
+            return self.emit_inline_asm(node)
         if isinstance(node, Index):
             return self.emit_index(node)
         if isinstance(node, Attr):
@@ -588,6 +626,39 @@ class LLVM:
     def emit_sizeof(self, node: SizeOf):
         ty = self.llvm_type(node.type_expr)
         return self._sizeof_type(ty)
+
+    def emit_inline_asm(self, node: InlineAsm):
+        arg_tys = []
+        arg_vals = []
+        for _, arg_expr in node.inputs:
+            val = self.emit(arg_expr)
+            arg_tys.append(val.type)
+            arg_vals.append(val)
+        ret_ty = _void
+        if node.outputs:
+            out_var = node.outputs[0][1]
+            if isinstance(out_var, Variable):
+                ptr = self._emit_lvalue(out_var)
+                loaded = self.builder.load(ptr)
+                ret_ty = loaded.type
+        out_constraints = [c for c, _ in node.outputs]
+        in_constraints = [c for c, _ in node.inputs]
+        clobbers = list(node.clobbers)
+        constraint_parts = []
+        if out_constraints:
+            constraint_parts.append(','.join(out_constraints))
+        if in_constraints:
+            constraint_parts.append(','.join(in_constraints))
+        if clobbers:
+            constraint_parts.append(','.join('~' + c for c in clobbers))
+        asm_constraints = ','.join(p for p in constraint_parts if p)
+        asm_fn_type = ir.FunctionType(ret_ty, arg_tys)
+        asm_fn = ir.InlineAsm(asm_fn_type, node.template, asm_constraints, side_effects=node.volatile)
+        call = self.builder.call(asm_fn, arg_vals)
+        if node.outputs and isinstance(node.outputs[0][1], Variable):
+            ptr = self._emit_lvalue(node.outputs[0][1])
+            self.builder.store(call, ptr)
+        return call
 
     def emit_index(self, node: Index):
         ptr = self._emit_lvalue(node)
@@ -1025,6 +1096,20 @@ class LLVM:
                 case TokenType.NOT_EQ:
                     return self.builder.fcmp_ordered('!=', left, right)
 
+        # String equality via strcmp (content, not pointer comparison)
+        if node.op in (TokenType.EQ_EQ, TokenType.NOT_EQ):
+            left_str = getattr(node.left, 'inferred_type', None) == 'str'
+            right_str = getattr(node.right, 'inferred_type', None) == 'str'
+            if left_str and right_str:
+                fnty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
+                fn = ir.Function(self.module, fnty, '__cpy_strcmp')
+                cmp = self.builder.call(fn, [left, right])
+                zero = ir.Constant(_i32, 0)
+                if node.op == TokenType.EQ_EQ:
+                    return self.builder.icmp_signed('==', cmp, zero)
+                else:
+                    return self.builder.icmp_signed('!=', cmp, zero)
+
         match node.op:
             case TokenType.PLUS:
                 return self.builder.add(left, right)
@@ -1406,6 +1491,12 @@ class LLVM:
         return self.builder.call(func, args)
 
     def emit_print(self, node):
+        if self.no_userspace:
+            # In no-userspace mode, print statements become no-ops
+            # Still emit the value for side effects, but don't call print function
+            self.emit(node.value)
+            return None
+        
         value = self.emit(node.value)
         if self._is_big(node.value):
             return self.builder.call(self.functions["bigint_print"], [value])
@@ -1463,10 +1554,16 @@ class LLVM:
         return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
 
     def emit_input(self, node):
+        if self.no_userspace:
+            # In no-userspace mode, input returns 0
+            return ir.Constant(_i32, 0)
         func = self.functions["input"]
         return self.builder.call(func, [])
 
     def emit_input_str(self, node):
+        if self.no_userspace:
+            # In no-userspace mode, input_str returns null pointer
+            return ir.Constant(_i8ptr, None)
         func = self.functions["input_str"]
         return self.builder.call(func, [])
 

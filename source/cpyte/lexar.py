@@ -1,4 +1,5 @@
 from enum import Enum, auto
+from typing import Set
 
 
 class TokenType(Enum):
@@ -56,7 +57,8 @@ class TokenType(Enum):
     EOF = auto()
 
 
-KEYWORDS = {
+# Base keywords - core language keywords that cannot be overridden
+_BASE_KEYWORDS = {
     'def', 'class', 'return', 'if', 'else', 'elif',
     'while', 'for', 'in', 'break', 'continue',
     'public', 'private', 'static', 'virtual', 'override',
@@ -69,7 +71,42 @@ KEYWORDS = {
     'int64', 'uint64',
     'let',
     'try', 'except', 'raise',
+    'asm',
 }
+
+# Additional keywords registered by packages
+_additional_keywords: Set[str] = set()
+
+
+def register_keywords(keywords: Set[str]) -> None:
+    """Register additional keywords from packages."""
+    _additional_keywords.update(keywords)
+    # Update legacy KEYWORDS for backward compatibility
+    global KEYWORDS
+    KEYWORDS = get_keywords()
+
+
+def unregister_keywords(keywords: Set[str]) -> None:
+    """Unregister keywords from packages."""
+    _additional_keywords.difference_update(keywords)
+    # Update legacy KEYWORDS for backward compatibility
+    global KEYWORDS
+    KEYWORDS = get_keywords()
+
+
+def get_keywords() -> Set[str]:
+    """Get the complete set of keywords (base + additional)."""
+    return _BASE_KEYWORDS | _additional_keywords
+
+
+def clear_additional_keywords() -> None:
+    """Clear all additional keywords (useful for testing)."""
+    _additional_keywords.clear()
+
+
+# Legacy support - keep KEYWORDS as a set for backward compatibility
+# This is updated when keywords are registered/unregistered
+KEYWORDS = get_keywords()
 
 
 class Token:
@@ -173,7 +210,7 @@ class _LineLexer:
             self.advance()
 
         value = self.line[start:self.pos]
-        if value in KEYWORDS:
+        if value in get_keywords():
             if value == 'and':
                 return Token(TokenType.AND, value, self.line_number, start_col)
             if value == 'or':
@@ -299,12 +336,23 @@ class _LineLexer:
 
 
 class Lexer:
-    def __init__(self, source: str, filename: str = '<string>', tab_size: int = 4):
+    def __init__(self, source: str, filename: str = '<string>', tab_size: int = 4, enable_extensions: bool = True):
         self.source = source
         self.filename = filename
         self.tab_size = tab_size
         self.tokens: list[Token] = []
+        self.enable_extensions = enable_extensions
         self._tokenize()
+    
+    @staticmethod
+    def register_package_keywords(keywords: Set[str]) -> None:
+        """Register keywords from a package."""
+        register_keywords(keywords)
+    
+    @staticmethod  
+    def unregister_package_keywords(keywords: Set[str]) -> None:
+        """Unregister keywords from a package."""
+        unregister_keywords(keywords)
 
     def _validate_indentation(self, raw_lines: list[str]):
         for i, line in enumerate(raw_lines):

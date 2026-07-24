@@ -110,7 +110,7 @@ def _maybe_compile(module):
         return prog, src_files
     return module, None
 
-def run_jit(module, opt_level=3, src_files=None):
+def run_jit(module, opt_level=3, src_files=None, no_userspace=False):
     module, src_files_auto = _maybe_compile(module)
     if src_files_auto is not None:
         src_files = src_files_auto
@@ -156,80 +156,90 @@ def run_jit(module, opt_level=3, src_files=None):
     engine = binding.create_mcjit_compiler(backing_mod, target_machine)
     engine.add_module(mod)
 
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_int)(_runtime_print)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("print_int"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+    if not no_userspace:
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_int)(_runtime_print)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_int"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_longlong)(_runtime_print_int64)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("print_int64"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_longlong)(_runtime_print_int64)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_int64"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_ulonglong)(_runtime_print_uint64)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("print_uint64"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_ulonglong)(_runtime_print_uint64)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_uint64"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_double)(_runtime_print_double)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("print_double"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_double)(_runtime_print_double)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_double"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(ctypes.c_int)(_runtime_input)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("input_int"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(ctypes.c_int)(_runtime_input)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("input_int"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(ctypes.c_char_p)(_runtime_input_str)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("input_str"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(ctypes.c_char_p)(_runtime_input_str)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("input_str"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(_runtime_print_str)
-    _callbacks.append(cb)
-    try:
-        engine.add_global_mapping(
-            mod.get_function("print_str"),
-            ctypes.cast(cb, ctypes.c_void_p).value,
-        )
-    except NameError:
-        pass
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(_runtime_print_str)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_str"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
 
     _map_libc_fn(engine, mod, 'malloc', ctypes.c_size_t, ctypes.c_void_p)
     _map_libc_fn(engine, mod, 'strlen', ctypes.c_char_p, ctypes.c_int)
     _map_libc_fn(engine, mod, 'memcpy', None, ctypes.c_void_p,
                  argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int])
+
+    try:
+        fn = mod.get_function('__cpy_strcmp')
+        cfunctype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
+        cfn = cfunctype(_libc.strcmp)
+        _callbacks.append(cfn)
+        engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
+    except NameError:
+        pass
 
     engine.finalize_object()
     engine.run_static_constructors()
@@ -261,7 +271,7 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
         pass
 
 
-def run_aot(module, output="program.o", opt_level=3, src_files=None):
+def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False):
     llvm_ir = str(module)
     import llvmlite.binding as binding
     binding.initialize_native_target()
@@ -293,13 +303,15 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None):
             print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
             raise SystemExit(1)
         objs.append(src_obj)
-    runtime_obj = output + '.runtime.o'
-    r = subprocess.run(
-        ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C],
-        capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        objs.append(runtime_obj)
+    
+    if not no_userspace:
+        runtime_obj = output + '.runtime.o'
+        r = subprocess.run(
+            ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            objs.append(runtime_obj)
 
     out_name = output.rsplit('.', 1)[0] if '.' in output else output
     r = subprocess.run(

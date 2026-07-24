@@ -20,16 +20,21 @@ def _get_sdk_paths():
                     paths.append(full)
     return paths
 
-from .lexar import Lexer, LexerError
+from .lexar import Lexer, LexerError, register_keywords, unregister_keywords
 from .astparse import (
     _loc, Number, String, Variable, Call, Index, Attr,
     UnaryOp, BinOp, Assign, Return, If, FuncDef, Print, ExprStmt,
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
-    InputStr, Signed67, Try, Raise, ExceptHandler,
+    InputStr, Signed67, Try, Raise, ExceptHandler, InlineAsm,
     parse_file, ParseError,
 )
 from .clib import resolve_library, parse_header_file, parse_c_source
+from .package_manifest import (
+    ManifestParser, ManifestValidator, PackageManifest, 
+    get_global_registry, reset_global_registry
+)
+from .extension_hooks import HookRegistry, HookLoader, get_global_hook_registry
 
 
 class Diagnostic:
@@ -141,7 +146,7 @@ class Scope:
 
 class SemanticAnalyzer:
     def __init__(self, source: str, filepath: str | None = None,
-                 workspace_root: str | None = None, strict: bool = False):
+                 workspace_root: str | None = None, strict: bool = False, enable_extensions: bool = True):
         self.reporter = Reporter(source)
         self.globals = Scope()
         self.current_func: FuncDef | None = None
@@ -151,6 +156,106 @@ class SemanticAnalyzer:
         self._workspace_root = workspace_root
         self._loop_depth = 0
         self.strict = strict
+        self.enable_extensions = enable_extensions
+        self._loaded_packages: set[str] = set()
+        self._manifest_registry = get_global_registry()
+        self._hook_registry = get_global_hook_registry()
+    
+    def _load_package_manifest(self, package_dir: str, package_name: str) -> bool:
+        """
+        Load and register a package manifest.
+        
+        Args:
+            package_dir: Directory containing the package
+            package_name: Name of the package
+            
+        Returns:
+            True if manifest was loaded successfully, False otherwise
+        """
+        if not self.enable_extensions:
+            return False
+            
+        if package_name in self._loaded_packages:
+            return True  # Already loaded
+            
+        manifest_path = os.path.join(package_dir, 'package.json')
+        if not os.path.exists(manifest_path):
+            return False  # No manifest file
+            
+        try:
+            manifest = ManifestParser.validate_and_parse(manifest_path)
+            
+            # Register keywords with lexer
+            if manifest.capabilities.keywords:
+                register_keywords(manifest.capabilities.keywords)
+            
+            # Register manifest in global registry
+            self._manifest_registry.register(manifest)
+            
+            # Load hooks if present
+            if self._workspace_root:
+                context = {
+                    'workspace_root': self._workspace_root,
+                    'package_dir': package_dir,
+                    'package_name': package_name,
+                    'analyzer': self,
+                }
+                
+                all_hook_files = (
+                    manifest.extensions.parser_hooks +
+                    manifest.extensions.semantic_hooks +
+                    manifest.extensions.codegen_hooks +
+                    manifest.extensions.runtime_hooks
+                )
+                
+                if all_hook_files:
+                    HookLoader.load_hooks_from_package(
+                        package_name, package_dir, all_hook_files,
+                        self._hook_registry, context
+                    )
+            
+            self._loaded_packages.add(package_name)
+            
+            # Register empty symbols for extension-only packages
+            # This allows the import to succeed even if there's no .cpy file
+            self.globals.define(package_name, Symbol('package'))
+            
+            return True
+            
+        except Exception as e:
+            self.error(f"Failed to load package manifest for '{package_name}': {e}")
+            return False
+    
+    def _load_cpm_package_manifests(self) -> None:
+        """Load manifests from all CPM packages in the workspace."""
+        if not self.enable_extensions or not self._workspace_root:
+            return
+            
+        cpm_root = os.path.join(self._workspace_root, '.cpm', 'modules')
+        if not os.path.isdir(cpm_root):
+            return
+            
+        for package_name in os.listdir(cpm_root):
+            # Strip @ from package name if present
+            clean_name = package_name.lstrip('@')
+            
+            if clean_name in self._loaded_packages:
+                continue
+                
+            pkg_dir = os.path.join(cpm_root, package_name)
+            if not os.path.isdir(pkg_dir):
+                continue
+                
+            # Check for versions
+            versions = [d for d in os.listdir(pkg_dir) if os.path.isdir(os.path.join(pkg_dir, d))]
+            if not versions:
+                continue
+                
+            # Load from latest version
+            latest_version = sorted(versions, reverse=True)[0]
+            version_dir = os.path.join(pkg_dir, latest_version)
+            
+            self._load_package_manifest(version_dir, clean_name)
 
     def _tok(self, node):
         if isinstance(node, dict):
@@ -244,6 +349,7 @@ class SemanticAnalyzer:
             return 'int'
 
         if isinstance(node, String):
+            node.inferred_type = 'str'
             return 'str'
 
         if isinstance(node, Variable):
@@ -254,6 +360,7 @@ class SemanticAnalyzer:
                 return None
             if sym.const_value is not None:
                 node.const_value = sym.const_value
+            node.inferred_type = sym.type
             return sym.type
 
         if isinstance(node, BinOp):
@@ -516,6 +623,13 @@ class SemanticAnalyzer:
         if isinstance(node, SizeOf):
             return 'int'
 
+        if isinstance(node, InlineAsm):
+            for _, arg_expr in node.inputs:
+                self._infer_type(arg_expr)
+            if node.outputs:
+                return 'i64'
+            return 'void'
+
         if isinstance(node, ExprStmt):
             return self._infer_type(node.expr)
 
@@ -560,6 +674,13 @@ class SemanticAnalyzer:
             )
 
     def _visit(self, node, scope: Scope | None = None):
+        for hook in self._hook_registry.get_semantic_hooks():
+            try:
+                if hook.should_visit_node(node):
+                    hook.visit_node(node, {'analyzer': self, 'scope': scope})
+            except Exception:
+                pass
+
         if isinstance(node, FuncDef):
             self._visit_funcdef(node, scope)
         elif isinstance(node, If):
@@ -598,6 +719,11 @@ class SemanticAnalyzer:
             self._infer_type(node)
         elif isinstance(node, SizeOf):
             pass
+        elif isinstance(node, InlineAsm):
+            for _, var_expr in node.outputs:
+                self._infer_type(var_expr)
+            for _, arg_expr in node.inputs:
+                self._infer_type(arg_expr)
         elif isinstance(node, Input):
             pass
         elif isinstance(node, InputStr):
@@ -792,18 +918,32 @@ class SemanticAnalyzer:
         return None
 
     def _try_cpm_import(self, node: Import, module: str) -> bool:
+        # Check if package was already loaded via manifest
+        # Handle both @package.name and package.name formats
+        pkg_name = module.lstrip('@').rsplit('/', 1)[-1]
+        if pkg_name in self._loaded_packages:
+            # Package was loaded via manifest, register empty symbols and succeed
+            self._register_import_symbols({}, node)
+            return True
+            
         cpm_root = None
         if self._workspace_root:
             cpm_root = os.path.join(self._workspace_root, '.cpm', 'modules')
         elif self._filedir:
             cpm_root = os.path.join(self._filedir, '..', '.cpm', 'modules')
         if cpm_root and os.path.isdir(cpm_root):
-            pkg_dir = os.path.join(cpm_root, module)
+            pkg_dir = os.path.join(cpm_root, module.lstrip('@'))
             if os.path.isdir(pkg_dir):
                 versions = sorted([d for d in os.listdir(pkg_dir) if os.path.isdir(os.path.join(pkg_dir, d))], reverse=True)
                 if versions:
-                    pkg_name = module.rsplit('/', 1)[-1]
+                    pkg_name = module.lstrip('@').rsplit('/', 1)[-1]
                     version_dir = os.path.join(pkg_dir, versions[0])
+                    
+                    # Load package manifest if extensions are enabled
+                    manifest_loaded = False
+                    if self.enable_extensions:
+                        manifest_loaded = self._load_package_manifest(version_dir, pkg_name)
+                    
                     cpy_file = self._find_package_entry(version_dir, pkg_name)
                     if cpy_file:
                         result = self._import_cpy(cpy_file, node)
@@ -812,6 +952,13 @@ class SemanticAnalyzer:
                         return True
                     result = self._import_prebuilt(version_dir, node)
                     if result:
+                        return True
+                    
+                    # If no .cpy or prebuilt files but manifest was loaded, allow the import
+                    # This supports extension-only packages
+                    if manifest_loaded:
+                        # Register empty symbols for extension-only packages
+                        self._register_import_symbols({}, node)
                         return True
         return False
 
@@ -1168,8 +1315,11 @@ class SemanticAnalyzer:
         self.locals = old_locals
 
 
-def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None) -> str | None:
-    analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root)
+def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True) -> str | None:
+    analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root, enable_extensions=enable_extensions)
+    # Pre-load CPM package manifests before analysis
+    if enable_extensions:
+        analyzer._load_cpm_package_manifests()
     if analyzer.analyze(nodes):
         return None
     return analyzer.reporter.display()

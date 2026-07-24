@@ -2,6 +2,46 @@ Check out the official documentation [here](https://gitea.5gnew.io.vn/duytung/Cp
 
 **Note:** Version 1.6.1 had a critical division by zero error that wasn't caught.
 
+## Package Extensions
+
+Cpyte supports a package extension system that allows packages to extend the compiler with custom keywords, operators, and compiler hooks. Packages can provide:
+
+- **Custom Keywords**: Add new language keywords via `package.json`
+- **Custom Operators**: Define new operators for syntax extensions  
+- **Compiler Hooks**: Extend lexing, parsing, semantic analysis, and code generation
+- **Runtime Extensions**: Add runtime code and libraries
+
+### Package Structure
+
+Packages are stored in `.cpm/modules/package_name/version/` and can include:
+
+- `package.json` - Extension manifest declaring capabilities
+- `parser_hooks.py` - Custom syntax extensions
+- `semantic_hooks.py` - Custom type checking and analysis rules
+- `codegen_hooks.py` - Custom LLVM IR generation
+- `runtime_hooks.py` - Runtime code and libraries
+- `*.cpy` - Main package entry point
+- `*.ll` - Prebuilt LLVM IR
+
+### Example Package
+
+See `examples/example_package/` for a complete example package with:
+- Custom keywords: `async`, `await`, `defer`
+- Custom operator: `~~`
+- Parser, semantic, codegen, and runtime hooks
+
+### Using Extension Packages
+
+```cpy
+import @package_name
+
+# Use custom keywords and syntax from the package
+async def my_function() -> Promise:
+    # Custom syntax
+    defer cleanup()
+    return result
+```
+
 ## Examples
 
 You'll find comprehensive examples in the `examples/` directory that cover C imports, header imports, 64-bit support, and standard library usage:
@@ -17,6 +57,7 @@ You'll find comprehensive examples in the `examples/` directory that cover C imp
 | `examples/mixed_features.cpy` | Combines C imports, H imports, 64-bit, structs, pointers, linked lists |
 | `examples/mixed_helpers.c` / `mixed_helpers.h` | Supporting C/header files for the mixed features example |
 | `examples/test.cpy` | macOS event tap example that intercepts keyboard events using ApplicationServices framework |
+| `examples/example_package/` | Example package demonstrating extension capabilities with custom keywords, operators, and compiler hooks |
 
 You can also import `.cpy` files — the examples show how to use `import "other.cpy"` to bring in public functions and structs from other Cpy files.
 

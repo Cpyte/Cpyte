@@ -1,4 +1,40 @@
 from .lexar import Token, TokenType
+from typing import Optional, Dict, Any, List
+
+
+_parser_hooks: List[Any] = []
+
+
+def register_parser_hook(hook: Any) -> None:
+    _parser_hooks.append(hook)
+
+
+def unregister_parser_hook(hook: Any) -> None:
+    if hook in _parser_hooks:
+        _parser_hooks.remove(hook)
+
+
+def get_parser_hooks() -> List[Any]:
+    return _parser_hooks.copy()
+
+
+def clear_parser_hooks() -> None:
+    _parser_hooks.clear()
+
+
+def _get_all_parser_hooks(enable_extensions: bool) -> List[Any]:
+    if not enable_extensions:
+        return []
+    hooks = list(_parser_hooks)
+    try:
+        from .extension_hooks import get_global_hook_registry
+        registry = get_global_hook_registry()
+        for hook in registry.get_parser_hooks():
+            if hook not in hooks:
+                hooks.append(hook)
+    except ImportError:
+        pass
+    return hooks
 
 
 def parse_f(tree: list[Token]):
@@ -45,7 +81,7 @@ class Number:
         return f'Number({self.value})'
 
 class String:
-    __slots__ = ('value', '_token')
+    __slots__ = ('value', '_token', 'inferred_type')
     def __init__(self, value: str, token=None):
         self.value = value
         self._token = token
@@ -53,7 +89,7 @@ class String:
         return f'String({self.value})'
 
 class Variable:
-    __slots__ = ('name', '_token', 'const_value')
+    __slots__ = ('name', '_token', 'const_value', 'inferred_type')
     def __init__(self, name: str, token=None):
         self.name = name
         self._token = token
@@ -263,6 +299,9 @@ def _parse_atom(tokens: list[Token], pos: int):
             pos += 1
         return NewExpr(type_str, size, token=tok), pos
 
+    if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+        return parse_inline_asm(tokens, pos)
+
     if tok.type == TokenType.KEYWORD and tok.value == 'sizeof':
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
@@ -321,7 +360,7 @@ def _parse_postfix(tokens: list[Token], pos: int, node):
     return node, pos
 
 
-def parse_file(tokens: list[Token], pos: int = 0):
+def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True):
     nodes = []
     while pos < len(tokens) and tokens[pos].type not in (TokenType.EOF, TokenType.DEDENT):
         while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
@@ -331,59 +370,79 @@ def parse_file(tokens: list[Token], pos: int = 0):
             break
 
         tok = tokens[pos]
-        if tok.type == TokenType.KEYWORD and tok.value == 'def':
-            node, pos = parse_def(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value in ('public', 'private', 'static', 'virtual', 'override'):
-            node, pos = parse_decorated_def(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'class':
-            node, pos = parse_class(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'struct':
-            node, pos = parse_struct_def(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'if':
-            node, pos = parse_if(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'return':
-            node, pos = parse_return(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'while':
-            node, pos = parse_while(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'for':
-            node, pos = parse_for(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'import':
-            node, pos = parse_import(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'print':
-            node, pos = parse_print(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'break':
-            node, pos = parse_break(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'continue':
-            node, pos = parse_continue(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'switch':
-            node, pos = parse_switch(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'try':
-            node, pos = parse_try(tokens, pos)
-        elif tok.type == TokenType.KEYWORD and tok.value == 'raise':
-            node, pos = parse_raise(tokens, pos)
-        elif tok.type == TokenType.IDENTIFIER and pos + 1 < len(tokens):
-            if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
+        
+        all_hooks = _get_all_parser_hooks(enable_extensions)
+        if all_hooks:
+            handled = False
+            for hook in all_hooks:
                 try:
-                    save = pos
-                    node, pos = parse_var_decl(tokens, pos)
-                    if node is not None:
+                    if hasattr(hook, 'should_handle_statement') and hook.should_handle_statement(tokens, pos):
+                        node, pos = hook.parse_statement(tokens, pos, {'tokens': tokens, 'pos': pos})
                         nodes.append(node)
-                        while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
-                            pos += 1
-                        continue
-                except ParseError:
+                        handled = True
+                        break
+                except Exception:
+                    pass
+            if not handled:
+                node, pos = _parse_standard_statement(tokens, pos)
+                nodes.append(node)
+        else:
+            node, pos = _parse_standard_statement(tokens, pos)
+            nodes.append(node)
+    
+    return nodes, pos
+
+
+def _parse_standard_statement(tokens: list[Token], pos: int):
+    """Parse a statement using standard grammar (non-hooked)."""
+    tok = tokens[pos]
+    if tok.type == TokenType.KEYWORD and tok.value == 'def':
+        node, pos = parse_def(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value in ('public', 'private', 'static', 'virtual', 'override'):
+        node, pos = parse_decorated_def(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'class':
+        node, pos = parse_class(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'struct':
+        node, pos = parse_struct_def(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'if':
+        node, pos = parse_if(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'return':
+        node, pos = parse_return(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'while':
+        node, pos = parse_while(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'for':
+        node, pos = parse_for(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'import':
+        node, pos = parse_import(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'print':
+        node, pos = parse_print(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'break':
+        node, pos = parse_break(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'continue':
+        node, pos = parse_continue(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'switch':
+        node, pos = parse_switch(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'try':
+        node, pos = parse_try(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'raise':
+        node, pos = parse_raise(tokens, pos)
+    elif tok.type == TokenType.IDENTIFIER and pos + 1 < len(tokens):
+        if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
+            try:
+                save = pos
+                node, pos = parse_var_decl(tokens, pos)
+                if node is None:
                     pos = save
-            node, pos = parse_expr_stmt(tokens, pos)
+                    node, pos = parse_expr_stmt(tokens, pos)
+            except ParseError:
+                pos = save
+                node, pos = parse_expr_stmt(tokens, pos)
         else:
             node, pos = parse_expr_stmt(tokens, pos)
-
-        if node is not None:
-            nodes.append(node)
-
-        while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
-            pos += 1
-
-    return nodes, pos
+    else:
+        node, pos = parse_expr_stmt(tokens, pos)
+    
+    return node, pos
 
 
 def _parse_func_with_visibility(tokens: list[Token], pos: int, visibility: str | None, tok: Token):
@@ -849,6 +908,93 @@ class Field:
         return f'Field({self.name}: {self.type_expr})'
 
 
+class InlineAsm:
+    __slots__ = ('template', 'outputs', 'inputs', 'clobbers', 'volatile', '_token')
+    def __init__(self, template: str, outputs=None, inputs=None, clobbers=None, volatile=False, token=None):
+        self.template = template
+        self.outputs = outputs or []
+        self.inputs = inputs or []
+        self.clobbers = clobbers or []
+        self.volatile = volatile
+        self._token = token
+    def __repr__(self):
+        return f'InlineAsm({self.template}, volatile={self.volatile})'
+
+
+def parse_inline_asm(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    pos += 1
+    volatile = False
+    if pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER and tokens[pos].value == 'volatile':
+        volatile = True
+        pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+        raise ParseError('Expected "(" after asm', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+        raise ParseError('Expected asm template string', tokens[pos] if pos < len(tokens) else tok)
+    template = tokens[pos].value
+    pos += 1
+    outputs = []
+    inputs = []
+    clobbers = []
+    if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
+        pos += 1
+        if pos < len(tokens) and tokens[pos].type not in (TokenType.COLON, TokenType.RPAREN):
+            while True:
+                if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+                    raise ParseError('Expected constraint string', tokens[pos] if pos < len(tokens) else tok)
+                constraint = tokens[pos].value
+                pos += 1
+                if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+                    raise ParseError('Expected "(" after constraint', tokens[pos] if pos < len(tokens) else tok)
+                pos += 1
+                var_expr, pos = parse_expression(tokens, pos)
+                if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                    raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else tok)
+                pos += 1
+                outputs.append((constraint, var_expr))
+                if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                    pos += 1
+                else:
+                    break
+        if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
+            pos += 1
+            if pos < len(tokens) and tokens[pos].type not in (TokenType.COLON, TokenType.RPAREN):
+                while True:
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+                        raise ParseError('Expected constraint string', tokens[pos] if pos < len(tokens) else tok)
+                    constraint = tokens[pos].value
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+                        raise ParseError('Expected "(" after constraint', tokens[pos] if pos < len(tokens) else tok)
+                    pos += 1
+                    arg_expr, pos = parse_expression(tokens, pos)
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                        raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else tok)
+                    pos += 1
+                    inputs.append((constraint, arg_expr))
+                    if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                        pos += 1
+                    else:
+                        break
+        if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
+            pos += 1
+            while True:
+                if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+                    raise ParseError('Expected clobber string', tokens[pos] if pos < len(tokens) else tok)
+                clobbers.append(tokens[pos].value)
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                    pos += 1
+                else:
+                    break
+    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+        raise ParseError('Expected ")" after asm', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    return InlineAsm(template, outputs, inputs, clobbers, volatile=volatile, token=tok), pos
+
+
 def parse_block(tokens: list[Token], pos: int = 0):
     stmts = []
     while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
@@ -1021,6 +1167,9 @@ def parse_statement(tokens: list[Token], pos: int):
 
     if tok.type == TokenType.KEYWORD and tok.value == 'raise':
         return parse_raise(tokens, pos)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+        return parse_inline_asm(tokens, pos)
 
     if tok.type == TokenType.IDENTIFIER:
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):

@@ -57,3 +57,7 @@ char* input_str(void) {
     buf[len] = '\0';
     return buf;
 }
+
+int __cpy_strcmp(const char *s1, const char *s2) {
+    return strcmp(s1, s2);
+}

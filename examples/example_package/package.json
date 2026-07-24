@@ -1,0 +1,23 @@
+{
+  "name": "example_package",
+  "version": "1.0.0",
+  "capabilities": {
+    "keywords": ["async", "await", "defer"],
+    "operators": ["~~"],
+    "tags": ["@async", "@callback"],
+    "macros": ["async_def"],
+    "custom_types": ["Promise", "Future"]
+  },
+  "extensions": {
+    "parser_hooks": ["parser_hooks.py"],
+    "semantic_hooks": ["semantic_hooks.py"],
+    "codegen_hooks": ["codegen_hooks.py"],
+    "runtime_hooks": ["runtime_hooks.py"]
+  },
+  "dependencies": [],
+  "metadata": {
+    "description": "Example package demonstrating Cpyte extension capabilities",
+    "author": "Cpyte Team",
+    "license": "MIT"
+  }
+}

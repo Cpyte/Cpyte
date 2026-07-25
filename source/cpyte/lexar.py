@@ -72,6 +72,7 @@ _BASE_KEYWORDS = {
     'let',
     'try', 'except', 'raise',
     'asm',
+    'enum', 'type',
 }
 
 # Additional keywords registered by packages

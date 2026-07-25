@@ -27,6 +27,7 @@ from .astparse import (
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
     InputStr, Signed67, Try, Raise, ExceptHandler, InlineAsm,
+    EnumDef, TypeAlias,
     parse_file, ParseError,
 )
 from .clib import resolve_library, parse_header_file, parse_c_source
@@ -360,6 +361,12 @@ class SemanticAnalyzer:
                 return None
             if sym.const_value is not None:
                 node.const_value = sym.const_value
+            if sym.kind in ('enum', 'struct'):
+                node.inferred_type = node.name
+                return node.name
+            if sym.kind == 'type_alias':
+                node.inferred_type = sym.type
+                return sym.type
             node.inferred_type = sym.type
             return sym.type
 
@@ -581,6 +588,17 @@ class SemanticAnalyzer:
             obj_t = self._infer_type(node.obj)
             if obj_t:
                 lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
+                sym = self.current_scope.lookup(lookup_t)
+                if sym and sym.kind == 'enum':
+                    member_sym = self.current_scope.lookup(f'{lookup_t}.{node.name}')
+                    if member_sym and member_sym.kind == 'enum_member':
+                        node._enum_member_value = member_sym.const_value
+                        return 'int'
+                    self.error(
+                        f'enum `{lookup_t}` has no member `{node.name}`',
+                        node
+                    )
+                    return None
                 struct_sym = self.current_scope.lookup(lookup_t)
                 if struct_sym and struct_sym.kind == 'struct' and struct_sym.node:
                     for field in struct_sym.node.fields:
@@ -707,6 +725,10 @@ class SemanticAnalyzer:
             self._visit_import(node)
         elif isinstance(node, StructDef):
             self._visit_struct(node, scope)
+        elif isinstance(node, EnumDef):
+            self._visit_enum(node, scope)
+        elif isinstance(node, TypeAlias):
+            self._visit_type_alias(node, scope)
         elif isinstance(node, Try):
             self._visit_try(node, scope)
         elif isinstance(node, Raise):
@@ -1160,7 +1182,8 @@ class SemanticAnalyzer:
             self._infer_type(node.target)
 
     def _visit_vardecl(self, node: VarDecl, scope: Scope | None = None):
-        val_type = node.var_type
+        val_type = self._resolve_type_alias(node.var_type)
+        node.var_type = val_type
         s = scope or self.current_scope
         existing = s.lookup_local(node.name)
         if existing:
@@ -1283,6 +1306,54 @@ class SemanticAnalyzer:
         for field in node.fields:
             struct_scope.define(field.name, Symbol('field', field.type_expr, node))
 
+    def _visit_enum(self, node: EnumDef, scope: Scope | None = None):
+        s = scope or self.globals
+        existing = s.lookup_local(node.name)
+        if existing:
+            self.error(f'redefinition of enum `{node.name}`', node)
+            return
+        s.define(node.name, Symbol('enum', None, node))
+        for i, member in enumerate(node.members):
+            if member['value'] is not None:
+                val = self._eval_const_expr(member['value'])
+                member['_const_value'] = val
+            else:
+                member['_const_value'] = i
+                member['_auto_index'] = i
+            sym = Symbol('enum_member', node.name, node)
+            sym.const_value = member['_const_value']
+            s.define(f'{node.name}.{member["name"]}', sym)
+
+    def _visit_type_alias(self, node: TypeAlias, scope: Scope | None = None):
+        s = scope or self.globals
+        existing = s.lookup_local(node.name)
+        if existing:
+            self.error(f'redefinition of type alias `{node.name}`', node)
+            return
+        s.define(node.name, Symbol('type_alias', node.target_type, node))
+
+    def _eval_const_expr(self, node):
+        if isinstance(node, Number):
+            return node.value
+        if isinstance(node, UnaryOp):
+            val = self._eval_const_expr(node.operand)
+            if node.op.name == 'MINUS':
+                return -val
+            if node.op.name == 'NOT':
+                return not val
+        if isinstance(node, BinOp):
+            left = self._eval_const_expr(node.left)
+            right = self._eval_const_expr(node.right)
+            match node.op.name:
+                case 'PLUS': return left + right
+                case 'MINUS': return left - right
+                case 'STAR': return left * right
+                case 'SLASH': return left // right
+                case 'PERCENT': return left % right
+        if isinstance(node, Variable):
+            return node.const_value
+        return None
+
     def _visit_while(self, node, scope: Scope | None = None):
         if isinstance(node, While):
             self._infer_type(node.cond)
@@ -1313,6 +1384,14 @@ class SemanticAnalyzer:
             self._visit(stmt, loop_scope)
         self._loop_depth -= 1
         self.locals = old_locals
+
+    def _resolve_type_alias(self, type_name):
+        if type_name is None:
+            return None
+        sym = self.current_scope.lookup(type_name)
+        if sym and sym.kind == 'type_alias':
+            return self._resolve_type_alias(sym.type)
+        return type_name
 
 
 def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True) -> str | None:

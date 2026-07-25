@@ -107,6 +107,15 @@ class LLVM:
 
     def __init__(self, no_userspace=False, enable_extensions=True):
         self.module = ir.Module("main")
+        try:
+            import llvmlite.binding as _binding
+            _binding.initialize_native_target()
+            _target = _binding.Target.from_default_triple()
+            _tm = _target.create_target_machine()
+            self.module.triple = _tm.triple
+            self.module.data_layout = _tm.target_data.get_data_layout()
+        except Exception:
+            pass
         self.builder = None
         self.functions = {}
         self.global_vars = {}
@@ -674,6 +683,9 @@ class LLVM:
         return self.builder.gep(obj, [idx], inbounds=True)
 
     def emit_attr(self, node: Attr):
+        enum_val = getattr(node, '_enum_member_value', None)
+        if enum_val is not None:
+            return ir.Constant(ir.IntType(32), enum_val)
         ptr = self._emit_lvalue_attr(node)
         return self.builder.load(ptr)
 
@@ -1067,6 +1079,18 @@ class LLVM:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
                     return self.builder.icmp_signed('>=', cmp, ir.Constant(_i64, 0))
 
+        # String equality via strcmp (content, not pointer comparison)
+        if node.op in (TokenType.EQ_EQ, TokenType.NOT_EQ):
+            left_str = getattr(node.left, 'inferred_type', None) == 'str'
+            right_str = getattr(node.right, 'inferred_type', None) == 'str'
+            if left_str and right_str:
+                cmp = self.builder.call(self._strcmp_fn, [left, right])
+                zero = ir.Constant(_i32, 0)
+                if node.op == TokenType.EQ_EQ:
+                    return self.builder.icmp_signed('==', cmp, zero)
+                else:
+                    return self.builder.icmp_signed('!=', cmp, zero)
+
         left, right = self._promote(left, right)
         is_float = isinstance(left.type, ir.DoubleType) or isinstance(right.type, ir.DoubleType)
         if is_float:
@@ -1095,20 +1119,6 @@ class LLVM:
                     return self.builder.fcmp_ordered('==', left, right)
                 case TokenType.NOT_EQ:
                     return self.builder.fcmp_ordered('!=', left, right)
-
-        # String equality via strcmp (content, not pointer comparison)
-        if node.op in (TokenType.EQ_EQ, TokenType.NOT_EQ):
-            left_str = getattr(node.left, 'inferred_type', None) == 'str'
-            right_str = getattr(node.right, 'inferred_type', None) == 'str'
-            if left_str and right_str:
-                fnty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
-                fn = ir.Function(self.module, fnty, '__cpy_strcmp')
-                cmp = self.builder.call(fn, [left, right])
-                zero = ir.Constant(_i32, 0)
-                if node.op == TokenType.EQ_EQ:
-                    return self.builder.icmp_signed('==', cmp, zero)
-                else:
-                    return self.builder.icmp_signed('!=', cmp, zero)
 
         match node.op:
             case TokenType.PLUS:

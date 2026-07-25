@@ -82,13 +82,15 @@ def optimize(mod, opt_level=3):
     npm.run(mod, pb)
 
 
-def _compile_sources_object(src_files, target_triple=None):
+def _compile_sources_object(src_files, target_triple=None, pic=False):
     objs = []
     for src in src_files:
         obj = src.rsplit('.', 1)[0] + '.o'
         cmd = ['clang', '-c', '-O3', '-o', obj, src]
         if target_triple:
             cmd.extend(['-target', target_triple])
+        if pic:
+            cmd.append('-fPIC')
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
@@ -110,7 +112,7 @@ def _maybe_compile(module):
         return prog, src_files
     return module, None
 
-def run_jit(module, opt_level=3, src_files=None, no_userspace=False):
+def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
     module, src_files_auto = _maybe_compile(module)
     if src_files_auto is not None:
         src_files = src_files_auto
@@ -128,16 +130,15 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False):
                 with open(src) as f:
                     src_ir = f.read()
             else:
-                ll = src.rsplit('.', 1)[0] + '.ll'
                 r = subprocess.run(
                     ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
-                     '-fno-stack-protector', '-o', ll, src],
-                    capture_output=True, text=True
-                )
+                     '-fno-stack-protector', '-o', '-', src],
+                    capture_output=True, text=True)
+
                 if r.returncode != 0:
                     print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
                     raise SystemExit(1)
-                src_ir = open(ll).read()
+                src_ir = r.stdout
             src_ir = _remove_probe_stack_ir(src_ir)
             src_mod = binding.parse_assembly(src_ir)
             binding.link_modules(mod, src_mod)
@@ -233,6 +234,15 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False):
                  argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int])
 
     try:
+        fn = mod.get_function('strcmp')
+        cfunctype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
+        cfn = cfunctype(_libc.strcmp)
+        _callbacks.append(cfn)
+        engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
+    except NameError:
+        pass
+
+    try:
         fn = mod.get_function('__cpy_strcmp')
         cfunctype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
         cfn = cfunctype(_libc.strcmp)
@@ -271,7 +281,7 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
         pass
 
 
-def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False):
+def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False):
     llvm_ir = str(module)
     import llvmlite.binding as binding
     binding.initialize_native_target()
@@ -285,7 +295,10 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     mod.verify()
 
     target = binding.Target.from_default_triple()
-    target_machine = target.create_target_machine()
+    if pic:
+        target_machine = target.create_target_machine(reloc='pic')
+    else:
+        target_machine = target.create_target_machine()
 
     obj = target_machine.emit_object(mod)
 
@@ -295,8 +308,11 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     objs = [output]
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
+        cmd = ['clang', '-c', '-O3', '-o', src_obj, src]
+        if pic:
+            cmd.append('-fPIC')
         r = subprocess.run(
-            ['clang', '-c', '-O3', '-o', src_obj, src],
+            cmd,
             capture_output=True, text=True
         )
         if r.returncode != 0:
@@ -306,8 +322,11 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     
     if not no_userspace:
         runtime_obj = output + '.runtime.o'
+        cmd = ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C]
+        if pic:
+            cmd.append('-fPIC')
         r = subprocess.run(
-            ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C],
+            cmd,
             capture_output=True, text=True
         )
         if r.returncode == 0:

@@ -283,9 +283,9 @@ def _collect_frameworks(nodes):
     return list(set(frameworks))
 
 
-def cmd_build(args, tab_size=4, strict=False, no_userspace=False):
+def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     if not args:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] <source.cpy>', file=sys.stderr)
+        print('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
     output = None
@@ -308,6 +308,9 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False):
         elif a == '--no-userspace':
             no_userspace = True
             i += 1
+        elif a == '--pic':
+            pic = True
+            i += 1
         elif a == '--opt' and i + 1 < len(args):
             opt = int(args[i + 1])
             i += 2
@@ -319,7 +322,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False):
             sys.exit(1)
 
     if not src_file:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] <source.cpy>', file=sys.stderr)
+        print('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
     with open(src_file) as f:
@@ -345,7 +348,10 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False):
     mod.verify()
 
     target = binding.Target.from_default_triple()
-    target_machine = target.create_target_machine()
+    if pic:
+        target_machine = target.create_target_machine(reloc='pic')
+    else:
+        target_machine = target.create_target_machine()
     obj = target_machine.emit_object(mod)
     with open(obj_file, 'wb') as f:
         f.write(obj)
@@ -354,16 +360,16 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False):
     objs = [obj_file]
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
-        l.compile_c(src, output=src_obj, opt_level=opt, debug=debug)
+        l.compile_c(src, output=src_obj, opt_level=opt, debug=debug, pic=pic)
         objs.append(src_obj)
 
     if not no_userspace:
         runtime_obj = out_base + '.runtime.o'
-        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug)
+        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug, pic=pic)
         objs.append(runtime_obj)
 
     executable = output or out_base
-    l.link(objs, executable, opt_level=opt, debug=debug, frameworks=frameworks)
+    l.link(objs, executable, opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
     print(f'Wrote {executable}')
 
 
@@ -374,6 +380,7 @@ def main():
 
     strict = False
     no_userspace = False
+    pic = False
     while args and args[0].startswith('--'):
         flag = args.pop(0)
         if flag == '--tab-size':
@@ -382,6 +389,8 @@ def main():
             strict = True
         elif flag == '--no-userspace':
             no_userspace = True
+        elif flag == '--pic':
+            pic = True
         elif flag == '--ast':
             mode = 'ast'
         elif flag == '--emit-llvm':
@@ -395,12 +404,12 @@ def main():
             sys.exit(1)
 
     if not args:
-        print('Usage: cpy [--tab-size N] [--strict] [--no-userspace] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
-        print('       cpy build [--output O] [--debug] [--opt N] [--no-userspace] <source.cpy>', file=sys.stderr)
+        print('Usage: cpy [--tab-size N] [--strict] [--no-userspace] [--pic] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
+        print('       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
     if args[0] == 'build':
-        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace)
+        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic)
         return
 
     with open(args[0]) as f:
@@ -419,10 +428,10 @@ def main():
     elif mode == 'aot':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         obj_file = 'program.o'
-        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace)
+        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic)
         print(f'Wrote {out_base}')
     else:
-        run_jit(prog, src_files=src_files, no_userspace=no_userspace)
+        run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)
 
 
 if __name__ == '__main__':

@@ -116,11 +116,12 @@ class Index:
         return f'Index({self.obj}, {self.index})'
 
 class Attr:
-    __slots__ = ('obj', 'name', '_token')
+    __slots__ = ('obj', 'name', '_token', '_enum_member_value')
     def __init__(self, obj, name: str, token=None):
         self.obj = obj
         self.name = name
         self._token = token
+        self._enum_member_value = None
     def __repr__(self):
         return f'Attr({self.obj}, {self.name})'
 
@@ -426,6 +427,10 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
         node, pos = parse_try(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == 'raise':
         node, pos = parse_raise(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'enum':
+        node, pos = parse_enum(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'type':
+        node, pos = parse_type_alias(tokens, pos)
     elif tok.type == TokenType.IDENTIFIER and pos + 1 < len(tokens):
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
             try:
@@ -1158,8 +1163,8 @@ def parse_statement(tokens: list[Token], pos: int):
     if tok.type == TokenType.KEYWORD and tok.value == 'switch':
         return parse_switch(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value in ('while', 'for', 'class', 'struct', 'import'):
-        handler = {'while': parse_while, 'for': parse_for, 'class': parse_class, 'struct': parse_struct_def, 'import': parse_import}[tok.value]
+    if tok.type == TokenType.KEYWORD and tok.value in ('while', 'for', 'class', 'struct', 'import', 'enum', 'type'):
+        handler = {'while': parse_while, 'for': parse_for, 'class': parse_class, 'struct': parse_struct_def, 'import': parse_import, 'enum': parse_enum, 'type': parse_type_alias}[tok.value]
         return handler(tokens, pos)
 
     if tok.type == TokenType.KEYWORD and tok.value == 'try':
@@ -1268,8 +1273,26 @@ class Switch:
         self._token = token
     def __repr__(self):
         return f'Switch({self.value}, {self.cases})'
+
+
+class EnumDef:
+    __slots__ = ('name', 'members', '_token')
+    def __init__(self, name: str, members: list, token=None):
+        self.name = name
+        self.members = members
+        self._token = token
     def __repr__(self):
-        return f'Switch({self.value}, {self.cases})'
+        return f'EnumDef({self.name}, {self.members})'
+
+
+class TypeAlias:
+    __slots__ = ('name', 'target_type', '_token')
+    def __init__(self, name: str, target_type, token=None):
+        self.name = name
+        self.target_type = target_type
+        self._token = token
+    def __repr__(self):
+        return f'TypeAlias({self.name}, {self.target_type})'
 
 
 def parse_switch(tokens: list[Token], pos: int):
@@ -1346,6 +1369,61 @@ def parse_generic_params(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.GREATER:
         raise ParseError('Expected ">"', tokens[pos] if pos < len(tokens) else None)
     return params, pos + 1
+
+
+def parse_enum(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        raise ParseError('Expected enum name', tokens[pos] if pos < len(tokens) else None)
+    name = tokens[pos].value
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+        raise ParseError('Expected ":" after enum name', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
+        raise ParseError('Expected newline after ":"', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
+        raise ParseError('Expected indented block', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+
+    members = []
+    while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
+        if tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError('Expected enum member name', tokens[pos])
+        member_name = tokens[pos].value
+        pos += 1
+        member_value = None
+        if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == '=':
+            pos += 1
+            member_value, pos = parse_expression(tokens, pos)
+        members.append({'name': member_name, 'value': member_value, '_token': tokens[pos - 1]})
+        if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+            pos += 1
+
+    if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
+        pos += 1
+
+    return EnumDef(name, members, token=tok), pos
+
+
+def parse_type_alias(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        raise ParseError('Expected type alias name', tokens[pos] if pos < len(tokens) else None)
+    name = tokens[pos].value
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.EQUAL:
+        raise ParseError('Expected "="', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+    target_type, pos = parse_type(tokens, pos)
+    target_type_str = _type_to_str(target_type) if isinstance(target_type, tuple) else target_type
+    _expect_newline(tokens, pos, tok)
+    if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+        pos += 1
+    return TypeAlias(name, target_type_str, token=tok), pos
 
 
 def parse_def(tokens: list[Token], pos: int):

@@ -35,13 +35,15 @@ class Linker:
     def cc(self):
         return self._cc
 
-    def compile_c(self, src, output=None, opt_level=3, debug=False):
+    def compile_c(self, src, output=None, opt_level=3, debug=False, pic=False):
         if output is None:
             base = src.rsplit('.', 1)[0] if '.' in src else src
             output = base + '.o'
         cmd = [self._cc, '-c']
         if debug:
             cmd.append('-g')
+        if pic:
+            cmd.append('-fPIC')
         if opt_level is not None:
             cmd.append(f'-O{opt_level}')
         cmd.extend(['-o', output, src])
@@ -52,10 +54,12 @@ class Linker:
         return output
 
     def link(self, objects, output, libraries=None, library_paths=None,
-             shared=False, debug=False, opt_level=3, frameworks=None):
+             shared=False, debug=False, opt_level=3, frameworks=None, pic=False):
         cmd = [self._cc]
         if shared:
             cmd.append('-shared')
+        if pic:
+            cmd.append('-fPIC')
         if debug:
             cmd.append('-g')
         if opt_level is not None:
@@ -77,13 +81,13 @@ class Linker:
 
 
 def build(objects, output=None, libraries=None, library_paths=None,
-          shared=False, debug=False, opt_level=3, cc=None, frameworks=None):
+          shared=False, debug=False, opt_level=3, cc=None, frameworks=None, pic=False):
     linker = Linker(cc)
 
     final_objects = []
     for src in objects:
         if src.endswith('.c'):
-            obj = linker.compile_c(src, opt_level=opt_level, debug=debug)
+            obj = linker.compile_c(src, opt_level=opt_level, debug=debug, pic=pic)
             final_objects.append(obj)
         else:
             final_objects.append(src)
@@ -100,5 +104,5 @@ def build(objects, output=None, libraries=None, library_paths=None,
         libraries=libraries, library_paths=library_paths,
         shared=shared,
         debug=debug, opt_level=opt_level,
-        frameworks=frameworks,
+        frameworks=frameworks, pic=pic,
     )

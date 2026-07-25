@@ -209,8 +209,13 @@ class HookRegistry:
         """Get the current compiler context."""
         return self._context.copy()
     
+    def _is_duplicate(self, existing_list, package_name, hook_path) -> bool:
+        return any(r.package_name == package_name and r.hook_path == hook_path for r in existing_list)
+
     def register_lexer_hook(self, hook: LexerHook, priority: int = 0) -> None:
         """Register a lexer hook."""
+        if self._is_duplicate(self._lexer_hooks, hook.package_name, hook.hook_path):
+            return
         registration = HookRegistration(
             hook=hook,
             priority=priority,
@@ -219,9 +224,11 @@ class HookRegistry:
         )
         self._lexer_hooks.append(registration)
         self._lexer_hooks.sort(key=lambda r: r.priority, reverse=True)
-    
+
     def register_parser_hook(self, hook: ParserHook, priority: int = 0) -> None:
         """Register a parser hook."""
+        if self._is_duplicate(self._parser_hooks, hook.package_name, hook.hook_path):
+            return
         registration = HookRegistration(
             hook=hook,
             priority=priority,
@@ -230,9 +237,11 @@ class HookRegistry:
         )
         self._parser_hooks.append(registration)
         self._parser_hooks.sort(key=lambda r: r.priority, reverse=True)
-    
+
     def register_semantic_hook(self, hook: SemanticHook, priority: int = 0) -> None:
         """Register a semantic analysis hook."""
+        if self._is_duplicate(self._semantic_hooks, hook.package_name, hook.hook_path):
+            return
         registration = HookRegistration(
             hook=hook,
             priority=priority,
@@ -244,6 +253,8 @@ class HookRegistry:
     
     def register_codegen_hook(self, hook: CodegenHook, priority: int = 0) -> None:
         """Register a code generation hook."""
+        if self._is_duplicate(self._codegen_hooks, hook.package_name, hook.hook_path):
+            return
         registration = HookRegistration(
             hook=hook,
             priority=priority,
@@ -252,9 +263,11 @@ class HookRegistry:
         )
         self._codegen_hooks.append(registration)
         self._codegen_hooks.sort(key=lambda r: r.priority, reverse=True)
-    
+
     def register_runtime_hook(self, hook: RuntimeHook, priority: int = 0) -> None:
         """Register a runtime hook."""
+        if self._is_duplicate(self._runtime_hooks, hook.package_name, hook.hook_path):
+            return
         registration = HookRegistration(
             hook=hook,
             priority=priority,

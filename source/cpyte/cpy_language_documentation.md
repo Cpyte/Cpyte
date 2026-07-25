@@ -6,7 +6,7 @@
 
 ## Overview
 
-Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, manual memory management, direct C interoperability, and compilation to native machine code via LLVM.
+Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, automatic memory management (Boehm GC), direct C interoperability, and compilation to native machine code via LLVM.
 
 ## Table of Contents
 
@@ -30,7 +30,7 @@ Cpy is a compiled programming language that combines Python-like syntax with sys
 Cpy combines high-level language syntax with low-level system programming capabilities. The language targets developers who need:
 
 - **Performance**: Native compilation via LLVM with optimization levels
-- **Control**: Manual memory management with pointer operations
+- **Control**: Automatic memory management (Boehm GC) with pointer operations
 - **Interoperability**: C library integration
 - **Safety**: Static type checking with semantic analysis
 - **Productivity**: Python-inspired syntax
@@ -232,7 +232,7 @@ bool is_error = false
 
 ### Pointer Types
 
-Cpy supports pointers for manual memory management:
+Cpy supports pointers with automatic garbage collection:
 
 ```cpy
 int* ptr           # Pointer to integer
@@ -1044,12 +1044,13 @@ int* second = arr + 1
 
 ### Memory Safety Considerations
 
-Cpy provides manual memory management:
+Cpy uses Boehm GC for automatic memory management:
 
-- **Memory leaks**: Free allocated memory when no longer needed
-- **Dangling pointers**: Avoid using pointers to freed memory
+- **No manual free needed**: Objects allocated with `new` are automatically collected
+- **Dangling pointers**: Still possible if pointers outlive collected objects
 - **Buffer overflows**: Ensure array accesses are within bounds
 - **Null pointer dereferences**: Check pointers before dereferencing
+- **Note**: Boehm GC adds a small runtime overhead compared to manual `malloc/free`
 
 ---
 
@@ -1449,8 +1450,8 @@ public def main() -> int:
 ### Current Limitations
 
 1. **Limited standard library**: Basic I/O and mathematical operations
-2. **Manual memory management**: No garbage collection
-3. **No exception handling**: Error handling through return codes
+2. **Boehm GC overhead**: Automatic garbage collection adds small runtime overhead
+3. **Limited exception handling**: Basic try/except support
 4. **Limited generics**: Basic generic type support
 5. **No modules system**: All code in single file or C imports
 6. **No 64-bit operations in standard library**: 64-bit types are supported but utility functions are limited
@@ -1458,7 +1459,7 @@ public def main() -> int:
 ### Potential Future Enhancements
 
 1. **Enhanced standard library**: More comprehensive built-in functions
-2. **Optional garbage collection**: Hybrid memory management
+2. **Generational GC**: Optimize garbage collection for better performance
 3. **Exception handling**: Structured error handling mechanism
 4. **Advanced generics**: More sophisticated generic programming
 5. **Module system**: Better code organization and reuse

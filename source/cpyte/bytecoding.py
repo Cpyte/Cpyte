@@ -131,6 +131,9 @@ class LLVM:
         self.loop_stack = []
         self._malloc_fn = None
         self._free_fn = None
+        self._gc_alloc_fn = None
+        self._gc_mark_fn = None
+        self._gc_root_register_fn = None
         self._strlen_fn = None
         self._memcpy_fn = None
         self.no_userspace = no_userspace
@@ -177,6 +180,24 @@ class LLVM:
             ('bigint_print', _void, [_i8ptr]),
         ]
         for name, ret, args in bignum_fns:
+            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+            self.functions[name] = fn
+
+        # Boehm GC runtime functions
+        gc_fns = [
+            ('GC_init', _void, []),
+            ('GC_malloc', _i8ptr, [_i64]),
+            ('GC_realloc', _i8ptr, [_i8ptr, _i64]),
+            ('GC_free', _void, [_i8ptr]),
+            ('GC_gcollect', _void, []),
+            ('GC_get_heap_size', _i64, []),
+            ('GC_get_free_bytes', _i64, []),
+            ('GC_disable', _void, []),
+            ('GC_enable', _void, []),
+            ('GC_add_roots', _void, [_i8ptr, _i8ptr]),
+            ('GC_remove_roots', _void, [_i8ptr, _i8ptr]),
+        ]
+        for name, ret, args in gc_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
 
@@ -422,6 +443,10 @@ class LLVM:
 
         if wrapper_builder is not None:
             self.builder = wrapper_builder
+            # Initialize Boehm GC at program start
+            gc_init_fn = self.functions.get('GC_init')
+            if gc_init_fn:
+                self.builder.call(gc_init_fn, [])
             for node in toplevel:
                 self.emit(node)
             self.builder.ret(ir.Constant(ir.IntType(32), 0))
@@ -556,19 +581,21 @@ class LLVM:
         return ptr
 
     def _get_malloc_fn(self):
-        fn = self._malloc_fn
+        # Use Boehm GC allocator instead of malloc
+        fn = self._gc_alloc_fn
         if fn is not None:
             return fn
         for f in self.module.functions:
-            if f.name == 'malloc':
-                self._malloc_fn = f
+            if f.name == 'GC_malloc':
+                self._gc_alloc_fn = f
                 return f
         fnty = ir.FunctionType(_i8ptr, [_i64])
-        fn = ir.Function(self.module, fnty, 'malloc')
-        self._malloc_fn = fn
+        fn = ir.Function(self.module, fnty, 'GC_malloc')
+        self._gc_alloc_fn = fn
         return fn
 
     def _get_free_fn(self):
+        # Boehm GC manages memory - free is a no-op but keep for compatibility
         fn = self._free_fn
         if fn is not None:
             return fn
@@ -812,6 +839,12 @@ class LLVM:
         entry = func.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
         self.builder.position_at_end(entry)
+
+        # Initialize Boehm GC in main function
+        if node.name == 'main':
+            gc_init_fn = self.functions.get('GC_init')
+            if gc_init_fn:
+                self.builder.call(gc_init_fn, [])
 
         old_locals = self.locals
         old_local_types = self.local_types

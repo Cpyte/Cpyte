@@ -369,7 +369,8 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
         objs.append(runtime_obj)
 
     executable = output or out_base
-    l.link(objs, executable, opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
+    l.link(objs, executable, libraries=['gc'], library_paths=['/opt/homebrew/opt/bdw-gc/lib'],
+           opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
     print(f'Wrote {executable}')
 
 

@@ -70,3 +70,9 @@ python source/mainpie.py --jit examples/<filename>.cpy
 Cpyte is experimental software. The compiler is continuously tested with fuzzing, and we're still discovering and fixing correctness bugs. While many programs compile and run correctly, I can't make any guarantees about correctness or stability.
 
 If you decide to use Cpyte, always use the latest version — older versions have bugs that are pretty easy to run into.
+
+## Memory Management
+
+Cpyte uses **Boehm GC** (bdw-gc) for automatic garbage collection. Heap-allocated objects (via `new`) are managed automatically — no manual `free` needed.
+
+**Note:** Boehm GC adds a small runtime overhead (~5-10%) compared to manual `malloc/free`. For performance-critical ecosystem projects or embedded use cases, this trade-off may be significant. The GC is required for safety but will slow down programs that do heavy heap allocation.

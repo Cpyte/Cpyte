@@ -207,7 +207,7 @@ def did_open(ls: CpyLanguageServer, params: lsp.DidOpenTextDocumentParams):
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
-def did_change(ls: CpyLanguageServer, params: lsp.DidOpenTextDocumentParams):
+def did_change(ls: CpyLanguageServer, params: lsp.DidChangeTextDocumentParams):
     try:
         logger.info(f"[didChange] {os.path.basename(_uri_to_path(params.text_document.uri))}")
         _do_analyze(ls, params.text_document.uri)

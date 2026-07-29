@@ -27,7 +27,7 @@ from .astparse import (
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
     InputStr, Signed67, Try, Raise, ExceptHandler, InlineAsm,
-    EnumDef, TypeAlias,
+    EnumDef, TypeAlias, ClassDef,
     parse_file, ParseError,
 )
 from .clib import resolve_library, parse_header_file, parse_c_source
@@ -151,6 +151,8 @@ class SemanticAnalyzer:
         self.reporter = Reporter(source)
         self.globals = Scope()
         self.current_func: FuncDef | None = None
+        self.current_class: ClassDef | None = None
+        self._generic_instantiations: dict[str, list[tuple]] = {}  # name -> [(type_args, ...)]
         self.locals: Scope | None = None
         self.filepath = filepath
         self._filedir = os.path.dirname(filepath) if filepath else None
@@ -600,7 +602,7 @@ class SemanticAnalyzer:
                     )
                     return None
                 struct_sym = self.current_scope.lookup(lookup_t)
-                if struct_sym and struct_sym.kind == 'struct' and struct_sym.node:
+                if struct_sym and struct_sym.kind in ('struct', 'class') and struct_sym.node:
                     for field in struct_sym.node.fields:
                         if field.name == node.name:
                             return field.type_expr
@@ -725,6 +727,8 @@ class SemanticAnalyzer:
             self._visit_import(node)
         elif isinstance(node, StructDef):
             self._visit_struct(node, scope)
+        elif isinstance(node, ClassDef):
+            self._visit_class(node, scope)
         elif isinstance(node, EnumDef):
             self._visit_enum(node, scope)
         elif isinstance(node, TypeAlias):
@@ -1036,9 +1040,7 @@ class SemanticAnalyzer:
 
     def _visit_dict(self, node: dict, scope: Scope | None = None):
         t = node.get('type')
-        if t == 'class':
-            self._visit_class(node, scope)
-        elif t == 'while':
+        if t == 'while':
             self._visit_while(node, scope)
         elif t == 'for':
             self._visit_for(node, scope)
@@ -1088,8 +1090,20 @@ class SemanticAnalyzer:
             if self.current_func:
                 expected = self.current_func.rettype
                 if expected and val_type and expected != val_type:
-                    ok = expected == 'str' and val_type == 'char*'
-                    ok = ok or expected == 'char*' and val_type == 'str'
+                    valid_conversions = [
+                        ('int', 'int64'), ('int', 'uint64'),
+                        ('int64', 'int'), ('uint64', 'int'),
+                        ('int64', 'uint64'), ('uint64', 'int64'),
+                        ('float', 'double'), ('double', 'float'),
+                        ('str', 'char*'), ('char*', 'str'),
+                        ('str', 'char'), ('char', 'str'),
+                        ('int', 'big'), ('int64', 'big'), ('uint64', 'big'),
+                        ('big', 'big'),
+                    ]
+                    ok = (val_type, expected) in valid_conversions
+                    ok = ok or (val_type == 'int' and expected.endswith('*'))
+                    ok = ok or (val_type == 'str' and (expected.endswith('*') or expected == 'char'))
+                    ok = ok or (expected == 'str' and (val_type.endswith('*') or val_type == 'char'))
                     if not ok:
                         self.error(
                             f'return type `{val_type}` does not match declared return type `{expected}`',
@@ -1184,6 +1198,8 @@ class SemanticAnalyzer:
     def _visit_vardecl(self, node: VarDecl, scope: Scope | None = None):
         val_type = self._resolve_type_alias(node.var_type)
         node.var_type = val_type
+        if val_type:
+            self._check_generic_type(val_type)
         s = scope or self.current_scope
         existing = s.lookup_local(node.name)
         if existing:
@@ -1254,27 +1270,44 @@ class SemanticAnalyzer:
     def _visit_print(self, node: Print):
         self._infer_type(node.value)
 
-    def _visit_class(self, node: dict, scope: Scope | None = None):
+    def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals
-        class_sym = Symbol('class', None, node)
-        s.define(node['name'], class_sym)
+        class_sym = Symbol('class', node.name, node)
+        s.define(node.name, class_sym)
         class_scope = Scope(s)
-        base = node.get('base')
-        if base:
-            base_sym = s.lookup(base)
+
+        # Resolve base class
+        base_sym = None
+        if node.base:
+            base_sym = s.lookup(node.base)
             if base_sym is None or base_sym.kind != 'class':
-                self.error(f'base class `{base}` not found', node)
-            elif base_sym.node:
-                for stmt in base_sym.node.get('body', []):
-                    if isinstance(stmt, FuncDef):
-                        existing = class_scope.lookup_local(stmt.name)
-                        if not existing:
-                            sym = Symbol(stmt.visibility or 'public', stmt.rettype or 'void', stmt)
-                            class_scope.define(stmt.name, sym)
-        for stmt in node.get('body', []):
-            if isinstance(stmt, FuncDef) and class_scope.lookup_local(stmt.name):
-                class_scope.undefine(stmt.name)
-            self._visit(stmt, class_scope)
+                self.error(f'base class `{node.base}` not found', node)
+            elif base_sym.node and isinstance(base_sym.node, ClassDef):
+                # Copy base class fields (for memory layout)
+                for f in base_sym.node.fields:
+                    class_scope.define(f.name, Symbol('field', f.type_expr, f))
+                # Copy base class methods
+                for m in base_sym.node.methods:
+                    existing = class_scope.lookup_local(m.name)
+                    if not existing:
+                        sym = Symbol(m.visibility or 'public', m.rettype or 'void', m)
+                        class_scope.define(m.name, sym)
+
+        # Register fields in class scope
+        for f in node.fields:
+            existing = class_scope.lookup_local(f.name)
+            if existing:
+                class_scope.undefine(f.name)
+            class_scope.define(f.name, Symbol('field', f.type_expr, f))
+
+        # Visit methods (second pass: analyze bodies, which registers signatures)
+        old_class = self.current_class
+        self.current_class = node
+        for m in node.methods:
+            # Inject 'this' parameter implicitly
+            m.params = {'this': node.name + '*', **m.params}
+            self._visit_funcdef(m, class_scope)
+        self.current_class = old_class
 
     def _visit_try(self, node: Try, scope: Scope | None = None):
         for stmt in node.body:
@@ -1323,6 +1356,41 @@ class SemanticAnalyzer:
             sym = Symbol('enum_member', node.name, node)
             sym.const_value = member['_const_value']
             s.define(f'{node.name}.{member["name"]}', sym)
+
+    def _check_generic_type(self, type_str: str):
+        """If type_str is a generic instantiation like 'Pair<int, string>',
+        record that the base struct needs monomorphization."""
+        if not type_str or '<' not in type_str:
+            return
+        idx = type_str.index('<')
+        base_name = type_str[:idx]
+        struct_sym = self.globals.lookup(base_name)
+        if struct_sym and struct_sym.kind == 'struct' and isinstance(struct_sym.node, StructDef):
+            if struct_sym.node.generic_params:
+                args_str = type_str[idx+1:-1]  # strip < and >
+                # Split on commas (respecting nested generics)
+                args = []
+                depth = 0
+                current = ''
+                for ch in args_str:
+                    if ch == '<':
+                        depth += 1
+                        current += ch
+                    elif ch == '>':
+                        depth -= 1
+                        current += ch
+                    elif ch == ',' and depth == 0:
+                        args.append(current.strip())
+                        current = ''
+                    else:
+                        current += ch
+                if current.strip():
+                    args.append(current.strip())
+                args_tuple = tuple(args)
+                if base_name not in self._generic_instantiations:
+                    self._generic_instantiations[base_name] = []
+                if args_tuple not in self._generic_instantiations[base_name]:
+                    self._generic_instantiations[base_name].append(args_tuple)
 
     def _visit_type_alias(self, node: TypeAlias, scope: Scope | None = None):
         s = scope or self.globals
@@ -1394,11 +1462,11 @@ class SemanticAnalyzer:
         return type_name
 
 
-def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True) -> str | None:
+def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True):
     analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root, enable_extensions=enable_extensions)
     # Pre-load CPM package manifests before analysis
     if enable_extensions:
         analyzer._load_cpm_package_manifests()
-    if analyzer.analyze(nodes):
-        return None
-    return analyzer.reporter.display()
+    if not analyzer.analyze(nodes):
+        return analyzer.reporter.display(), None
+    return None, analyzer._generic_instantiations

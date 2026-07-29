@@ -6,12 +6,9 @@ import sys
 import warnings
 
 from ._bignum_bc import load_bignum_bc
+from ._gc_bc import load_gc_bc
 
-# ctypes warns "memory leak in callback function" when a CFUNCTYPE wrapper
-# is garbage collected, even if no C code will ever call it again.  We keep
-# all runtime callbacks alive in _callbacks for the program's lifetime, but
-# the warning still fires during interpreter shutdown when module globals are
-# cleared.  This is harmless so we suppress it.
+# Suppress ctypes callback cleanup warning during shutdown (harmless)
 warnings.filterwarnings("ignore", category=RuntimeWarning,
                         message="memory leak in callback function")
 
@@ -146,6 +143,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
 
+    gc_mod = load_gc_bc()
+    binding.link_modules(mod, gc_mod)
+
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()
@@ -252,48 +252,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
     except NameError:
         pass
 
-    # Map Boehm GC functions
-    # NOTE: Boehm GC cannot safely scan JIT'd code stacks on ARM64 macOS
-    # because JIT'd frames lack DWARF unwind info. For JIT, GC_malloc
-    # falls back to malloc (no collection needed - process exits immediately).
-    # For AOT, Boehm GC works normally via libgc linkage (-lgc).
-    try:
-        _libgc = ctypes.CDLL('/opt/homebrew/lib/libgc.dylib')
-        _gc_fns = {
-            'GC_init': (None, []),
-            'GC_realloc': (ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_size_t]),
-            'GC_free': (None, [ctypes.c_void_p]),
-            'GC_gcollect': (None, []),
-            'GC_get_heap_size': (ctypes.c_size_t, []),
-            'GC_get_free_bytes': (ctypes.c_size_t, []),
-            'GC_disable': (None, []),
-            'GC_enable': (None, []),
-            'GC_add_roots': (None, [ctypes.c_void_p, ctypes.c_void_p]),
-            'GC_remove_roots': (None, [ctypes.c_void_p, ctypes.c_void_p]),
-        }
-        for gc_name, (gc_restype, gc_argtypes) in _gc_fns.items():
-            try:
-                fn = mod.get_function(gc_name)
-                if gc_argtypes:
-                    cfunctype = ctypes.CFUNCTYPE(gc_restype, *gc_argtypes)
-                else:
-                    cfunctype = ctypes.CFUNCTYPE(gc_restype)
-                cfn = cfunctype(getattr(_libgc, gc_name))
-                _callbacks.append(cfn)
-                engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
-            except (NameError, AttributeError):
-                pass
-        # For JIT: map GC_malloc to malloc (avoids Boehm stack scanning crashes)
-        try:
-            fn = mod.get_function('GC_malloc')
-            cfunctype = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)
-            cfn = cfunctype(_libc.malloc)
-            _callbacks.append(cfn)
-            engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
-        except (NameError, AttributeError):
-            pass
-    except OSError:
-        pass
+    # GC functions come from the linked gc_runtime bitcode
 
     engine.finalize_object()
     engine.run_static_constructors()
@@ -334,6 +293,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     mod = binding.parse_assembly(llvm_ir)
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
+    gc_mod = load_gc_bc()
+    binding.link_modules(mod, gc_mod)
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()
@@ -378,8 +339,7 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
 
     out_name = output.rsplit('.', 1)[0] if '.' in output else output
     r = subprocess.run(
-        ['clang', '-O3', '-o', out_name] + objs + ['-lgc', '-lm',
-         '-L/opt/homebrew/opt/bdw-gc/lib', '-I/opt/homebrew/opt/bdw-gc/include'],
+        ['clang', '-O3', '-o', out_name] + objs + ['-lm'],
         capture_output=True, text=True
     )
     if r.returncode != 0:

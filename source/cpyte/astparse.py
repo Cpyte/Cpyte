@@ -37,33 +37,6 @@ def _get_all_parser_hooks(enable_extensions: bool) -> List[Any]:
     return hooks
 
 
-def parse_f(tree: list[Token]):
-    node = {}
-
-    node["type"] = tree[0].value
-    node["name"] = tree[1].value
-
-    i = 3
-    params = {}
-
-    while i < len(tree) and tree[i].type != TokenType.RPAREN:
-        if tree[i].type != TokenType.IDENTIFIER:
-            i += 1
-            continue
-        param_name = tree[i].value
-        i += 1
-        while i < len(tree) and tree[i].type != TokenType.IDENTIFIER:
-            i += 1
-        if i < len(tree) and tree[i].type == TokenType.IDENTIFIER:
-            param_type = tree[i].value
-            i += 1
-            params[param_name] = param_type
-
-    node["params"] = params
-    node["body"] = tree[i + 1:] if i < len(tree) else []
-
-    return node
-
 def _loc(node):
     token = getattr(node, '_token', None)
     if token:
@@ -519,6 +492,7 @@ def parse_class(tokens: list[Token], pos: int):
         raise ParseError('Expected class name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
     pos += 1
+    generic_params, pos = parse_generic_params(tokens, pos)
     base = None
     if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
         pos += 1
@@ -530,7 +504,15 @@ def parse_class(tokens: list[Token], pos: int):
             raise ParseError('Expected ")" after base class name', tokens[pos] if pos < len(tokens) else None)
         pos += 1
     body, pos = parse_suite(tokens, pos)
-    return {'type': 'class', 'name': name, 'base': base, 'body': body, '_token': tok}, pos
+    fields = []
+    methods = []
+    for stmt in body:
+        if isinstance(stmt, FuncDef):
+            methods.append(stmt)
+        elif isinstance(stmt, VarDecl):
+            fields.append(Field(stmt.name, stmt.var_type, token=stmt._token))
+    return ClassDef(name, base=base, fields=fields, methods=methods,
+                    generic_params=generic_params, token=tok), pos
 
 
 def parse_try(tokens: list[Token], pos: int):
@@ -737,13 +719,14 @@ class If:
         return f'If({self.cond}, {self.body}, {self.orelse})'
 
 class FuncDef:
-    __slots__ = ('name', 'params', 'rettype', 'body', 'visibility', '_token')
-    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, token=None):
+    __slots__ = ('name', 'params', 'rettype', 'body', 'visibility', 'generic_params', '_token')
+    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, token=None):
         self.name = name
         self.params = params
         self.rettype = rettype
         self.body = body
         self.visibility = visibility
+        self.generic_params = generic_params or []
         self._token = token
     def __repr__(self):
         vis = f'{self.visibility} ' if self.visibility else ''
@@ -926,6 +909,20 @@ class InlineAsm:
         return f'InlineAsm({self.template}, volatile={self.volatile})'
 
 
+class ClassDef:
+    __slots__ = ('name', 'base', 'fields', 'methods', 'generic_params', '_token')
+    def __init__(self, name: str, base: str | None = None, fields: list | None = None,
+                 methods: list | None = None, generic_params: list | None = None, token=None):
+        self.name = name
+        self.base = base
+        self.fields = fields or []
+        self.methods = methods or []
+        self.generic_params = generic_params or []
+        self._token = token
+    def __repr__(self):
+        return f'ClassDef({self.name}, base={self.base}, fields={self.fields}, methods={self.methods})'
+
+
 def parse_inline_asm(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
@@ -1058,6 +1055,9 @@ def _looks_like_type(tokens, pos):
                     depth += 1
                 elif tokens[i].type == TokenType.GREATER:
                     depth -= 1
+                elif tokens[i].type == TokenType.COMMA and depth == 1:
+                    i += 1
+                    continue
                 i += 1
             continue
         break
@@ -1087,17 +1087,17 @@ def parse_type(tokens: list[Token], pos: int):
         if t.type == TokenType.LBRACKET:
             if pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.RBRACKET:
                 pos += 2
-                base = base + '[]'
+                base = _type_to_str(base) + '[]' if not isinstance(base, str) else base + '[]'
                 continue
             break
         elif t.type == TokenType.STAR:
-            base = base + '*'
+            base = _type_to_str(base) + '*'
             pos += 1
         elif t.type == TokenType.POW:
-            base = base + '**'
+            base = _type_to_str(base) + '**'
             pos += 1
         elif t.type == TokenType.AMPERSAND:
-            base = base + '&'
+            base = _type_to_str(base) + '&'
             pos += 1
         elif t.type == TokenType.LESS and isinstance(base, str):
             pos += 1
@@ -1112,7 +1112,7 @@ def parse_type(tokens: list[Token], pos: int):
                 raise ParseError('Expected ">" to close generic type', t)
             pos += 1
             base = (base, tuple(params))
-            break
+            continue
         else:
             break
     return base, pos
@@ -1434,7 +1434,7 @@ def parse_def(tokens: list[Token], pos: int):
     params, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return FuncDef(name, params, body, rettype, token=tok), pos
+    return FuncDef(name, params, body, rettype, generic_params=generic_params, token=tok), pos
 
 
 def _is_assignable(expr):

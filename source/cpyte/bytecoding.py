@@ -50,9 +50,19 @@ class LLVM:
             return ir.PointerType(base)
         if t in self.structs:
             return self.structs[t]
-        base_name = t.split('<')[0]
-        if base_name in self.structs:
-            return self.structs[base_name]
+        # Handle generic types like Pair<int, string>
+        if '<' in t:
+            # Check if we have a monomorphized version
+            if t in self.structs:
+                return self.structs[t]
+            # Try to generate it now
+            resolved = self._resolve_generic_type(t)
+            if resolved is not None:
+                return resolved
+            # Fallback: use base struct (will have wrong field types but at least won't crash)
+            base_name = t.split('<')[0]
+            if base_name in self.structs:
+                return self.structs[base_name]
         return ir.IntType(32)
 
     def _base_type_name(self, t: str) -> str:
@@ -68,6 +78,63 @@ class LLVM:
         if idx != -1:
             t = t[:idx]
         return t
+
+    def _resolve_generic_type(self, type_str: str):
+        """Resolve a generic type like Pair<int, string> to a monomorphized LLVM struct."""
+        if '<' not in type_str:
+            return None
+        idx = type_str.index('<')
+        base_name = type_str[:idx]
+        args_str = type_str[idx+1:-1]  # strip < and >
+        # Parse type args (handle nested generics)
+        args = []
+        depth = 0
+        current = ''
+        for ch in args_str:
+            if ch == '<':
+                depth += 1
+                current += ch
+            elif ch == '>':
+                depth -= 1
+                current += ch
+            elif ch == ',' and depth == 0:
+                args.append(current.strip())
+                current = ''
+            else:
+                current += ch
+        if current.strip():
+            args.append(current.strip())
+        # Look up the base struct
+        base_struct_node = None
+        for name, sym in [('struct', None)]:
+            # We need the original AST node; store it during emit_struct
+            pass
+        # Check if we already emitted a specialized version
+        spec_name = f'{base_name}__{"_".join(a.replace("<", "_").replace(">", "_").replace(",", "_").replace(" ", "") for a in args)}'
+        if spec_name in self.structs:
+            return self.structs[spec_name]
+        # Look up the base struct definition
+        if base_name not in self.structs:
+            return None
+        # Find the StructDef node for this struct
+        struct_node = getattr(self, '_struct_nodes', {}).get(base_name)
+        if struct_node is None or not struct_node.generic_params:
+            return None
+        if len(struct_node.generic_params) != len(args):
+            return None
+        # Create type substitution map
+        type_map = dict(zip(struct_node.generic_params, args))
+        # Generate specialized field types
+        field_tys = []
+        for f in struct_node.fields:
+            concrete_type = type_map.get(f.type_expr, f.type_expr)
+            field_tys.append(self.llvm_type(concrete_type))
+        # Create the specialized struct
+        llvm_struct = ir.IdentifiedStructType(ir.global_context, f"struct.{spec_name}")
+        llvm_struct.set_body(*field_tys)
+        self.structs[spec_name] = llvm_struct
+        self.struct_fields[spec_name] = struct_node.fields
+        return llvm_struct
 
     def _is_ir_constant_zero(self, val):
         if isinstance(val, ir.Constant) and val.constant == 0:
@@ -132,13 +199,14 @@ class LLVM:
         self._malloc_fn = None
         self._free_fn = None
         self._gc_alloc_fn = None
-        self._gc_mark_fn = None
-        self._gc_root_register_fn = None
+        self._gc_write_barrier_fn = None
         self._strlen_fn = None
         self._memcpy_fn = None
         self.no_userspace = no_userspace
         self.enable_extensions = enable_extensions
         self._hook_registry = get_global_hook_registry()
+        self.generic_instantiations = {}  # name -> [(type_args_tuple, ...)]
+        self._struct_nodes = {}  # name -> StructDef AST node (for generic resolution)
         
         if not no_userspace:
             print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -183,19 +251,15 @@ class LLVM:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
 
-        # Boehm GC runtime functions
+        # Concurrent tri-color GC runtime functions (ugc-based)
         gc_fns = [
-            ('GC_init', _void, []),
-            ('GC_malloc', _i8ptr, [_i64]),
-            ('GC_realloc', _i8ptr, [_i8ptr, _i64]),
-            ('GC_free', _void, [_i8ptr]),
-            ('GC_gcollect', _void, []),
-            ('GC_get_heap_size', _i64, []),
-            ('GC_get_free_bytes', _i64, []),
-            ('GC_disable', _void, []),
-            ('GC_enable', _void, []),
-            ('GC_add_roots', _void, [_i8ptr, _i8ptr]),
-            ('GC_remove_roots', _void, [_i8ptr, _i8ptr]),
+            ('gc_init', _void, []),
+            ('gc_malloc', _i8ptr, [_i64]),
+            ('gc_write_barrier', _void, [_i8ptr, _i8ptr]),
+            ('gc_collect', _void, []),
+            ('gc_start_thread', _void, []),
+            ('gc_stop_thread', _void, []),
+            ('gc_shutdown', _void, []),
         ]
         for name, ret, args in gc_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
@@ -377,7 +441,7 @@ class LLVM:
 
         def _collect_nodes(nodes):
             for node in nodes:
-                if isinstance(node, StructDef):
+                if isinstance(node, (StructDef, ClassDef)):
                     structs.append(node)
                 elif isinstance(node, Import):
                     imports.append(node)
@@ -406,6 +470,8 @@ class LLVM:
                     pass
 
         for node in structs:
+            if isinstance(node, ClassDef):
+                continue
             st = ir.IdentifiedStructType(
                 ir.global_context, f"struct.{node.name}"
             )
@@ -443,12 +509,19 @@ class LLVM:
 
         if wrapper_builder is not None:
             self.builder = wrapper_builder
-            # Initialize Boehm GC at program start
-            gc_init_fn = self.functions.get('GC_init')
+            # Initialize concurrent tri-color GC and start background thread
+            gc_init_fn = self.functions.get('gc_init')
             if gc_init_fn:
                 self.builder.call(gc_init_fn, [])
+            gc_start_fn = self.functions.get('gc_start_thread')
+            if gc_start_fn:
+                self.builder.call(gc_start_fn, [])
             for node in toplevel:
                 self.emit(node)
+            # Shutdown GC before exit
+            gc_shutdown_fn = self.functions.get('gc_shutdown')
+            if gc_shutdown_fn:
+                self.builder.call(gc_shutdown_fn, [])
             self.builder.ret(ir.Constant(ir.IntType(32), 0))
 
         return self.module, self.import_src_files
@@ -517,6 +590,8 @@ class LLVM:
             return self.emit_sizeof(node)
         if isinstance(node, InlineAsm):
             return self.emit_inline_asm(node)
+        if isinstance(node, ClassDef):
+            return self.emit_class(node)
         if isinstance(node, Index):
             return self.emit_index(node)
         if isinstance(node, Attr):
@@ -536,6 +611,12 @@ class LLVM:
         return None
 
     def emit_struct(self, node: StructDef):
+        self._struct_nodes[node.name] = node
+        if node.generic_params:
+            # For generic structs, don't emit the base version with raw type params.
+            # Specialized versions are generated on demand by _resolve_generic_type.
+            # Still register it so lookup works.
+            return
         field_tys = []
         for f in node.fields:
             field_tys.append(self.llvm_type(f.type_expr))
@@ -548,6 +629,96 @@ class LLVM:
             self.structs[node.name] = llvm_struct
         self.struct_fields[node.name] = node.fields
 
+    def emit_class(self, node: ClassDef):
+        """Emit a class as a struct with methods as functions having a hidden 'this' pointer."""
+        self._struct_nodes[node.name] = node
+        # Collect all fields (including inherited)
+        all_fields = []
+        if node.base and node.base in self.struct_fields:
+            all_fields.extend(self.struct_fields[node.base])
+        all_fields.extend(node.fields)
+        # Generate struct type
+        field_tys = [self.llvm_type(f.type_expr) for f in all_fields]
+        if field_tys:
+            llvm_struct = ir.IdentifiedStructType(ir.global_context, f"class.{node.name}")
+            llvm_struct.set_body(*field_tys)
+            self.structs[node.name] = llvm_struct
+            self.struct_fields[node.name] = all_fields
+        # Emit methods — each gets a hidden 'this' pointer as first parameter
+        for m in node.methods:
+            self._emit_class_method(node, m, all_fields)
+                # Emit inherited methods (call through to base class implementation)
+        if node.base:
+            for fname, fobj in list(self.functions.items()):
+                if fname.startswith(node.base + '.'):
+                    method_name = fname[len(node.base) + 1:]
+                    child_name = f'{node.name}.{method_name}'
+                    if child_name not in self.functions:
+                        # Create a wrapper that bitcasts the child pointer to base type
+                        base_fnty = fobj.function_type
+                        child_fnty = ir.FunctionType(base_fnty.return_type, [ir.PointerType(self.structs[node.name])] + list(base_fnty.args[1:]))
+                        wrapper = ir.Function(self.module, child_fnty, child_name)
+                        entry = wrapper.append_basic_block('entry')
+                        wb = ir.IRBuilder(entry)
+                        casted = wb.bitcast(wrapper.args[0], base_fnty.args[0])
+                        args = [casted] + list(wrapper.args[1:])
+                        ret = wb.call(fobj, args)
+                        if base_fnty.return_type == ir.VoidType():
+                            wb.ret_void()
+                        else:
+                            wb.ret(ret)
+                        self.functions[child_name] = wrapper
+
+    def _emit_class_method(self, class_node: ClassDef, method: FuncDef, all_fields: list):
+        """Emit a class method with a hidden 'this' pointer."""
+        # Build param types: this* + declared params
+        class_ty = self.structs.get(class_node.name)
+        if class_ty is None:
+            return
+        this_ty = ir.PointerType(class_ty)
+        non_this_params = {k: v for k, v in method.params.items() if k != 'this'}
+        param_tys = [this_ty] + [self.llvm_type(t) for t in non_this_params.values()]
+        ret_ty = self.llvm_type(method.rettype or 'void')
+        func_name = f'{class_node.name}.{method.name}'
+        fnty = ir.FunctionType(ret_ty, param_tys)
+        if func_name in self.functions:
+            func = self.functions[func_name]
+        else:
+            func = ir.Function(self.module, fnty, func_name)
+            self.functions[func_name] = func
+        entry = func.append_basic_block("entry")
+        self.builder = ir.IRBuilder(entry)
+        self.builder.position_at_end(entry)
+        old_locals = self.locals
+        old_local_types = self.local_types
+        old_ssa = self.ssa_values
+        self.locals = {}
+        self.local_types = {}
+        self.ssa_values = {}
+        # Store 'this' pointer
+        this_arg = func.args[0]
+        this_ptr = self.builder.alloca(this_ty, name='this')
+        self.builder.store(this_arg, this_ptr)
+        self.locals['this'] = this_ptr
+        self.local_types['this'] = class_node.name + '*'
+        # Store method params
+        for llvm_arg, (pname, ptype) in zip(func.args[1:], non_this_params.items()):
+            ptr = self.builder.alloca(llvm_arg.type, name=pname)
+            self.builder.store(llvm_arg, ptr)
+            self.locals[pname] = ptr
+            self.local_types[pname] = ptype
+        # Emit body
+        for stmt in method.body:
+            self.emit(stmt)
+        if self.builder.block is not None and not self.builder.block.is_terminated:
+            if ret_ty == ir.VoidType():
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+        self.locals = old_locals
+        self.local_types = old_local_types
+        self.ssa_values = old_ssa
+
     def emit_new_expr(self, node: NewExpr):
         if node.type_expr == 'str':
             malloc_fn = self._get_malloc_fn()
@@ -556,7 +727,12 @@ class LLVM:
             i8pp = ir.PointerType(_i8ptr)
             ptr = self.builder.bitcast(ptr, i8pp)
             self.builder.store(empty_str, ptr)
+            self._emit_write_barrier(ptr, empty_str)
             return ptr
+        # Resolve generic types
+        type_str = node.type_expr
+        if '<' in type_str and type_str not in self.structs:
+            self._resolve_generic_type(type_str)
         if node.size is not None:
             count = self.emit(node.size)
             if isinstance(count.type, ir.PointerType):
@@ -581,21 +757,45 @@ class LLVM:
         return ptr
 
     def _get_malloc_fn(self):
-        # Use Boehm GC allocator instead of malloc
+        # Concurrent tri-color GC allocator
         fn = self._gc_alloc_fn
         if fn is not None:
             return fn
         for f in self.module.functions:
-            if f.name == 'GC_malloc':
+            if f.name == 'gc_malloc':
                 self._gc_alloc_fn = f
                 return f
         fnty = ir.FunctionType(_i8ptr, [_i64])
-        fn = ir.Function(self.module, fnty, 'GC_malloc')
+        fn = ir.Function(self.module, fnty, 'gc_malloc')
         self._gc_alloc_fn = fn
         return fn
 
+    def _get_write_barrier_fn(self):
+        # Get the gc_write_barrier function for pointer stores between heap objects
+        fn = self._gc_write_barrier_fn
+        if fn is not None:
+            return fn
+        for f in self.module.functions:
+            if f.name == 'gc_write_barrier':
+                self._gc_write_barrier_fn = f
+                return f
+        fnty = ir.FunctionType(_void, [_i8ptr, _i8ptr])
+        fn = ir.Function(self.module, fnty, 'gc_write_barrier')
+        self._gc_write_barrier_fn = fn
+        return fn
+
+    def _emit_write_barrier(self, parent_ptr, child_ptr):
+        """Insert a write barrier call when storing a pointer value into a heap object.
+        parent_ptr and child_ptr must be i8* typed LLVM values."""
+        if parent_ptr.type != _i8ptr:
+            parent_ptr = self.builder.bitcast(parent_ptr, _i8ptr)
+        if child_ptr.type != _i8ptr:
+            child_ptr = self.builder.bitcast(child_ptr, _i8ptr)
+        wb_fn = self._get_write_barrier_fn()
+        self.builder.call(wb_fn, [parent_ptr, child_ptr])
+
     def _get_free_fn(self):
-        # Boehm GC manages memory - free is a no-op but keep for compatibility
+        # GC manages memory - free is a no-op but keep for compatibility
         fn = self._free_fn
         if fn is not None:
             return fn
@@ -606,6 +806,14 @@ class LLVM:
         fnty = ir.FunctionType(ir.VoidType(), [_i8ptr])
         fn = ir.Function(self.module, fnty, 'free')
         self._free_fn = fn
+        return fn
+
+    def _get_trap_fn(self):
+        for f in self.module.functions:
+            if f.name == 'llvm.trap':
+                return f
+        fnty = ir.FunctionType(ir.VoidType(), [])
+        fn = ir.Function(self.module, fnty, 'llvm.trap')
         return fn
 
     def _type_abi_info(self, ty):
@@ -775,15 +983,23 @@ class LLVM:
     def _emit_lvalue_attr(self, node: Attr):
         obj_ptr = self._emit_lvalue(node.obj)
         struct_name = self._struct_name_from_node(node.obj)
-        if struct_name and struct_name in self.struct_fields:
-            var_name = getattr(node.obj, 'name', '')
-            declared = self.local_types.get(var_name, '')
-            if declared == struct_name + '*' or ('struct.' in declared and self._base_type_name(declared) == struct_name):
-                obj_ptr = self.builder.load(obj_ptr)
-            fields = self.struct_fields[struct_name]
-            for i, f in enumerate(fields):
-                if f.name == node.name:
-                    return self.builder.gep(obj_ptr, [ir.Constant(_i32, 0), ir.Constant(_i32, i)], inbounds=True)
+        if struct_name:
+            # Handle generic struct names
+            if '<' in struct_name and struct_name not in self.struct_fields:
+                self._resolve_generic_type(struct_name)
+            # Try the full generic name first, then base name
+            for sn in (struct_name, struct_name.split('<')[0]):
+                if sn and sn in self.struct_fields:
+                    var_name = getattr(node.obj, 'name', '')
+                    declared = self.local_types.get(var_name, '')
+                    if declared == sn + '*' or ('struct.' in declared and self._base_type_name(declared) == sn):
+                        obj_ptr = self.builder.load(obj_ptr)
+                    elif sn in self.structs and isinstance(self.structs.get(sn), ir.IdentifiedStructType):
+                        obj_ptr = self.builder.load(obj_ptr)
+                    fields = self.struct_fields[sn]
+                    for i, f in enumerate(fields):
+                        if f.name == node.name:
+                            return self.builder.gep(obj_ptr, [ir.Constant(_i32, 0), ir.Constant(_i32, i)], inbounds=True)
         raise Exception(f"Unknown field '{node.name}' in struct '{struct_name}'")
 
     def _emit_lvalue(self, node):
@@ -792,7 +1008,7 @@ class LLVM:
             ptr = self.locals.get(name)
             if ptr is not None:
                 return ptr
-            ssa = self.ssa_values.pop(name, None)
+            ssa = self.ssa_values.get(name)
             if ssa is not None:
                 ptr = self._alloca(ssa.type, name)
                 self.builder.store(ssa, ptr)
@@ -806,21 +1022,6 @@ class LLVM:
         if isinstance(node, Deref):
             return self.emit(node.operand)
         raise Exception("Cannot take address of expression")
-
-    def _infer_llvm_type(self, node):
-        if isinstance(node, Variable):
-            ptr = self.locals.get(node.name)
-            if ptr:
-                return ptr.type.pointee
-            return None
-        if isinstance(node, Index):
-            obj_t = self._infer_llvm_type(node.obj)
-            if isinstance(obj_t, ir.PointerType):
-                return obj_t.pointee
-            return None
-        if isinstance(node, Attr):
-            return None
-        return None
 
     def funcdo(self, node: FuncDef):
         ret_ty = self.llvm_type(getattr(node, 'rettype', None) or 'int')
@@ -840,11 +1041,14 @@ class LLVM:
         self.builder = ir.IRBuilder(entry)
         self.builder.position_at_end(entry)
 
-        # Initialize Boehm GC in main function
+        # Initialize concurrent tri-color GC in main function
         if node.name == 'main':
-            gc_init_fn = self.functions.get('GC_init')
+            gc_init_fn = self.functions.get('gc_init')
             if gc_init_fn:
                 self.builder.call(gc_init_fn, [])
+            gc_start_fn = self.functions.get('gc_start_thread')
+            if gc_start_fn:
+                self.builder.call(gc_start_fn, [])
 
         old_locals = self.locals
         old_local_types = self.local_types
@@ -861,6 +1065,11 @@ class LLVM:
                 self.emit(stmt)
 
         if not self.builder.block.is_terminated:
+            # Shutdown GC before main returns
+            if node.name == 'main':
+                gc_shutdown_fn = self.functions.get('gc_shutdown')
+                if gc_shutdown_fn:
+                    self.builder.call(gc_shutdown_fn, [])
             if isinstance(ret_ty, ir.VoidType):
                 self.builder.ret_void()
             elif isinstance(ret_ty, ir.PointerType):
@@ -875,6 +1084,12 @@ class LLVM:
     def emit_return(self, node: Return):
         if self.builder.block.is_terminated:
             return None
+        # Shutdown GC before main returns
+        fn_name = self.builder.function.name
+        if fn_name == 'main':
+            gc_shutdown_fn = self.functions.get('gc_shutdown')
+            if gc_shutdown_fn:
+                self.builder.call(gc_shutdown_fn, [])
         if node.value is not None:
             value = self.emit(node.value)
             ret_ty = self.builder.function.ftype.return_type
@@ -999,10 +1214,17 @@ class LLVM:
         return left, right
 
     def _bitwise_promote(self, left, right):
-        if isinstance(left.type, (ir.FloatType, ir.DoubleType)):
-            int_ty = ir.IntType(32) if isinstance(left.type, ir.FloatType) else ir.IntType(64)
-            left = self.builder.bitcast(left, int_ty)
-            right = self.builder.bitcast(right, int_ty)
+        if isinstance(left.type, (ir.FloatType, ir.DoubleType)) or isinstance(right.type, (ir.FloatType, ir.DoubleType)):
+            src_ty = left.type if isinstance(left.type, (ir.FloatType, ir.DoubleType)) else right.type
+            int_ty = ir.IntType(32) if isinstance(src_ty, ir.FloatType) else ir.IntType(64)
+            if isinstance(left.type, (ir.FloatType, ir.DoubleType)):
+                left = self.builder.bitcast(left, int_ty)
+            else:
+                left = self._promote_int(left, int_ty)
+            if isinstance(right.type, (ir.FloatType, ir.DoubleType)):
+                right = self.builder.bitcast(right, int_ty)
+            else:
+                right = self._promote_int(right, int_ty)
         return left, right
 
     def _promote_int(self, val, target_ty):
@@ -1010,9 +1232,7 @@ class LLVM:
             return val
         if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
             if val.type.width < target_ty.width:
-                if val.type.width == 32:
-                    return self.builder.sext(val, target_ty)
-                return self.builder.zext(val, target_ty)
+                return self.builder.sext(val, target_ty)
             if val.type.width > target_ty.width:
                 return self.builder.trunc(val, target_ty)
         elif isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_ty, ir.IntType):
@@ -1067,10 +1287,6 @@ class LLVM:
                 phi = self.builder.phi(_i1)
                 phi.add_incoming(ir.Constant(_i1, 1), entry_bb)
                 phi.add_incoming(rhs_true, actual_rhs_bb)
-                return phi
-                phi = self.builder.phi(res_ty)
-                phi.add_incoming(lhs, entry_bb)
-                phi.add_incoming(rhs, actual_rhs_bb)
                 return phi
 
         left = self.emit(node.left)
@@ -1165,27 +1381,42 @@ class LLVM:
                     raise ZeroDivisionError('division by zero')
                 if not isinstance(right, ir.Constant):
                     z = ir.Constant(right.type, 0)
-                    o = ir.Constant(right.type, 1)
                     is_zero = self.builder.icmp_signed('==', right, z)
-                    right = self.builder.select(is_zero, o, right)
+                    trap_bb = self.builder.append_basic_block("div.trap")
+                    ok_bb = self.builder.append_basic_block("div.ok")
+                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
+                    self.builder.position_at_end(trap_bb)
+                    self.builder.call(self._get_trap_fn(), [])
+                    self.builder.unreachable()
+                    self.builder.position_at_end(ok_bb)
                 return self.builder.sdiv(left, right)
             case TokenType.SLASH_SLASH:
                 if self._is_ir_constant_zero(right):
                     raise ZeroDivisionError('division by zero')
                 if not isinstance(right, ir.Constant):
                     z = ir.Constant(right.type, 0)
-                    o = ir.Constant(right.type, 1)
                     is_zero = self.builder.icmp_signed('==', right, z)
-                    right = self.builder.select(is_zero, o, right)
+                    trap_bb = self.builder.append_basic_block("div.trap")
+                    ok_bb = self.builder.append_basic_block("div.ok")
+                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
+                    self.builder.position_at_end(trap_bb)
+                    self.builder.call(self._get_trap_fn(), [])
+                    self.builder.unreachable()
+                    self.builder.position_at_end(ok_bb)
                 return self.builder.sdiv(left, right)
             case TokenType.PERCENT:
                 if self._is_ir_constant_zero(right):
                     raise ZeroDivisionError('division by zero')
                 if not isinstance(right, ir.Constant):
                     z = ir.Constant(right.type, 0)
-                    o = ir.Constant(right.type, 1)
                     is_zero = self.builder.icmp_signed('==', right, z)
-                    right = self.builder.select(is_zero, o, right)
+                    trap_bb = self.builder.append_basic_block("div.trap")
+                    ok_bb = self.builder.append_basic_block("div.ok")
+                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
+                    self.builder.position_at_end(trap_bb)
+                    self.builder.call(self._get_trap_fn(), [])
+                    self.builder.unreachable()
+                    self.builder.position_at_end(ok_bb)
                 return self.builder.srem(left, right)
             case TokenType.SHL:
                 left, right = self._bitwise_promote(left, right)
@@ -1498,9 +1729,38 @@ class LLVM:
         if pointee and value.type != pointee:
             value = self._coerce_store(value, pointee)
         self.builder.store(value, target_ptr)
+        # Write barrier for pointer stores into heap objects (tri-color invariant)
+        if isinstance(pointee, ir.PointerType):
+            self._emit_write_barrier(target_ptr, value)
         return None
 
     def emit_call(self, node):
+        # Handle method calls: obj.method(args) -> ClassName.method(obj, args)
+        if isinstance(node.callee, Attr):
+            callee_name = node.callee.name
+            obj_val = self.emit(node.callee.obj)
+            # Look up the method by finding the class type of the object
+            obj_type_name = None
+            if isinstance(node.callee.obj, Variable):
+                obj_type_name = self.local_types.get(node.callee.obj.name)
+            elif hasattr(node.callee.obj, '_inferred_type'):
+                obj_type_name = node.callee.obj._inferred_type
+            if obj_type_name:
+                # Strip pointer
+                if obj_type_name.endswith('*'):
+                    obj_type_name = obj_type_name[:-1]
+                # Resolve generic types
+                resolved = self._resolve_generic_type(obj_type_name)
+                if resolved is not None:
+                    obj_type_name = resolved
+                method_name = f'{obj_type_name}.{callee_name}'
+                func = self.functions.get(method_name)
+                if func:
+                    args = [obj_val]
+                    for arg in node.args:
+                        args.append(self.emit(arg))
+                    return self.builder.call(func, args)
+
         # Handle known macro functions by inlining
         if node.callee.name == 'CGEventMaskBit':
             arg = self.emit(node.args[0])

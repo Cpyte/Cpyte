@@ -598,11 +598,6 @@ _C_PTR_TYPE_MAP = {
     'SecKeychainItemRef': 'void*',
     'SecTrustedApplicationRef': 'void*',
     'SecAccessControlRef': 'void*',
-    'void': 'void*',
-    'char': 'str',
-    'int': 'int*',
-    'float': 'float*',
-    'double': 'double*',
 }
 
 _C_UNSIGNED_TYPES = {

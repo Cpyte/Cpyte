@@ -9,6 +9,7 @@ if __package__:
     from .compiling import run_jit, run_aot, _RUNTIME_C
     from .linker import Linker, find_linker, LinkerNotFoundError
     from ._bignum_bc import load_bignum_bc
+    from ._gc_bc import load_gc_bc
     from .package_manifest import ManifestParser, get_global_registry
     from .extension_hooks import HookLoader, get_global_hook_registry
 else:
@@ -20,6 +21,7 @@ else:
     from cpyte.compiling import run_jit, run_aot, _RUNTIME_C
     from cpyte.linker import Linker, find_linker, LinkerNotFoundError
     from cpyte._bignum_bc import load_bignum_bc
+    from cpyte._gc_bc import load_gc_bc
     from cpyte.package_manifest import ManifestParser, get_global_registry
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
 
@@ -249,15 +251,16 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True):
     except (LexerError, ParseError) as e:
         print(f'parse error: {e}', file=sys.stderr)
         sys.exit(1)
-    result = analyze(source, parsed, strict=strict, workspace_root=os.getcwd(), enable_extensions=enable_extensions)
+    result, generic_instantiations = analyze(source, parsed, strict=strict, workspace_root=os.getcwd(), enable_extensions=enable_extensions)
     if result:
         print(result, file=sys.stderr)
         sys.exit(1)
-    return parsed
+    return parsed, generic_instantiations
 
 
-def _emit(parsed, no_userspace=False, enable_extensions=True):
+def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True):
     c = LLVM(no_userspace=no_userspace, enable_extensions=enable_extensions)
+    c.generic_instantiations = generic_instantiations or {}
     try:
         prog, src_files = c.emit_program(parsed)
     except Exception as e:
@@ -328,11 +331,11 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     with open(src_file) as f:
         source = f.read()
 
-    parsed = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
+    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
 
     frameworks = _collect_frameworks(parsed)
 
-    prog, src_files = _emit(parsed, no_userspace=no_userspace, enable_extensions=not no_userspace)
+    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
 
     out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
     obj_file = out_base + '.o'
@@ -345,6 +348,8 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     mod = binding.parse_assembly(str(prog))
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
+    gc_mod = load_gc_bc()
+    binding.link_modules(mod, gc_mod)
     mod.verify()
 
     target = binding.Target.from_default_triple()
@@ -369,8 +374,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
         objs.append(runtime_obj)
 
     executable = output or out_base
-    l.link(objs, executable, libraries=['gc'], library_paths=['/opt/homebrew/opt/bdw-gc/lib'],
-           opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
+    l.link(objs, executable, libraries=['m'], opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
     print(f'Wrote {executable}')
 
 
@@ -416,13 +420,13 @@ def main():
     with open(args[0]) as f:
         source = f.read()
 
-    parsed = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
+    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
 
     if mode == 'ast':
         print(pretty_ast(parsed))
         sys.exit(0)
 
-    prog, src_files = _emit(parsed, no_userspace=no_userspace, enable_extensions=not no_userspace)
+    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
 
     if mode == 'emit-llvm':
         print(prog)

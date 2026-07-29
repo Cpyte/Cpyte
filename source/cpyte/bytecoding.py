@@ -200,6 +200,7 @@ class LLVM:
         self._free_fn = None
         self._gc_alloc_fn = None
         self._gc_write_barrier_fn = None
+        self._sizeof_cache = {}
         self._strlen_fn = None
         self._memcpy_fn = None
         self.no_userspace = no_userspace
@@ -845,8 +846,13 @@ class LLVM:
         return (4, 4)
 
     def _sizeof_type(self, ty):
+        key = id(ty)
+        if key in self._sizeof_cache:
+            return self._sizeof_cache[key]
         sz, _ = self._type_abi_info(ty)
-        return ir.Constant(ir.IntType(32), sz)
+        c = ir.Constant(ir.IntType(32), sz)
+        self._sizeof_cache[key] = c
+        return c
 
     def emit_deref(self, node: Deref):
         ptr = self.emit(node.operand)

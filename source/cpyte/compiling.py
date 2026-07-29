@@ -74,8 +74,44 @@ def optimize(mod, opt_level=3):
     target = binding.Target.from_default_triple()
     target_machine = target.create_target_machine()
     pto = binding.create_pipeline_tuning_options(speed_level=opt_level)
+
+    if opt_level >= 2:
+        pto.slp_vectorization = True
+    if opt_level >= 3:
+        pto.inlining_threshold = 275
+
     pb = binding.create_pass_builder(target_machine, pto)
+
+    # Early function-level cleanup: promote allocas to SSA, simplify CFG
+    if opt_level >= 2:
+        fpm = pb.getFunctionPassManager()
+        fpm.add_sroa_pass()
+        fpm.add_instruction_combine_pass()
+        fpm.add_simplify_cfg_pass()
+        for fn in mod.functions:
+            if not fn.is_declaration:
+                fpm.run(fn, pb)
+
+    # Default module pipeline (includes inliner, GVN, DCE, loop opts, etc.)
     npm = pb.getModulePassManager()
+
+    # Extra global passes at O3 for interprocedural optimization
+    if opt_level >= 3:
+        npm.add_ipsccp_pass()
+        npm.add_global_opt_pass()
+        npm.add_constant_merge_pass()
+        npm.add_global_dead_code_eliminate_pass()
+
+    # Let extension hooks add their own passes
+    try:
+        from .extension_hooks import get_global_hook_registry
+        registry = get_global_hook_registry()
+        for hook in registry.get_codegen_hooks():
+            if hook.should_add_module_passes():
+                hook.add_module_passes(npm, {})
+    except Exception:
+        pass
+
     npm.run(mod, pb)
 
 

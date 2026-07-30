@@ -172,12 +172,17 @@ class LLVM:
             return val
         return self.builder.call(fn, [val])
 
-    def __init__(self, no_userspace=False, enable_extensions=True):
+    def __init__(self, no_userspace=False, enable_extensions=True, target_triple=None, no_gc=False):
         self.module = ir.Module("main")
+        self.no_gc = no_gc
+        self._target_triple = target_triple
         try:
             import llvmlite.binding as _binding
             _binding.initialize_native_target()
-            _target = _binding.Target.from_default_triple()
+            if target_triple:
+                _target = _binding.Target.from_triple(target_triple)
+            else:
+                _target = _binding.Target.from_default_triple()
             _tm = _target.create_target_machine()
             self.module.triple = _tm.triple
             self.module.data_layout = _tm.target_data.get_data_layout()
@@ -253,18 +258,19 @@ class LLVM:
             self.functions[name] = fn
 
         # Concurrent tri-color GC runtime functions (ugc-based)
-        gc_fns = [
-            ('gc_init', _void, []),
-            ('gc_malloc', _i8ptr, [_i64]),
-            ('gc_write_barrier', _void, [_i8ptr, _i8ptr]),
-            ('gc_collect', _void, []),
-            ('gc_start_thread', _void, []),
-            ('gc_stop_thread', _void, []),
-            ('gc_shutdown', _void, []),
-        ]
-        for name, ret, args in gc_fns:
-            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
-            self.functions[name] = fn
+        if not self.no_gc:
+            gc_fns = [
+                ('gc_init', _void, []),
+                ('gc_malloc', _i8ptr, [_i64]),
+                ('gc_write_barrier', _void, [_i8ptr, _i8ptr]),
+                ('gc_collect', _void, []),
+                ('gc_start_thread', _void, []),
+                ('gc_stop_thread', _void, []),
+                ('gc_shutdown', _void, []),
+            ]
+            for name, ret, args in gc_fns:
+                fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+                self.functions[name] = fn
 
         # Exception handling globals
         self._exc_buf_ptr = ir.GlobalVariable(self.module, _i8ptr, "_exc_buf_ptr")
@@ -510,19 +516,20 @@ class LLVM:
 
         if wrapper_builder is not None:
             self.builder = wrapper_builder
-            # Initialize concurrent tri-color GC and start background thread
-            gc_init_fn = self.functions.get('gc_init')
-            if gc_init_fn:
-                self.builder.call(gc_init_fn, [])
-            gc_start_fn = self.functions.get('gc_start_thread')
-            if gc_start_fn:
-                self.builder.call(gc_start_fn, [])
+            if not self.no_gc:
+                # Initialize concurrent tri-color GC and start background thread
+                gc_init_fn = self.functions.get('gc_init')
+                if gc_init_fn:
+                    self.builder.call(gc_init_fn, [])
+                gc_start_fn = self.functions.get('gc_start_thread')
+                if gc_start_fn:
+                    self.builder.call(gc_start_fn, [])
             for node in toplevel:
                 self.emit(node)
-            # Shutdown GC before exit
-            gc_shutdown_fn = self.functions.get('gc_shutdown')
-            if gc_shutdown_fn:
-                self.builder.call(gc_shutdown_fn, [])
+            if not self.no_gc:
+                gc_shutdown_fn = self.functions.get('gc_shutdown')
+                if gc_shutdown_fn:
+                    self.builder.call(gc_shutdown_fn, [])
             self.builder.ret(ir.Constant(ir.IntType(32), 0))
 
         return self.module, self.import_src_files
@@ -758,6 +765,19 @@ class LLVM:
         return ptr
 
     def _get_malloc_fn(self):
+        if self.no_gc:
+            # Bare-metal: use plain malloc
+            fn = self._malloc_fn
+            if fn is not None:
+                return fn
+            for f in self.module.functions:
+                if f.name == 'malloc':
+                    self._malloc_fn = f
+                    return f
+            fnty = ir.FunctionType(_i8ptr, [_i64])
+            fn = ir.Function(self.module, fnty, 'malloc')
+            self._malloc_fn = fn
+            return fn
         # Concurrent tri-color GC allocator
         fn = self._gc_alloc_fn
         if fn is not None:
@@ -788,6 +808,8 @@ class LLVM:
     def _emit_write_barrier(self, parent_ptr, child_ptr):
         """Insert a write barrier call when storing a pointer value into a heap object.
         parent_ptr and child_ptr must be i8* typed LLVM values."""
+        if self.no_gc:
+            return
         if parent_ptr.type != _i8ptr:
             parent_ptr = self.builder.bitcast(parent_ptr, _i8ptr)
         if child_ptr.type != _i8ptr:
@@ -1048,7 +1070,7 @@ class LLVM:
         self.builder.position_at_end(entry)
 
         # Initialize concurrent tri-color GC in main function
-        if node.name == 'main':
+        if node.name == 'main' and not self.no_gc:
             gc_init_fn = self.functions.get('gc_init')
             if gc_init_fn:
                 self.builder.call(gc_init_fn, [])
@@ -1072,7 +1094,7 @@ class LLVM:
 
         if not self.builder.block.is_terminated:
             # Shutdown GC before main returns
-            if node.name == 'main':
+            if node.name == 'main' and not self.no_gc:
                 gc_shutdown_fn = self.functions.get('gc_shutdown')
                 if gc_shutdown_fn:
                     self.builder.call(gc_shutdown_fn, [])
@@ -1092,7 +1114,7 @@ class LLVM:
             return None
         # Shutdown GC before main returns
         fn_name = self.builder.function.name
-        if fn_name == 'main':
+        if fn_name == 'main' and not self.no_gc:
             gc_shutdown_fn = self.functions.get('gc_shutdown')
             if gc_shutdown_fn:
                 self.builder.call(gc_shutdown_fn, [])

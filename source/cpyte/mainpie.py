@@ -6,7 +6,7 @@ if __package__:
     from .astparse import parse_file, ParseError, Import
     from .semantic_analasis import analyze
     from .bytecoding import LLVM
-    from .compiling import run_jit, run_aot, _RUNTIME_C
+    from .compiling import run_jit, run_aot, run_scorpion, _RUNTIME_C
     from .linker import Linker, find_linker, LinkerNotFoundError
     from ._bignum_bc import load_bignum_bc
     from ._gc_bc import load_gc_bc
@@ -18,7 +18,7 @@ else:
     from cpyte.astparse import parse_file, ParseError, Import
     from cpyte.semantic_analasis import analyze
     from cpyte.bytecoding import LLVM
-    from cpyte.compiling import run_jit, run_aot, _RUNTIME_C
+    from cpyte.compiling import run_jit, run_aot, run_scorpion, _RUNTIME_C
     from cpyte.linker import Linker, find_linker, LinkerNotFoundError
     from cpyte._bignum_bc import load_bignum_bc
     from cpyte._gc_bc import load_gc_bc
@@ -258,8 +258,8 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True):
     return parsed, generic_instantiations
 
 
-def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True):
-    c = LLVM(no_userspace=no_userspace, enable_extensions=enable_extensions)
+def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True, no_gc=False, target_triple=None):
+    c = LLVM(no_userspace=no_userspace, enable_extensions=enable_extensions, no_gc=no_gc, target_triple=target_triple)
     c.generic_instantiations = generic_instantiations or {}
     try:
         prog, src_files = c.emit_program(parsed)
@@ -404,12 +404,14 @@ def main():
             mode = 'jit'
         elif flag == '--aot':
             mode = 'aot'
+        elif flag == '--scorpion':
+            mode = 'scorpion'
         else:
             print(f'Unknown flag: {flag}', file=sys.stderr)
             sys.exit(1)
 
     if not args:
-        print('Usage: cpy [--tab-size N] [--strict] [--no-userspace] [--pic] [--ast|--emit-llvm|--jit|--aot] <source file>', file=sys.stderr)
+        print('Usage: cpy [--tab-size N] [--strict] [--no-userspace] [--pic] [--ast|--emit-llvm|--jit|--aot|--scorpion] <source file>', file=sys.stderr)
         print('       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
@@ -426,7 +428,10 @@ def main():
         print(pretty_ast(parsed))
         sys.exit(0)
 
-    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
+    if mode == 'scorpion':
+        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=True, target_triple='riscv32-unknown-elf')
+    else:
+        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
 
     if mode == 'emit-llvm':
         print(prog)
@@ -435,6 +440,10 @@ def main():
         obj_file = 'program.o'
         run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic)
         print(f'Wrote {out_base}')
+    elif mode == 'scorpion':
+        out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
+        sef_file = out_base + '.sef'
+        run_scorpion(prog, output=sef_file, src_files=src_files)
     else:
         run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)
 

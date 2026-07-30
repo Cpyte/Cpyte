@@ -381,3 +381,161 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     if r.returncode != 0:
         print(f'error linking: {r.stderr}', file=__import__('sys').stderr)
         raise SystemExit(1)
+
+
+if getattr(sys, 'frozen', False):
+    _RUNTIME_SCORPION_C = os.path.join(sys._MEIPASS, 'runtime_scorpion.c')
+else:
+    _RUNTIME_SCORPION_C = os.path.join(os.path.dirname(__file__), 'runtime_scorpion.c')
+
+_SCORPION_CC = 'riscv32-unknown-elf-gcc'
+_SCORPION_AS = 'riscv64-elf-as'
+_SCORPION_LD = 'riscv64-elf-ld'
+_SCORPION_OBJCOPY = 'riscv64-elf-objcopy'
+_SCORPION_ARCH = '-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb'
+_SCORPION_ABI = '-mabi=ilp32'
+
+
+def _find_scorpion_tool(name, fallback):
+    """Find a scorpion cross-compilation tool."""
+    import shutil
+    candidates = [
+        f'riscv32-unknown-elf-{name}',
+        f'riscv64-unknown-elf-{name}',
+        f'riscv64-elf-{name}',
+    ]
+    for c in candidates:
+        if shutil.which(c):
+            return c
+    return fallback
+
+
+def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=False):
+    """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file."""
+    import llvmlite.binding as binding
+    binding.initialize_all_targets()
+    binding.initialize_native_asmprinter()
+
+    llvm_ir = str(module)
+    mod = binding.parse_assembly(llvm_ir)
+
+    mod.verify()
+    optimize(mod, opt_level)
+    mod.verify()
+
+    target = binding.Target.from_triple('riscv32-unknown-elf')
+    if pic:
+        target_machine = target.create_target_machine(reloc='pic')
+    else:
+        target_machine = target.create_target_machine()
+
+    # Emit RV32 object file
+    obj = target_machine.emit_object(mod)
+    obj_file = output.rsplit('.', 1)[0] + '.o'
+    with open(obj_file, 'wb') as f:
+        f.write(obj)
+
+    objs = [obj_file]
+
+    # Compile Scorpion runtime
+    runtime_obj = output.rsplit('.', 1)[0] + '.runtime.o'
+    cc = _find_scorpion_tool('gcc', _SCORPION_CC)
+    cmd = [cc, '-c', '-O3', _SCORPION_ARCH, _SCORPION_ABI,
+           '-nostdlib', '-ffreestanding',
+           '-o', runtime_obj, _RUNTIME_SCORPION_C]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f'error compiling runtime_scorpion.c: {r.stderr}', file=sys.stderr)
+        raise SystemExit(1)
+    objs.append(runtime_obj)
+
+    # Link into ELF
+    elf_base = output.rsplit('.', 1)[0]
+    elf_file = elf_base + '.elf'
+    ld = _find_scorpion_tool('ld', _SCORPION_LD)
+    cmd = [ld, '-m', 'elf32lriscv', '-e', 'main', '--no-relax',
+           '-Ttext=0', '-o', elf_file] + objs
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f'error linking: {r.stderr}', file=sys.stderr)
+        raise SystemExit(1)
+
+    # Convert ELF to SEF using mksef.py
+    mksef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
+                         '..', '..', 'WEW-scorpion', 'user', 'mksef.py')
+    if not os.path.isfile(mksef):
+        # Fallback: inline SEF generation using objdump/objcopy
+        _elf_to_sef(elf_file, output, 0)
+    else:
+        r = subprocess.run([sys.executable, mksef, elf_file, output],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f'error converting to SEF: {r.stderr}', file=sys.stderr)
+            raise SystemExit(1)
+
+    print(f'Wrote {os.path.getsize(output)} bytes to {output}')
+    return elf_file
+
+
+def _elf_to_sef(elf_path, sef_output, flags=0):
+    """Convert ELF to SEF format without mksef.py."""
+    import struct
+
+    sections = {}
+    result = subprocess.run(
+        [_find_scorpion_tool('objdump', _SCORPION_LD.replace('ld', 'objdump')),
+         '-h', elf_path],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"error: objdump failed on {elf_path}", file=sys.stderr)
+        raise SystemExit(1)
+
+    for line in result.stdout.split('\n'):
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit():
+            name = parts[1]
+            if name in ('.text', '.rodata', '.data', '.bss'):
+                sections[name] = int(parts[2], 16)
+
+    result = subprocess.run(
+        [_find_scorpion_tool('readelf', _SCORPION_LD.replace('ld', 'readelf')),
+         '-h', elf_path],
+        capture_output=True, text=True
+    )
+    entry = 0
+    for line in result.stdout.split('\n'):
+        if 'Entry point address' in line:
+            entry = int(line.split(':')[1].strip(), 16)
+
+    bin_path = elf_path + '.bin'
+    objcopy = _find_scorpion_tool('objcopy', _SCORPION_OBJCOPY)
+    subprocess.run([objcopy, '-O', 'binary', elf_path, bin_path],
+                   capture_output=True)
+
+    with open(bin_path, 'rb') as f:
+        flat = f.read()
+    os.unlink(bin_path)
+
+    segments = []
+    off = 0
+    for sec in ('.text', '.rodata', '.data'):
+        if sec in sections:
+            segments.append((0 if sec == '.text' else 1, off, sections[sec]))
+            off += sections[sec]
+    if '.bss' in sections:
+        segments.append((2, off, sections['.bss']))
+
+    num = len(segments)
+    hdr = 12 + num * 16
+
+    out = bytearray()
+    out += struct.pack('<IIHH', 0x00464553, entry, num, flags)
+    dc = hdr
+    for st, sv, ss in segments:
+        out += struct.pack('<IIII', st, sv, ss, dc)
+        dc += ss
+    out += flat
+
+    with open(sef_output, 'wb') as f:
+        f.write(out)

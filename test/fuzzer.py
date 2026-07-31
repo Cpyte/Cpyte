@@ -1051,7 +1051,7 @@ def run_test(source, label=''):
         return
 
     try:
-        err = analyze(source, parsed, strict=False)
+        err, _ = analyze(source, parsed, strict=False)
     except Exception as e:
         CRASH_COUNT += 1
         save_crash(source, f'analyzer crash: {e}')

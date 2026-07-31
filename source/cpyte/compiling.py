@@ -19,7 +19,29 @@ else:
 
 _callbacks: list = []
 
-_libc = ctypes.CDLL(ctypes.util.find_library('c'))
+
+def _load_libc():
+    """Open libc bypassing symbol interposition where possible.
+
+    On macOS, tools like MallocStackLogging may interpose malloc/free with a
+    private arena allocator whose pointers the interposed free() rejects
+    ("pointer being freed was not allocated"). Using RTLD_FIRST forces dlsym
+    to resolve to the real libSystem symbols so JIT'd malloc/free/realloc/
+    calloc stay self-consistent.
+    """
+    if sys.platform == 'darwin':
+        RTLD_FIRST = 0x100
+        try:
+            return ctypes.CDLL(
+                '/usr/lib/libSystem.B.dylib',
+                mode=os.RTLD_NOW | RTLD_FIRST,
+            )
+        except OSError:
+            pass
+    return ctypes.CDLL(ctypes.util.find_library('c'))
+
+
+_libc = _load_libc()
 _libc.strlen.argtypes = [ctypes.c_char_p]
 _libc.strlen.restype = ctypes.c_int
 _libc.memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
@@ -266,25 +288,23 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
 
     _map_libc_fn(engine, mod, 'malloc', ctypes.c_size_t, ctypes.c_void_p)
     _map_libc_fn(engine, mod, 'free', None, None, argtypes=[ctypes.c_void_p])
+    _map_libc_fn(engine, mod, 'realloc', ctypes.c_void_p, ctypes.c_void_p,
+                 argtypes=[ctypes.c_void_p, ctypes.c_size_t])
+    _map_libc_fn(engine, mod, 'calloc', ctypes.c_size_t, ctypes.c_void_p,
+                 argtypes=[ctypes.c_size_t, ctypes.c_size_t])
     _map_libc_fn(engine, mod, 'strlen', ctypes.c_char_p, ctypes.c_int)
     _map_libc_fn(engine, mod, 'memcpy', None, ctypes.c_void_p,
                  argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int])
 
     try:
         fn = mod.get_function('strcmp')
-        cfunctype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
-        cfn = cfunctype(_libc.strcmp)
-        _callbacks.append(cfn)
-        engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
+        engine.add_global_mapping(fn, _libc_addr('strcmp'))
     except NameError:
         pass
 
     try:
         fn = mod.get_function('__cpy_strcmp')
-        cfunctype = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
-        cfn = cfunctype(_libc.strcmp)
-        _callbacks.append(cfn)
-        engine.add_global_mapping(fn, ctypes.cast(cfn, ctypes.c_void_p).value)
+        engine.add_global_mapping(fn, _libc_addr('strcmp'))
     except NameError:
         pass
 
@@ -300,24 +320,28 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
     return ret
 
 
+def _libc_addr(name):
+    """Return the raw address of a libc function.
+
+    Returns the real libSystem implementation (RTLD_FIRST on macOS), avoiding
+    allocator interposition that can break malloc/free round-trips in JIT'd
+    code.
+    """
+    return ctypes.cast(getattr(_libc, name), ctypes.c_void_p).value
+
+
 def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
+    """Map an external libc symbol in the JIT module to its raw native address.
+
+    Direct raw-address mapping (rather than an ffi closure) avoids the
+    closure -> Python -> ctypes -> libffi round trip, which is fragile under
+    malloc interposers and slower at runtime.
+    """
     try:
         fn = mod.get_function(name)
-        if argtypes:
-            cfunctype = ctypes.CFUNCTYPE(restype, *argtypes)
-            cfn = cfunctype(getattr(_libc, name))
-        elif argtype is None:
-            return
-        else:
-            cfunctype = ctypes.CFUNCTYPE(restype, argtype)
-            cfn = cfunctype(getattr(_libc, name))
-        _callbacks.append(cfn)
-        engine.add_global_mapping(
-            fn,
-            ctypes.cast(cfn, ctypes.c_void_p).value,
-        )
     except NameError:
-        pass
+        return
+    engine.add_global_mapping(fn, _libc_addr(name))
 
 
 def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False):

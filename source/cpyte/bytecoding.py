@@ -1516,7 +1516,9 @@ class LLVM:
         return left, right
 
     def _is_string_concat(self, node):
-        if isinstance(node.left, String) or isinstance(node.right, String):
+        left_is_str = getattr(node.left, 'inferred_type', None) == 'str'
+        right_is_str = getattr(node.right, 'inferred_type', None) == 'str'
+        if left_is_str or right_is_str:
             return True
         if isinstance(node.left, Variable) and self.local_types.get(node.left.name) == 'str':
             return True
@@ -2002,7 +2004,10 @@ class LLVM:
 
     def emit_number(self, node):
         if getattr(node, 'inferred_type', '') == 'big':
-            s = node.value + '\0'
+            s = node.value
+            if s.startswith('0x') or s.startswith('0X'):
+                s = str(int(s, 16))
+            s = s + '\0'
             arr_ty = ir.ArrayType(_i8, len(s))
             g = ir.GlobalVariable(self.module, arr_ty, f'.biglit.{id(node)}')
             g.initializer = ir.Constant(arr_ty, bytearray(s.encode()))

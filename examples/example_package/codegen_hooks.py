@@ -28,7 +28,7 @@ class AsyncCodegenHook(CodegenHook):
         # with async runtime and promise handling
         
         # For now, just use standard function generation
-        return llvm.funcdo(node)
+        return llvm.emit_funcdef(node)
     
     def should_add_module_passes(self):
         """Return True to add custom optimization passes."""

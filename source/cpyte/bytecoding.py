@@ -6,7 +6,7 @@ from llvmlite import ir
 from .lexar import Token, TokenType
 from .astparse import *
 from .extension_hooks import get_global_hook_registry
-
+from .extension_hooks import HookLoadError
 
 _i8 = ir.IntType(8)
 _i32 = ir.IntType(32)
@@ -15,6 +15,16 @@ _i1 = ir.IntType(1)
 _double = ir.DoubleType()
 _void = ir.VoidType()
 _i8ptr = ir.PointerType(_i8)
+
+# Registry-based visitor: node type -> emit handler
+_EMIT_REGISTRY = {}
+
+
+def register_emitter(node_type):
+    def decorator(func):
+        _EMIT_REGISTRY[node_type] = func
+        return func
+    return decorator
 
 
 class LLVM:
@@ -300,6 +310,7 @@ class LLVM:
                     break
         self.functions['strcmp'] = self._strcmp_fn
 
+    @register_emitter(Switch)
     def emit_switch(self, node):
         value = self.emit(node.value)
         if not isinstance(value.type, ir.IntType):
@@ -379,6 +390,7 @@ class LLVM:
 
     _JMP_BUF_SIZE = 200
 
+    @register_emitter(Try)
     def emit_try(self, node):
         buf = self._alloca(ir.ArrayType(_i8, self._JMP_BUF_SIZE), "exc_buf")
         buf_ptr = self.builder.gep(buf, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)])
@@ -437,6 +449,7 @@ class LLVM:
         self.builder.position_at_end(after_blk)
         return None
 
+    @register_emitter(Raise)
     def emit_raise(self, node):
         exc_type_str = self._string_const(node.exc_type)
         self.builder.store(exc_type_str, self._exc_type)
@@ -541,6 +554,10 @@ class LLVM:
 
         return self.module, self.import_src_files
 
+    @register_emitter(ExprStmt)
+    def emit_exprstmt(self, node):
+        return self.emit(node.expr)
+
     def emit(self, node: list[Token]):
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
@@ -553,79 +570,33 @@ class LLVM:
                             'builder': self.builder,
                         })
                 except Exception as e:
-                    # If hook fails, continue with standard codegen
-                    pass
-        
-        # Standard codegen
-        if isinstance(node, FuncDef):
-            return self.funcdo(node)
-        if isinstance(node, Return):
-            return self.emit_return(node)
-        if isinstance(node, If):
-            return self.emit_if(node)
-        if isinstance(node, BinOp):
-            return self.emit_binop(node)
-        if isinstance(node, UnaryOp):
-            return self.emit_unary(node)
-        if isinstance(node, Variable):
-            return self.emit_variable(node)
-        if isinstance(node, Assign):
-            return self.emit_assign(node)
-        if isinstance(node, Call):
-            return self.emit_call(node)
-        if isinstance(node, While):
-            return self.emit_while(node)
-        if isinstance(node, Print):
-            return self.emit_print(node)
-        if isinstance(node, Input):
-            return self.emit_input(node)
-        if isinstance(node, InputStr):
-            return self.emit_input_str(node)
-        if isinstance(node, Signed67):
-            return self.emit_signed_67(node)
-        if isinstance(node, Number):
-            return self.emit_number(node)
-        if isinstance(node, String):
-            return self.emit_string(node)
-        if isinstance(node, VarDecl):
-            return self.emit_var_decl(node)
-        if isinstance(node, ExprStmt):
-            return self.emit(node.expr)
-        if isinstance(node, Import):
-            return self.emit_import(node)
-        if isinstance(node, StructDef):
-            return self.emit_struct(node)
-        if isinstance(node, NewExpr):
-            return self.emit_new_expr(node)
-        if isinstance(node, Deref):
-            return self.emit_deref(node)
-        if isinstance(node, AddrOf):
-            return self.emit_addr_of(node)
-        if isinstance(node, SizeOf):
-            return self.emit_sizeof(node)
-        if isinstance(node, InlineAsm):
-            return self.emit_inline_asm(node)
-        if isinstance(node, ClassDef):
-            return self.emit_class(node)
-        if isinstance(node, Index):
-            return self.emit_index(node)
-        if isinstance(node, Attr):
-            return self.emit_attr(node)
-        if isinstance(node, Switch):
-            return self.emit_switch(node)
-        if isinstance(node, Try):
-            return self.emit_try(node)
-        if isinstance(node, Raise):
-            return self.emit_raise(node)
-        if isinstance(node, Break):
-            return self.emit_break(node)
-        if isinstance(node, Continue):
-            return self.emit_continue(node)
-        if isinstance(node, dict) and node.get('type') == 'for':
-            return self.emit_for(node)
+                    raise HookLoadError(
+                        f"codegen hook {hook.__class__.__name__} failed: {e}"
+                    ) from e
+
+        if isinstance(node, dict):
+            if node.get('type') == 'for':
+                return self.emit_for(node)
+            return None
+
+        # Registry-based visitor (primary dispatch)
+        handler = _EMIT_REGISTRY.get(type(node))
+        if handler is not None:
+            return handler(self, node)
+
+        # Fallback: dynamic dispatch by naming convention
+        method = getattr(
+            self,
+            f"emit_{type(node).__name__.lower()}",
+            None
+        )
+        if method is not None:
+            return method(node)
+
         return None
 
-    def emit_struct(self, node: StructDef):
+    @register_emitter(StructDef)
+    def emit_structdef(self, node: StructDef):
         self._struct_nodes[node.name] = node
         if node.generic_params:
             # For generic structs, don't emit the base version with raw type params.
@@ -644,7 +615,8 @@ class LLVM:
             self.structs[node.name] = llvm_struct
         self.struct_fields[node.name] = node.fields
 
-    def emit_class(self, node: ClassDef):
+    @register_emitter(ClassDef)
+    def emit_classdef(self, node: ClassDef):
         """Emit a class as a struct with methods as functions having a hidden 'this' pointer."""
         self._struct_nodes[node.name] = node
         # Collect all fields (including inherited)
@@ -740,7 +712,8 @@ class LLVM:
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
 
-    def emit_new_expr(self, node: NewExpr):
+    @register_emitter(NewExpr)
+    def emit_newexpr(self, node: NewExpr):
         if node.type_expr == 'str':
             malloc_fn = self._get_malloc_fn()
             empty_str = self._string_const('')
@@ -889,11 +862,13 @@ class LLVM:
         self._sizeof_cache[key] = c
         return c
 
+    @register_emitter(Deref)
     def emit_deref(self, node: Deref):
         ptr = self.emit(node.operand)
         return self.builder.load(ptr)
 
-    def emit_addr_of(self, node: AddrOf):
+    @register_emitter(AddrOf)
+    def emit_addrof(self, node: AddrOf):
         if isinstance(node.operand, Variable):
             name = node.operand.name
             ptr = self.locals.get(name)
@@ -908,11 +883,13 @@ class LLVM:
             raise Exception(f"Undefined variable '{name}'")
         raise Exception("Address-of requires a variable")
 
+    @register_emitter(SizeOf)
     def emit_sizeof(self, node: SizeOf):
         ty = self.llvm_type(node.type_expr)
         return self._sizeof_type(ty)
 
-    def emit_inline_asm(self, node: InlineAsm):
+    @register_emitter(InlineAsm)
+    def emit_inlineasm(self, node: InlineAsm):
         arg_tys = []
         arg_vals = []
         for _, arg_expr in node.inputs:
@@ -945,6 +922,7 @@ class LLVM:
             self.builder.store(call, ptr)
         return call
 
+    @register_emitter(Index)
     def emit_index(self, node: Index):
         ptr = self._emit_lvalue(node)
         return self.builder.load(ptr)
@@ -958,6 +936,7 @@ class LLVM:
             idx = self.builder.fptosi(idx, _i64)
         return self.builder.gep(obj, [idx], inbounds=True)
 
+    @register_emitter(Attr)
     def emit_attr(self, node: Attr):
         enum_val = getattr(node, '_enum_member_value', None)
         if enum_val is not None:
@@ -1064,7 +1043,8 @@ class LLVM:
             return self.emit(node.operand)
         raise Exception("Cannot take address of expression")
 
-    def funcdo(self, node: FuncDef):
+    @register_emitter(FuncDef)
+    def emit_funcdef(self, node: FuncDef):
         ret_ty = self.llvm_type(getattr(node, 'rettype', None) or 'int')
         param_tys = [self.llvm_type(t) for t in node.params.values()]
 
@@ -1131,6 +1111,7 @@ class LLVM:
         self.scope_stack = old_scope_stack
         return None
 
+    @register_emitter(Return)
     def emit_return(self, node: Return):
         if self.builder.block.is_terminated:
             return None
@@ -1195,6 +1176,7 @@ class LLVM:
             return None
         return Switch(Variable(var_name), cases)
 
+    @register_emitter(If)
     def emit_if(self, node: If):
         sw = self._switchable_if(node)
         if sw is not None:
@@ -1302,6 +1284,7 @@ class LLVM:
             return self.builder.fcmp_unordered('!=', val, ir.Constant(val.type, 0.0))
         return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
 
+    @register_emitter(BinOp)
     def emit_binop(self, node):
         if node.op == TokenType.PLUS and self._is_string_concat(node):
             return self._emit_string_concat(node)
@@ -1596,7 +1579,8 @@ class LLVM:
         self._memcpy_fn = fn
         return fn
 
-    def emit_unary(self, node: UnaryOp):
+    @register_emitter(UnaryOp)
+    def emit_unaryop(self, node: UnaryOp):
         match node.op:
             case TokenType.PLUS:
                 return self.emit(node.operand)
@@ -1649,6 +1633,7 @@ class LLVM:
                 zero = ir.Constant(value.type, 0)
                 return self.builder.icmp_unsigned('==', value, zero)
 
+    @register_emitter(Variable)
     def emit_variable(self, node):
         if node.const_value is not None:
             val = node.const_value
@@ -1730,6 +1715,7 @@ class LLVM:
         except Exception:
             return None
 
+    @register_emitter(Assign)
     def emit_assign(self, node):
         if isinstance(node.target, Variable):
             name = node.target.name
@@ -1788,6 +1774,7 @@ class LLVM:
             self._emit_write_barrier(target_ptr, value)
         return None
 
+    @register_emitter(Call)
     def emit_call(self, node):
         # Handle method calls: obj.method(args) -> ClassName.method(obj, args)
         if isinstance(node.callee, Attr):
@@ -1847,6 +1834,7 @@ class LLVM:
             args.append(val)
         return self.builder.call(func, args)
 
+    @register_emitter(Print)
     def emit_print(self, node):
         if self.no_userspace:
             # In no-userspace mode, print statements become no-ops
@@ -1910,6 +1898,7 @@ class LLVM:
             return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
         return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
 
+    @register_emitter(Input)
     def emit_input(self, node):
         if self.no_userspace:
             # In no-userspace mode, input returns 0
@@ -1917,18 +1906,21 @@ class LLVM:
         func = self.functions["input"]
         return self.builder.call(func, [])
 
-    def emit_input_str(self, node):
+    @register_emitter(InputStr)
+    def emit_inputstr(self, node):
         if self.no_userspace:
             # In no-userspace mode, input_str returns null pointer
             return ir.Constant(_i8ptr, None)
         func = self.functions["input_str"]
         return self.builder.call(func, [])
 
-    def emit_signed_67(self, node):
+    @register_emitter(Signed67)
+    def emit_signed67(self, node):
         key = b'cpyte-easter-egg-2024'
         sig = hmac.new(key, b'67', hashlib.sha256).hexdigest()
         return self._string_const(sig)
 
+    @register_emitter(While)
     def emit_while(self, node):
         cond_bb = self.builder.append_basic_block("while.cond")
         body_bb = self.builder.append_basic_block("while.body")
@@ -1956,12 +1948,14 @@ class LLVM:
 
         self.builder.position_at_end(end_bb)
 
+    @register_emitter(Break)
     def emit_break(self, node):
         if not self.loop_stack:
             return None
         _, end_bb = self.loop_stack[-1]
         self.builder.branch(end_bb)
 
+    @register_emitter(Continue)
     def emit_continue(self, node):
         if not self.loop_stack:
             return None
@@ -2025,6 +2019,7 @@ class LLVM:
         self.builder.position_at_end(end_bb)
         self._pop_scope()
 
+    @register_emitter(Number)
     def emit_number(self, node):
         if getattr(node, 'inferred_type', '') == 'big':
             s = node.value
@@ -2055,6 +2050,7 @@ class LLVM:
             return ir.Constant(ir.IntType(64), value)
         return ir.Constant(ir.IntType(32), value)
 
+    @register_emitter(String)
     def emit_string(self, node):
         return self._string_const(node.value)
 
@@ -2134,7 +2130,8 @@ class LLVM:
             if name not in frame:
                 frame[name] = state
 
-    def emit_var_decl(self, node):
+    @register_emitter(VarDecl)
+    def emit_vardecl(self, node):
         ty = self.llvm_type(node.var_type)
         ptr = self._alloca(ty, name=node.name)
         self._declare_local(node.name, ptr, node.var_type)
@@ -2177,6 +2174,7 @@ class LLVM:
         elif isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):
             self.builder.store(ir.Constant(ty, 0), ptr)
 
+    @register_emitter(Import)
     def emit_import(self, node):
         var_names = getattr(node, 'var_names', set()) or set()
         for fname, (ret_type, params, vararg) in node.symbols:

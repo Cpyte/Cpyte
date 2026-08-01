@@ -13,6 +13,7 @@ if __package__:
     from ._gc_bc import load_gc_bc
     from .package_manifest import ManifestParser, get_global_registry
     from .extension_hooks import HookLoader, get_global_hook_registry
+    from .sef import *
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     from cpyte import __version__
@@ -26,11 +27,13 @@ else:
     from cpyte._gc_bc import load_gc_bc
     from cpyte.package_manifest import ManifestParser, get_global_registry
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
+    from .sef import *
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
        cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>
        cpy format [--write] [--check] [--tab-size N] <source.cpy>
+       cpy sef <subcommand> ...
 
 Global options:
   --tab-size N        Set tab size (default 4)
@@ -48,6 +51,7 @@ Global options:
 Commands:
   build               Compile source.cpy to a native executable
   format              Canonically reformat source.cpy (AST-based)
+  sef                 Scorpion SEF binary tools (pack/dump/check/size)
 """
 
 
@@ -458,6 +462,81 @@ def cmd_format(args, tab_size=4):
         sys.stdout.write(result.formatted)
 
 
+_SEF_USAGE = """Usage: cpy sef <subcommand> ...
+
+Subcommands:
+  pack    assemble a SEF binary: cpy sef pack <output.sef>
+            [--entry N] [--flags N] [--text FILE ...] [--data FILE ...]
+            [--bss SIZE ...] [--spec JSON]
+  dump    decode and pretty-print: cpy sef dump <input.sef>
+  check   validate a SEF binary:  cpy sef check <input.sef>
+  size    report footprint/layout: cpy sef size <input.sef>
+"""
+
+
+def cmd_sef(args):
+    if not args or args[0] in ('-h', '--help'):
+        print(_SEF_USAGE, file=sys.stderr)
+        sys.exit(0 if args else 1)
+
+    cmd = args[0]
+    rest = args[1:]
+
+    if cmd == 'pack':
+        output = None
+        entry = 0
+        flags = 0
+        text = []
+        data = []
+        bss = []
+        spec = None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == '--entry' and i + 1 < len(rest):
+                entry = int(rest[i + 1], 0)
+                i += 2
+            elif a == '--flags' and i + 1 < len(rest):
+                flags = int(rest[i + 1], 0)
+                i += 2
+            elif a == '--text' and i + 1 < len(rest):
+                text.append(rest[i + 1])
+                i += 2
+            elif a == '--data' and i + 1 < len(rest):
+                data.append(rest[i + 1])
+                i += 2
+            elif a == '--bss' and i + 1 < len(rest):
+                bss.append(int(rest[i + 1], 0))
+                i += 2
+            elif a == '--spec' and i + 1 < len(rest):
+                spec = rest[i + 1]
+                i += 2
+            elif not a.startswith('-'):
+                output = a
+                i += 1
+            else:
+                print(f'Unknown flag: {a}', file=sys.stderr)
+                sys.exit(1)
+        if not output:
+            print('Usage: cpy sef pack <output.sef> [--entry N] [--flags N] '
+                  '[--text FILE ...] [--data FILE ...] [--bss SIZE ...] [--spec JSON]',
+                  file=sys.stderr)
+            sys.exit(1)
+        sys.exit(cmd_pack(output, entry=entry, flags=flags, text=text, data=data,
+                          bss=bss, spec=spec))
+
+    if cmd in ('dump', 'check', 'size'):
+        if len(rest) != 1:
+            print(f'Usage: cpy sef {cmd} <input.sef>', file=sys.stderr)
+            sys.exit(1)
+        fn = {'dump': cmd_dump, 'check': cmd_check, 'size': cmd_size}[cmd]
+        sys.exit(fn(rest[0]))
+
+    print(f'Unknown sef subcommand: {cmd}', file=sys.stderr)
+    print(_SEF_USAGE, file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     tab_size = 4
     mode = 'jit'
@@ -510,6 +589,10 @@ def main():
 
     if args[0] == 'format':
         cmd_format(args[1:], tab_size=tab_size)
+        return
+
+    if args[0] == 'sef':
+        cmd_sef(args[1:])
         return
 
     with open(args[0]) as f:

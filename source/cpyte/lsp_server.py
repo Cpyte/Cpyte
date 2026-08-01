@@ -9,6 +9,7 @@ from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
 from .astparse import parse_file, ParseError, FuncDef, StructDef
+from .formatter import format_source
 from .lexar import Lexer, LexerError
 from .semantic_analasis import SemanticAnalyzer
 
@@ -350,6 +351,32 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
         return None
     except Exception:
         logger.error(f"hover error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_FORMATTING)
+def formatting(ls: CpyLanguageServer, params: lsp.DocumentFormattingParams):
+    try:
+        uri = params.text_document.uri
+        doc = ls.workspace.get_text_document(uri)
+        t0 = time.time()
+        result = format_source(doc.source, tab_size=params.options.tab_size or 4)
+        if result.errors:
+            logger.info(f"[format] {os.path.basename(_uri_to_path(uri))}: "
+                        f"{len(result.errors)} error(s): {result.errors[0]}")
+            return None
+        lines = doc.source.splitlines()
+        if not lines:
+            end = lsp.Position(line=0, character=0)
+        else:
+            end = lsp.Position(line=len(lines) - 1, character=len(lines[-1]))
+        rng = lsp.Range(start=lsp.Position(line=0, character=0), end=end)
+        elapsed = time.time() - t0
+        logger.info(f"[format] {os.path.basename(_uri_to_path(uri))}: "
+                    f"{len(result.formatted)} chars in {elapsed*1000:.0f}ms")
+        return [lsp.TextEdit(range=rng, new_text=result.formatted)]
+    except Exception:
+        logger.error(f"formatting error:\n{traceback.format_exc()}")
         return None
 
 

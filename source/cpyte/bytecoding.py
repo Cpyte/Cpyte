@@ -197,6 +197,7 @@ class LLVM:
         self.string_pool = {}
         self.ssa_values = {}
         self.ssa_types = {}  # Track types of SSA values
+        self.scope_stack = []
         self.structs = {}
         self.struct_fields = {}
         self.import_src_files = []
@@ -331,16 +332,20 @@ class LLVM:
                     nxt_blk = self.builder.append_basic_block(name="sw_next")
                     self.builder.cbranch(eq, then_blk, nxt_blk)
                     self.builder.position_at_start(then_blk)
+                    self._push_scope()
                     for stmt in body:
                         self.emit(stmt)
+                    self._pop_scope()
                     if not self.builder.block.is_terminated:
                         self.builder.branch(end_blk)
                     self.builder.position_at_start(nxt_blk)
                 else:
                     self.builder.branch(default_blk)
                     self.builder.position_at_start(default_blk)
+                    self._push_scope()
                     for stmt in body:
                         self.emit(stmt)
+                    self._pop_scope()
                     if not self.builder.block.is_terminated:
                         self.builder.branch(end_blk)
             self.builder.position_at_start(end_blk)
@@ -363,8 +368,10 @@ class LLVM:
         for i, (case_val, body) in enumerate(node.cases):
             blk = case_blks[i]
             self.builder.position_at_start(blk)
+            self._push_scope()
             for stmt in body:
                 self.emit(stmt)
+            self._pop_scope()
             if not self.builder.block.is_terminated:
                 self.builder.branch(end_blk)
 
@@ -700,9 +707,13 @@ class LLVM:
         old_locals = self.locals
         old_local_types = self.local_types
         old_ssa = self.ssa_values
+        old_ssa_types = self.ssa_types
+        old_scope_stack = self.scope_stack
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
+        self.ssa_types = {}
+        self.scope_stack = [{}]
         # Store 'this' pointer
         this_arg = func.args[0]
         this_ptr = self.builder.alloca(this_ty, name='this')
@@ -726,6 +737,8 @@ class LLVM:
         self.locals = old_locals
         self.local_types = old_local_types
         self.ssa_values = old_ssa
+        self.ssa_types = old_ssa_types
+        self.scope_stack = old_scope_stack
 
     def emit_new_expr(self, node: NewExpr):
         if node.type_expr == 'str':
@@ -1080,8 +1093,14 @@ class LLVM:
 
         old_locals = self.locals
         old_local_types = self.local_types
+        old_ssa = self.ssa_values
+        old_ssa_types = self.ssa_types
+        old_scope_stack = self.scope_stack
         self.locals = {}
         self.local_types = {}
+        self.ssa_values = {}
+        self.ssa_types = {}
+        self.scope_stack = [{}]
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
             ptr = self.builder.alloca(llvm_arg.type, name=name)
             self.builder.store(llvm_arg, ptr)
@@ -1107,6 +1126,9 @@ class LLVM:
 
         self.locals = old_locals
         self.local_types = old_local_types
+        self.ssa_values = old_ssa
+        self.ssa_types = old_ssa_types
+        self.scope_stack = old_scope_stack
         return None
 
     def emit_return(self, node: Return):
@@ -1194,17 +1216,21 @@ class LLVM:
             self.builder.cbranch(cond, then_bb, end_bb)
 
         self.builder.position_at_end(then_bb)
+        self._push_scope()
         for stmt in node.body:
             if not self.builder.block.is_terminated:
                 self.emit(stmt)
+        self._pop_scope()
         if not self.builder.block.is_terminated:
             self.builder.branch(end_bb)
 
         if node.orelse:
             self.builder.position_at_end(else_bb)
+            self._push_scope()
             for stmt in node.orelse:
                 if not self.builder.block.is_terminated:
                     self.emit(stmt)
+            self._pop_scope()
             if not self.builder.block.is_terminated:
                 self.builder.branch(end_bb)
 
@@ -1725,8 +1751,7 @@ class LLVM:
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
             ptr = self._alloca(value.type, name)
-            self.locals[name] = ptr
-            self.local_types[name] = str(value.type)
+            self._declare_local(name, ptr, str(value.type))
             self.builder.store(value, ptr)
             return None
         if isinstance(node.target, str):
@@ -1748,8 +1773,7 @@ class LLVM:
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
             ptr = self._alloca(value.type, name)
-            self.locals[name] = ptr
-            self.local_types[name] = str(value.type)
+            self._declare_local(name, ptr, str(value.type))
             self.builder.store(value, ptr)
             return None
 
@@ -1920,9 +1944,11 @@ class LLVM:
         self.builder.position_at_end(body_bb)
 
         self.loop_stack.append((cond_bb, end_bb))
+        self._push_scope()
         for stmt in node.body:
             if not self.builder.block.is_terminated:
                 self.emit(stmt)
+        self._pop_scope()
         self.loop_stack.pop()
 
         if not self.builder.block.is_terminated:
@@ -1959,10 +1985,9 @@ class LLVM:
         idx_ptr = self._alloca(_i32, name=f"{var_name}.idx")
         self.builder.store(ir.Constant(_i32, 0), idx_ptr)
 
-        if var_name in self.locals:
-            var_ptr = self.locals[var_name]
-        else:
-            var_ptr = self._alloca(_i8, name=var_name)
+        self._push_scope()
+        var_ptr = self._alloca(_i8, name=var_name)
+        self._declare_local(var_name, var_ptr, 'char')
 
         cond_bb = self.builder.append_basic_block(f"for.{var_name}.cond")
         body_bb = self.builder.append_basic_block(f"for.{var_name}.body")
@@ -1982,9 +2007,6 @@ class LLVM:
         char_val = self.builder.load(char_ptr)
         self.builder.store(char_val, var_ptr)
 
-        self.locals[var_name] = var_ptr
-        self.local_types[var_name] = 'char'
-
         self.loop_stack.append((inc_bb, end_bb))
         for stmt in body:
             if not self.builder.block.is_terminated:
@@ -2001,6 +2023,7 @@ class LLVM:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+        self._pop_scope()
 
     def emit_number(self, node):
         if getattr(node, 'inferred_type', '') == 'big':
@@ -2068,11 +2091,53 @@ class LLVM:
         self.builder.position_at_end(saved_block)
         return result
 
+    def _push_scope(self):
+        """Enter a lexical scope; inner declarations shadow (not clobber) outer ones."""
+        self.scope_stack.append({})
+
+    def _pop_scope(self):
+        """Leave a lexical scope, restoring any bindings shadowed inside it."""
+        saved = self.scope_stack.pop()
+        for name, state in saved.items():
+            prev_local, prev_type, prev_ssa, prev_ssa_type = state
+            if prev_local is None:
+                self.locals.pop(name, None)
+            else:
+                self.locals[name] = prev_local
+            if prev_type is None:
+                self.local_types.pop(name, None)
+            else:
+                self.local_types[name] = prev_type
+            if prev_ssa is None:
+                self.ssa_values.pop(name, None)
+            else:
+                self.ssa_values[name] = prev_ssa
+            if prev_ssa_type is None:
+                self.ssa_types.pop(name, None)
+            else:
+                self.ssa_types[name] = prev_ssa_type
+
+    def _declare_local(self, name, ptr, ty):
+        """Bind a variable in the current scope, remembering any outer binding."""
+        state = (
+            self.locals.get(name),
+            self.local_types.get(name),
+            self.ssa_values.get(name),
+            self.ssa_types.get(name),
+        )
+        self.locals[name] = ptr
+        self.local_types[name] = ty
+        self.ssa_values.pop(name, None)
+        self.ssa_types.pop(name, None)
+        if self.scope_stack:
+            frame = self.scope_stack[-1]
+            if name not in frame:
+                frame[name] = state
+
     def emit_var_decl(self, node):
         ty = self.llvm_type(node.var_type)
         ptr = self._alloca(ty, name=node.name)
-        self.locals[node.name] = ptr
-        self.local_types[node.name] = node.var_type
+        self._declare_local(node.name, ptr, node.var_type)
         if node.init:
             value = self.emit(node.init)
             if node.var_type == 'big' and not self._is_big(node.init):

@@ -301,6 +301,36 @@ class SemanticAnalyzer:
     def _is_compile_time_true(self, node) -> bool:
         return isinstance(node, Number) and not self._is_compile_time_false(node)
 
+    _NUMERIC_TYPES = ('int', 'int64', 'uint64', 'float', 'double', 'big', 'char')
+    _INT_TYPES = ('int', 'int64', 'uint64', 'char')
+    _FLOAT_TYPES = ('float', 'double')
+    _WIDE_INT_TYPES = ('int64', 'uint64')
+
+    def _numeric_promote(self, t1: str | None, t2: str | None) -> str | None:
+        """C-like usual arithmetic conversions for numeric types.
+
+        Returns the type an arithmetic operation on ``t1`` and ``t2`` produces,
+        or ``None`` if the operands are not mutually promotable.
+        """
+        if t1 is None or t2 is None:
+            return None
+        if t1 == t2:
+            return t1 if t1 in self._NUMERIC_TYPES else None
+        if t1 in self._FLOAT_TYPES or t2 in self._FLOAT_TYPES:
+            if (t1 in self._FLOAT_TYPES or t1 in self._INT_TYPES) and \
+               (t2 in self._FLOAT_TYPES or t2 in self._INT_TYPES):
+                return 'double' if 'double' in (t1, t2) else 'float'
+            return None
+        if 'big' in (t1, t2):
+            if t1 in ('int', 'int64', 'uint64', 'big') and t2 in ('int', 'int64', 'uint64', 'big'):
+                return 'big'
+            return None
+        if t1 in self._INT_TYPES and t2 in self._INT_TYPES:
+            if t1 in self._WIDE_INT_TYPES or t2 in self._WIDE_INT_TYPES:
+                return 'int64'
+            return 'int'
+        return None
+
     def analyze(self, nodes: list) -> bool:
         for node in nodes:
             self._visit(node)
@@ -392,7 +422,8 @@ class SemanticAnalyzer:
 
             if node.op.name in ('EQ_EQ', 'NOT_EQ', 'LESS', 'GREATER', 'LESS_EQ', 'GREATER_EQ'):
                 if left_t is not None and right_t is not None and left_t != right_t:
-                    ok = (left_t == 'int' and right_t.endswith('*'))
+                    ok = self._numeric_promote(left_t, right_t) is not None
+                    ok = ok or (left_t == 'int' and right_t.endswith('*'))
                     ok = ok or (left_t.endswith('*') and right_t == 'int')
                     ok = ok or (left_t == 'str' and (right_t.endswith('*') or right_t == 'char'))
                     ok = ok or (right_t == 'str' and (left_t.endswith('*') or left_t == 'char'))
@@ -486,27 +517,19 @@ class SemanticAnalyzer:
                             note=f'cannot divide integer by zero'
                         )
                 if left_t is not None and right_t is not None and left_t != right_t:
-                    # Allow mixed integer types with promotion
-                    valid_int_types = ('int', 'int64', 'uint64', 'big')
-                    if left_t in valid_int_types and right_t in valid_int_types:
-                        # Promote to larger type
-                        if left_t == 'big' or right_t == 'big':
-                            node.inferred_type = 'big'
-                            return 'big'
-                        if left_t in ('int64', 'uint64') or right_t in ('int64', 'uint64'):
-                            node.inferred_type = 'int64'
-                            return 'int64'
-                        node.inferred_type = 'int'
-                        return 'int'  # Both are int
-                    else:
-                        self.error(
-                            f'mismatched types `{left_t}` and `{right_t}` in arithmetic expression',
-                            node,
-                            note=f'cannot apply `{node.op.name}` to different types'
-                        )
-                if left_t == 'float' or right_t == 'float':
-                    node.inferred_type = 'float'
-                    return 'float'
+                    # Usual arithmetic conversions: promote to the widest type
+                    promoted = self._numeric_promote(left_t, right_t)
+                    if promoted is not None:
+                        node.inferred_type = promoted
+                        return promoted
+                    self.error(
+                        f'mismatched types `{left_t}` and `{right_t}` in arithmetic expression',
+                        node,
+                        note=f'cannot apply `{node.op.name}` to different types'
+                    )
+                if left_t in ('float', 'double') or right_t in ('float', 'double'):
+                    node.inferred_type = 'double' if 'double' in (left_t, right_t) else 'float'
+                    return node.inferred_type
                 # Return the larger integer type
                 if left_t == 'big' or right_t == 'big':
                     node.inferred_type = 'big'
@@ -526,7 +549,7 @@ class SemanticAnalyzer:
                 node.inferred_type = 'int'
                 return 'int'
             if node.op.name == 'MINUS':
-                valid_types = ('int', 'float', 'int64', 'uint64', 'big')
+                valid_types = ('int', 'float', 'double', 'int64', 'uint64', 'big')
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f'cannot apply unary minus to `{operand_t}`',
@@ -1425,18 +1448,26 @@ class SemanticAnalyzer:
     def _visit_while(self, node, scope: Scope | None = None):
         if isinstance(node, While):
             self._infer_type(node.cond)
+            old_locals = self.locals
+            loop_scope = Scope(scope or self.current_scope)
+            self.locals = loop_scope
             self._loop_depth += 1
             for stmt in node.body:
-                self._visit(stmt, scope)
+                self._visit(stmt, loop_scope)
             self._loop_depth -= 1
+            self.locals = old_locals
         elif isinstance(node, dict):
             cond = node.get('cond')
             if cond is not None:
                 self._infer_type(cond)
+            old_locals = self.locals
+            loop_scope = Scope(scope or self.current_scope)
+            self.locals = loop_scope
             self._loop_depth += 1
             for stmt in node.get('body', []):
-                self._visit(stmt, scope)
+                self._visit(stmt, loop_scope)
             self._loop_depth -= 1
+            self.locals = old_locals
 
     def _visit_for(self, node: dict, scope: Scope | None = None):
         s = scope or self.current_scope

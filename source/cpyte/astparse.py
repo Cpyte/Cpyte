@@ -1395,7 +1395,7 @@ def parse_enum(tokens: list[Token], pos: int):
         member_name = tokens[pos].value
         pos += 1
         member_value = None
-        if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == '=':
+        if pos < len(tokens) and tokens[pos].type == TokenType.EQUAL:
             pos += 1
             member_value, pos = parse_expression(tokens, pos)
         members.append({'name': member_name, 'value': member_value, '_token': tokens[pos - 1]})

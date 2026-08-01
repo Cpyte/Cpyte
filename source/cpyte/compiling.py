@@ -438,7 +438,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
     """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file."""
     import llvmlite.binding as binding
     binding.initialize_all_targets()
-    binding.initialize_native_asmprinter()
+    binding.initialize_all_asmprinters()
 
     llvm_ir = str(module)
     mod = binding.parse_assembly(llvm_ir)
@@ -473,12 +473,14 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
         raise SystemExit(1)
     objs.append(runtime_obj)
 
-    # Link into ELF
+    # Link into ELF using the GCC driver so libgcc (e.g. __fixdfsi) is resolved
     elf_base = output.rsplit('.', 1)[0]
     elf_file = elf_base + '.elf'
-    ld = _find_scorpion_tool('ld', _SCORPION_LD)
-    cmd = [ld, '-m', 'elf32lriscv', '-e', 'main', '--no-relax',
-           '-Ttext=0', '-o', elf_file] + objs
+    cc = _find_scorpion_tool('gcc', _SCORPION_CC)
+    cmd = [cc, _SCORPION_ARCH, _SCORPION_ABI,
+           '-nostdlib', '-nostartfiles',
+           '-Wl,-e,main', '-Wl,--no-relax', '-Wl,-Ttext=0',
+           '-o', elf_file] + objs + ['-lgcc']
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f'error linking: {r.stderr}', file=sys.stderr)

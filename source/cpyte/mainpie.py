@@ -2,6 +2,7 @@ import sys
 import os
 
 if __package__:
+    from . import __version__
     from .lexar import Lexer, LexerError, register_keywords
     from .astparse import parse_file, ParseError, Import
     from .semantic_analasis import analyze
@@ -14,6 +15,7 @@ if __package__:
     from .extension_hooks import HookLoader, get_global_hook_registry
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from cpyte import __version__
     from cpyte.lexar import Lexer, LexerError, register_keywords
     from cpyte.astparse import parse_file, ParseError, Import
     from cpyte.semantic_analasis import analyze
@@ -24,6 +26,29 @@ else:
     from cpyte._gc_bc import load_gc_bc
     from cpyte.package_manifest import ManifestParser, get_global_registry
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
+
+
+_USAGE = """Usage: cpy [options] <source.cpy>
+       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>
+       cpy format [--write] [--check] [--tab-size N] <source.cpy>
+
+Global options:
+  --tab-size N        Set tab size (default 4)
+  --strict            Enable strict semantic analysis
+  --no-userspace      Compile without the userspace runtime
+  --pic               Position-independent code
+  --ast               Print the parsed AST
+  --emit-llvm         Print the generated LLVM IR
+  --jit               JIT-compile and run (default)
+  --aot               Compile to a native executable
+  --scorpion          Cross-compile to RISC-V 32-bit (SEF)
+  --version           Print the cpyte version
+  -h, --help          Show this help
+
+Commands:
+  build               Compile source.cpy to a native executable
+  format              Canonically reformat source.cpy (AST-based)
+"""
 
 
 def pretty_ast(node, indent=0):
@@ -378,6 +403,61 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     print(f'Wrote {executable}')
 
 
+def cmd_format(args, tab_size=4):
+    if not args or args[0] in ('-h', '--help'):
+        print('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>', file=sys.stderr)
+        sys.exit(0 if args else 1)
+
+    write = False
+    check = False
+    enable_extensions = True
+    path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('-w', '--write'):
+            write = True
+            i += 1
+        elif a in ('-c', '--check'):
+            check = True
+            i += 1
+        elif a == '--tab-size' and i + 1 < len(args):
+            tab_size = int(args[i + 1])
+            i += 2
+        elif a == '--no-extensions':
+            enable_extensions = False
+            i += 1
+        elif not a.startswith('-'):
+            path = a
+            i += 1
+        else:
+            print(f'Unknown flag: {a}', file=sys.stderr)
+            sys.exit(1)
+
+    if not path:
+        print('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>', file=sys.stderr)
+        sys.exit(1)
+
+    from .formatter import format_file
+    result, code = format_file(path, write=write, check=check, tab_size=tab_size, enable_extensions=enable_extensions)
+
+    if code != 0:
+        for err in result.errors:
+            print(f'error: {err}', file=sys.stderr)
+        if check and not result.errors:
+            print(f'{path}: file is not formatted', file=sys.stderr)
+        elif not result.errors:
+            print(f'{path}: formatting failed', file=sys.stderr)
+        sys.exit(1)
+
+    if write:
+        print(f'Formatted {path}')
+    elif check:
+        print(f'{path}: ok')
+    else:
+        sys.stdout.write(result.formatted)
+
+
 def main():
     tab_size = 4
     mode = 'jit'
@@ -406,17 +486,30 @@ def main():
             mode = 'aot'
         elif flag == '--scorpion':
             mode = 'scorpion'
+        elif flag == '--version':
+            print(f'cpyte {__version__}')
+            sys.exit(0)
+        elif flag == '--help':
+            print(_USAGE, file=sys.stderr)
+            sys.exit(0)
         else:
             print(f'Unknown flag: {flag}', file=sys.stderr)
             sys.exit(1)
 
+    if args and args[0] in ('-h', '--help'):
+        print(_USAGE, file=sys.stderr)
+        sys.exit(0)
+
     if not args:
-        print('Usage: cpy [--tab-size N] [--strict] [--no-userspace] [--pic] [--ast|--emit-llvm|--jit|--aot|--scorpion] <source file>', file=sys.stderr)
-        print('       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>', file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
         sys.exit(1)
 
     if args[0] == 'build':
         cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic)
+        return
+
+    if args[0] == 'format':
+        cmd_format(args[1:], tab_size=tab_size)
         return
 
     with open(args[0]) as f:

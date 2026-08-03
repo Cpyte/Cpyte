@@ -344,7 +344,7 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
     engine.add_global_mapping(fn, _libc_addr(name))
 
 
-def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False):
+def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False, lto=False):
     llvm_ir = str(module)
     import llvmlite.binding as binding
     binding.initialize_native_target()
@@ -374,6 +374,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
         cmd = ['clang', '-c', '-O3', '-o', src_obj, src]
+        if lto:
+            cmd.append('-flto')
         if pic:
             cmd.append('-fPIC')
         r = subprocess.run(
@@ -388,6 +390,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     if not no_userspace:
         runtime_obj = output + '.runtime.o'
         cmd = ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C]
+        if lto:
+            cmd.append('-flto')
         if pic:
             cmd.append('-fPIC')
         r = subprocess.run(
@@ -398,8 +402,11 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
             objs.append(runtime_obj)
 
     out_name = output.rsplit('.', 1)[0] if '.' in output else output
+    link_cmd = ['clang', '-O3', '-o', out_name] + objs + ['-lm']
+    if lto:
+        link_cmd.insert(1, '-flto')
     r = subprocess.run(
-        ['clang', '-O3', '-o', out_name] + objs + ['-lm'],
+        link_cmd,
         capture_output=True, text=True
     )
     if r.returncode != 0:

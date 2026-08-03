@@ -113,7 +113,7 @@ The extension system is tested with:
 Run tests:
 ```bash
 python test_extension_system.py
-python source/cpyte/mainpie.py examples/example_package_example.cpy
+cpy examples/example_package_example.cpy
 ```
 
 ## Security Considerations

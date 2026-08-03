@@ -6,7 +6,7 @@
 
 ## Overview
 
-Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, automatic memory management (Boehm GC), direct C interoperability, and compilation to native machine code via LLVM.
+Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, automatic memory management (concurrent tri-color GC), direct C interoperability, and compilation to native machine code via LLVM.
 
 ## Table of Contents
 
@@ -30,7 +30,7 @@ Cpy is a compiled programming language that combines Python-like syntax with sys
 Cpy combines high-level language syntax with low-level system programming capabilities. The language targets developers who need:
 
 - **Performance**: Native compilation via LLVM with optimization levels
-- **Control**: Automatic memory management (Boehm GC) with pointer operations
+- **Control**: Automatic memory management (concurrent tri-color GC) with pointer operations
 - **Interoperability**: C library integration
 - **Safety**: Static type checking with semantic analysis
 - **Productivity**: Python-inspired syntax
@@ -1044,13 +1044,13 @@ int* second = arr + 1
 
 ### Memory Safety Considerations
 
-Cpy uses Boehm GC for automatic memory management:
+Cpy uses a concurrent tri-color garbage collector for automatic memory management:
 
 - **No manual free needed**: Objects allocated with `new` are automatically collected
 - **Dangling pointers**: Still possible if pointers outlive collected objects
 - **Buffer overflows**: Ensure array accesses are within bounds
 - **Null pointer dereferences**: Check pointers before dereferencing
-- **Note**: Boehm GC adds a small runtime overhead compared to manual `malloc/free`
+- **Note**: The collector adds a small runtime overhead compared to manual `malloc/free`
 
 ---
 
@@ -1450,11 +1450,9 @@ public def main() -> int:
 ### Current Limitations
 
 1. **Limited standard library**: Basic I/O and mathematical operations
-2. **Boehm GC overhead**: Automatic garbage collection adds small runtime overhead
-3. **Limited exception handling**: Basic try/except support
+2. **GC overhead**: Automatic garbage collection adds small runtime overhead
+3. **Limited exception handling**: Basic `try`/`except` support
 4. **Limited generics**: Basic generic type support
-5. **No modules system**: All code in single file or C imports
-6. **No 64-bit operations in standard library**: 64-bit types are supported but utility functions are limited
 
 ### Potential Future Enhancements
 

@@ -7,7 +7,7 @@ if __package__:
     from .astparse import parse_file, ParseError, Import
     from .semantic_analasis import analyze
     from .bytecoding import LLVM
-    from .compiling import run_jit, run_aot, run_scorpion, _RUNTIME_C
+    from .compiling import run_jit, run_aot, run_scorpion, optimize, _RUNTIME_C
     from .linker import Linker, find_linker, LinkerNotFoundError
     from ._bignum_bc import load_bignum_bc
     from ._gc_bc import load_gc_bc
@@ -21,7 +21,7 @@ else:
     from cpyte.astparse import parse_file, ParseError, Import
     from cpyte.semantic_analasis import analyze
     from cpyte.bytecoding import LLVM
-    from cpyte.compiling import run_jit, run_aot, run_scorpion, _RUNTIME_C
+    from cpyte.compiling import run_jit, run_aot, run_scorpion, optimize, _RUNTIME_C
     from cpyte.linker import Linker, find_linker, LinkerNotFoundError
     from cpyte._bignum_bc import load_bignum_bc
     from cpyte._gc_bc import load_gc_bc
@@ -31,7 +31,7 @@ else:
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
-       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>
+       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>
        cpy format [--write] [--check] [--tab-size N] <source.cpy>
        cpy sef <subcommand> ...
 
@@ -40,6 +40,7 @@ Global options:
   --strict            Enable strict semantic analysis
   --no-userspace      Compile without the userspace runtime
   --pic               Position-independent code
+  --lto               Enable link-time optimization (requires clang)
   --ast               Print the parsed AST
   --emit-llvm         Print the generated LLVM IR
   --jit               JIT-compile and run (default)
@@ -315,9 +316,9 @@ def _collect_frameworks(nodes):
     return list(set(frameworks))
 
 
-def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
+def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto=False):
     if not args:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] <source.cpy>', file=sys.stderr)
+        print('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
     output = None
@@ -343,6 +344,9 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
         elif a == '--pic':
             pic = True
             i += 1
+        elif a == '--lto':
+            lto = True
+            i += 1
         elif a == '--opt' and i + 1 < len(args):
             opt = int(args[i + 1])
             i += 2
@@ -354,7 +358,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
             sys.exit(1)
 
     if not src_file:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] <source.cpy>', file=sys.stderr)
+        print('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] [--lto] <source.cpy>', file=sys.stderr)
         sys.exit(1)
 
     with open(src_file) as f:
@@ -381,6 +385,10 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     binding.link_modules(mod, gc_mod)
     mod.verify()
 
+    if lto:
+        optimize(mod, opt)
+        mod.verify()
+
     target = binding.Target.from_default_triple()
     if pic:
         target_machine = target.create_target_machine(reloc='pic')
@@ -389,8 +397,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False):
     obj = target_machine.emit_object(mod)
     with open(obj_file, 'wb') as f:
         f.write(obj)
-
-    l = Linker()
+    l = Linker(lto=lto)
     objs = [obj_file]
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
@@ -545,6 +552,7 @@ def main():
     strict = False
     no_userspace = False
     pic = False
+    lto = False
     while args and args[0].startswith('--'):
         flag = args.pop(0)
         if flag == '--tab-size':
@@ -555,6 +563,8 @@ def main():
             no_userspace = True
         elif flag == '--pic':
             pic = True
+        elif flag == '--lto':
+            lto = True
         elif flag == '--ast':
             mode = 'ast'
         elif flag == '--emit-llvm':
@@ -584,7 +594,7 @@ def main():
         sys.exit(1)
 
     if args[0] == 'build':
-        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic)
+        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic, lto=lto)
         return
 
     if args[0] == 'format':
@@ -614,7 +624,7 @@ def main():
     elif mode == 'aot':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         obj_file = 'program.o'
-        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic)
+        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic, lto=lto)
         print(f'Wrote {out_base}')
     elif mode == 'scorpion':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'

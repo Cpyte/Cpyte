@@ -27,9 +27,24 @@ def find_linker(candidates=None):
     )
 
 
+def _is_clang(cc):
+    try:
+        r = subprocess.run([cc, '--version'], capture_output=True, text=True, timeout=5)
+        return 'clang' in (r.stdout + r.stderr).lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 class Linker:
-    def __init__(self, cc=None):
+    def __init__(self, cc=None, lto=False):
         self._cc = cc or find_linker()
+        self._lto = bool(lto)
+        if self._lto and not _is_clang(self._cc):
+            print(
+                f'error: LTO requires a clang-compatible compiler, but found {self._cc}',
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
     @property
     def cc(self):
@@ -44,6 +59,8 @@ class Linker:
             cmd.append('-g')
         if pic:
             cmd.append('-fPIC')
+        if self._lto:
+            cmd.append('-flto')
         if opt_level is not None:
             cmd.append(f'-O{opt_level}')
         cmd.extend(['-o', output, src])
@@ -62,6 +79,8 @@ class Linker:
             cmd.append('-fPIC')
         if debug:
             cmd.append('-g')
+        if self._lto:
+            cmd.append('-flto')
         if opt_level is not None:
             cmd.append(f'-O{opt_level}')
         cmd.extend(['-o', output] + list(objects))
@@ -81,8 +100,8 @@ class Linker:
 
 
 def build(objects, output=None, libraries=None, library_paths=None,
-          shared=False, debug=False, opt_level=3, cc=None, frameworks=None, pic=False):
-    linker = Linker(cc)
+          shared=False, debug=False, opt_level=3, cc=None, frameworks=None, pic=False, lto=False):
+    linker = Linker(cc, lto=lto)
 
     final_objects = []
     for src in objects:

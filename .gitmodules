@@ -1,0 +1,3 @@
+[submodule "gmp-6.3.0"]
+	path = gmp-6.3.0
+	url = https://github.com/gmp-mirror/gmp-6.3

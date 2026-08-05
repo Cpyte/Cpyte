@@ -1,1 +1,0 @@
-../mpn/arm64/applem1/aorsmul_1.asm

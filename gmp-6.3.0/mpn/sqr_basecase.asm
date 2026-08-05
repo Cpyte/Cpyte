@@ -1,1 +1,0 @@
-../mpn/arm64/applem1/sqr_basecase.asm

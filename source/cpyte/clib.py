@@ -27,14 +27,14 @@ def _init_libclang():
                 expanded = candidates[0]
         if os.path.exists(expanded):
             try:
-                import clang.cindex
+                import clang.cindex  # type: ignore[reportMissingImports]
                 clang.cindex.Config.set_library_file(expanded)
                 _libclang_loaded = True
                 return True
             except Exception:
                 continue
     try:
-        import clang.cindex
+        import clang.cindex  # type: ignore[reportMissingImports]
         _libclang_loaded = True
         return True
     except Exception:
@@ -687,7 +687,7 @@ def parse_c_source(filepath):
     if not _init_libclang():
         return _parse_c_source_regex(filepath)
 
-    import clang.cindex as ci
+    import clang.cindex as ci  # type: ignore[reportMissingImports]
     try:
         idx = ci.Index.create()
         tu = idx.parse(filepath)

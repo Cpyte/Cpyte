@@ -7,13 +7,14 @@ import warnings
 
 from ._bignum_bc import load_bignum_bc
 from ._gc_bc import load_gc_bc
+from .generate_bc import _remove_probe_stack_ir
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
 warnings.filterwarnings("ignore", category=RuntimeWarning,
                         message="memory leak in callback function")
 
 if getattr(sys, 'frozen', False):
-    _RUNTIME_C = os.path.join(sys._MEIPASS, 'runtime.c')
+    _RUNTIME_C = os.path.join(getattr(sys, '_MEIPASS', ''), 'runtime.c')
 else:
     _RUNTIME_C = os.path.join(os.path.dirname(__file__), 'runtime.c')
 
@@ -194,11 +195,6 @@ def _compile_sources_object(src_files, target_triple=None, pic=False):
             raise SystemExit(1)
         objs.append(obj)
     return objs
-
-
-def _remove_probe_stack_ir(llvm_ir):
-    import re
-    return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
 
 
 def _maybe_compile(module, use_native_eh=False):
@@ -459,7 +455,7 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
 
 
 if getattr(sys, 'frozen', False):
-    _RUNTIME_SCORPION_C = os.path.join(sys._MEIPASS, 'runtime_scorpion.c')
+    _RUNTIME_SCORPION_C = os.path.join(getattr(sys, '_MEIPASS', ''), 'runtime_scorpion.c')
 else:
     _RUNTIME_SCORPION_C = os.path.join(os.path.dirname(__file__), 'runtime_scorpion.c')
 

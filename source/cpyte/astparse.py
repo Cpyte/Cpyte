@@ -45,6 +45,7 @@ def _loc(node):
 
 
 class Number:
+    inferred_type: Optional[str]
     __slots__ = ('value', '_token', 'inferred_type')
     def __init__(self, value: str, token=None):
         self.value = value
@@ -99,6 +100,7 @@ class Attr:
         return f'Attr({self.obj}, {self.name})'
 
 class UnaryOp:
+    inferred_type: Optional[str]
     __slots__ = ('op', 'operand', '_token', 'inferred_type')
     def __init__(self, op: TokenType, operand, token=None):
         self.op = op
@@ -109,6 +111,7 @@ class UnaryOp:
         return f'UnaryOp({self.op.name}, {self.operand})'
 
 class BinOp:
+    inferred_type: Optional[str]
     __slots__ = ('left', 'op', 'right', '_token', 'inferred_type')
     def __init__(self, left, op: TokenType, right, token=None):
         self.left = left
@@ -225,12 +228,15 @@ def _parse_atom(tokens: list[Token], pos: int):
         return Number('67', token=tok), pos + 1
 
     if tok.type == TokenType.NUMBER:
+        assert tok.value is not None
         return Number(tok.value, token=tok), pos + 1
 
     if tok.type == TokenType.STRING:
+        assert tok.value is not None
         return String(tok.value, token=tok), pos + 1
 
     if tok.type == TokenType.IDENTIFIER:
+        assert tok.value is not None
         return Variable(tok.value, token=tok), pos + 1
 
     if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'True', 'False', 'null'):
@@ -329,6 +335,7 @@ def _parse_postfix(tokens: list[Token], pos: int, node):
             if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
                 raise ParseError('Expected attribute name', tokens[pos] if pos < len(tokens) else None)
             name = tokens[pos].value
+            assert name is not None
             pos += 1
             node = Attr(node, name, token=tok)
     return node, pos
@@ -437,6 +444,7 @@ def _parse_func_name(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected function name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
+    assert name is not None
     return name, pos + 1
 
 
@@ -491,6 +499,7 @@ def parse_class(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected class name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
+    assert name is not None
     pos += 1
     generic_params, pos = parse_generic_params(tokens, pos)
     base = None
@@ -547,6 +556,7 @@ def parse_raise(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected exception class name after raise', tokens[pos] if pos < len(tokens) else None)
     exc_type = tokens[pos].value
+    assert exc_type is not None
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
         raise ParseError('Expected "(" after exception class name', tokens[pos] if pos < len(tokens) else None)
@@ -565,6 +575,7 @@ def parse_struct_def(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected struct name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
+    assert name is not None
     pos += 1
 
     generic_params = []
@@ -596,6 +607,7 @@ def parse_struct_def(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError('Expected field name', tokens[pos] if pos < len(tokens) else None)
         field_name = tokens[pos].value
+        assert field_name is not None
         pos += 1
         field_type_str = _type_to_str(field_type) if isinstance(field_type, tuple) else field_type
         fields.append(Field(field_name, field_type_str, token=tok))
@@ -638,24 +650,30 @@ def parse_import(tokens: list[Token], pos: int):
         raise ParseError('Expected module name or quoted header path', tok)
     t = tokens[pos]
     if t.type == TokenType.STRING:
+        assert t.value is not None
         module = t.value
         pos += 1
     elif t.type == TokenType.AT_SIGN:
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError('Expected package name after @', tokens[pos] if pos < len(tokens) else None)
-        parts = [tokens[pos].value]
+        first = tokens[pos].value
+        assert first is not None
+        parts = [first]
         pos += 1
         while pos < len(tokens) and tokens[pos].type == TokenType.DOT:
             pos += 1
             if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
                 raise ParseError('Expected identifier after . in package name', tokens[pos] if pos < len(tokens) else None)
-            parts.append(tokens[pos].value)
+            part = tokens[pos].value
+            assert part is not None
+            parts.append(part)
             pos += 1
         module = '@' + '/'.join(parts)
         node = Import(module, token=tok)
         return node, pos
     elif t.type == TokenType.IDENTIFIER:
+        assert t.value is not None
         module = t.value
         pos += 1
     else:
@@ -670,6 +688,7 @@ def parse_import(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
             raise ParseError('Expected SDK path string', tokens[pos] if pos < len(tokens) else None)
         sdk_path = tokens[pos].value
+        assert sdk_path is not None
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
             raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else None)
@@ -792,6 +811,10 @@ class VarDecl:
         return f'VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})'
 
 class Import:
+    src_file: Optional[str]
+    sub_ast: Optional[list]
+    sdk_path: Optional[str]
+    prebuilt_ll_files: Optional[list]
     __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names', 'is_package', 'prebuilt_ll_files')
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
@@ -937,6 +960,7 @@ def parse_inline_asm(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
         raise ParseError('Expected asm template string', tokens[pos] if pos < len(tokens) else tok)
     template = tokens[pos].value
+    assert template is not None
     pos += 1
     outputs = []
     inputs = []
@@ -1069,7 +1093,7 @@ def _looks_like_type(tokens, pos):
     return i > pos + 1
 
 
-def _type_to_str(t):
+def _type_to_str(t: str | tuple) -> str:
     if isinstance(t, tuple):
         name, params = t
         return f'{name}<{", ".join(_type_to_str(p) if isinstance(p, tuple) else p for p in params)}>'
@@ -1082,6 +1106,7 @@ def parse_type(tokens: list[Token], pos: int):
 
     tok = tokens[pos]
     if tok.type == TokenType.IDENTIFIER:
+        assert tok.value is not None
         base = tok.value
         pos += 1
     else:
@@ -1134,6 +1159,7 @@ def parse_var_decl(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError('Expected constant name after "("', tokens[pos] if pos < len(tokens) else tok)
         name = tokens[pos].value
+        assert name is not None
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
             raise ParseError('Expected ")" to close constant name', tokens[pos] if pos < len(tokens) else tok)
@@ -1142,6 +1168,7 @@ def parse_var_decl(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError('Expected variable name after type', tok)
         name = tokens[pos].value
+        assert name is not None
         pos += 1
 
     init = None
@@ -1395,6 +1422,7 @@ def parse_enum(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected enum name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
+    assert name is not None
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
         raise ParseError('Expected ":" after enum name', tokens[pos] if pos < len(tokens) else None)
@@ -1432,6 +1460,7 @@ def parse_type_alias(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError('Expected type alias name', tokens[pos] if pos < len(tokens) else None)
     name = tokens[pos].value
+    assert name is not None
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.EQUAL:
         raise ParseError('Expected "="', tokens[pos] if pos < len(tokens) else None)

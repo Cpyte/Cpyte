@@ -103,18 +103,24 @@ def _canonicalize_module(mod) -> None:
     (linkonce/weak/external) symbols are never internalised, so linked-in
     user modules can still resolve them.
     """
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
+    target = binding.Target.from_default_triple()
+    target_machine = target.create_target_machine()
+    pto = binding.create_pipeline_tuning_options(speed_level=0)
+    pb = binding.create_pass_builder(target_machine, pto)
     pm = binding.create_new_module_pass_manager()
     pm.add_constant_merge_pass()
     pm.add_global_dead_code_eliminate_pass()
     pm.add_strip_dead_prototype_pass()
-    pm.run(mod)
+    pm.run(mod, pb)
 
 
 def compile_to_bitcode(c_path: str, target_triple: str | None = None,
                        cpu: str | None = None, opt_level: int = 3,
                        gmp_include: str | None = None,
                        canonicalize: bool = False) -> bytes:
-    c_path = Path(c_path).resolve()
+    c_path = str(Path(c_path).resolve())
     clang_opt = max(0, min(int(opt_level), 3))
     with tempfile.TemporaryDirectory() as tmp:
         ll_path = Path(tmp) / 'out.ll'

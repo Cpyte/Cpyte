@@ -186,6 +186,7 @@ class SemanticAnalyzer:
         self._filedir = os.path.dirname(filepath) if filepath else None
         self._workspace_root = workspace_root
         self._loop_depth = 0
+        self._enum_context_name: str | None = None
         self.strict = strict
         self.enable_extensions = enable_extensions
         self._loaded_packages: set[str] = set()
@@ -378,12 +379,18 @@ class SemanticAnalyzer:
 
         if isinstance(node, Variable):
             sym = self.current_scope.lookup(node.name)
+            if sym is None and self._enum_context_name:
+                sym = self.current_scope.lookup(f'{self._enum_context_name}.{node.name}')
             if sym is None:
                 self.error(f'use of undeclared identifier `{node.name}`', node,
                            note=f'no definition found in this scope')
                 return None
             if sym.const_value is not None:
                 node.const_value = sym.const_value
+            if sym.kind == 'enum_member':
+                node.inferred_type = 'int'
+                node.const_value = sym.const_value
+                return 'int'
             if sym.kind in ('enum', 'struct'):
                 node.inferred_type = node.name
                 return node.name
@@ -1368,21 +1375,26 @@ class SemanticAnalyzer:
             self.error(f'redefinition of enum `{node.name}`', node)
             return
         s.define(node.name, Symbol('enum', None, node))
+        prev_ctx = self._enum_context_name
+        self._enum_context_name = node.name
         next_val = 0
-        for i, member in enumerate(node.members):
-            if member['value'] is not None:
-                self._infer_type(member['value'])
-                val = self._eval_const_expr(member['value'])
-                member['_const_value'] = val
-                if isinstance(val, int):
-                    next_val = val + 1
-            else:
-                member['_const_value'] = next_val
-                member['_auto_index'] = next_val
-                next_val += 1
-            sym = Symbol('enum_member', node.name, node)
-            sym.const_value = member['_const_value']
-            s.define(f'{node.name}.{member["name"]}', sym)
+        try:
+            for member in node.members:
+                if member['value'] is not None:
+                    self._infer_type(member['value'])
+                    val = self._eval_const_expr(member['value'], s)
+                    member['_const_value'] = val
+                    if isinstance(val, int):
+                        next_val = val + 1
+                else:
+                    member['_const_value'] = next_val
+                    member['_auto_index'] = next_val
+                    next_val += 1
+                sym = Symbol('enum_member', node.name, node)
+                sym.const_value = member['_const_value']
+                s.define(f'{node.name}.{member["name"]}', sym)
+        finally:
+            self._enum_context_name = prev_ctx
 
     def _check_generic_type(self, type_str: str):
         """If type_str is a generic instantiation like 'Pair<int, string>',
@@ -1427,7 +1439,14 @@ class SemanticAnalyzer:
             return
         s.define(node.name, Symbol('type_alias', node.target_type, node))
 
-    def _eval_const_expr(self, node):
+    def _eval_const_expr(self, node, scope: Scope | None = None):
+        """Fold a constant expression to a Python int/float/str.
+
+        Supports numeric literals (decimal/hex/float), unary -/+/~/not,
+        arithmetic/bitwise/logical binary operators, references to previously
+        defined enum members (bare or qualified) and const variables.
+        """
+        scope = scope or self.current_scope
         if isinstance(node, Number):
             if node.inferred_type == 'float':
                 return float(node.value)
@@ -1439,19 +1458,24 @@ class SemanticAnalyzer:
                 except (ValueError, TypeError):
                     return node.value
         if isinstance(node, UnaryOp):
-            val = self._eval_const_expr(node.operand)
+            val = self._eval_const_expr(node.operand, scope)
             if val is None:
                 return None
-            if node.op.name == 'MINUS':
-                try:
+            try:
+                if node.op.name == 'MINUS':
                     return -val
-                except TypeError:
-                    return None
-            if node.op.name == 'NOT':
-                return not val
+                if node.op.name == 'PLUS':
+                    return +val
+                if node.op.name == 'TILDE':
+                    return ~val
+                if node.op.name == 'NOT':
+                    return not val
+            except TypeError:
+                return None
+            return None
         if isinstance(node, BinOp):
-            left = self._eval_const_expr(node.left)
-            right = self._eval_const_expr(node.right)
+            left = self._eval_const_expr(node.left, scope)
+            right = self._eval_const_expr(node.right, scope)
             if left is None or right is None:
                 return None
             try:
@@ -1459,12 +1483,44 @@ class SemanticAnalyzer:
                     case 'PLUS': return left + right
                     case 'MINUS': return left - right
                     case 'STAR': return left * right
-                    case 'SLASH': return left // right
+                    case 'SLASH' | 'SLASH_SLASH': return left // right
                     case 'PERCENT': return left % right
+                    case 'POW': return left ** right
+                    case 'SHL': return left << right
+                    case 'SHR': return left >> right
+                    case 'AMPERSAND': return left & right
+                    case 'PIPE': return left | right
+                    case 'CARET': return left ^ right
+                    case 'AND': return left and right
+                    case 'OR': return left or right
             except (ZeroDivisionError, TypeError):
                 return None
+            return None
         if isinstance(node, Variable):
-            return node.const_value
+            if node.const_value is not None:
+                return node.const_value
+            sym = scope.lookup(node.name)
+            if sym is None and self._enum_context_name:
+                sym = scope.lookup(f'{self._enum_context_name}.{node.name}')
+            if sym is not None and sym.kind == 'enum_member':
+                return sym.const_value
+            if sym is not None and sym.kind == 'const' and sym.node is not None:
+                init = getattr(sym.node, 'init', None)
+                if init is not None:
+                    return self._eval_const_expr(init, scope)
+            if sym is not None and sym.const_value is not None:
+                return sym.const_value
+            return None
+        if isinstance(node, Attr):
+            if getattr(node, '_enum_member_value', None) is not None:
+                return node._enum_member_value
+            if isinstance(node.obj, Variable):
+                member_sym = scope.lookup(f'{node.obj.name}.{node.name}')
+                if member_sym is not None and member_sym.kind == 'enum_member':
+                    return member_sym.const_value
+            return None
+        if isinstance(node, String):
+            return node.value
         return None
 
     def _visit_while(self, node, scope: Scope | None = None):

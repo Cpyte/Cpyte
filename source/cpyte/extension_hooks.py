@@ -8,7 +8,7 @@ at various stages: lexing, parsing, semantic analysis, and code generation.
 import os
 import sys
 import importlib.util
-from typing import Dict, List, Optional, Callable, Any, Set
+from typing import Dict, List, Optional, Callable, Any, Set, Generic, TypeVar
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
@@ -171,10 +171,13 @@ class RuntimeHook(CompilerHook):
 # Hook Registry
 # =============================================================================
 
+H = TypeVar('H', bound=CompilerHook)
+
+
 @dataclass
-class HookRegistration:
+class HookRegistration(Generic[H]):
     """Represents a registered hook with its metadata."""
-    hook: CompilerHook
+    hook: H
     priority: int  # Higher priority hooks run first
     package_name: str
     hook_path: Optional[str] = None
@@ -189,11 +192,11 @@ class HookRegistry:
     """
     
     def __init__(self):
-        self._lexer_hooks: List[HookRegistration] = []
-        self._parser_hooks: List[HookRegistration] = []
-        self._semantic_hooks: List[HookRegistration] = []
-        self._codegen_hooks: List[HookRegistration] = []
-        self._runtime_hooks: List[HookRegistration] = []
+        self._lexer_hooks: List[HookRegistration[LexerHook]] = []
+        self._parser_hooks: List[HookRegistration[ParserHook]] = []
+        self._semantic_hooks: List[HookRegistration[SemanticHook]] = []
+        self._codegen_hooks: List[HookRegistration[CodegenHook]] = []
+        self._runtime_hooks: List[HookRegistration[RuntimeHook]] = []
         
         self._context: Dict[str, Any] = {}
     

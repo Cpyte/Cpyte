@@ -1,5 +1,6 @@
 import hmac
 import hashlib
+from typing import Any, Protocol
 
 from llvmlite import ir
 from llvmlite.ir import instructions
@@ -8,6 +9,11 @@ from .lexar import Token, TokenType
 from .astparse import *
 from .extension_hooks import get_global_hook_registry
 from .extension_hooks import HookLoadError
+
+
+class _IRValue(Protocol):
+    """Anything that carries an LLVM type."""
+    type: Any
 
 _i8 = ir.IntType(8)
 _i32 = ir.IntType(32)
@@ -215,10 +221,10 @@ class LLVM:
                 _target = _binding.Target.from_default_triple()
             _tm = _target.create_target_machine()
             self.module.triple = _tm.triple
-            self.module.data_layout = _tm.target_data.get_data_layout()
+            self.module.data_layout = str(_tm.target_data)
         except Exception:
             pass
-        self.builder = None
+        self.builder: Any = None
         self.functions = {}
         self.global_vars = {}
         #Constant Variable store here.
@@ -227,6 +233,7 @@ class LLVM:
         self.local_types = {}
         self.string_id = 0
         self.string_pool = {}
+        self.biglit_pool = {}
         self.ssa_values = {}
         self.ssa_types = {}  # Track types of SSA values
         self.scope_stack = []
@@ -283,7 +290,7 @@ class LLVM:
             ('bigint_div', _i8ptr, [_i8ptr, _i8ptr]),
             ('bigint_mod', _i8ptr, [_i8ptr, _i8ptr]),
             ('bigint_neg', _i8ptr, [_i8ptr]),
-            ('bigint_cmp', _i64, [_i8ptr, _i8ptr]),
+            ('bigint_cmp', _i32, [_i8ptr, _i8ptr]),
             ('bigint_print', _void, [_i8ptr]),
         ]
         for name, ret, args in bignum_fns:
@@ -306,32 +313,16 @@ class LLVM:
                 self.functions[name] = fn
 
         # Exception handling globals
-        self.exception_stack = []
-
         self._exc_type = ir.GlobalVariable(
             self.module,
             _i8ptr,
             "_exc_type"
         )
-        self._exc_type.initializer = ir.Constant(_i8ptr, None)
-
-        self._exc_msg = ir.GlobalVariable(
-            self.module,
-            _i8ptr,
-            "_exc_msg"
-        )
-        self._exc_msg.initializer = ir.Constant(_i8ptr, None)
-
-        self._exc_active = ir.GlobalVariable(
-            self.module,
-            _i1,
-            "_exc_active"
-        )
-        self._exc_active.initializer = ir.Constant(_i1, 0)
+        self._exc_type.initializer = ir.Constant(_i8ptr, None)  # type: ignore[attr-defined]
 
         if not use_native_eh:
             self._exc_buf_ptr = ir.GlobalVariable(self.module, _i8ptr, "_exc_buf_ptr")
-            self._exc_buf_ptr.initializer = ir.Constant(_i8ptr, None)
+            self._exc_buf_ptr.initializer = ir.Constant(_i8ptr, None)  # type: ignore[attr-defined]
             setjmp_ty = ir.FunctionType(_i32, [_i8ptr])
             self._setjmp_fn = ir.Function(self.module, setjmp_ty, "setjmp")
             self._setjmp_fn.attributes.add('returns_twice')
@@ -394,7 +385,7 @@ class LLVM:
                     for stmt in body:
                         self.emit(stmt)
                     self._pop_scope()
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.builder.branch(end_blk)
                     self.builder.position_at_start(nxt_blk)
                 else:
@@ -404,7 +395,7 @@ class LLVM:
                     for stmt in body:
                         self.emit(stmt)
                     self._pop_scope()
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.builder.branch(end_blk)
             self.builder.position_at_start(end_blk)
             return
@@ -430,7 +421,7 @@ class LLVM:
             for stmt in body:
                 self.emit(stmt)
             self._pop_scope()
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.builder.branch(end_blk)
 
         self.builder.position_at_start(end_blk)
@@ -457,9 +448,9 @@ class LLVM:
 
         self.builder.position_at_end(try_blk)
         for stmt in node.body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.store(old_buf, self._exc_buf_ptr)
             self.builder.branch(after_blk)
 
@@ -478,9 +469,9 @@ class LLVM:
                 self.builder.position_at_end(match_blk)
                 self.builder.store(old_buf, self._exc_buf_ptr)
                 for stmt in handler.body:
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.emit(stmt)
-                if not self.builder.block.is_terminated:
+                if not self._block_terminated():
                     self.builder.branch(after_blk)
 
                 self.builder.position_at_end(next_blk)
@@ -488,13 +479,13 @@ class LLVM:
             else:
                 self.builder.store(old_buf, self._exc_buf_ptr)
                 for stmt in handler.body:
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.emit(stmt)
-                if not self.builder.block.is_terminated:
+                if not self._block_terminated():
                     self.builder.branch(after_blk)
                 last_blk = self.builder.block
 
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.store(old_buf, self._exc_buf_ptr)
             self.builder.branch(after_blk)
 
@@ -517,10 +508,10 @@ class LLVM:
         saved_unwind = self.builder._unwind_to
         self.builder._unwind_to = lpad_blk
         for stmt in node.body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
         self.builder._unwind_to = saved_unwind
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.branch(after_blk)
 
         self.builder.position_at_end(lpad_blk)
@@ -543,20 +534,20 @@ class LLVM:
 
                 self.builder.position_at_end(match_blk)
                 for stmt in handler.body:
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.emit(stmt)
-                if not self.builder.block.is_terminated:
+                if not self._block_terminated():
                     self.builder.branch(after_blk)
 
                 self.builder.position_at_end(next_blk)
             else:
                 for stmt in handler.body:
-                    if not self.builder.block.is_terminated:
+                    if not self._block_terminated():
                         self.emit(stmt)
-                if not self.builder.block.is_terminated:
+                if not self._block_terminated():
                     self.builder.branch(after_blk)
 
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.call(self._resume_fn, [exc])
             self.builder.unreachable()
 
@@ -572,8 +563,6 @@ class LLVM:
     def _emit_raise_setjmp(self, node):
         exc_type_str = self._string_const(node.exc_type)
         self.builder.store(exc_type_str, self._exc_type)
-        msg = self.emit(node.message)
-        self.builder.store(msg, self._exc_msg)
         buf = self.builder.load(self._exc_buf_ptr)
         self.builder.call(self._longjmp_fn, [buf, ir.Constant(_i32, 1)])
         self.builder.unreachable()
@@ -684,7 +673,7 @@ class LLVM:
     def emit_exprstmt(self, node):
         return self.emit(node.expr)
 
-    def emit(self, node: list[Token]):
+    def emit(self, node: list[Token]) -> _IRValue:
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
             for hook in self._hook_registry.get_codegen_hooks():
@@ -702,8 +691,10 @@ class LLVM:
 
         if isinstance(node, dict):
             if node.get('type') == 'for':
-                return self.emit_for(node)
-            return None
+                return self.emit_for(node)  # type: ignore[return]
+            raise RuntimeError(
+                f"emit: unsupported dict node type {node.get('type')!r}"
+            )
 
         # Registry-based visitor (primary dispatch)
         handler = _EMIT_REGISTRY.get(type(node))
@@ -719,7 +710,9 @@ class LLVM:
         if method is not None:
             return method(node)
 
-        return None
+        raise RuntimeError(
+            f"emit: no emitter registered for {type(node).__name__}"
+        )
 
     @register_emitter(StructDef)
     def emit_structdef(self, node: StructDef):
@@ -737,9 +730,20 @@ class LLVM:
             llvm_struct.set_body(*field_tys)
         else:
             llvm_struct = ir.LiteralStructType(field_tys)
-            llvm_struct.name = f"struct.{node.name}"
+            llvm_struct.name = f"struct.{node.name}"  # type: ignore[attr-defined]
             self.structs[node.name] = llvm_struct
         self.struct_fields[node.name] = node.fields
+
+    @register_emitter(EnumDef)
+    def emit_enumdef(self, node: EnumDef):
+        # Enum members are constant-folded during semantic analysis and resolved
+        # in emit_attr via _enum_member_value; the definition itself emits nothing.
+        return None
+
+    @register_emitter(TypeAlias)
+    def emit_typealias(self, node: TypeAlias):
+        # Type aliases are resolved during semantic analysis; no runtime code.
+        return None
 
     @register_emitter(ClassDef)
     def emit_classdef(self, node: ClassDef):
@@ -827,7 +831,7 @@ class LLVM:
         # Emit body
         for stmt in method.body:
             self.emit(stmt)
-        if self.builder.block is not None and not self.builder.block.is_terminated:
+        if not self._block_terminated():
             if ret_ty == ir.VoidType():
                 self.builder.ret_void()
             else:
@@ -929,20 +933,6 @@ class LLVM:
         wb_fn = self._get_write_barrier_fn()
         self.builder.call(wb_fn, [parent_ptr, child_ptr])
 
-    def _get_free_fn(self):
-        # GC manages memory - free is a no-op but keep for compatibility
-        fn = self._free_fn
-        if fn is not None:
-            return fn
-        for f in self.module.functions:
-            if f.name == 'free':
-                self._free_fn = f
-                return f
-        fnty = ir.FunctionType(ir.VoidType(), [_i8ptr])
-        fn = ir.Function(self.module, fnty, 'free')
-        self._free_fn = fn
-        return fn
-
     def _get_trap_fn(self):
         for f in self.module.functions:
             if f.name == 'llvm.trap':
@@ -1041,7 +1031,7 @@ class LLVM:
             constraint_parts.append(','.join('~' + c for c in clobbers))
         asm_constraints = ','.join(p for p in constraint_parts if p)
         asm_fn_type = ir.FunctionType(ret_ty, arg_tys)
-        asm_fn = ir.InlineAsm(asm_fn_type, node.template, asm_constraints, side_effects=node.volatile)
+        asm_fn = ir.InlineAsm(asm_fn_type, node.template, asm_constraints, side_effect=node.volatile)
         call = self.builder.call(asm_fn, arg_vals)
         if node.outputs and isinstance(node.outputs[0][1], Variable):
             ptr = self._emit_lvalue(node.outputs[0][1])
@@ -1171,7 +1161,7 @@ class LLVM:
 
     @register_emitter(FuncDef)
     def emit_funcdef(self, node: FuncDef):
-        ret_ty = self.llvm_type(getattr(node, 'rettype', None) or 'int')
+        ret_ty = self.llvm_type(node.rettype or 'int')
         param_tys = [self.llvm_type(t) for t in node.params.values()]
 
         if node.name in self.functions:
@@ -1214,10 +1204,10 @@ class LLVM:
             self.local_types[name] = ptype
 
         for stmt in node.body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
 
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             # Shutdown GC before main returns
             if node.name == 'main' and not self.no_gc:
                 gc_shutdown_fn = self.functions.get('gc_shutdown')
@@ -1239,7 +1229,7 @@ class LLVM:
 
     @register_emitter(Return)
     def emit_return(self, node: Return):
-        if self.builder.block.is_terminated:
+        if self._block_terminated():
             return None
         # Shutdown GC before main returns
         fn_name = self.builder.function.name
@@ -1298,6 +1288,8 @@ class LLVM:
 
         if not extract(node):
             return None
+        if var_name is None:
+            return None
         if len(cases) < 2:
             return None
         return Switch(Variable(var_name), cases)
@@ -1326,20 +1318,20 @@ class LLVM:
         self.builder.position_at_end(then_bb)
         self._push_scope()
         for stmt in node.body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
         self._pop_scope()
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.branch(end_bb)
 
         if node.orelse:
             self.builder.position_at_end(else_bb)
             self._push_scope()
             for stmt in node.orelse:
-                if not self.builder.block.is_terminated:
+                if not self._block_terminated():
                     self.emit(stmt)
             self._pop_scope()
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.builder.branch(end_bb)
 
         self.builder.position_at_end(end_bb)
@@ -1360,11 +1352,11 @@ class LLVM:
         if isinstance(right.type, ir.PointerType) and isinstance(left.type, (ir.FloatType, ir.DoubleType)):
             return self.builder.fptosi(left, _i64), self.builder.ptrtoint(right, _i64)
 
-        if isinstance(left.type, ir.PointerType) and not (isinstance(left.type.pointee, ir.IntType) and left.type.pointee.width == 8) and isinstance(right.type, ir.IntType):
+        if isinstance(left.type, ir.PointerType) and not (isinstance(left.type.pointee, ir.IntType) and left.type.pointee.width == 8) and isinstance(right.type, ir.IntType):  # type: ignore[attr-defined]
             left = self.builder.ptrtoint(left, _i64)
             right = self._promote_int(right, _i64)
             return left, right
-        if isinstance(right.type, ir.PointerType) and not (isinstance(right.type.pointee, ir.IntType) and right.type.pointee.width == 8) and isinstance(left.type, ir.IntType):
+        if isinstance(right.type, ir.PointerType) and not (isinstance(right.type.pointee, ir.IntType) and right.type.pointee.width == 8) and isinstance(left.type, ir.IntType):  # type: ignore[attr-defined]
             right = self.builder.ptrtoint(right, _i64)
             left = self._promote_int(left, _i64)
             return left, right
@@ -1409,6 +1401,12 @@ class LLVM:
         if isinstance(val.type, (ir.FloatType, ir.DoubleType)):
             return self.builder.fcmp_unordered('!=', val, ir.Constant(val.type, 0.0))
         return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
+
+    def _block_terminated(self) -> bool:
+        block = self.builder.block
+        if block is None:
+            return True
+        return block.is_terminated
 
     @register_emitter(BinOp)
     def emit_binop(self, node):
@@ -1474,22 +1472,22 @@ class LLVM:
                     return self.builder.call(self.functions['bigint_mod'], [left, right])
                 case TokenType.EQ_EQ:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('==', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('==', cmp, ir.Constant(_i32, 0))
                 case TokenType.NOT_EQ:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('!=', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('!=', cmp, ir.Constant(_i32, 0))
                 case TokenType.LESS:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('<', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('<', cmp, ir.Constant(_i32, 0))
                 case TokenType.GREATER:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('>', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('>', cmp, ir.Constant(_i32, 0))
                 case TokenType.LESS_EQ:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('<=', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('<=', cmp, ir.Constant(_i32, 0))
                 case TokenType.GREATER_EQ:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
-                    return self.builder.icmp_signed('>=', cmp, ir.Constant(_i64, 0))
+                    return self.builder.icmp_signed('>=', cmp, ir.Constant(_i32, 0))
 
         # String equality via strcmp (content, not pointer comparison)
         if node.op in (TokenType.EQ_EQ, TokenType.NOT_EQ):
@@ -1825,7 +1823,7 @@ class LLVM:
         if isinstance(pointee, ir.PointerType) and isinstance(value.type, ir.PointerType):
             return self.builder.bitcast(value, pointee)
         if isinstance(pointee, ir.IntType) and isinstance(value.type, ir.PointerType):
-            if pointee.width == 8 and isinstance(value.type.pointee, ir.IntType) and value.type.pointee.width == 8:
+            if pointee.width == 8 and isinstance(value.type.pointee, ir.IntType) and value.type.pointee.width == 8:  # type: ignore[attr-defined]
                 loaded = self.builder.load(value)
                 if loaded.type != pointee:
                     loaded = self._trunc_or_ext(loaded, pointee)
@@ -1838,7 +1836,9 @@ class LLVM:
         if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, ir.IntType):
             return self.builder.sitofp(value, pointee)
         if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, (ir.FloatType, ir.DoubleType)):
-            return self.builder.fpext(value, pointee) if value.type.width < pointee.width else self.builder.fptrunc(value, pointee)
+            src_w = 64 if isinstance(value.type, ir.DoubleType) else 32
+            dst_w = 64 if isinstance(pointee, ir.DoubleType) else 32
+            return self.builder.fpext(value, pointee) if src_w < dst_w else self.builder.fptrunc(value, pointee)
         if isinstance(pointee, ir.IntType) and isinstance(value.type, (ir.FloatType, ir.DoubleType)):
             return self.builder.fptosi(value, pointee)
         if isinstance(pointee, (ir.FloatType, ir.DoubleType)) and isinstance(value.type, ir.PointerType):
@@ -1926,28 +1926,6 @@ class LLVM:
             self._emit_write_barrier(target_ptr, value)
         return None
 
-    def _emit_call_checked(self, func, args):
-        result = self.builder.call(func, args)
-
-        # No try block active, nothing to check
-        if not self.exception_stack:
-            return result
-
-        exc = self.builder.load(self._exc_active)
-
-        ok_block = self.builder.append_basic_block("call.ok")
-        exc_block = self.exception_stack[-1]
-
-        self.builder.cbranch(
-            exc,
-            exc_block,
-            ok_block
-        )
-
-        self.builder.position_at_end(ok_block)
-
-        return result
-
     @register_emitter(Call)
     def emit_call(self, node):
         # Handle method calls: obj.method(args) -> ClassName.method(obj, args)
@@ -2022,8 +2000,8 @@ class LLVM:
         if isinstance(value.type, ir.DoubleType):
             return self.builder.call(self.functions["print_double"], [value])
         if (isinstance(value.type, ir.PointerType)
-                and isinstance(value.type.pointee, ir.IntType)
-                and value.type.pointee.width == 8):
+                and isinstance(value.type.pointee, ir.IntType)  # type: ignore[attr-defined]
+                and value.type.pointee.width == 8):  # type: ignore[attr-defined]
             return self.builder.call(self.functions["print_str"], [value])
         # Handle 64-bit integers
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
@@ -2112,12 +2090,12 @@ class LLVM:
         self.loop_stack.append((cond_bb, end_bb))
         self._push_scope()
         for stmt in node.body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
         self._pop_scope()
         self.loop_stack.pop()
 
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
@@ -2177,11 +2155,11 @@ class LLVM:
 
         self.loop_stack.append((inc_bb, end_bb))
         for stmt in body:
-            if not self.builder.block.is_terminated:
+            if not self._block_terminated():
                 self.emit(stmt)
         self.loop_stack.pop()
 
-        if not self.builder.block.is_terminated:
+        if not self._block_terminated():
             self.builder.branch(inc_bb)
 
         self.builder.position_at_end(inc_bb)
@@ -2199,11 +2177,14 @@ class LLVM:
             s = node.value
             if s.startswith('0x') or s.startswith('0X'):
                 s = str(int(s, 16))
-            s = s + '\0'
-            arr_ty = ir.ArrayType(_i8, len(s))
-            g = ir.GlobalVariable(self.module, arr_ty, f'.biglit.{id(node)}')
-            g.initializer = ir.Constant(arr_ty, bytearray(s.encode()))
-            g.global_constant = True
+            key = s + '\0'
+            g = self.biglit_pool.get(key)
+            if g is None:
+                arr_ty = ir.ArrayType(_i8, len(key))
+                g = ir.GlobalVariable(self.module, arr_ty, f'.biglit.{len(self.biglit_pool)}')
+                g.initializer = ir.Constant(arr_ty, bytearray(key.encode()))  # type: ignore[attr-defined]
+                g.global_constant = True
+                self.biglit_pool[key] = g
             ptr = self.builder.bitcast(g, _i8ptr)
             return self.builder.call(self.functions['bigint_from_str'], [ptr])
 
@@ -2237,7 +2218,7 @@ class LLVM:
             self.string_id += 1
             gv = ir.GlobalVariable(self.module, arr_ty, name=name)
             gv.global_constant = True
-            gv.initializer = init
+            gv.initializer = init  # type: ignore[attr-defined]
             self.string_pool[val] = gv
         else:
             gv = self.string_pool[val]

@@ -192,7 +192,8 @@ def _find_containing_function(parsed, line):
 
 def _walk_stmt(stmt, cursor_line, out):
     if isinstance(stmt, VarDecl):
-        if getattr(stmt, '_token', None) is not None and stmt._token.line <= cursor_line:
+        tok = stmt._token
+        if tok is not None and tok.line <= cursor_line:
             out[stmt.name] = stmt.var_type or 'int'
         return
     if isinstance(stmt, If):
@@ -418,7 +419,7 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
         t0 = time.time()
         tokens, parsed, analyzer, _ = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
         tok = _find_token_at(tokens, line, col)
-        prefix = tok.value if tok else ""
+        prefix = (tok.value or "") if tok else ""
 
         items = []
         seen = set()

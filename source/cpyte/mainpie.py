@@ -13,7 +13,8 @@ if __package__:
     from ._gc_bc import load_gc_bc
     from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from .extension_hooks import HookLoader, get_global_hook_registry
-    from .sef import *
+    from .sef import cmd_pack, cmd_check, cmd_dump, cmd_size
+    from . import ui
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     from cpyte import __version__
@@ -27,7 +28,8 @@ else:
     from cpyte._gc_bc import load_gc_bc
     from cpyte.package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
-    from .sef import *
+    from cpyte.sef import cmd_pack, cmd_check, cmd_dump, cmd_size
+    from cpyte import ui
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
@@ -253,7 +255,7 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
                 )
                 
         except Exception as e:
-            print(f"Warning: Failed to load package manifest for '{package_name}': {e}", file=sys.stderr)
+            ui.print_warn(f"Failed to load package manifest for '{package_name}': {e}")
 
 
 def _compile(source, tab_size=4, strict=False, enable_extensions=True):
@@ -266,11 +268,11 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True):
     try:
         parsed, _ = parse_file(tokens, enable_extensions=enable_extensions)
     except (LexerError, ParseError) as e:
-        print(f'parse error: {e}', file=sys.stderr)
+        ui.print_err(f'parse error: {e}')
         sys.exit(1)
     result, generic_instantiations = analyze(source, parsed, strict=strict, workspace_root=os.getcwd(), enable_extensions=enable_extensions)
     if result:
-        print(result, file=sys.stderr)
+        ui.print_err(result)
         sys.exit(1)
     return parsed, generic_instantiations
 
@@ -281,7 +283,7 @@ def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extens
     try:
         prog, src_files = c.emit_program(parsed)
     except Exception as e:
-        print(f'codegen error: {e}', file=sys.stderr)
+        ui.print_err(f'codegen error: {e}')
         sys.exit(1)
     return prog, src_files
 
@@ -305,7 +307,7 @@ def _collect_frameworks(nodes):
 
 def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto=False):
     if not args:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>', file=sys.stderr)
+        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>')
         sys.exit(1)
 
     output = None
@@ -320,7 +322,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
                 output = args[i + 1]
                 i += 2
             else:
-                print(f'{a} requires an argument', file=sys.stderr)
+                ui.print_err(f'{a} requires an argument')
                 sys.exit(1)
         elif a == '-g' or a == '--debug':
             debug = True
@@ -341,11 +343,11 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
             src_file = a
             i += 1
         else:
-            print(f'Unknown flag: {a}', file=sys.stderr)
+            ui.print_warn(f'Unknown flag: {a}')
             sys.exit(1)
 
     if not src_file:
-        print('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] [--lto] <source.cpy>', file=sys.stderr)
+        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] [--lto] <source.cpy>')
         sys.exit(1)
 
     with open(src_file) as f:
@@ -354,6 +356,8 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
     parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
 
     frameworks = _collect_frameworks(parsed)
+
+    ui.print_status(f'Compiling {src_file} ...')
 
     prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, use_native_eh=True)
 
@@ -399,12 +403,12 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
 
     executable = output or out_base
     l.link(objs, executable, libraries=['m'], opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
-    print(f'Wrote {executable}')
+    ui.print_ok(f'Wrote {executable}')
 
 
 def cmd_format(args, tab_size=4):
     if not args or args[0] in ('-h', '--help'):
-        print('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>', file=sys.stderr)
+        ui.print_usage('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>')
         sys.exit(0 if args else 1)
 
     write = False
@@ -430,29 +434,29 @@ def cmd_format(args, tab_size=4):
             path = a
             i += 1
         else:
-            print(f'Unknown flag: {a}', file=sys.stderr)
+            ui.print_warn(f'Unknown flag: {a}')
             sys.exit(1)
 
     if not path:
-        print('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>', file=sys.stderr)
+        ui.print_usage('Usage: cpy format [--write] [--check] [--tab-size N] [--no-extensions] <source.cpy>')
         sys.exit(1)
 
-    from .formatter import format_file
+    from cpyte.formatter import format_file
     result, code = format_file(path, write=write, check=check, tab_size=tab_size, enable_extensions=enable_extensions)
 
     if code != 0:
         for err in result.errors:
-            print(f'error: {err}', file=sys.stderr)
+            ui.print_err(f'error: {err}')
         if check and not result.errors:
-            print(f'{path}: file is not formatted', file=sys.stderr)
+            ui.print_err(f'{path}: file is not formatted')
         elif not result.errors:
-            print(f'{path}: formatting failed', file=sys.stderr)
+            ui.print_err(f'{path}: formatting failed')
         sys.exit(1)
 
     if write:
-        print(f'Formatted {path}')
+        ui.print_ok(f'Formatted {path}')
     elif check:
-        print(f'{path}: ok')
+        ui.print_ok(f'{path}: ok')
     else:
         sys.stdout.write(result.formatted)
 
@@ -471,7 +475,7 @@ Subcommands:
 
 def cmd_sef(args):
     if not args or args[0] in ('-h', '--help'):
-        print(_SEF_USAGE, file=sys.stderr)
+        print(ui.paint_usage(_SEF_USAGE, stream=sys.stderr), file=sys.stderr)
         sys.exit(0 if args else 1)
 
     cmd = args[0]
@@ -510,25 +514,24 @@ def cmd_sef(args):
                 output = a
                 i += 1
             else:
-                print(f'Unknown flag: {a}', file=sys.stderr)
+                ui.print_warn(f'Unknown flag: {a}')
                 sys.exit(1)
         if not output:
-            print('Usage: cpy sef pack <output.sef> [--entry N] [--flags N] '
-                  '[--text FILE ...] [--data FILE ...] [--bss SIZE ...] [--spec JSON]',
-                  file=sys.stderr)
+            ui.print_usage('Usage: cpy sef pack <output.sef> [--entry N] [--flags N] '
+                           '[--text FILE ...] [--data FILE ...] [--bss SIZE ...] [--spec JSON]')
             sys.exit(1)
         sys.exit(cmd_pack(output, entry=entry, flags=flags, text=text, data=data,
                           bss=bss, spec=spec))
 
     if cmd in ('dump', 'check', 'size'):
         if len(rest) != 1:
-            print(f'Usage: cpy sef {cmd} <input.sef>', file=sys.stderr)
+            ui.print_usage(f'Usage: cpy sef {cmd} <input.sef>')
             sys.exit(1)
         fn = {'dump': cmd_dump, 'check': cmd_check, 'size': cmd_size}[cmd]
         sys.exit(fn(rest[0]))
 
-    print(f'Unknown sef subcommand: {cmd}', file=sys.stderr)
-    print(_SEF_USAGE, file=sys.stderr)
+    ui.print_warn(f'Unknown sef subcommand: {cmd}')
+    print(ui.paint_usage(_SEF_USAGE, stream=sys.stderr), file=sys.stderr)
     sys.exit(1)
 
 
@@ -564,21 +567,21 @@ def main():
         elif flag == '--scorpion':
             mode = 'scorpion'
         elif flag == '--version':
-            print(f'cpyte {__version__}')
+            print(ui.info(f'cpyte {__version__}'))
             sys.exit(0)
         elif flag == '--help':
-            print(_USAGE, file=sys.stderr)
+            print(ui.paint_usage(_USAGE, stream=sys.stderr), file=sys.stderr)
             sys.exit(0)
         else:
-            print(f'Unknown flag: {flag}', file=sys.stderr)
+            ui.print_warn(f'Unknown flag: {flag}')
             sys.exit(1)
 
     if args and args[0] in ('-h', '--help'):
-        print(_USAGE, file=sys.stderr)
+        print(ui.paint_usage(_USAGE, stream=sys.stderr), file=sys.stderr)
         sys.exit(0)
 
     if not args:
-        print(_USAGE, file=sys.stderr)
+        print(ui.paint_usage(_USAGE, stream=sys.stderr), file=sys.stderr)
         sys.exit(1)
 
     if args[0] == 'build':
@@ -615,11 +618,12 @@ def main():
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         obj_file = 'program.o'
         run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic, lto=lto)
-        print(f'Wrote {out_base}')
+        ui.print_ok(f'Wrote {out_base}')
     elif mode == 'scorpion':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         sef_file = out_base + '.sef'
         run_scorpion(prog, output=sef_file, src_files=src_files)
+        ui.print_ok(f'Wrote {sef_file}')
     else:
         run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)
 

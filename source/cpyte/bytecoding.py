@@ -2,6 +2,7 @@ import hmac
 import hashlib
 
 from llvmlite import ir
+from llvmlite.ir import instructions
 
 from .lexar import Token, TokenType
 from .astparse import *
@@ -25,6 +26,24 @@ def register_emitter(node_type):
         _EMIT_REGISTRY[node_type] = func
         return func
     return decorator
+
+
+class _EHBuilder(ir.IRBuilder):
+    def __init__(self, block):
+        super().__init__(block)
+        self._unwind_to = None
+
+    def call(self, fn, args, name='', cconv=None, tail=False, fastmath=(),
+             attrs=(), arg_attrs=None):
+        if self._unwind_to is not None and not isinstance(fn, ir.InlineAsm):
+            cont = self.append_basic_block("invoke.cont")
+            ret = self.invoke(fn, args, cont, self._unwind_to, name=name,
+                              cconv=cconv, fastmath=fastmath, attrs=attrs,
+                              arg_attrs=arg_attrs)
+            self.position_at_end(cont)
+            return ret
+        return super().call(fn, args, name=name, cconv=cconv, tail=tail,
+                            fastmath=fastmath, attrs=attrs, arg_attrs=arg_attrs)
 
 
 class LLVM:
@@ -182,9 +201,10 @@ class LLVM:
             return val
         return self.builder.call(fn, [val])
 
-    def __init__(self, no_userspace=False, enable_extensions=True, target_triple=None, no_gc=False):
+    def __init__(self, no_userspace=False, enable_extensions=True, target_triple=None, no_gc=False, use_native_eh=False):
         self.module = ir.Module("main")
         self.no_gc = no_gc
+        self.use_native_eh = use_native_eh
         self._target_triple = target_triple
         try:
             import llvmlite.binding as _binding
@@ -201,6 +221,8 @@ class LLVM:
         self.builder = None
         self.functions = {}
         self.global_vars = {}
+        #Constant Variable store here.
+        self.const_vars = {}
         self.locals = {}
         self.local_types = {}
         self.string_id = 0
@@ -284,20 +306,45 @@ class LLVM:
                 self.functions[name] = fn
 
         # Exception handling globals
-        self._exc_buf_ptr = ir.GlobalVariable(self.module, _i8ptr, "_exc_buf_ptr")
-        self._exc_buf_ptr.initializer = ir.Constant(_i8ptr, None)
-        self._exc_type = ir.GlobalVariable(self.module, _i8ptr, "_exc_type")
+        self.exception_stack = []
+
+        self._exc_type = ir.GlobalVariable(
+            self.module,
+            _i8ptr,
+            "_exc_type"
+        )
         self._exc_type.initializer = ir.Constant(_i8ptr, None)
-        self._exc_msg = ir.GlobalVariable(self.module, _i8ptr, "_exc_msg")
+
+        self._exc_msg = ir.GlobalVariable(
+            self.module,
+            _i8ptr,
+            "_exc_msg"
+        )
         self._exc_msg.initializer = ir.Constant(_i8ptr, None)
 
-        # setjmp/longjmp for try/except
-        setjmp_ty = ir.FunctionType(_i32, [_i8ptr])
-        self._setjmp_fn = ir.Function(self.module, setjmp_ty, "setjmp")
-        self._setjmp_fn.attributes.add('returns_twice')
-        longjmp_ty = ir.FunctionType(_void, [_i8ptr, _i32])
-        self._longjmp_fn = ir.Function(self.module, longjmp_ty, "longjmp")
-        self._longjmp_fn.attributes.add('noreturn')
+        self._exc_active = ir.GlobalVariable(
+            self.module,
+            _i1,
+            "_exc_active"
+        )
+        self._exc_active.initializer = ir.Constant(_i1, 0)
+
+        if not use_native_eh:
+            self._exc_buf_ptr = ir.GlobalVariable(self.module, _i8ptr, "_exc_buf_ptr")
+            self._exc_buf_ptr.initializer = ir.Constant(_i8ptr, None)
+            setjmp_ty = ir.FunctionType(_i32, [_i8ptr])
+            self._setjmp_fn = ir.Function(self.module, setjmp_ty, "setjmp")
+            self._setjmp_fn.attributes.add('returns_twice')
+            longjmp_ty = ir.FunctionType(_void, [_i8ptr, _i32])
+            self._longjmp_fn = ir.Function(self.module, longjmp_ty, "longjmp")
+            self._longjmp_fn.attributes.add('noreturn')
+        else:
+            pers_ty = ir.FunctionType(_i32, [], var_arg=True)
+            self._personality_fn = ir.Function(self.module, pers_ty, "cpy_personality")
+            raise_ty = ir.FunctionType(_void, [_i8ptr, _i8ptr])
+            self._raise_exception_fn = ir.Function(self.module, raise_ty, "cpy_raise_exception")
+            resume_ty = ir.FunctionType(_void, [_i8ptr])
+            self._resume_fn = ir.Function(self.module, resume_ty, "cpy_resume")
 
         # strcmp for exception type matching
         strcmp_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
@@ -392,6 +439,11 @@ class LLVM:
 
     @register_emitter(Try)
     def emit_try(self, node):
+        if self.use_native_eh:
+            return self._emit_try_native(node)
+        return self._emit_try_setjmp(node)
+
+    def _emit_try_setjmp(self, node):
         buf = self._alloca(ir.ArrayType(_i8, self._JMP_BUF_SIZE), "exc_buf")
         buf_ptr = self.builder.gep(buf, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)])
         old_buf = self.builder.load(self._exc_buf_ptr)
@@ -449,14 +501,88 @@ class LLVM:
         self.builder.position_at_end(after_blk)
         return None
 
+    def _emit_try_native(self, node):
+        fn = self.builder.function
+        fn.attributes.add('uwtable')
+        fn.attributes.personality = self._personality_fn
+        if not isinstance(self.builder, _EHBuilder):
+            self.builder = _EHBuilder(self.builder.block)
+
+        try_blk = self.builder.append_basic_block("try.body")
+        lpad_blk = self.builder.append_basic_block("try.lpad")
+        after_blk = self.builder.append_basic_block("try.after")
+        self.builder.branch(try_blk)
+        self.builder.position_at_end(try_blk)
+
+        saved_unwind = self.builder._unwind_to
+        self.builder._unwind_to = lpad_blk
+        for stmt in node.body:
+            if not self.builder.block.is_terminated:
+                self.emit(stmt)
+        self.builder._unwind_to = saved_unwind
+        if not self.builder.block.is_terminated:
+            self.builder.branch(after_blk)
+
+        self.builder.position_at_end(lpad_blk)
+        lp = self.builder.landingpad(ir.LiteralStructType([_i8ptr, _i32]), name="lp")
+        lp.add_clause(instructions.CatchClause(ir.Constant(_i8ptr, None)))
+        exc = self.builder.extract_value(lp, 0)
+        exc_struct = ir.LiteralStructType([_i64, _i8ptr, _i64, _i64, _i8ptr, _i8ptr])
+        es = self.builder.bitcast(exc, ir.PointerType(exc_struct))
+        tnp = self.builder.gep(es, [ir.Constant(_i32, 0), ir.Constant(_i32, 4)])
+        exc_type_val = self.builder.load(tnp)
+
+        for i, handler in enumerate(node.handlers):
+            if handler.type_name:
+                htype = self._string_const(handler.type_name)
+                cmp_res = self.builder.call(self._strcmp_fn, [exc_type_val, htype])
+                is_match = self.builder.icmp_signed('==', cmp_res, ir.Constant(_i32, 0))
+                match_blk = self.builder.append_basic_block(f"try.match.{i}")
+                next_blk = self.builder.append_basic_block(f"try.next.{i}")
+                self.builder.cbranch(is_match, match_blk, next_blk)
+
+                self.builder.position_at_end(match_blk)
+                for stmt in handler.body:
+                    if not self.builder.block.is_terminated:
+                        self.emit(stmt)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(after_blk)
+
+                self.builder.position_at_end(next_blk)
+            else:
+                for stmt in handler.body:
+                    if not self.builder.block.is_terminated:
+                        self.emit(stmt)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(after_blk)
+
+        if not self.builder.block.is_terminated:
+            self.builder.call(self._resume_fn, [exc])
+            self.builder.unreachable()
+
+        self.builder.position_at_end(after_blk)
+        return None
+
     @register_emitter(Raise)
     def emit_raise(self, node):
+        if self.use_native_eh:
+            return self._emit_raise_native(node)
+        return self._emit_raise_setjmp(node)
+
+    def _emit_raise_setjmp(self, node):
         exc_type_str = self._string_const(node.exc_type)
         self.builder.store(exc_type_str, self._exc_type)
         msg = self.emit(node.message)
         self.builder.store(msg, self._exc_msg)
         buf = self.builder.load(self._exc_buf_ptr)
         self.builder.call(self._longjmp_fn, [buf, ir.Constant(_i32, 1)])
+        self.builder.unreachable()
+        return None
+
+    def _emit_raise_native(self, node):
+        exc_type_str = self._string_const(node.exc_type)
+        msg = self.emit(node.message)
+        self.builder.call(self._raise_exception_fn, [exc_type_str, msg])
         self.builder.unreachable()
         return None
 
@@ -1632,31 +1758,47 @@ class LLVM:
                     return self.builder.fcmp_unordered('==', value, zero)
                 zero = ir.Constant(value.type, 0)
                 return self.builder.icmp_unsigned('==', value, zero)
+        return None
 
+    #Added constant check code
+    #Is it good man?
     @register_emitter(Variable)
     def emit_variable(self, node):
-        if node.const_value is not None:
+        const = self.const_vars.get(node.name)
+        if const is not None:
+            # Compile-time constant
+            if isinstance(const, ir.Constant):
+                return const
+            # Runtime constant stored in immutable global
+            return self.builder.load(const, node.name)
+
+        # Constants resolved during semantic analysis (enum members, imported C constants)
+        if getattr(node, 'const_value', None) is not None:
             val = node.const_value
             # Use i32 for small values, i64 for large ones
             if -2**31 <= val < 2**31:
                 return ir.Constant(ir.IntType(32), val)
             return ir.Constant(ir.IntType(64), val)
+
         ptr = self.locals.get(node.name)
         if ptr is not None:
             return self.builder.load(ptr, node.name)
+
         gv = self.global_vars.get(node.name)
         if gv is not None:
             return self.builder.load(gv, node.name)
+
         ssa = self.ssa_values.get(node.name)
         if ssa is not None:
             return ssa
-        # Check if it's a defined function (to pass as function pointer)
+
         func = self.functions.get(node.name)
         if func is not None:
-            # Return a pointer to the function (for use as callback arg)
-            ptr_ty = ir.PointerType(ir.IntType(8))
-            return self.builder.bitcast(func, ptr_ty)
-        raise Exception(f"Undefined variable '{node.name}' at L{node._token.line}:{node._token.column}")
+            return self.builder.bitcast(func, ir.PointerType(ir.IntType(8)))
+
+        raise Exception(
+            f"Undefined variable '{node.name}' at L{node._token.line}:{node._token.column}"
+        )
 
     def _trunc_or_ext(self, value, target_type):
         ty = target_type
@@ -1719,6 +1861,11 @@ class LLVM:
     def emit_assign(self, node):
         if isinstance(node.target, Variable):
             name = node.target.name
+
+            # Constant assignment check :)
+            if name in self.const_vars:
+                raise Exception(f"Cannot assign to constant '{name}' at L{node._token.line}:{node._token.column}")
+
             ptr = self.locals.get(name)
             if ptr is not None:
                 value = self.emit(node.value)
@@ -1742,6 +1889,11 @@ class LLVM:
             return None
         if isinstance(node.target, str):
             name = node.target
+
+            # Constant assignment check :) (AGAIN!)
+            if name in self.const_vars:
+                raise Exception(f"Cannot assign to constant '{name}' at L{node._token.line}:{node._token.column}")
+
             ptr = self.locals.get(name)
             if ptr is not None:
                 value = self.emit(node.value)
@@ -1773,6 +1925,28 @@ class LLVM:
         if isinstance(pointee, ir.PointerType):
             self._emit_write_barrier(target_ptr, value)
         return None
+
+    def _emit_call_checked(self, func, args):
+        result = self.builder.call(func, args)
+
+        # No try block active, nothing to check
+        if not self.exception_stack:
+            return result
+
+        exc = self.builder.load(self._exc_active)
+
+        ok_block = self.builder.append_basic_block("call.ok")
+        exc_block = self.exception_stack[-1]
+
+        self.builder.cbranch(
+            exc,
+            exc_block,
+            ok_block
+        )
+
+        self.builder.position_at_end(ok_block)
+
+        return result
 
     @register_emitter(Call)
     def emit_call(self, node):
@@ -2095,7 +2269,7 @@ class LLVM:
         """Leave a lexical scope, restoring any bindings shadowed inside it."""
         saved = self.scope_stack.pop()
         for name, state in saved.items():
-            prev_local, prev_type, prev_ssa, prev_ssa_type = state
+            prev_local, prev_type, prev_ssa, prev_ssa_type, prev_const = state
             if prev_local is None:
                 self.locals.pop(name, None)
             else:
@@ -2112,6 +2286,10 @@ class LLVM:
                 self.ssa_types.pop(name, None)
             else:
                 self.ssa_types[name] = prev_ssa_type
+            if prev_const is None:
+                self.const_vars.pop(name, None)
+            else:
+                self.const_vars[name] = prev_const
 
     def _declare_local(self, name, ptr, ty):
         """Bind a variable in the current scope, remembering any outer binding."""
@@ -2120,6 +2298,7 @@ class LLVM:
             self.local_types.get(name),
             self.ssa_values.get(name),
             self.ssa_types.get(name),
+            self.const_vars.get(name),
         )
         self.locals[name] = ptr
         self.local_types[name] = ty
@@ -2130,9 +2309,44 @@ class LLVM:
             if name not in frame:
                 frame[name] = state
 
+    def _declare_const(self, name, value):
+        """Bind a compile-time constant in the current scope, remembering any outer binding."""
+        state = (
+            self.locals.get(name),
+            self.local_types.get(name),
+            self.ssa_values.get(name),
+            self.ssa_types.get(name),
+            self.const_vars.get(name),
+        )
+        self.const_vars[name] = value
+        self.locals.pop(name, None)
+        self.local_types.pop(name, None)
+        self.ssa_values.pop(name, None)
+        self.ssa_types.pop(name, None)
+        if self.scope_stack:
+            frame = self.scope_stack[-1]
+            if name not in frame:
+                frame[name] = state
+
     @register_emitter(VarDecl)
     def emit_vardecl(self, node):
         ty = self.llvm_type(node.var_type)
+        if node.is_const:
+            if node.init:
+                value = self.emit(node.init)
+                if node.var_type == 'big' and not self._is_big(node.init):
+                    value = self._promote_to_big(value)
+                elif node.var_type in ('int64', 'uint64'):
+                    value = self._extend_to_i64(value)
+                if isinstance(value, ir.Constant):
+                    self._declare_const(node.name, value)
+                else:
+                    ptr = self._alloca(ty, name=node.name)
+                    self.builder.store(value, ptr)
+                    self._declare_const(node.name, ptr)
+            else:
+                self._declare_const(node.name, ir.Constant(ty, 0))
+            return None
         ptr = self._alloca(ty, name=node.name)
         self._declare_local(node.name, ptr, node.var_type)
         if node.init:

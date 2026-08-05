@@ -245,7 +245,10 @@ class _Formatter:
     def _emit_vardecl(self, node, level: int):
         text = node.name
         if node.var_type:
-            text = f'{node.var_type} {text}'
+            if getattr(node, 'is_const', False):
+                text = f'{node.var_type} ({text})'
+            else:
+                text = f'{node.var_type} {text}'
         if node.init is not None:
             text += f' = {self._expr(node.init)}'
         self._emit_simple(node, text, level)

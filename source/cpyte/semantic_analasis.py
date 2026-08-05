@@ -33,7 +33,7 @@ from .astparse import (
 from .clib import resolve_library, parse_header_file, parse_c_source
 from .package_manifest import (
     ManifestParser, ManifestValidator, PackageManifest, 
-    get_global_registry, reset_global_registry
+    get_global_registry, reset_global_registry, iter_cpm_version_dirs
 )
 from .extension_hooks import HookRegistry, HookLoader, get_global_hook_registry
 
@@ -145,6 +145,34 @@ class Scope:
         return self.symbols.get(name)
 
 
+def _is_literal_zero(node) -> bool:
+    if not isinstance(node, Number):
+        return False
+    if node.inferred_type == 'float':
+        return False
+    try:
+        return int(node.value, 0) == 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_compile_time_false(node) -> bool:
+    if isinstance(node, Number):
+        try:
+            v = int(node.value, 0)
+            return v == 0
+        except (ValueError, TypeError):
+            try:
+                return float(node.value) == 0.0
+            except (ValueError, TypeError):
+                return False
+    return False
+
+
+def _is_compile_time_true(node) -> bool:
+    return isinstance(node, Number) and not _is_compile_time_false(node)
+
+
 class SemanticAnalyzer:
     def __init__(self, source: str, filepath: str | None = None,
                  workspace_root: str | None = None, strict: bool = False, enable_extensions: bool = True):
@@ -238,27 +266,15 @@ class SemanticAnalyzer:
         if not os.path.isdir(cpm_root):
             return
             
-        for package_name in os.listdir(cpm_root):
-            # Strip @ from package name if present
-            clean_name = package_name.lstrip('@')
+        for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
+            # Match on the base package name so import lookups (which use the
+            # final path segment, e.g. "json" for "@std/json") find it.
+            base_name = package_name.rsplit('/', 1)[-1]
             
-            if clean_name in self._loaded_packages:
+            if base_name in self._loaded_packages:
                 continue
-                
-            pkg_dir = os.path.join(cpm_root, package_name)
-            if not os.path.isdir(pkg_dir):
-                continue
-                
-            # Check for versions
-            versions = [d for d in os.listdir(pkg_dir) if os.path.isdir(os.path.join(pkg_dir, d))]
-            if not versions:
-                continue
-                
-            # Load from latest version
-            latest_version = sorted(versions, reverse=True)[0]
-            version_dir = os.path.join(pkg_dir, latest_version)
             
-            self._load_package_manifest(version_dir, clean_name)
+            self._load_package_manifest(version_dir, base_name)
 
     def _tok(self, node):
         if isinstance(node, dict):
@@ -275,31 +291,6 @@ class SemanticAnalyzer:
     def _strict_warning(self, message: str, node=None, note: str | None = None):
         if self.strict:
             self.reporter.strict_warning(message, self._tok(node), note)
-
-    def _is_literal_zero(self, node) -> bool:
-        if not isinstance(node, Number):
-            return False
-        if node.inferred_type == 'float':
-            return False
-        try:
-            return int(node.value, 0) == 0
-        except (ValueError, TypeError):
-            return False
-
-    def _is_compile_time_false(self, node) -> bool:
-        if isinstance(node, Number):
-            try:
-                v = int(node.value, 0)
-                return v == 0
-            except (ValueError, TypeError):
-                try:
-                    return float(node.value) == 0.0
-                except (ValueError, TypeError):
-                    return False
-        return False
-
-    def _is_compile_time_true(self, node) -> bool:
-        return isinstance(node, Number) and not self._is_compile_time_false(node)
 
     _NUMERIC_TYPES = ('int', 'int64', 'uint64', 'float', 'double', 'big', 'char')
     _INT_TYPES = ('int', 'int64', 'uint64', 'char')
@@ -406,11 +397,11 @@ class SemanticAnalyzer:
             left_t = self._infer_type(node.left)
 
             if node.op.name in ('AND', 'OR'):
-                if node.op.name == 'AND' and self._is_compile_time_false(node.left):
+                if node.op.name == 'AND' and _is_compile_time_false(node.left):
                     self._infer_type(node.right)
                     node.inferred_type = 'bool'
                     return 'bool'
-                if node.op.name == 'OR' and self._is_compile_time_true(node.left):
+                if node.op.name == 'OR' and _is_compile_time_true(node.left):
                     self._infer_type(node.right)
                     node.inferred_type = 'bool'
                     return 'bool'
@@ -479,7 +470,7 @@ class SemanticAnalyzer:
                         node,
                         note=f'got `{left_t}` and `{right_t}`'
                     )
-                if self._is_literal_zero(node.right):
+                if _is_literal_zero(node.right):
                     self.error(
                         f'division by zero in `{node.op.name}`',
                         node,
@@ -510,7 +501,7 @@ class SemanticAnalyzer:
                     return result
                 if node.op.name == 'SLASH':
                     int_types = ('int', 'int64', 'uint64')
-                    if left_t in int_types and right_t in int_types and self._is_literal_zero(node.right):
+                    if left_t in int_types and right_t in int_types and _is_literal_zero(node.right):
                         self.error(
                             f'division by zero',
                             node,
@@ -1151,6 +1142,10 @@ class SemanticAnalyzer:
                 existing = s.lookup(name)
             if existing is None:
                 s.define(name, Symbol('variable', val_type, node))
+            elif existing.kind == 'const':
+                self.error(f'cannot assign to constant `{name}`', node,
+                           note='constants are immutable once declared; '
+                                'declare a variable with `{type} {name} = ...` if you need to reassign it')
             elif val_type is not None and existing.type is not None and val_type != existing.type:
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64
@@ -1229,6 +1224,9 @@ class SemanticAnalyzer:
             self.error(f'redeclaration of `{node.name}`', node,
                        note=f'variable already exists in this scope')
             return
+        if node.is_const and node.init is None:
+            self.error(f'constant `{node.name}` requires an initializer', node,
+                       note=f'declare it as `{node.var_type} ({node.name}) = <value>`')
         if node.init is not None:
             init_type = self._infer_type(node.init)
             if init_type is not None and val_type is not None and init_type != val_type:
@@ -1272,7 +1270,8 @@ class SemanticAnalyzer:
                         f'cannot initialize `{val_type}` variable with value of type `{init_type}`',
                         node
                     )
-        s.define(node.name, Symbol('variable', val_type, node))
+        kind = 'const' if node.is_const else 'variable'
+        s.define(node.name, Symbol(kind, val_type, node))
 
     def _visit_break(self, node: Break):
         if self._loop_depth == 0:
@@ -1369,13 +1368,18 @@ class SemanticAnalyzer:
             self.error(f'redefinition of enum `{node.name}`', node)
             return
         s.define(node.name, Symbol('enum', None, node))
+        next_val = 0
         for i, member in enumerate(node.members):
             if member['value'] is not None:
+                self._infer_type(member['value'])
                 val = self._eval_const_expr(member['value'])
                 member['_const_value'] = val
+                if isinstance(val, int):
+                    next_val = val + 1
             else:
-                member['_const_value'] = i
-                member['_auto_index'] = i
+                member['_const_value'] = next_val
+                member['_auto_index'] = next_val
+                next_val += 1
             sym = Symbol('enum_member', node.name, node)
             sym.const_value = member['_const_value']
             s.define(f'{node.name}.{member["name"]}', sym)
@@ -1425,22 +1429,40 @@ class SemanticAnalyzer:
 
     def _eval_const_expr(self, node):
         if isinstance(node, Number):
-            return node.value
+            if node.inferred_type == 'float':
+                return float(node.value)
+            try:
+                return int(node.value, 0)
+            except (ValueError, TypeError):
+                try:
+                    return int(node.value)
+                except (ValueError, TypeError):
+                    return node.value
         if isinstance(node, UnaryOp):
             val = self._eval_const_expr(node.operand)
+            if val is None:
+                return None
             if node.op.name == 'MINUS':
-                return -val
+                try:
+                    return -val
+                except TypeError:
+                    return None
             if node.op.name == 'NOT':
                 return not val
         if isinstance(node, BinOp):
             left = self._eval_const_expr(node.left)
             right = self._eval_const_expr(node.right)
-            match node.op.name:
-                case 'PLUS': return left + right
-                case 'MINUS': return left - right
-                case 'STAR': return left * right
-                case 'SLASH': return left // right
-                case 'PERCENT': return left % right
+            if left is None or right is None:
+                return None
+            try:
+                match node.op.name:
+                    case 'PLUS': return left + right
+                    case 'MINUS': return left - right
+                    case 'STAR': return left * right
+                    case 'SLASH': return left // right
+                    case 'PERCENT': return left % right
+            except (ZeroDivisionError, TypeError):
+                return None
         if isinstance(node, Variable):
             return node.const_value
         return None

@@ -50,7 +50,7 @@ class Linker:
     def cc(self):
         return self._cc
 
-    def compile_c(self, src, output=None, opt_level=3, debug=False, pic=False):
+    def compile_c(self, src, output=None, opt_level=3, debug=False, pic=False, eh=False):
         if output is None:
             base = src.rsplit('.', 1)[0] if '.' in src else src
             output = base + '.o'
@@ -59,6 +59,9 @@ class Linker:
             cmd.append('-g')
         if pic:
             cmd.append('-fPIC')
+        if eh:
+            cmd.append('-fexceptions')
+            cmd.append('-funwind-tables')
         if self._lto:
             cmd.append('-flto')
         if opt_level is not None:

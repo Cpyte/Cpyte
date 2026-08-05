@@ -408,3 +408,44 @@ def get_global_registry() -> ManifestRegistry:
 def reset_global_registry() -> None:
     """Reset the global manifest registry (useful for testing)."""
     _global_registry.clear()
+
+
+def iter_cpm_version_dirs(cpm_root: str):
+    """Yield (package_name, version_dir) for every installed CPM package.
+
+    Handles both layouts found under ``<project>/.cpm/modules``:
+
+        ``<name>/<version>/``            unscoped packages
+        ``@scope/<name>/<version>/``     scoped packages (e.g. @std/json)
+
+    Only the highest installed version of each package is yielded, mirroring
+    CPM's "latest version wins" semantics.
+    """
+    if not os.path.isdir(cpm_root):
+        return
+
+    def _versions(entry_dir: str) -> List[str]:
+        return sorted(
+            (d for d in os.listdir(entry_dir)
+             if os.path.isdir(os.path.join(entry_dir, d))),
+            reverse=True,
+        )
+
+    for top in sorted(os.listdir(cpm_root)):
+        top_dir = os.path.join(cpm_root, top)
+        if not os.path.isdir(top_dir):
+            continue
+
+        if top.startswith('@'):
+            # Scoped group: @scope/<name>/<version>
+            for name in sorted(os.listdir(top_dir)):
+                name_dir = os.path.join(top_dir, name)
+                if not os.path.isdir(name_dir):
+                    continue
+                versions = _versions(name_dir)
+                if versions:
+                    yield f"{top}/{name}", os.path.join(name_dir, versions[0])
+        else:
+            versions = _versions(top_dir)
+            if versions:
+                yield top, os.path.join(top_dir, versions[0])

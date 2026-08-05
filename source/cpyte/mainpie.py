@@ -11,7 +11,7 @@ if __package__:
     from .linker import Linker, find_linker, LinkerNotFoundError
     from ._bignum_bc import load_bignum_bc
     from ._gc_bc import load_gc_bc
-    from .package_manifest import ManifestParser, get_global_registry
+    from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from .extension_hooks import HookLoader, get_global_hook_registry
     from .sef import *
 else:
@@ -25,7 +25,7 @@ else:
     from cpyte.linker import Linker, find_linker, LinkerNotFoundError
     from cpyte._bignum_bc import load_bignum_bc
     from cpyte._gc_bc import load_gc_bc
-    from cpyte.package_manifest import ManifestParser, get_global_registry
+    from cpyte.package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
     from .sef import *
 
@@ -213,23 +213,10 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
     hook_registry = get_global_hook_registry()
     
     # Load all available packages in the workspace
-    for package_name in os.listdir(cpm_root):
+    for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
         # Check if already loaded
         if manifest_registry.is_loaded(package_name):
             continue
-            
-        pkg_dir = os.path.join(cpm_root, package_name)
-        if not os.path.isdir(pkg_dir):
-            continue
-            
-        # Check for versions
-        versions = [d for d in os.listdir(pkg_dir) if os.path.isdir(os.path.join(pkg_dir, d))]
-        if not versions:
-            continue
-            
-        # Load from latest version
-        latest_version = sorted(versions, reverse=True)[0]
-        version_dir = os.path.join(pkg_dir, latest_version)
         
         manifest_path = os.path.join(version_dir, 'package.json')
         if not os.path.exists(manifest_path):
@@ -288,8 +275,8 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True):
     return parsed, generic_instantiations
 
 
-def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True, no_gc=False, target_triple=None):
-    c = LLVM(no_userspace=no_userspace, enable_extensions=enable_extensions, no_gc=no_gc, target_triple=target_triple)
+def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True, no_gc=False, target_triple=None, use_native_eh=False):
+    c = LLVM(no_userspace=no_userspace, enable_extensions=enable_extensions, no_gc=no_gc, target_triple=target_triple, use_native_eh=use_native_eh)
     c.generic_instantiations = generic_instantiations or {}
     try:
         prog, src_files = c.emit_program(parsed)
@@ -368,7 +355,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
 
     frameworks = _collect_frameworks(parsed)
 
-    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
+    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, use_native_eh=True)
 
     out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
     obj_file = out_base + '.o'
@@ -399,6 +386,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
         f.write(obj)
     l = Linker(lto=lto)
     objs = [obj_file]
+
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
         l.compile_c(src, output=src_obj, opt_level=opt, debug=debug, pic=pic)
@@ -406,7 +394,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
 
     if not no_userspace:
         runtime_obj = out_base + '.runtime.o'
-        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug, pic=pic)
+        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug, pic=pic, eh=True)
         objs.append(runtime_obj)
 
     executable = output or out_base
@@ -616,6 +604,8 @@ def main():
 
     if mode == 'scorpion':
         prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=True, target_triple='riscv32-unknown-elf')
+    elif mode == 'aot':
+        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, use_native_eh=True)
     else:
         prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
 

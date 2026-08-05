@@ -781,14 +781,15 @@ class ExprStmt:
         return f'ExprStmt({self.expr})'
 
 class VarDecl:
-    __slots__ = ('name', 'var_type', 'init', '_token')
-    def __init__(self, name: str, var_type: str | None = None, init=None, token=None):
+    __slots__ = ('name', 'var_type', 'init', 'is_const', '_token')
+    def __init__(self, name: str, var_type: str | None = None, init=None, is_const: bool = False, token=None):
         self.name = name
         self.var_type = var_type
         self.init = init
+        self.is_const = is_const
         self._token = token
     def __repr__(self):
-        return f'VarDecl({self.name}: {self.var_type} = {self.init})'
+        return f'VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})'
 
 class Import:
     __slots__ = ('module', 'symbols', 'src_file', '_token', 'sub_ast', 'frameworks', 'constants', 'sdk_path', 'var_names', 'is_package', 'prebuilt_ll_files')
@@ -1061,6 +1062,10 @@ def _looks_like_type(tokens, pos):
                 i += 1
             continue
         break
+    # Constant syntax: <type> (NAME) = <value>
+    if i < len(tokens) and tokens[i].type == TokenType.LPAREN:
+        if (i + 2) < len(tokens) and tokens[i + 1].type == TokenType.IDENTIFIER and tokens[i + 2].type == TokenType.RPAREN:
+            return True
     return i > pos + 1
 
 
@@ -1121,10 +1126,23 @@ def parse_type(tokens: list[Token], pos: int):
 def parse_var_decl(tokens: list[Token], pos: int):
     tok = tokens[pos]
     var_type, pos = parse_type(tokens, pos)
-    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected variable name after type', tok)
-    name = tokens[pos].value
-    pos += 1
+    is_const = False
+    if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+        # Constant syntax: <type> (<name>) = <value>
+        is_const = True
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError('Expected constant name after "("', tokens[pos] if pos < len(tokens) else tok)
+        name = tokens[pos].value
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+            raise ParseError('Expected ")" to close constant name', tokens[pos] if pos < len(tokens) else tok)
+        pos += 1
+    else:
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError('Expected variable name after type', tok)
+        name = tokens[pos].value
+        pos += 1
 
     init = None
     if pos < len(tokens) and tokens[pos].type == TokenType.EQUAL:
@@ -1133,7 +1151,7 @@ def parse_var_decl(tokens: list[Token], pos: int):
 
     _expect_newline(tokens, pos, tok)
     var_type_str = _type_to_str(var_type) if isinstance(var_type, tuple) else var_type
-    return VarDecl(name, var_type_str, init, token=tok), pos
+    return VarDecl(name, var_type_str, init, is_const=is_const, token=tok), pos
 
 
 def parse_statement(tokens: list[Token], pos: int):

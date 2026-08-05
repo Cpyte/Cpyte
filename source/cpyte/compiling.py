@@ -95,34 +95,76 @@ def optimize(mod, opt_level=3):
         return
     target = binding.Target.from_default_triple()
     target_machine = target.create_target_machine()
-    pto = binding.create_pipeline_tuning_options(speed_level=opt_level)
+    pto = binding.create_pipeline_tuning_options(speed_level=min(opt_level, 3))
+
+    heavy = opt_level >= 3
+    extra_heavy = opt_level >= 4
 
     if opt_level >= 2:
         pto.slp_vectorization = True
-    if opt_level >= 3:
-        pto.inlining_threshold = 275
+    if heavy:
+        pto.inlining_threshold = 450 if extra_heavy else 275
+        pto.loop_unrolling = True
+        pto.loop_vectorization = True
+        pto.loop_interleaving = True
 
     pb = binding.create_pass_builder(target_machine, pto)
 
-    # Early function-level cleanup: promote allocas to SSA, simplify CFG
+    # Phase 1: infer function attributes (readonly/noalias/nonnull) so every
+    # later pass can exploit them (RPO function-attrs runs as a module pass).
+    if heavy:
+        mpm = pb.getModulePassManager()
+        mpm.add_rpo_function_attrs_pass()
+        mpm.run(mod, pb)
+
+    # Phase 2: aggressive per-function simplification. Promote allocas to SSA,
+    # fold constants, remove dead stores/blocks, and specialise loops.
     if opt_level >= 2:
         fpm = pb.getFunctionPassManager()
+        fpm.add_simplify_cfg_pass()
         fpm.add_sroa_pass()
         fpm.add_instruction_combine_pass()
+        if heavy:
+            fpm.add_new_gvn_pass()              # global value numbering
+            fpm.add_instruction_combine_pass()
+            fpm.add_sccp_pass()                 # sparse conditional constant propagation
+            fpm.add_reassociate_pass()
+            fpm.add_jump_threading_pass()
+            fpm.add_loop_rotate_pass()
+            fpm.add_loop_unroll_pass()
+            fpm.add_loop_strength_reduce_pass()
+            fpm.add_sinking_pass()
+            fpm.add_mem_copy_opt_pass()
+            fpm.add_dead_store_elimination_pass()
+            fpm.add_tail_call_elimination_pass()
+            fpm.add_aggressive_dce_pass()
         fpm.add_simplify_cfg_pass()
         for fn in mod.functions:
             if not fn.is_declaration:
                 fpm.run(fn, pb)
 
-    # Default module pipeline (includes inliner, GVN, DCE, loop opts, etc.)
-    npm = pb.getModulePassManager()
+    # Phase 3: aggressive interprocedural module passes (by-ref promotion,
+    # whole-module constant propagation, dead argument/function elimination,
+    # function merging). These shrink and specialise the module before the
+    # default pipeline runs the inliner and vectorizers.
+    if heavy:
+        mpm = pb.getModulePassManager()
+        mpm.add_argument_promotion_pass()
+        mpm.add_ipsccp_pass()
+        mpm.add_global_opt_pass()
+        mpm.add_constant_merge_pass()
+        mpm.add_global_dead_code_eliminate_pass()
+        mpm.add_dead_arg_elimination_pass()
+        if extra_heavy:
+            mpm.add_post_order_function_attributes_pass()
+            mpm.add_aggressive_instcombine_pass()
+            mpm.add_always_inliner_pass()
+            mpm.add_partial_inliner_pass()
+            mpm.add_merge_functions_pass()
+        mpm.run(mod, pb)
 
-    # Extra global passes at O3 for interprocedural optimization
-    if opt_level >= 3:
-        npm.add_ipsccp_pass()
-        npm.add_global_opt_pass()
-        npm.add_constant_merge_pass()
-        npm.add_global_dead_code_eliminate_pass()
+    # Default module pipeline (includes inliner, GVN, DCE, loop and vectorization opts)
+    npm = pb.getModulePassManager()
 
     # Let extension hooks add their own passes
     try:
@@ -159,16 +201,16 @@ def _remove_probe_stack_ir(llvm_ir):
     return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
 
 
-def _maybe_compile(module):
+def _maybe_compile(module, use_native_eh=False):
     if isinstance(module, list):
         from .bytecoding import LLVM
-        c = LLVM()
+        c = LLVM(use_native_eh=use_native_eh)
         prog, src_files = c.emit_program(module)
         return prog, src_files
     return module, None
 
-def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False):
-    module, src_files_auto = _maybe_compile(module)
+def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, use_native_eh=False):
+    module, src_files_auto = _maybe_compile(module, use_native_eh=use_native_eh)
     if src_files_auto is not None:
         src_files = src_files_auto
     global _print_fn, _input_fn
@@ -390,6 +432,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     if not no_userspace:
         runtime_obj = output + '.runtime.o'
         cmd = ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C]
+        cmd.append('-fexceptions')
+        cmd.append('-funwind-tables')
         if lto:
             cmd.append('-flto')
         if pic:

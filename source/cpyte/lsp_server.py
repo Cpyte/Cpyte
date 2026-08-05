@@ -8,9 +8,12 @@ from lsprotocol import types as lsp
 from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
-from .astparse import parse_file, ParseError, FuncDef, StructDef
+from .astparse import (
+    parse_file, ParseError,
+    FuncDef, StructDef, ClassDef, EnumDef, VarDecl, If, While, Switch, Try,
+)
 from .formatter import format_source
-from .lexar import Lexer, LexerError
+from .lexar import Lexer, LexerError, TokenType
 from .semantic_analasis import SemanticAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -121,6 +124,191 @@ def _find_token_at(tokens, line, col):
             if tok_start <= col < tok_end:
                 return tok
     return None
+
+
+def _dot_context(tokens, line, col):
+    """Return the base identifier of a 'base.<member>' context at the cursor,
+    or None if the cursor is not inside a member access."""
+    tok = _find_token_at(tokens, line, col)
+    if tok is not None and tok.type == TokenType.IDENTIFIER:
+        idx = tokens.index(tok)
+        if idx >= 2 and tokens[idx - 1] is not None and tokens[idx - 1].type == TokenType.DOT:
+            base = tokens[idx - 2]
+            if base is not None and base.type == TokenType.IDENTIFIER:
+                return base.value
+        return None
+    before = None
+    for t in tokens:
+        if t is None:
+            continue
+        t_line = t.line - 1
+        t_end = t.column - 1 + len(t.value or "")
+        if t_line < line or (t_line == line and t_end <= col):
+            before = t
+        elif t_line > line or (t_line == line and t.column - 1 > col):
+            break
+    if before is not None and before.type == TokenType.DOT:
+        idx = tokens.index(before)
+        base = tokens[idx - 1] if idx >= 1 else None
+        if base is not None and base.type == TokenType.IDENTIFIER:
+            return base.value
+    return None
+
+
+def _iter_functions(parsed):
+    for node in parsed:
+        if isinstance(node, FuncDef):
+            yield node
+        elif isinstance(node, ClassDef):
+            for m in node.methods:
+                yield m
+
+
+def _find_containing_function(parsed, line):
+    funcs = list(_iter_functions(parsed))
+    if not funcs:
+        return None
+    matches = []
+    for f in funcs:
+        start = getattr(getattr(f, '_token', None), 'line', None)
+        if start is None:
+            continue
+        end = start
+        for stmt in getattr(f, 'body', None) or []:
+            l = getattr(getattr(stmt, '_token', None), 'line', None)
+            if l is not None:
+                end = max(end, l)
+        if start <= line <= end:
+            matches.append((start, end, f))
+    if matches:
+        matches.sort(key=lambda t: -t[0])
+        return matches[0][2]
+    for f in funcs:
+        start = getattr(getattr(f, '_token', None), 'line', None)
+        if start is not None and start <= line:
+            return f
+    return None
+
+
+def _walk_stmt(stmt, cursor_line, out):
+    if isinstance(stmt, VarDecl):
+        if getattr(stmt, '_token', None) is not None and stmt._token.line <= cursor_line:
+            out[stmt.name] = stmt.var_type or 'int'
+        return
+    if isinstance(stmt, If):
+        for s in stmt.body:
+            _walk_stmt(s, cursor_line, out)
+        for s in stmt.orelse or []:
+            _walk_stmt(s, cursor_line, out)
+        return
+    if isinstance(stmt, While):
+        for s in stmt.body:
+            _walk_stmt(s, cursor_line, out)
+        return
+    if isinstance(stmt, Switch):
+        for _, body in stmt.cases:
+            for s in body:
+                _walk_stmt(s, cursor_line, out)
+        return
+    if isinstance(stmt, Try):
+        for s in stmt.body:
+            _walk_stmt(s, cursor_line, out)
+        for h in stmt.handlers:
+            for s in h.body:
+                _walk_stmt(s, cursor_line, out)
+        return
+    if isinstance(stmt, dict) and stmt.get('type') == 'for':
+        if stmt.get('var'):
+            out[stmt['var']] = 'int'
+        for s in stmt.get('body') or []:
+            _walk_stmt(s, cursor_line, out)
+        return
+
+
+def _collect_locals(func, cursor_line):
+    out = {}
+    for p, t in (func.params or {}).items():
+        out[p] = t
+    for stmt in getattr(func, 'body', None) or []:
+        _walk_stmt(stmt, cursor_line, out)
+    return out
+
+
+def _const_value_text(sym):
+    node = getattr(sym, 'node', None)
+    if node is not None and getattr(node, 'init', None) is not None:
+        val = getattr(node.init, 'value', None)
+        if val is not None:
+            return str(val)
+    if sym.const_value is not None:
+        return str(sym.const_value)
+    return '?'
+
+
+def _member_completions(analyzer, parsed, base, prefix, cursor_line):
+    items = []
+    if not base or analyzer is None:
+        return items
+    sym = analyzer.globals.lookup(base)
+    if sym is None:
+        func = _find_containing_function(parsed, cursor_line)
+        if func is not None and base in func.params:
+            from types import SimpleNamespace
+            sym = SimpleNamespace(kind='param', type=func.params[base], node=None)
+        else:
+            locs = _collect_locals(func, cursor_line) if func else {}
+            if base in locs:
+                from types import SimpleNamespace
+                sym = SimpleNamespace(kind='variable', type=locs[base], node=None)
+    if sym is None:
+        return items
+    seen = set()
+    if sym.kind == 'enum':
+        pfx = f'{base}.'
+        for name, m in analyzer.globals.symbols.items():
+            if name.startswith(pfx):
+                label = name[len(pfx):]
+                if label.startswith(prefix) and label not in seen:
+                    items.append(lsp.CompletionItem(
+                        label=label,
+                        kind=lsp.CompletionItemKind.EnumMember,
+                        detail=f'enum member = {m.const_value}',
+                        insert_text=label,
+                    ))
+                    seen.add(label)
+        return items
+    type_name = sym.type
+    if type_name and type_name.endswith('*'):
+        type_name = type_name[:-1]
+    node = None
+    if type_name:
+        type_sym = analyzer.globals.lookup(type_name)
+        if type_sym is not None:
+            node = type_sym.node
+    if node is None:
+        node = getattr(sym, 'node', None)
+    if node is None:
+        return items
+    for f in getattr(node, 'fields', None) or []:
+        if f.name.startswith(prefix) and f.name not in seen:
+            items.append(lsp.CompletionItem(
+                label=f.name,
+                kind=lsp.CompletionItemKind.Field,
+                detail=f'field: {f.type_expr}',
+                insert_text=f.name,
+            ))
+            seen.add(f.name)
+    for m in getattr(node, 'methods', None) or []:
+        if m.name.startswith(prefix) and m.name not in seen:
+            sig = ", ".join(f"{n}: {t}" for n, t in m.params.items() if n != 'this')
+            items.append(lsp.CompletionItem(
+                label=m.name,
+                kind=lsp.CompletionItemKind.Method,
+                detail=f"({sig}) -> {m.rettype or 'void'}",
+                insert_text=f"{m.name}(",
+            ))
+            seen.add(m.name)
+    return items
 
 
 class CpyLanguageServer(LanguageServer):
@@ -235,6 +423,14 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
         items = []
         seen = set()
 
+        base = _dot_context(tokens, line, col)
+        if base is not None:
+            items = _member_completions(analyzer, parsed, base, prefix, line + 1)
+            elapsed = time.time() - t0
+            logger.info(f"[completion] {os.path.basename(filepath)} @L{line+1}:{col}: "
+                        f"{len(items)} member item(s) for `{base}.` in {elapsed*1000:.0f}ms")
+            return lsp.CompletionList(is_incomplete=False, items=items)
+
         for kw in _KEYWORDS:
             if kw.startswith(prefix):
                 snippet = _SNIPPETS.get(kw)
@@ -257,7 +453,7 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
 
         for node in parsed:
             if isinstance(node, FuncDef) and node.name.startswith(prefix) and node.name not in seen:
-                sig = ", ".join(f"{n}: {t}" for n, t in node.params.items())
+                sig = ", ".join(f"{n}: {t}" for n, t in node.params.items() if n != 'this')
                 items.append(lsp.CompletionItem(
                     label=node.name,
                     kind=lsp.CompletionItemKind.Function,
@@ -272,17 +468,68 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
                     detail="struct",
                 ))
                 seen.add(node.name)
+            elif isinstance(node, ClassDef) and node.name.startswith(prefix) and node.name not in seen:
+                items.append(lsp.CompletionItem(
+                    label=node.name,
+                    kind=lsp.CompletionItemKind.Class,
+                    detail=f"class{(' extends ' + node.base) if node.base else ''}",
+                ))
+                seen.add(node.name)
+            elif isinstance(node, EnumDef) and node.name.startswith(prefix) and node.name not in seen:
+                items.append(lsp.CompletionItem(
+                    label=node.name,
+                    kind=lsp.CompletionItemKind.Enum,
+                    detail="enum",
+                ))
+                seen.add(node.name)
 
         if analyzer:
             for name, sym in analyzer.globals.symbols.items():
+                if '.' in name:
+                    continue
                 if name.startswith(prefix) and name not in seen:
-                    kind = lsp.CompletionItemKind.Function if sym.kind == "function" else lsp.CompletionItemKind.Variable
+                    if sym.kind == 'const':
+                        kind = lsp.CompletionItemKind.Constant
+                        detail = f"const {sym.type} = {_const_value_text(sym)}"
+                    elif sym.kind == 'function':
+                        kind = lsp.CompletionItemKind.Function
+                        detail = f"-> {sym.type or ''}"
+                    elif sym.kind == 'enum':
+                        kind = lsp.CompletionItemKind.Enum
+                        detail = 'enum'
+                    elif sym.kind in ('struct', 'class'):
+                        kind = lsp.CompletionItemKind.Class
+                        detail = sym.kind
+                    else:
+                        kind = lsp.CompletionItemKind.Variable
+                        detail = sym.type or sym.kind
                     items.append(lsp.CompletionItem(
                         label=name,
                         kind=kind,
-                        detail=sym.type or sym.kind,
+                        detail=detail,
                     ))
                     seen.add(name)
+
+        func = _find_containing_function(parsed, line + 1)
+        if func is not None:
+            for p, pt in (func.params or {}).items():
+                if p == 'this':
+                    continue
+                if p.startswith(prefix) and p not in seen:
+                    items.append(lsp.CompletionItem(
+                        label=p,
+                        kind=lsp.CompletionItemKind.Variable,
+                        detail=f"parameter: {pt}",
+                    ))
+                    seen.add(p)
+            for lname, ltype in _collect_locals(func, line + 1).items():
+                if lname.startswith(prefix) and lname not in seen:
+                    items.append(lsp.CompletionItem(
+                        label=lname,
+                        kind=lsp.CompletionItemKind.Variable,
+                        detail=ltype or 'int',
+                    ))
+                    seen.add(lname)
 
         elapsed = time.time() - t0
         logger.info(f"[completion] {os.path.basename(filepath)} @L{line+1}:{col}: {len(items)} items in {elapsed*1000:.0f}ms")
@@ -328,14 +575,21 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
                     fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
                     content = f"**`struct {node.name}`**  \n`{{ {fields} }}`"
                     break
+                elif isinstance(node, EnumDef) and node.name == word:
+                    members = ", ".join(f"`{m['name']}` = `{m.get('_const_value')}`" for m in node.members)
+                    content = f"**`enum {node.name}`**  \n{{ {members} }}"
+                    break
             if not content:
                 sym = analyzer.globals.lookup(word) if analyzer else None
                 if sym:
-                    t = sym.type or sym.kind
                     if sym.kind == "function":
                         content = f"**`{word}`** → `{sym.type if sym.type != 'void' else ''}`"
+                    elif sym.kind == "const":
+                        content = f"**`{word}`**: `{sym.type}` = `{_const_value_text(sym)}`  \n*constant*"
+                    elif sym.kind == "enum":
+                        content = f"**`enum {word}`**"
                     else:
-                        content = f"**`{word}`**: `{t}`"
+                        content = f"**`{word}`**: `{sym.type or sym.kind}`"
                 else:
                     for node in parsed:
                         if isinstance(node, FuncDef) and word in node.params:
@@ -392,26 +646,63 @@ def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
         _, parsed, _, _ = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
         symbols = []
         for node in parsed:
+            tok = getattr(node, '_token', None)
+            loc = lsp.Location(
+                uri=uri,
+                range=lsp.Range(
+                    start=lsp.Position(line=(tok.line - 1 if tok else 0),
+                                       character=(tok.column - 1 if tok else 0)),
+                    end=lsp.Position(line=(tok.line - 1 if tok else 0),
+                                     character=(tok.column - 1 + len(tok.value or "") if tok else 0)),
+                ),
+            )
             if isinstance(node, FuncDef):
-                sig = f"({', '.join(f'{n}: {t}' for n, t in node.params.items())})"
+                sig = f"({', '.join(f'{n}: {t}' for n, t in node.params.items() if n != 'this')})"
                 symbols.append(lsp.SymbolInformation(
                     name=f"{node.name}{sig}",
                     kind=lsp.SymbolKind.Function,
-                    location=lsp.Location(
-                        uri=uri,
-                        range=lsp.Range(start=lsp.Position(line=0, character=0),
-                                        end=lsp.Position(line=0, character=0)),
-                    ),
+                    location=loc,
                 ))
             elif isinstance(node, StructDef):
                 symbols.append(lsp.SymbolInformation(
                     name=node.name,
                     kind=lsp.SymbolKind.Struct,
-                    location=lsp.Location(
+                    location=loc,
+                ))
+            elif isinstance(node, ClassDef):
+                symbols.append(lsp.SymbolInformation(
+                    name=node.name,
+                    kind=lsp.SymbolKind.Class,
+                    location=loc,
+                ))
+                for m in node.methods:
+                    mtok = getattr(m, '_token', None)
+                    mloc = lsp.Location(
                         uri=uri,
-                        range=lsp.Range(start=lsp.Position(line=0, character=0),
-                                        end=lsp.Position(line=0, character=0)),
-                    ),
+                        range=lsp.Range(
+                            start=lsp.Position(line=(mtok.line - 1 if mtok else 0),
+                                               character=(mtok.column - 1 if mtok else 0)),
+                            end=lsp.Position(line=(mtok.line - 1 if mtok else 0),
+                                             character=(mtok.column - 1 + len(mtok.value or "") if mtok else 0)),
+                        ),
+                    )
+                    sig = f"({', '.join(f'{n}: {t}' for n, t in m.params.items() if n != 'this')})"
+                    symbols.append(lsp.SymbolInformation(
+                        name=f"{node.name}.{m.name}{sig}",
+                        kind=lsp.SymbolKind.Method,
+                        location=mloc,
+                    ))
+            elif isinstance(node, EnumDef):
+                symbols.append(lsp.SymbolInformation(
+                    name=node.name,
+                    kind=lsp.SymbolKind.Enum,
+                    location=loc,
+                ))
+            elif isinstance(node, VarDecl) and node.is_const:
+                symbols.append(lsp.SymbolInformation(
+                    name=f"const {node.name}",
+                    kind=lsp.SymbolKind.Constant,
+                    location=loc,
                 ))
         elapsed = time.time() - t0
         logger.info(f"[symbols] {os.path.basename(filepath)}: {len(symbols)} symbol(s) in {elapsed*1000:.0f}ms")

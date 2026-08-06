@@ -10,6 +10,7 @@ piped output stays clean. Standard conventions are honoured:
 
 import os
 import sys
+import traceback
 
 _RESET = '\x1b[0m'
 
@@ -118,3 +119,33 @@ def paint_usage(text, stream=None):
         else:
             painted.append(ln)
     return '\n'.join(painted)
+
+
+def format_traceback(exc=None, stream=None):
+    """Render a Python traceback in the cpyte terminal style.
+
+    The header and stack frames are dimmed so the interesting parts stand out:
+    the source line stays plain and the final exception line is bright red.
+
+    ``exc`` may be an exception instance; when ``None`` the traceback of the
+    exception currently being handled is used.
+    """
+    if exc is None:
+        text = traceback.format_exc()
+    else:
+        text = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    lines = text.rstrip('\n').split('\n')
+    painted = []
+    for i, ln in enumerate(lines):
+        if i == 0 or ln.startswith('  File '):
+            painted.append(paint(ln, 'dim', stream=stream))
+        elif ln.strip() and i == len(lines) - 1:
+            painted.append(paint(ln, 'bright_red', stream=stream))
+        else:
+            painted.append(ln)
+    return '\n'.join(painted)
+
+
+def print_traceback(exc=None, stream=None):
+    stream = stream if stream is not None else sys.stderr
+    print(format_traceback(exc=exc, stream=stream), file=stream)

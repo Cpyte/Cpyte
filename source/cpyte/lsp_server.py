@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -112,6 +113,145 @@ def _analyze(source, filepath=None, workspace_root=None):
         return tokens, parsed, analyzer, error
     except Exception as e:
         return [], [], None, ("internal", str(e), None)
+
+
+_LEVEL_SEVERITY = {
+    'error': lsp.DiagnosticSeverity.Error,
+    'strict-error': lsp.DiagnosticSeverity.Error,
+    'strict-warning': lsp.DiagnosticSeverity.Warning,
+    'warning': lsp.DiagnosticSeverity.Warning,
+}
+
+
+def _make_error_diagnostic(error):
+    kind, msg, token = error
+    if token and hasattr(token, "line"):
+        line = token.line - 1
+        col = token.column - 1
+        rng = lsp.Range(
+            start=lsp.Position(line=line, character=col),
+            end=lsp.Position(line=line, character=col + len(token.value or "")),
+        )
+    else:
+        rng = lsp.Range(start=lsp.Position(line=0, character=0),
+                        end=lsp.Position(line=0, character=0))
+    severity = lsp.DiagnosticSeverity.Error
+    return lsp.Diagnostic(message=msg, severity=severity, range=rng)
+
+
+def _reporter_diagnostics(analyzer):
+    diagnostics = []
+    for d in analyzer.reporter.diagnostics:
+        if d.token:
+            rng = lsp.Range(
+                start=lsp.Position(line=d.token.line - 1, character=d.token.column - 1),
+                end=lsp.Position(line=d.token.line - 1,
+                                 character=d.token.column - 1 + len(d.token.value or "")),
+            )
+        else:
+            rng = lsp.Range(start=lsp.Position(line=0, character=0),
+                            end=lsp.Position(line=0, character=0))
+        diagnostics.append(lsp.Diagnostic(
+            message=d.message,
+            severity=_LEVEL_SEVERITY.get(d.level, lsp.DiagnosticSeverity.Error),
+            range=rng,
+        ))
+    return diagnostics
+
+
+def _analyze_bundle(source, filepath=None, workspace_root=None):
+    """Full lex+parse+analyze plus LSP diagnostics.
+
+    Returns ``(source, tokens, parsed, analyzer, diagnostics, error)``.
+    This is the expensive path; call it from a worker thread, never inline on
+    the pygls event loop. Results are safe to hand back to the main thread
+    (all objects are only read afterwards)."""
+    t0 = time.time()
+    tokens, parsed, analyzer, error = _analyze(
+        source, filepath=filepath, workspace_root=workspace_root)
+    diagnostics = []
+    if error:
+        diagnostics.append(_make_error_diagnostic(error))
+    if analyzer:
+        diagnostics.extend(_reporter_diagnostics(analyzer))
+    elapsed = time.time() - t0
+    logger.info(f"[analyze] {os.path.basename(filepath or '')}: "
+                f"{len(diagnostics)} diag(s) in {elapsed*1000:.0f}ms")
+    return (source, tokens, parsed, analyzer, diagnostics, error)
+
+
+def _get_bundle(ls, uri):
+    """Return the analysis bundle for ``uri``, reusing the cached result when
+    the document source is unchanged. Falls back to a synchronous analysis on
+    the caller's thread when the cache is stale (handlers that use this are
+    thread-marked, so this never blocks the event loop)."""
+    doc = ls.workspace.get_text_document(uri)
+    source = doc.source
+    filepath = _uri_to_path(uri)
+    workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+    cache = getattr(ls, '_analysis_cache', None)
+    if cache is not None:
+        bundle = cache.get(uri)
+        if bundle is not None and bundle[0] == source:
+            return bundle
+    bundle = _analyze_bundle(source, filepath=filepath, workspace_root=workspace_root)
+    if cache is not None:
+        cache[uri] = bundle
+    return bundle
+
+
+_ANALYSIS_DEBOUNCE = 0.25
+
+
+def _schedule_analysis(ls, uri, delay=_ANALYSIS_DEBOUNCE):
+    """Coalesce didOpen/didChange notifications: wait until the user pauses,
+    then run the (off-loop) analysis and publish diagnostics."""
+    loop = getattr(ls, '_loop', None)
+    if loop is None or loop.is_closed():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+    pending = getattr(ls, '_pending_analysis', None)
+    if pending is None:
+        pending = {}
+        ls._pending_analysis = pending
+    prev = pending.get(uri)
+    if prev is not None:
+        prev.cancel()
+    pending[uri] = loop.call_later(delay, _fire_analysis, ls, uri)
+
+
+def _fire_analysis(ls, uri):
+    pending = getattr(ls, '_pending_analysis', None)
+    if pending is not None:
+        pending.pop(uri, None)
+    asyncio.ensure_future(_analyze_and_publish(ls, uri))
+
+
+async def _analyze_and_publish(ls, uri):
+    try:
+        doc = ls.workspace.get_text_document(uri)
+        source = doc.source
+    except Exception:
+        return
+    filepath = _uri_to_path(uri)
+    workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+    bundle = await asyncio.to_thread(
+        _analyze_bundle, source, filepath=filepath, workspace_root=workspace_root)
+    cache = getattr(ls, '_analysis_cache', None)
+    if cache is not None:
+        cache[uri] = bundle
+    try:
+        if ls.workspace.get_text_document(uri).source != source:
+            return
+    except Exception:
+        return
+    try:
+        ls.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(
+            uri=uri, diagnostics=bundle[4]))
+    except Exception:
+        pass
 
 
 def _find_token_at(tokens, line, col):
@@ -322,7 +462,7 @@ class CpyLanguageServer(LanguageServer):
 
 
 server = CpyLanguageServer("cpyte-lsp", "0.1",
-                           text_document_sync_kind=lsp.TextDocumentSyncKind.Full)
+                           text_document_sync_kind=lsp.TextDocumentSyncKind.Incremental)
 
 
 @server.feature(lsp.INITIALIZE)
@@ -331,67 +471,18 @@ def initialize(ls: CpyLanguageServer, params: lsp.InitializeParams):
         ls.workspace_root = _uri_to_path(params.root_uri)
     elif params.root_path:
         ls.workspace_root = params.root_path
-    logger.info(f"[initialize] workspace_root={ls.workspace_root}")
-
-
-def _make_error_diagnostic(error):
-    kind, msg, token = error
-    if token and hasattr(token, "line"):
-        line = token.line - 1
-        col = token.column - 1
-        rng = lsp.Range(
-            start=lsp.Position(line=line, character=col),
-            end=lsp.Position(line=line, character=col + len(token.value or "")),
-        )
-    else:
-        rng = lsp.Range(start=lsp.Position(line=0, character=0),
-                        end=lsp.Position(line=0, character=0))
-    severity = lsp.DiagnosticSeverity.Error
-    return lsp.Diagnostic(message=msg, severity=severity, range=rng)
-
-
-def _do_analyze(ls, uri):
     try:
-        doc = ls.workspace.get_text_document(uri)
-    except Exception:
-        return
-    filepath = _uri_to_path(uri)
-    workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
-    t0 = time.time()
-    _, _, analyzer, error = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
-    elapsed = time.time() - t0
-    diagnostics = []
-    if error:
-        diagnostics.append(_make_error_diagnostic(error))
-    if analyzer:
-        for d in analyzer.reporter.diagnostics:
-            if d.token:
-                rng = lsp.Range(
-                    start=lsp.Position(line=d.token.line - 1, character=d.token.column - 1),
-                    end=lsp.Position(line=d.token.line - 1,
-                                     character=d.token.column - 1 + len(d.token.value or "")),
-                )
-            else:
-                rng = lsp.Range(start=lsp.Position(line=0, character=0),
-                                end=lsp.Position(line=0, character=0))
-            diagnostics.append(lsp.Diagnostic(
-                message=d.message,
-                severity=lsp.DiagnosticSeverity.Error,
-                range=rng,
-            ))
-    logger.info(f"[diag] {os.path.basename(filepath)}: {len(diagnostics)} diag(s) in {elapsed*1000:.0f}ms")
-    try:
-        ls.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(
-            uri=uri, diagnostics=diagnostics))
-    except Exception:
+        ls._loop = asyncio.get_running_loop()
+    except RuntimeError:
         pass
+    logger.info(f"[initialize] workspace_root={ls.workspace_root}")
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: CpyLanguageServer, params: lsp.DidOpenTextDocumentParams):
     try:
         logger.info(f"[didOpen] {os.path.basename(_uri_to_path(params.text_document.uri))}")
-        _do_analyze(ls, params.text_document.uri)
+        _schedule_analysis(ls, params.text_document.uri, 0.0)
     except Exception:
         logger.error(f"did_open error:\n{traceback.format_exc()}")
 
@@ -400,24 +491,37 @@ def did_open(ls: CpyLanguageServer, params: lsp.DidOpenTextDocumentParams):
 def did_change(ls: CpyLanguageServer, params: lsp.DidChangeTextDocumentParams):
     try:
         logger.info(f"[didChange] {os.path.basename(_uri_to_path(params.text_document.uri))}")
-        _do_analyze(ls, params.text_document.uri)
+        _schedule_analysis(ls, params.text_document.uri, _ANALYSIS_DEBOUNCE)
     except Exception:
         logger.error(f"did_change error:\n{traceback.format_exc()}")
 
 
+@server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
+def did_close(ls: CpyLanguageServer, params: lsp.DidCloseTextDocumentParams):
+    try:
+        uri = params.text_document.uri
+        pending = getattr(ls, '_pending_analysis', None)
+        if pending is not None:
+            handle = pending.pop(uri, None)
+            if handle is not None:
+                handle.cancel()
+        cache = getattr(ls, '_analysis_cache', None)
+        if cache is not None:
+            cache.pop(uri, None)
+    except Exception:
+        logger.error(f"did_close error:\n{traceback.format_exc()}")
+
+
 @server.feature(lsp.TEXT_DOCUMENT_COMPLETION,
                 lsp.CompletionOptions(trigger_characters=[".", " "]))
+@server.thread()
 def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
     try:
         uri = params.text_document.uri
         line = params.position.line
         col = params.position.character
-        doc = ls.workspace.get_text_document(uri)
-
-        filepath = _uri_to_path(uri)
-        workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
         t0 = time.time()
-        tokens, parsed, analyzer, _ = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
+        source, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
         tok = _find_token_at(tokens, line, col)
         prefix = (tok.value or "") if tok else ""
 
@@ -428,7 +532,7 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
         if base is not None:
             items = _member_completions(analyzer, parsed, base, prefix, line + 1)
             elapsed = time.time() - t0
-            logger.info(f"[completion] {os.path.basename(filepath)} @L{line+1}:{col}: "
+            logger.info(f"[completion] {os.path.basename(_uri_to_path(uri))} @L{line+1}:{col}: "
                         f"{len(items)} member item(s) for `{base}.` in {elapsed*1000:.0f}ms")
             return lsp.CompletionList(is_incomplete=False, items=items)
 
@@ -533,7 +637,8 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
                     seen.add(lname)
 
         elapsed = time.time() - t0
-        logger.info(f"[completion] {os.path.basename(filepath)} @L{line+1}:{col}: {len(items)} items in {elapsed*1000:.0f}ms")
+        logger.info(f"[completion] {os.path.basename(_uri_to_path(uri))} @L{line+1}:{col}: "
+                    f"{len(items)} items in {elapsed*1000:.0f}ms")
         return lsp.CompletionList(is_incomplete=False, items=items)
     except Exception:
         logger.error(f"completions error:\n{traceback.format_exc()}")
@@ -541,17 +646,14 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
 
 
 @server.feature(lsp.TEXT_DOCUMENT_HOVER)
+@server.thread()
 def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
     try:
         uri = params.text_document.uri
         line = params.position.line
         col = params.position.character
-        doc = ls.workspace.get_text_document(uri)
-
-        filepath = _uri_to_path(uri)
-        workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
         t0 = time.time()
-        tokens, parsed, analyzer, _ = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
+        source, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
         tok = _find_token_at(tokens, line, col)
         if not tok or not tok.value:
             return None
@@ -576,6 +678,13 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
                     fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
                     content = f"**`struct {node.name}`**  \n`{{ {fields} }}`"
                     break
+                elif isinstance(node, ClassDef) and node.name == word:
+                    fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
+                    methods = ", ".join(f"`{m.name}()`" for m in node.methods)
+                    content = f"**`class {node.name}`**  \n`{{ {fields} }}`"
+                    if node.methods:
+                        content += f"  \nmethods: {methods}"
+                    break
                 elif isinstance(node, EnumDef) and node.name == word:
                     members = ", ".join(f"`{m['name']}` = `{m.get('_const_value')}`" for m in node.members)
                     content = f"**`enum {node.name}`**  \n{{ {members} }}"
@@ -589,17 +698,23 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
                         content = f"**`{word}`**: `{sym.type}` = `{_const_value_text(sym)}`  \n*constant*"
                     elif sym.kind == "enum":
                         content = f"**`enum {word}`**"
+                    elif sym.kind == "enum_member":
+                        content = f"**`{word}`**: `{sym.type}` = `{_const_value_text(sym)}`  \n*enum member*"
                     else:
                         content = f"**`{word}`**: `{sym.type or sym.kind}`"
                 else:
-                    for node in parsed:
-                        if isinstance(node, FuncDef) and word in node.params:
-                            ptype = node.params[word]
-                            content = f"**`{word}`**: `{ptype}`  \n*parameter*"
-                            break
+                    func = _find_containing_function(parsed, line + 1)
+                    if func is not None:
+                        if word in (func.params or {}):
+                            content = f"**`{word}`**: `{func.params[word]}`  \n*parameter*"
+                        else:
+                            locs = _collect_locals(func, line + 1)
+                            if word in locs:
+                                content = f"**`{word}`**: `{locs[word] or 'int'}`  \n*local variable*"
 
         elapsed = time.time() - t0
-        logger.info(f"[hover] {os.path.basename(filepath)} @L{line+1}:{col}: {len(content or '')} chars in {elapsed*1000:.0f}ms")
+        logger.info(f"[hover] {os.path.basename(_uri_to_path(uri))} @L{line+1}:{col}: "
+                    f"{len(content or '')} chars in {elapsed*1000:.0f}ms")
         if content:
             return lsp.Hover(contents=lsp.MarkupContent(
                 kind=lsp.MarkupKind.Markdown, value=content))
@@ -610,6 +725,7 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
 
 
 @server.feature(lsp.TEXT_DOCUMENT_FORMATTING)
+@server.thread()
 def formatting(ls: CpyLanguageServer, params: lsp.DocumentFormattingParams):
     try:
         uri = params.text_document.uri
@@ -636,15 +752,12 @@ def formatting(ls: CpyLanguageServer, params: lsp.DocumentFormattingParams):
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
+@server.thread()
 def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
     try:
         uri = params.text_document.uri
-        doc = ls.workspace.get_text_document(uri)
-
-        filepath = _uri_to_path(uri)
-        workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
         t0 = time.time()
-        _, parsed, _, _ = _analyze(doc.source, filepath=filepath, workspace_root=workspace_root)
+        _, _, parsed, _, _, _ = _get_bundle(ls, uri)
         symbols = []
         for node in parsed:
             tok = getattr(node, '_token', None)
@@ -706,11 +819,91 @@ def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
                     location=loc,
                 ))
         elapsed = time.time() - t0
-        logger.info(f"[symbols] {os.path.basename(filepath)}: {len(symbols)} symbol(s) in {elapsed*1000:.0f}ms")
+        logger.info(f"[symbols] {os.path.basename(_uri_to_path(uri))}: "
+                    f"{len(symbols)} symbol(s) in {elapsed*1000:.0f}ms")
         return symbols
     except Exception:
         logger.error(f"document_symbols error:\n{traceback.format_exc()}")
         return []
+
+
+def _iter_var_decls(stmt):
+    """Yield VarDecl nodes nested inside a statement (if/while/switch/try/for)."""
+    if isinstance(stmt, VarDecl):
+        yield stmt
+        return
+    if isinstance(stmt, If):
+        for s in stmt.body:
+            yield from _iter_var_decls(s)
+        for s in stmt.orelse or []:
+            yield from _iter_var_decls(s)
+        return
+    if isinstance(stmt, While):
+        for s in stmt.body:
+            yield from _iter_var_decls(s)
+        return
+    if isinstance(stmt, Switch):
+        for _, body in stmt.cases:
+            for s in body:
+                yield from _iter_var_decls(s)
+        return
+    if isinstance(stmt, Try):
+        for s in stmt.body:
+            yield from _iter_var_decls(s)
+        for h in stmt.handlers:
+            for s in h.body:
+                yield from _iter_var_decls(s)
+        return
+    if isinstance(stmt, dict) and stmt.get('type') == 'for':
+        for s in stmt.get('body') or []:
+            yield from _iter_var_decls(s)
+
+
+def _find_local_decl(func, name):
+    for stmt in getattr(func, 'body', None) or []:
+        for decl in _iter_var_decls(stmt):
+            if decl.name == name:
+                return decl
+    return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_DEFINITION)
+@server.thread()
+def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value:
+            return None
+        word = tok.value
+        target = None
+        if analyzer is not None:
+            name = word
+            base = _dot_context(tokens, line, col)
+            if base is not None:
+                name = f'{base}.{word}'
+            sym = analyzer.globals.lookup(name)
+            if sym is not None and getattr(sym, 'node', None) is not None:
+                target = sym.node
+        if target is None:
+            func = _find_containing_function(parsed, line + 1)
+            if func is not None:
+                target = _find_local_decl(func, word)
+        if target is None:
+            return None
+        t = getattr(target, '_token', None)
+        if t is None or t.line is None:
+            return None
+        start = lsp.Position(line=t.line - 1, character=t.column - 1)
+        end = lsp.Position(line=t.line - 1,
+                           character=t.column - 1 + len(t.value or ""))
+        return lsp.Location(uri=uri, range=lsp.Range(start=start, end=end))
+    except Exception:
+        logger.error(f"definition error:\n{traceback.format_exc()}")
+        return None
 
 
 if __name__ == "__main__":

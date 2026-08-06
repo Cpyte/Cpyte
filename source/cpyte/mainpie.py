@@ -282,8 +282,9 @@ def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extens
     c.generic_instantiations = generic_instantiations or {}
     try:
         prog, src_files = c.emit_program(parsed)
-    except Exception as e:
-        ui.print_err(f'codegen error: {e}')
+    except Exception:
+        ui.print_err('codegen error:')
+        ui.print_traceback()
         sys.exit(1)
     return prog, src_files
 
@@ -536,6 +537,18 @@ def cmd_sef(args):
 
 
 def main():
+    try:
+        return _main()
+    except KeyboardInterrupt:
+        ui.print_warn('interrupted')
+        return 130
+    except Exception:
+        ui.print_err('cpy error:')
+        ui.print_traceback()
+        return 1
+
+
+def _main():
     tab_size = 4
     mode = 'jit'
     args = sys.argv[1:]

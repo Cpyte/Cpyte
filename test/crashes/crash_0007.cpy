@@ -1,21 +1,27 @@
-struct S1:
-    int next
-
 struct S2:
-    int prev
-    big key
+    float left
+    double name
 
 struct S3:
-    float* ptr
-    big left
-    double value
+    int prev
+    str next
+    char z
+    big value
+    uint64 ptr
 
-str g4 = '\t\tf\teggega'
-int64 g5
-int64 g6
+big g4 = 293214873781412733337453408536
 
 def main() -> int:
-    if 0xdeadbeefcafebabedeadbeef:
-        while '':
-            str v7 = 'baad\n h\tgeb\t'
-    return 0
+    big v5 = g4
+    if ((-97013.042648 - 1.5) or (13890435509728846021 < 14215479744395276387)):
+        g4 = (~(4294967296 >> sizeof(int64)) | (11434878168256015562 + (733078552844160736 & 100)))
+        int w6 = 3
+        while ((((9223372036854775808 * (-16328747384809358211 * (2350764050653372376 + 5))) // not (29549021 >> (11516042025807259935 * 18446744073709551615)))) and (w6 > 0)):
+            w6 = w6 - 1
+            int w7 = 1
+            while (((g4 <= v5)) and (w7 > 0)):
+                w7 = w7 - 1
+                if (v5 >= 959620414986713320260963380013):
+                    if (10000000000000000000 << 1393450740):
+                        g4 = v5
+                        print(v5)

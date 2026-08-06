@@ -84,6 +84,24 @@ ALL_SCALAR = TYPES + ['bool']
 FIELD_NAMES = ['x', 'y', 'z', 'data', 'next', 'prev', 'left', 'right',
                'value', 'key', 'name', 'head', 'tail', 'ptr']
 
+# Type sets the generator can safely emit. These mirror the type-checking
+# rules in cpyte/semantic_analasis.py so that generated programs actually
+# parse and analyze:
+#   - INT_FAMILY: everything assignable into any int-family variable.
+#   - BITWISE_OK: operands allowed for ~ << >> & | ^  (no char, no big).
+#   - MOD_OK:     operands allowed for % and // (no char, no float).
+#   - NEG_OK:     operands allowed for unary minus.
+# Note: 'char' is deliberately excluded from these sets. cpy only allows
+# char -> int (widening) and str -> char conversions; an int value can NOT
+# initialize a char variable, and there are no char literals.
+INT_FAMILY = tuple(sorted(('int', 'int64', 'uint64', 'big')))
+FLOAT_FAMILY = tuple(sorted(('float', 'double')))
+BITWISE_OK = tuple(sorted(('int', 'int64', 'uint64')))
+MOD_OK = tuple(sorted(('int', 'int64', 'uint64', 'big')))
+NEG_OK = tuple(sorted(('int', 'int64', 'uint64', 'big', 'float', 'double')))
+_NO_CHAR = tuple(sorted(('int', 'int64', 'uint64', 'big')))
+SCALAR_GEN_TYPES = ('int', 'int64', 'uint64', 'big', 'float', 'double', 'str')
+
 
 # ---------------------------------------------------------------------------
 # Type-aware fuzzer state
@@ -347,7 +365,7 @@ def expr_is_always_truthy(code: str, known_truthy_globals: set[str] | None = Non
         return True
     if code.startswith('sizeof('):
         return True
-    if code.startswith('new '):
+    if code.startswith('new ') or code.startswith('(new '):
         return True
 
     # not expr: not 0 → 1 (truthy), not <non-zero> → 0 (falsy)
@@ -391,274 +409,319 @@ def pointee_type(ty: str) -> str:
 # Expression generators — return (code: str, type_str: str)
 # ---------------------------------------------------------------------------
 
+def _gen_int_literal(rng: random.Random, target: str) -> str:
+    """Produce a decimal literal whose inferred type is exactly `target`.
+    Mirrors the Number typing in semantic_analasis.py (int32 / int64 / uint64 /
+    big range checks). Only non-negative values are emitted; negation is done
+    with unary minus so the literal's inferred type is predictable."""
+    if target == 'int64':
+        if rng.random() < 0.35:
+            return rng.choice(['2147483648', '4294967296', '1000000000000', '9223372036854775807'])
+        return str(rng.randint(2**31, 2**63 - 1))
+    if target == 'uint64':
+        if rng.random() < 0.35:
+            return rng.choice(['9223372036854775808', '10000000000000000000', '18446744073709551615'])
+        return str(rng.randint(2**63, 2**64 - 1))
+    if target == 'big':
+        if rng.random() < 0.35:
+            return rng.choice(['18446744073709551616', '340282366920938463463374607431768211456'])
+        return str(rng.randint(2**64 + 1, 10**30))
+    # 'int' / 'char' targets: small literal (inferred 'int', assignable to char)
+    if rng.random() < 0.35:
+        return rng.choice(['0', '1', '2', '5', '42', '-1', '-5', '100', '1000', '1000000'])
+    return str(rng.randint(0, 2147483647))
+
+
+def _random_string(rng: random.Random) -> str:
+    """A single-line string literal body (no quotes / escapes / newlines)."""
+    return ''.join(rng.choices(
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _+-*/=.,', k=rng.randint(0, 12)))
+
+
 def gen_literal(state: FuzzerState, target_type: str | None = None) -> tuple[str, str]:
     rng = state.rng
-    ty = target_type or rng.choice(TYPES)
-
-    if ty == 'int':
-        kind = rng.choices(['edge', 'hex', 'big'], weights=[40, 20, 40])[0]
-        if kind == 'edge':  return rng.choice(EDGE_INTS), 'int'
-        if kind == 'hex':   return rng.choice(EDGE_HEX), 'int'
-        return str(rng.randint(-10**9, 10**9)), 'int'
-
-    if ty == 'big':
-        kind = rng.choices(['dec', 'hex'], weights=[60, 40])[0]
-        if kind == 'dec':
-            return rng.choice(BIG_EDGE), 'big'
-        return rng.choice(BIG_EDGE_HEX), 'big'
-
-    if ty == 'int64':
-        return rng.choice(EDGE_INTS), 'int64'
-
-    if ty == 'uint64':
-        return rng.choice(EDGE_INTS), 'uint64'
-
-    if ty in ('float', 'double'):
-        return rng.choice(EDGE_FLOATS), ty
-
-    if ty == 'char':
-        return repr(rng.choice(string.printable.strip())), 'char'
-
-    if ty == 'str':
-        if rng.random() < 0.2:   return repr(''), 'str'
-        if rng.random() < 0.2:   return repr(' ' * rng.randint(1, 10)), 'str'
-        return repr(''.join(rng.choices('abcdefgh \t\n', k=rng.randint(0, 15)))), 'str'
-
-    if ty == 'bool':
-        return rng.choice(['true', 'false']), 'bool'
+    ty = target_type or rng.choice(SCALAR_GEN_TYPES)
 
     if type_is_ptr(ty):
-        return 'null', ty
+        # Never null: a null pointer indexed / dereferenced / converted to
+        # str is a runtime null deref (UB). cpy zero-inits raw `new` boxes, so
+        # `new T` is always a usable non-null pointer.
+        pointee = ty[:-1] if ty.endswith('*') else ty[:-2]
+        return f'(new {pointee})', ty
 
-    return '0', 'int'
+    if ty == 'str':
+        if rng.random() < 0.2:
+            return '""', 'str'
+        if rng.random() < 0.2:
+            return '"hello"', 'str'
+        return f'"{_random_string(rng)}"', 'str'
+
+    if ty in ('float', 'double'):
+        return _gen_float_literal(rng), 'float'
+
+    if ty == 'char':
+        # No char literals exist; a single-char str converts to char.
+        return rng.choice(['"a"', '"b"', '"c"', '"x"', '" "']), 'str'
+
+    return _gen_int_literal(rng, ty), ('int' if ty in ('int', 'char') else ty)
+
+
+def _gen_float_literal(rng: random.Random) -> str:
+    """A float literal cpy can actually lex — no `e`-exponent notation
+    (1e10 fails to tokenize; only `digits.digits` is supported)."""
+    if rng.random() < 0.6:
+        return rng.choice(['0.0', '1.0', '-1.0', '0.5', '1.5', '3.14159', '2.71828',
+                           '0.0000000001', '9999999999999999.0', '123.456'])
+    return f'{rng.uniform(-100000.0, 100000.0):.6f}'
 
 
 def gen_variable(state: FuzzerState, target_type: str | None = None) -> tuple[str, str] | None:
-    candidates = state.scope.vars_of_type(target_type)
+    candidates = [(n, t) for n, t in state.scope.all_vars()
+                  if _assignable(t, target_type)]
     if not candidates:
         return None
-    name, ty = state.rng.choice(candidates)
-    return name, ty
+    return state.rng.choice(candidates)
 
 
-def gen_expr(state: FuzzerState, target_type: str | None = None, depth: int = 0) -> tuple[str, str]:
+def _assignable(vt: str, target: str | None) -> bool:
+    """True if a value of type vt may initialize / be assigned into target.
+    Mirrors the valid_conversions table in semantic_analasis.py (one-way!):
+    no int-family variable accepts a `big` value, and pointer targets require
+    an exactly matching pointer type (or void*/int/str interop)."""
+    if target is None:
+        return True
+    if vt == target:
+        return True
+    if target == 'str':
+        # Only real string sources. cpy's analyzer also allows any pointer ->
+        # str, but a null pointer stored as a str then dereferenced (str->char)
+        # is a null deref at runtime, so the generator keeps str truly non-null.
+        return vt == 'char' or vt == 'str'
+    if type_is_ptr(target):
+        return vt in ('int', 'str') or vt == 'void*' or target == 'void*'
+    if target in ('float', 'double'):
+        return vt in ('float', 'double')
+    if target == 'char':
+        return vt in ('char', 'str')
+    if target == 'int':
+        # char -> int widening is the only char-to-int-family conversion.
+        return vt in ('int', 'int64', 'uint64', 'char')
+    if target in ('int64', 'uint64'):
+        return vt in ('int', 'int64', 'uint64')
+    return vt in ('int', 'int64', 'uint64', 'big')  # target == 'big'
+
+
+def _num_promote(lt: str, rt: str) -> str:
+    """Usual arithmetic conversions — mirrors semantic_analasis._numeric_promote."""
+    if lt == rt:
+        return lt
+    if lt in ('float', 'double') or rt in ('float', 'double'):
+        return 'double' if 'double' in (lt, rt) else 'float'
+    if 'big' in (lt, rt):
+        return 'big'
+    if lt in ('int64', 'uint64') or rt in ('int64', 'uint64'):
+        return 'int64'
+    return 'int'
+
+
+def _is_constant_zero(code: str) -> bool:
+    val = _eval_constant(code)
+    return val is not None and val == 0
+
+
+def _ensure_nonzero(state: FuzzerState, value: tuple[str, str], depth: int,
+                    exact: frozenset | None) -> tuple[str, str]:
+    """Regenerate a divisor until it is not a constant zero."""
+    rng = state.rng
+    code, vt = value
+    for _ in range(4):
+        if not _is_constant_zero(code):
+            return (code, vt)
+        code, vt = gen_expr(state, vt, depth + 1, exact)
+    return ('(0 + 1)', 'int')
+
+
+def gen_expr(state: FuzzerState, target_type: str | None = None, depth: int = 0,
+             exact: frozenset | None = None) -> tuple[str, str]:
+    """Generate a *value* expression (never bool) whose type is assignable to
+    target_type. `exact` optionally restricts the set of acceptable value
+    types (e.g. bitwise operands must not be big/char)."""
     rng = state.rng
 
-    if depth > 5 or (depth > 0 and rng.random() < 0.15):
-        # terminal: literal or variable
-        if rng.random() < 0.5:
-            var = gen_variable(state, target_type)
-            if var:
-                return var
+    if depth > 5 or (depth > 0 and rng.random() < 0.12):
+        var = gen_variable(state, target_type)
+        if var and (exact is None or var[1] in exact):
+            return var
         return gen_literal(state, target_type)
 
     candidates = []
     weights = []
 
-    # Literal (always possible)
     candidates.append(('literal', lambda: gen_literal(state, target_type)))
     weights.append(15)
 
-    # Variable (if any variable of target_type exists, or any variable)
     if state.scope.all_vars():
-        if target_type and state.scope.vars_of_type(target_type):
-            candidates.append(('var', lambda: gen_variable(state, target_type)))
+        var = gen_variable(state, target_type)
+        if var:
+            candidates.append(('var', lambda: var))
             weights.append(30)
-        elif target_type is None:
-            candidates.append(('var', lambda: gen_variable(state, None)))
-            weights.append(20)
 
-    # Binary op
-    candidates.append(('binop', lambda: gen_binop(state, target_type, depth)))
-    weights.append(30)
+    want_num = target_type is None or target_type in INT_FAMILY or target_type in FLOAT_FAMILY
+    want_ptr = target_type is None or type_is_ptr(target_type)
+    want_scalar = target_type is None or target_type in SCALAR_GEN_TYPES or type_is_ptr(target_type)
 
-    # Unary op
-    candidates.append(('unary', lambda: gen_unary(state, target_type, depth)))
-    weights.append(12)
+    if want_num:
+        candidates.append(('binop', lambda: gen_binop(state, target_type, depth)))
+        weights.append(30)
+        candidates.append(('unary', lambda: gen_unary(state, target_type, depth)))
+        weights.append(12)
 
-    # Call (builtin cast or registered function)
-    candidates.append(('call', lambda: gen_call(state, target_type, depth)))
-    weights.append(15)
-
-    # new expr — produces pointer types
-    if target_type is None or type_is_ptr(target_type):
+    if want_ptr:
         candidates.append(('new', lambda: gen_new(state, target_type, depth)))
         weights.append(5)
 
-    # sizeof — produces int
-    if target_type is None or target_type == 'int':
+    if target_type in (None, 'int'):
         candidates.append(('sizeof', lambda: gen_sizeof(state)))
         weights.append(3)
 
-    # String concat — produces str
-    if target_type is None or target_type == 'str':
+    if target_type in (None, 'str'):
         candidates.append(('strcat', lambda: gen_strcat(state, depth)))
         weights.append(5)
 
-    # Struct field access — produces inner field type
-    if target_type is None:
-        candidates.append(('field', lambda: gen_field_access(state, depth)))
+    if want_scalar:
+        candidates.append(('field', lambda: gen_field_access(state, target_type, depth)))
         weights.append(5)
-
-    # Index expression — produces pointee type
-    if target_type is None or (type_is_ptr(target_type) and not target_type.endswith('*')):
         candidates.append(('index', lambda: gen_index_expr(state, target_type, depth)))
         weights.append(4)
 
-    # Pointer arithmetic (ptr + int)
-    if target_type is None:
-        candidates.append(('ptr_arith', lambda: gen_ptr_arith(state, depth)))
-        weights.append(3)
-
-    # Cast — only if target_type differs from inner expression's type
-    # (cast functions like int(), float() are NOT registered in the runtime)
-
     kind, fn = rng.choices(candidates, weights=weights)[0]
-    return fn()
+    code, vt = fn()
+    if not _assignable(vt, target_type) or (exact is not None and vt not in exact):
+        return gen_literal(state, target_type)
+    return code, vt
 
 
 def gen_binop(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
     rng = state.rng
 
-    # Choose operation category first
-    cat = rng.choices(
-        ['arith_int', 'arith_float', 'bitwise', 'compare', 'logical', 'shift'],
-        weights=[30, 20, 15, 15, 10, 10]
-    )[0]
-
-    if cat == 'arith_int':
-        op = rng.choice(['+', '-', '*', '/', '//', '%'])
-        ty = target_type if target_type in NUMERIC_TYPES + ['char'] else rng.choice(NUMERIC_TYPES + ['char'])
-        left = gen_expr(state, ty, depth + 1)
-        right = gen_expr(state, ty, depth + 1)
-        return f'({left[0]} {op} {right[0]})', ty
+    if target_type is None:
+        cat = rng.choices(['arith_int', 'arith_float', 'bitwise', 'mod', 'shift'],
+                          weights=[30, 15, 15, 20, 20])[0]
+    elif target_type in ('float', 'double'):
+        cat = 'arith_float'
+    else:
+        cat = rng.choices(['arith_int', 'bitwise', 'mod', 'shift'],
+                          weights=[45, 15, 20, 20])[0]
 
     if cat == 'arith_float':
         op = rng.choice(['+', '-', '*', '/'])
-        ty = target_type if target_type in FLOAT_TYPES else rng.choice(FLOAT_TYPES)
-        left = gen_expr(state, ty, depth + 1)
-        right = gen_expr(state, ty, depth + 1)
-        return f'({left[0]} {op} {right[0]})', ty
+        left = gen_expr(state, rng.choice(list(FLOAT_FAMILY)), depth + 1, FLOAT_FAMILY)
+        right = gen_expr(state, rng.choice(list(FLOAT_FAMILY)), depth + 1, FLOAT_FAMILY)
+        if op == '/':
+            right = _ensure_nonzero(state, right, depth, FLOAT_FAMILY)
+        return f'({left[0]} {op} {right[0]})', _num_promote(left[1], right[1])
 
-    if cat == 'bitwise':
-        op = rng.choice(['&', '|', '^'])
-        ty = target_type if target_type in NUMERIC_TYPES else rng.choice(NUMERIC_TYPES)
-        left = gen_expr(state, ty, depth + 1)
-        right = gen_expr(state, ty, depth + 1)
-        return f'({left[0]} {op} {right[0]})', ty
+    if cat == 'arith_int':
+        op = rng.choice(['+', '-', '*', '/'])
+        left = gen_expr(state, rng.choice(list(INT_FAMILY)), depth + 1, INT_FAMILY)
+        right = gen_expr(state, rng.choice(list(INT_FAMILY)), depth + 1, INT_FAMILY)
+        if op == '/':
+            right = _ensure_nonzero(state, right, depth, INT_FAMILY)
+        return f'({left[0]} {op} {right[0]})', _num_promote(left[1], right[1])
+
+    if cat == 'mod':
+        op = rng.choice(['//', '%'])
+        left = gen_expr(state, rng.choice(['int', 'int64', 'uint64', 'big']), depth + 1, MOD_OK)
+        right = gen_expr(state, rng.choice(['int', 'int64', 'uint64', 'big']), depth + 1, MOD_OK)
+        right = _ensure_nonzero(state, right, depth, MOD_OK)
+        return f'({left[0]} {op} {right[0]})', _num_promote(left[1], right[1])
 
     if cat == 'shift':
         op = rng.choice(['<<', '>>'])
-        ty = target_type if target_type in NUMERIC_TYPES else rng.choice(NUMERIC_TYPES)
-        left = gen_expr(state, ty, depth + 1)
-        right = gen_expr(state, 'int', depth + 1)
-        return f'({left[0]} {op} {right[0]})', ty
+        left = gen_expr(state, rng.choice(['int', 'int64', 'uint64']), depth + 1, BITWISE_OK)
+        right = gen_expr(state, 'int', depth + 1, BITWISE_OK)
+        return f'({left[0]} {op} {right[0]})', ('int64' if left[1] in ('int64', 'uint64') else 'int')
 
-    if cat == 'compare':
-        op = rng.choice(['==', '!=', '<', '>', '<=', '>='])
-        # Compare needs matching types; result is int
-        ty = target_type if target_type in TYPES else rng.choice(TYPES)
-        left = gen_expr(state, ty, depth + 1)
-        right = gen_expr(state, ty, depth + 1)
-        return f'({left[0]} {op} {right[0]})', 'int'
-
-    if cat == 'logical':
-        op = rng.choice(['and', 'or'])
-        # Logical ops work on truthy values, result is int
-        left = gen_expr(state, None, depth + 1)
-        right = gen_expr(state, None, depth + 1)
-        return f'({left[0]} {op} {right[0]})', 'int'
-
-    return gen_literal(state, target_type)
+    # bitwise & | ^
+    op = rng.choice(['&', '|', '^'])
+    left = gen_expr(state, rng.choice(['int', 'int64', 'uint64']), depth + 1, BITWISE_OK)
+    right = gen_expr(state, rng.choice(['int', 'int64', 'uint64']), depth + 1, BITWISE_OK)
+    result = 'int64' if left[1] in ('int64', 'uint64') or right[1] in ('int64', 'uint64') else 'int'
+    return f'({left[0]} {op} {right[0]})', result
 
 
 def gen_unary(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
     rng = state.rng
-    kind = rng.choices(['neg', 'not', 'tilde', 'plus', 'deref', 'addr', 'pow'],
-                       weights=[25, 25, 10, 5, 10, 10, 5])[0]
+
+    if target_type is None:
+        kind = rng.choices(['neg', 'not', 'tilde', 'deref', 'addr'], weights=[25, 25, 15, 20, 15])[0]
+    elif target_type in ('float', 'double'):
+        kind = 'neg'
+    elif type_is_ptr(target_type):
+        kind = rng.choices(['deref', 'addr'], weights=[60, 40])[0]
+    else:
+        kind = rng.choices(['neg', 'not', 'tilde'], weights=[45, 35, 20])[0]
 
     if kind == 'neg':
-        ty = target_type if target_type and type_is_numeric(target_type) else rng.choice(NUMERIC_TYPES + FLOAT_TYPES + ['char'])
-        inner = gen_expr(state, ty, depth + 1)
-        return f'-{inner[0]}', inner[1]
+        op_t = target_type if target_type in NEG_OK else rng.choice(['int', 'int64', 'uint64', 'big', 'float', 'double'])
+        exact = NEG_OK if op_t in INT_FAMILY else FLOAT_FAMILY
+        inner = gen_expr(state, op_t, depth + 1, exact)
+        code = inner[0]
+        # `-` followed by `-` would lex as a decrement (`--`).
+        if code.startswith('-'):
+            code = f'({code})'
+        return f'-{code}', inner[1]
 
     if kind == 'not':
         inner = gen_expr(state, None, depth + 1)
         return f'not {inner[0]}', 'int'
 
     if kind == 'tilde':
-        ty = target_type if target_type in NUMERIC_TYPES else rng.choice(NUMERIC_TYPES)
-        inner = gen_expr(state, ty, depth + 1)
-        return f'~{inner[0]}', ty
-
-    if kind == 'plus':
-        inner = gen_expr(state, target_type, depth + 1)
-        return f'+{inner[0]}', inner[1]
-
-    if kind == 'deref':
-        # Need a pointer expression
-        ptr_ty = (pointee_type(target_type) + '*') if target_type else random_ptr_type(rng)
-        inner = gen_expr(state, ptr_ty, depth + 1)
-        return f'*{inner[0]}', pointee_type(ptr_ty)
+        inner = gen_expr(state, rng.choice(['int', 'int64', 'uint64']), depth + 1, BITWISE_OK)
+        return f'~{inner[0]}', ('int64' if inner[1] in ('int64', 'uint64') else 'int')
 
     if kind == 'addr':
-        var = gen_variable(state)
+        var = gen_variable(state, None)
         if var:
             return f'&{var[0]}', var[1] + '*'
         return gen_literal(state, target_type)
 
-    if kind == 'pow':
-        inner = gen_expr(state, None, depth + 1)
-        return f'**{inner[0]}', pointee_type(inner[1]) if type_is_ptr(inner[1]) else inner[1]
+    # deref — operand must be a genuine pointer (T*), never a literal or array
+    inner, vt = _gen_ptr_operand(state, depth)
+    return f'*{inner[0]}', vt
 
-    return gen_literal(state, target_type)
+
+def _gen_ptr_operand(state: FuzzerState, depth: int) -> tuple[tuple[str, str], str]:
+    """Return ((code, T*), pointee_type) for a genuine pointer expression."""
+    rng = state.rng
+    ptr_vars = [(n, t) for n, t in state.scope.all_vars() if t.endswith('*')]
+    if ptr_vars and rng.random() < 0.6:
+        name, pty = rng.choice(ptr_vars)
+        return (name, pty), pty[:-1]
+    inner = rng.choice(SCALAR_GEN_TYPES + tuple(state.structs.keys()))
+    return (f'(new {inner})', f'{inner}*'), inner
 
 
 def gen_call(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
-    rng = state.rng
-    candidates = []
-    weights = []
-
-    # input/input_str — registered runtime functions (disabled: no stdin in fuzzer)
-    # if target_type is None or target_type == 'int':
-    #     candidates.append(('input', lambda: ('input()', 'int')))
-    #     weights.append(30)
-    # if target_type is None or target_type == 'str':
-    #     candidates.append(('input_str', lambda: ('input_str()', 'str')))
-    #     weights.append(15)
-
-    # User-defined functions
-    if state.funcs:
-        func_name = rng.choice(list(state.funcs.keys()))
-        func_info = state.funcs[func_name]
-        params = func_info.get('params', [])   # list of (name, type)
-        ret = func_info.get('ret') or 'void'
-        if target_type is None or ret == target_type or (ret == 'void' and target_type is None):
-            def gen_user_call(p=params, r=ret):
-                args = []
-                for pname, ptype in p:
-                    arg, _ = gen_expr(state, ptype, depth + 1)
-                    args.append(arg)
-                return f'{func_name}({", ".join(args)})', r
-            candidates.append(('user_func', gen_user_call))
-            weights.append(55)
-
-    if not candidates:
-        return gen_literal(state, target_type)
-    kind, fn = rng.choices(candidates, weights=weights)[0]
-    return fn()
+    # No user-defined functions are emitted (globals are hoisted into main, so
+    # calls from main would be undefined). Falls back to a literal.
+    return gen_literal(state, target_type)
 
 
 def gen_new(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
     rng = state.rng
-    inner_ty = rng.choice(TYPES)
-    if target_type and type_is_ptr(target_type):
-        inner_ty = pointee_type(target_type)
-    result_ty = inner_ty + '*'
+    # Parenthesize the whole `new` form: `new T * x` / `new T & x` are parsed
+    # as a pointer-type continuation / fail, so never leave `*`/`&` adjacent.
+    if target_type and target_type.endswith('*'):
+        return f'(new {target_type[:-1]})', target_type
+    if target_type and target_type.endswith('[]'):
+        size = rng.randint(1, 8)
+        return f'(new {target_type[:-2]}[{size}])', target_type
+    inner = rng.choice(SCALAR_GEN_TYPES + tuple(state.structs.keys()))
     if rng.random() < 0.4:
-        size = gen_expr(state, 'int', depth + 1)
-        return f'new {inner_ty}[{size[0]}]', result_ty
-    return f'new {inner_ty}', result_ty
+        size = rng.randint(1, 8)
+        return f'(new {inner}[{size}])', f'{inner}[]'
+    return f'(new {inner})', f'{inner}*'
 
 
 def gen_sizeof(state: FuzzerState) -> tuple[str, str]:
@@ -667,32 +730,41 @@ def gen_sizeof(state: FuzzerState) -> tuple[str, str]:
     if kind == 'expr' and state.scope.all_vars():
         name, ty = rng.choice(state.scope.all_vars())
         return f'sizeof({name})', 'int'
-    ty = random_type(rng, allow_ptr=True, allow_array=True)
+    # Array types (`int64[5]`) do not parse inside sizeof().
+    ty = random_type(rng, allow_ptr=True, allow_array=False)
     return f'sizeof({ty})', 'int'
 
 
-def gen_strcat(state: FuzzerState, depth: int) -> tuple[str, str]:
+def _gen_str_operand(state: FuzzerState, depth: int) -> tuple[str, str]:
+    """A str-typed expression (string concat needs exact str operands)."""
     rng = state.rng
-    left = gen_expr(state, 'str', depth + 1)
-    right = gen_expr(state, 'str', depth + 1)
+    for _ in range(4):
+        code, vt = gen_expr(state, 'str', depth + 1)
+        if vt == 'str':
+            return (code, vt)
+    return gen_literal(state, 'str')
+
+
+def gen_strcat(state: FuzzerState, depth: int) -> tuple[str, str]:
+    left = _gen_str_operand(state, depth)
+    right = _gen_str_operand(state, depth)
     return f'({left[0]} + {right[0]})', 'str'
 
 
-def gen_field_access(state: FuzzerState, depth: int) -> tuple[str, str]:
+def gen_field_access(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
     rng = state.rng
-    if not state.structs or not state.scope.all_vars():
-        return gen_literal(state, None)
-    struct_name = rng.choice(list(state.structs.keys()))
-    ptr_ty = struct_name + '*'
-    struct_vars = state.scope.vars_of_type(ptr_ty)
+    if not state.structs:
+        return gen_literal(state, target_type)
+    struct_vars = [(n, t) for n, t in state.scope.all_vars()
+                   if t.endswith('*') and t[:-1] in state.structs]
     if not struct_vars:
-        struct_vars = state.scope.vars_of_type(struct_name)
-    if not struct_vars:
-        return gen_literal(state, None)
-    var_name, _ = rng.choice(struct_vars)
-    fields = state.structs[struct_name]
-    fname, ftype = rng.choice(fields)
-    return f'{var_name}.{fname}', ftype
+        return gen_literal(state, target_type)
+    name, pty = rng.choice(struct_vars)
+    matches = [f for f in state.structs[pty[:-1]] if _assignable(f[1], target_type)]
+    if not matches:
+        return gen_literal(state, target_type)
+    fname, ftype = rng.choice(matches)
+    return f'{name}.{fname}', ftype
 
 
 def gen_ptr_arith(state: FuzzerState, depth: int) -> tuple[str, str]:
@@ -701,20 +773,20 @@ def gen_ptr_arith(state: FuzzerState, depth: int) -> tuple[str, str]:
     if not ptr_vars:
         return gen_literal(state, None)
     name, ty = rng.choice(ptr_vars)
-    idx = gen_expr(state, 'int', depth + 1)
     op = rng.choice(['+', '-'])
-    return f'({name} {op} {idx[0]})', ty
+    return f'({name} {op} 0)', ty
 
 
 def gen_index_expr(state: FuzzerState, target_type: str | None, depth: int) -> tuple[str, str]:
     rng = state.rng
-    ptr_vars = [(n, t) for n, t in state.scope.all_vars() if type_is_ptr(t)]
-    if not ptr_vars:
+    arr_vars = [(n, t) for n, t in state.scope.all_vars() if t.endswith('*') or t.endswith('[]')]
+    if not arr_vars:
         return gen_literal(state, target_type)
-    name, ty = rng.choice(ptr_vars)
-    inner = pointee_type(ty)
-    idx = gen_expr(state, 'int', depth + 1)
-    return f'{name}[{idx[0]}]', inner
+    name, aty = rng.choice(arr_vars)
+    inner = aty[:-1] if aty.endswith('*') else aty[:-2]
+    if not _assignable(inner, target_type):
+        return gen_literal(state, target_type)
+    return f'{name}[0]', inner
 
 
 # ---------------------------------------------------------------------------
@@ -726,13 +798,9 @@ def gen_var_decl(state: FuzzerState, indent: int, depth: int) -> str | None:
     pad = '    ' * indent
     ty = random_type(rng)
     name = state.fresh()
-    has_init = rng.random() < 0.7
-    if has_init:
-        init_text, _ = gen_expr(state, ty, depth + 1)
-        state.scope.add(name, ty)
-        return f'{pad}{ty} {name} = {init_text}'
+    init_text, _ = gen_expr(state, ty, depth + 1)
     state.scope.add(name, ty)
-    return f'{pad}{ty} {name}'
+    return f'{pad}{ty} {name} = {init_text}'
 
 
 def gen_assign(state: FuzzerState, indent: int, depth: int) -> str | None:
@@ -742,11 +810,12 @@ def gen_assign(state: FuzzerState, indent: int, depth: int) -> str | None:
     if not all_v:
         return None
     name, ty = rng.choice(all_v)
-    value, _ = gen_expr(state, ty, depth + 1)
-    # Occasionally add index
-    if rng.random() < 0.1 and type_is_ptr(ty):
-        idx, _ = gen_expr(state, 'int', depth + 1)
-        return f'{pad}{name}[{idx}] = {value}'
+    if type_is_ptr(ty) and rng.random() < 0.2:
+        inner = ty[:-1] if ty.endswith('*') else ty[:-2]
+        value, _ = gen_expr(state, inner, depth + 1, _NO_CHAR)
+        return f'{pad}{name}[0] = {value}'
+    # Assignment (unlike initialization) does not allow char -> int.
+    value, _ = gen_expr(state, ty, depth + 1, _NO_CHAR if ty == 'int' else None)
     return f'{pad}{name} = {value}'
 
 
@@ -756,50 +825,110 @@ def gen_compound_assign(state: FuzzerState, indent: int, depth: int) -> str | No
     all_v = state.scope.all_vars()
     if not all_v:
         return None
-    # Only numeric types support compound assignment
-    numeric_vars = [(n, t) for n, t in all_v if type_is_numeric(t)]
-    if not numeric_vars:
+    candidates = [(n, t) for n, t in all_v if t in INT_FAMILY or t in FLOAT_FAMILY]
+    if not candidates:
         return None
-    name, ty = rng.choice(numeric_vars)
-    op = rng.choice(['+=', '-=', '*=', '/=', '//='])
-    value, _ = gen_expr(state, ty, depth + 1)
-    return f'{pad}{name} {op} {value}'
+    name, ty = rng.choice(candidates)
+    if ty == 'big':
+        # big is only mutually promotable with the int family; char/float
+        # operands are a "mismatched types" analyzer error.
+        op = rng.choice(['+=', '-=', '*=', '/=', '//='])
+        exact = MOD_OK
+        val_tuple = gen_expr(state, ty, depth + 1, exact)
+    else:
+        if ty in ('float', 'double') or ty == 'char':
+            op = rng.choice(['+=', '-=', '*=', '/='])
+        else:
+            op = rng.choice(['+=', '-=', '*=', '/=', '//='])
+        if op == '//=':
+            exact = MOD_OK
+            val_tuple = gen_expr(state, ty, depth + 1, exact)
+        else:
+            exact = None
+            val_tuple = gen_expr(state, ty, depth + 1)
+    if op in ('/=', '//='):
+        val_tuple = _ensure_nonzero(state, val_tuple, depth, exact)
+    return f'{pad}{name} {op} {val_tuple[0]}'
+
+
+def gen_compare(state: FuzzerState, depth: int) -> tuple[str, str]:
+    rng = state.rng
+    fam = rng.choices(['int', 'float', 'str'], weights=[50, 25, 25])[0]
+    if fam == 'int':
+        ct = rng.choice(['int', 'int64', 'uint64', 'big'])
+        left = gen_expr(state, ct, depth + 1, MOD_OK)
+        right = gen_expr(state, ct, depth + 1, MOD_OK)
+    elif fam == 'float':
+        left = gen_expr(state, rng.choice(['float', 'double']), depth + 1, FLOAT_FAMILY)
+        right = gen_expr(state, rng.choice(['float', 'double']), depth + 1, FLOAT_FAMILY)
+    else:
+        left = gen_expr(state, 'str', depth + 1, frozenset(('str',)))
+        right = gen_expr(state, 'str', depth + 1, frozenset(('str',)))
+    op = rng.choice(['==', '!=', '<', '>', '<=', '>='])
+    return f'({left[0]} {op} {right[0]})', 'bool'
+
+
+def gen_cond(state: FuzzerState, depth: int = 0) -> tuple[str, str]:
+    """A condition expression for if/while: a value or a bool expression."""
+    rng = state.rng
+    if depth > 4:
+        return gen_expr(state, None, depth)
+    kind = rng.choices(['value', 'compare', 'logical'], weights=[40, 35, 25])[0]
+    if kind == 'compare':
+        return gen_compare(state, depth)
+    if kind == 'logical':
+        op = rng.choice(['and', 'or'])
+        left = gen_cond(state, depth + 1)
+        right = gen_cond(state, depth + 1)
+        return f'({left[0]} {op} {right[0]})', 'bool'
+    return gen_expr(state, None, depth)
 
 
 def gen_if(state: FuzzerState, indent: int, depth: int) -> str:
     rng = state.rng
     pad = '    ' * indent
-    cond, _ = gen_expr(state, None, depth + 1)
-    body = gen_body(state, depth + 1, indent + 1)
+    cond, _ = gen_cond(state, depth + 1)
+    body = gen_body_in_scope(state, depth + 1, indent + 1) or [f'{pad}    print(0)']
     result = f'{pad}if {cond}:\n' + '\n'.join(body)
     if rng.random() < 0.3:
-        else_body = gen_body(state, depth + 1, indent + 1)
+        else_body = gen_body_in_scope(state, depth + 1, indent + 1) or [f'{pad}    print(0)']
         result += f'\n{pad}else:\n' + '\n'.join(else_body)
     return result
 
 
 def gen_while(state: FuzzerState, indent: int, depth: int) -> str | None:
     pad = '    ' * indent
+    cond = None
     for _ in range(8):
-        cond, _ = gen_expr(state, None, depth + 1)
-        if not expr_is_always_truthy(cond, state.known_truthy_globals):
+        c, _ = gen_cond(state, depth + 1)
+        if not expr_is_always_truthy(c, state.known_truthy_globals):
+            cond = c
             break
-    else:
+    if cond is None:
         return None
+    counter = state.fresh('w')
+    trips = state.rng.randint(1, 4)
     state.loop_depth += 1
-    body = gen_body(state, depth + 1, indent + 1)
+    body = gen_body_in_scope(state, depth + 1, indent + 1) or [f'{pad}    print(0)']
     state.loop_depth -= 1
-    return f'{pad}while {cond}:\n' + '\n'.join(body)
+    guard = f'(({cond}) and ({counter} > 0))'
+    inner = f'{pad}    {counter} = {counter} - 1'
+    return (f'{pad}int {counter} = {trips}\n'
+            f'{pad}while {guard}:\n'
+            + inner + '\n' + '\n'.join(body))
 
 
 def gen_for(state: FuzzerState, indent: int, depth: int) -> str:
     rng = state.rng
     pad = '    ' * indent
     v = state.fresh()
-    state.scope.add(v, 'char')
     iter_expr = rng.choice(EDGE_STRINGS)
     state.loop_depth += 1
-    body = gen_body(state, depth + 1, indent + 1)
+    old_scope = state.scope
+    state.scope = Scope(old_scope)
+    state.scope.add(v, 'char')
+    body = gen_body(state, depth + 1, indent + 1) or [f'{pad}    print(0)']
+    state.scope = old_scope
     state.loop_depth -= 1
     return f'{pad}for {v} in {iter_expr}:\n' + '\n'.join(body)
 
@@ -807,7 +936,7 @@ def gen_for(state: FuzzerState, indent: int, depth: int) -> str:
 def gen_print(state: FuzzerState, indent: int, depth: int) -> str | None:
     pad = '    ' * indent
     expr, etype = gen_expr(state, None, depth + 1)
-    if not type_is_printable_safely(etype):
+    if etype not in SCALAR_GEN_TYPES:
         return None
     return f'{pad}print({expr})'
 
@@ -823,6 +952,14 @@ def gen_return(state: FuzzerState, indent: int) -> str:
     return f'{pad}return 0'
 
 
+def gen_body_in_scope(state: FuzzerState, depth: int, indent: int) -> list[str]:
+    """Generate a body inside a fresh child scope (blocks scope like cpy)."""
+    old_scope = state.scope
+    state.scope = Scope(old_scope)
+    try:
+        return gen_body(state, depth, indent)
+    finally:
+        state.scope = old_scope
 
 
 def gen_body(state: FuzzerState, depth: int, indent: int) -> list[str]:
@@ -866,7 +1003,7 @@ def gen_body(state: FuzzerState, depth: int, indent: int) -> list[str]:
             if kind == 'return':
                 had_return = True
     if not stmts:
-        stmts.append(f'{pad}pass')
+        stmts.append(f'{pad}print(0)')
     return stmts
 
 
@@ -886,10 +1023,9 @@ def gen_struct(state: FuzzerState) -> str:
         while fname in used_names:
             fname = rng.choice(FIELD_NAMES)
         used_names.add(fname)
-        # Pick either pointer OR array, not both
-        if rng.random() < 0.2:
-            ftype = rng.choice(TYPES) + '[' + str(rng.randint(1, 10)) + ']'
-        elif rng.random() < 0.2:
+        # Pick scalar or pointer field types only — array field syntax
+        # (`int64[10] next`) does not parse in cpy struct bodies.
+        if rng.random() < 0.25:
             ftype = random_ptr_type(rng)
         else:
             ftype = rng.choice(TYPES)
@@ -946,10 +1082,6 @@ def gen_program(state: FuzzerState) -> str:
 
     lines = []
 
-    # Imports (rarely)
-    if rng.random() < 0.05:
-        lines.append('import "stdio.h"')
-
     # Structs
     n_structs = rng.choices([0, 1, 2, 3], weights=[40, 30, 20, 10])[0]
     for _ in range(n_structs):
@@ -960,21 +1092,16 @@ def gen_program(state: FuzzerState) -> str:
     for _ in range(rng.randint(0, 4)):
         ty = random_type(rng)
         name = state.fresh('g')
-        if rng.random() < 0.5:
-            # Don't add name to scope yet — init can't reference itself
-            init_text, _ = gen_expr(state, ty, 0)
-            state.scope.add(name, ty)
-            lines.append(f'{ty} {name} = {init_text}')
-            # Track known-truthy globals to avoid infinite while loops
-            if type_is_ptr(ty):
-                pass  # null is a common pointer initializer
-            elif ty == 'str' and _is_nonempty_str_literal(init_text):
-                state.known_truthy_globals.add(name)
-            elif ty != 'str' and init_text.strip() not in ('0', 'null', 'false', "''", '""', '0.0') and expr_is_always_truthy(init_text):
-                state.known_truthy_globals.add(name)
-        else:
-            state.scope.add(name, ty)
-            lines.append(f'{ty} {name}')
+        init_text, _ = gen_expr(state, ty, 0)
+        state.scope.add(name, ty)
+        lines.append(f'{ty} {name} = {init_text}')
+        # Track known-truthy globals to avoid infinite while loops
+        if type_is_ptr(ty):
+            pass  # null is a common pointer initializer
+        elif ty == 'str' and _is_nonempty_str_literal(init_text):
+            state.known_truthy_globals.add(name)
+        elif ty != 'str' and init_text.strip() not in ('0', 'null', 'false', "''", '""', '0.0') and expr_is_always_truthy(init_text):
+            state.known_truthy_globals.add(name)
     if lines and lines[-1] != '':
         lines.append('')
 

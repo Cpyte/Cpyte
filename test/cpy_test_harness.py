@@ -27,6 +27,10 @@ from cpyte.semantic_analasis import analyze
 from cpyte.bytecoding import LLVM
 from cpyte.compiling import run_jit
 
+# The syntax-aware generator lives in fuzzer.py; its programs are lex/parse/
+# analyze-clean, so fuzz mode compiles and executes only valid programs.
+from fuzzer import FuzzerState as GenState, gen_program as fuzz_gen_program
+
 TIMEOUT_S = 30
 CRASH_DIR = os.path.join(os.path.dirname(__file__), 'crashes')
 os.makedirs(CRASH_DIR, exist_ok=True)
@@ -499,13 +503,13 @@ def run_program(source, label='', save=True):
     out0, ret0, err0 = _run_jit_capture(prog, src_files, opt_level=0)
     out3, ret3, err3 = _run_jit_capture(prog, src_files, opt_level=3)
 
-    if err0 or err3:
+    if err0 != err3:
         reason0 = err0 or 'ok'
         reason3 = err3 or 'ok'
         _save_crash(source, f'diff fail: unopt={reason0} opt={reason3}')
         return 'bug'
-    if out0 != out3:
-        _save_crash(source, f'output mismatch: unopt={out0!r} opt={out3!r}')
+    if err0 is None and (out0 != out3 or ret0 != ret3):
+        _save_crash(source, f'output mismatch: unopt={out0!r}/{ret0} opt={out3!r}/{ret3}')
         return 'bug'
     return 'pass'
 
@@ -866,13 +870,13 @@ def run_fuzz(n=5000, seed=None):
     print(f'Fuzzing: seed={seed}, iterations={n}')
 
     stats = {'pass': 0, 'reject': 0, 'crash': 0, 'bug': 0}
-    state = FuzzerState(seed)
+    state = GenState(seed)
 
     for i in range(n):
-        source = gen_program(state)
+        source = fuzz_gen_program(state)
         result = run_program(source, label=f'iter {i}', save=True)
         stats[result] = stats.get(result, 0) + 1
-        state = FuzzerState(rng.randint(0, 2**31 - 1))
+        state = GenState(rng.randint(0, 2**31 - 1))
 
         if (i + 1) % 500 == 0:
             print(f'  [{i+1}/{n}] pass={stats["pass"]} reject={stats["reject"]} '

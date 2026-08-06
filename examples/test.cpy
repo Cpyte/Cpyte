@@ -1,14 +1,14 @@
 import "ApplicationServices/ApplicationServices.h"
 
-def callback(proxy void*, type: int, event void*, user_data void*):
-    if type == kCGEventTapDisabledByTimeout or \
-       type == kCGEventTapDisabledByUserInput:
+def callback(proxy void*, type_: int, event void*, user_data void*):
+    if type_ == kCGEventTapDisabledByTimeout or \
+       type_ == kCGEventTapDisabledByUserInput:
         CGEventTapEnable(user_data, true)
         return event
 
-    if type == kCGEventKeyDown or \
-       type == kCGEventKeyUp or \
-       type == kCGEventFlagsChanged:
+    if type_ == kCGEventKeyDown or \
+       type_ == kCGEventKeyUp or \
+       type_ == kCGEventFlagsChanged:
         return null      # Drop the event
 
     return event         # Pass everything else through

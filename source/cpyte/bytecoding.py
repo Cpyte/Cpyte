@@ -329,6 +329,9 @@ class LLVM:
             longjmp_ty = ir.FunctionType(_void, [_i8ptr, _i32])
             self._longjmp_fn = ir.Function(self.module, longjmp_ty, "longjmp")
             self._longjmp_fn.attributes.add('noreturn')
+            # Define functions so dedup function can check duplications. (Error in examples/test.cpy)
+            self.functions['setjmp'] = self._setjmp_fn
+            self.functions['longjmp'] = self._longjmp_fn
         else:
             pers_ty = ir.FunctionType(_i32, [], var_arg=True)
             self._personality_fn = ir.Function(self.module, pers_ty, "cpy_personality")
@@ -336,6 +339,10 @@ class LLVM:
             self._raise_exception_fn = ir.Function(self.module, raise_ty, "cpy_raise_exception")
             resume_ty = ir.FunctionType(_void, [_i8ptr])
             self._resume_fn = ir.Function(self.module, resume_ty, "cpy_resume")
+            # Defined for the same reason
+            self.functions['resume'] = self._resume_fn
+            self.functions['raise'] = self._raise_exception_fn
+            self.functions['personality'] = self._personality_fn
 
         # strcmp for exception type matching
         strcmp_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
@@ -1809,10 +1816,33 @@ class LLVM:
                 return self.builder.trunc(value, ty)
         return value
 
+    def _char_to_str(self, value):
+        """Convert an i8 char value into a 1-char heap-allocated string (str).
+
+        cpy's analyzer allows char -> str in initializers, assignments and
+        concatenation. Without this, a char is bit-cast to a pointer
+        (`inttoptr`) and the resulting str dereferences a bogus address.
+        """
+        malloc_fn = self._get_malloc_fn()
+        new_str = self.builder.call(malloc_fn, [ir.Constant(_i64, 2)])
+        addr = self.builder.gep(new_str, [ir.Constant(_i32, 0)], inbounds=True)
+        self.builder.store(value, addr)
+        null_byte = self.builder.gep(new_str, [ir.Constant(_i32, 1)], inbounds=True)
+        self.builder.store(ir.Constant(_i8, 0), null_byte)
+        return new_str
+
+    def _is_i8_to_str(self, value, pointee):
+        """True when storing an i8 char into a str (i8*) slot."""
+        return (isinstance(value.type, ir.IntType) and value.type.width == 8
+                and isinstance(pointee, ir.PointerType)
+                and getattr(pointee.pointee, 'width', None) == 8)
+
     def _coerce_store(self, value, pointee):
         if isinstance(pointee, ir.IntType) and isinstance(value.type, ir.IntType):
             return self._trunc_or_ext(value, pointee)
         if isinstance(pointee, ir.PointerType) and isinstance(value.type, ir.IntType):
+            if self._is_i8_to_str(value, pointee):
+                return self._char_to_str(value)
             i64_ty = ir.IntType(64)
             if value.type.width < 64:
                 if value.type.width == 32:
@@ -2340,10 +2370,13 @@ class LLVM:
                 value = self._extend_to_i64(value)
             if value.type != ty:
                 if isinstance(value.type, ir.IntType) and isinstance(ty, ir.PointerType):
-                    i64_ty = ir.IntType(64)
-                    if value.type.width < 64:
-                        value = self.builder.zext(value, i64_ty)
-                    value = self.builder.inttoptr(value, ty)
+                    if self._is_i8_to_str(value, ty):
+                        value = self._char_to_str(value)
+                    else:
+                        i64_ty = ir.IntType(64)
+                        if value.type.width < 64:
+                            value = self.builder.zext(value, i64_ty)
+                        value = self.builder.inttoptr(value, ty)
                 elif isinstance(value.type, ir.IntType) and isinstance(ty, ir.IntType):
                     if value.type.width < ty.width:
                         value = self.builder.zext(value, ty)

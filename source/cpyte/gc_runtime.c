@@ -245,9 +245,7 @@ void gc_collect(void) {
     pthread_mutex_unlock(&gc_lock);
 }
 
-void gc_set_threshold(size_t bytes) {
-    gc_threshold = bytes;
-}
+// Bruh, dead code.
 
 /* ── Background GC thread ───────────────────────────────────────── */
 
@@ -307,16 +305,5 @@ void gc_shutdown(void) {
 
 /* ── GC state queries ───────────────────────────────────────────── */
 
-int gc_is_collecting(void) {
-    return gc.state != UGC_IDLE;
-}
+// Bruh, dead code.
 
-size_t gc_heap_size(void) {
-    /* approximate: count tracked objects */
-    size_t count = 0;
-    for (int i = 0; i < OBJ_TABLE_SIZE; i++) {
-        obj_entry_t* e = obj_table[i];
-        while (e) { count++; e = e->next; }
-    }
-    return count;
-}

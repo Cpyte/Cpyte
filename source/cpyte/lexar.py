@@ -100,13 +100,11 @@ def get_keywords() -> Set[str]:
     return _BASE_KEYWORDS | _additional_keywords
 
 
-def clear_additional_keywords() -> None:
-    """Clear all additional keywords (useful for testing)."""
-    _additional_keywords.clear()
+# Bruh, dead code.
 
 
 # Legacy support - keep KEYWORDS as a set for backward compatibility
-# This is updated when keywords are registered/unregistered
+# This is updated when keywords are registered/unregistered LOl.
 KEYWORDS = get_keywords()
 
 

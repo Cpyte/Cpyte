@@ -622,7 +622,7 @@ def main():
     elif mode == 'scorpion':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         sef_file = out_base + '.sef'
-        run_scorpion(prog, output=sef_file, src_files=src_files)
+        run_scorpion(prog, output=sef_file, src_files=src_files, pic=pic)
         ui.print_ok(f'Wrote {sef_file}')
     else:
         run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)

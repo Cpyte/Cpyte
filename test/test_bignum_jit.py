@@ -1,11 +1,19 @@
 import sys, os
 sys.path.insert(0, '/Users/main/PycharmProjects/WEW/source')
 from cpyte._bignum_bc import load_bignum_bc
-from cpyte._runtime_bc import load_runtime_bc
+from cpyte._runtime_bc import _B64
 from llvmlite import binding as llvm
 
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
+
+import base64
+import zlib
+
+
+def load_runtime_bc():
+    data = zlib.decompress(base64.b64decode(_B64))
+    return llvm.parse_bitcode(data)
 
 ir = r"""
 declare i8* @bigint_new()

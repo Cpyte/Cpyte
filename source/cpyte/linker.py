@@ -2,6 +2,7 @@ import subprocess
 import sys
 import os
 import shutil
+from .ui import print_err
 
 
 _CANDIDATES = ['cc', 'clang', 'gcc']
@@ -40,9 +41,8 @@ class Linker:
         self._cc = cc or find_linker()
         self._lto = bool(lto)
         if self._lto and not _is_clang(self._cc):
-            print(
-                f'error: LTO requires a clang-compatible compiler, but found {self._cc}',
-                file=sys.stderr,
+            print_err(
+                f'error: LTO requires a clang-compatible compiler, but found {self._cc}'
             )
             raise SystemExit(1)
 

@@ -39,6 +39,11 @@ from pathlib import Path
 
 from llvmlite import binding
 
+try:
+    from .ui import print_ok
+except Exception:
+    print_ok = print
+
 
 def _remove_probe_stack_ir(llvm_ir: str) -> str:
     return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
@@ -173,7 +178,7 @@ def load_{module_name}_bc():
     return binding.parse_bitcode(data)
 '''
     Path(out_py).write_text(py_code)
-    print(f'Wrote {out_py}')
+    print_ok(f'Wrote {out_py}')
 
 
 def _default_module_name(out_py: str) -> str:

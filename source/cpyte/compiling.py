@@ -8,6 +8,7 @@ import warnings
 from ._bignum_bc import load_bignum_bc
 from ._gc_bc import load_gc_bc
 from .generate_bc import _remove_probe_stack_ir
+from .ui import print_err, print_ok
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
 warnings.filterwarnings("ignore", category=RuntimeWarning,
@@ -180,21 +181,7 @@ def optimize(mod, opt_level=3):
     npm.run(mod, pb)
 
 
-def _compile_sources_object(src_files, target_triple=None, pic=False):
-    objs = []
-    for src in src_files:
-        obj = src.rsplit('.', 1)[0] + '.o'
-        cmd = ['clang', '-c', '-O3', '-o', obj, src]
-        if target_triple:
-            cmd.extend(['-target', target_triple])
-        if pic:
-            cmd.append('-fPIC')
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
-            raise SystemExit(1)
-        objs.append(obj)
-    return objs
+# Bruh, dead code.
 
 
 def _maybe_compile(module, use_native_eh=False):
@@ -340,11 +327,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     except NameError:
         pass
 
-    try:
-        fn = mod.get_function('__cpy_strcmp')
-        engine.add_global_mapping(fn, _libc_addr('strcmp'))
-    except NameError:
-        pass
+    # Bruh, dead code.
 
     # GC functions come from the linked gc_runtime bitcode
 
@@ -450,7 +433,7 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
         capture_output=True, text=True
     )
     if r.returncode != 0:
-        print(f'error linking: {r.stderr}', file=__import__('sys').stderr)
+        print_err(f'error linking: {r.stderr}')
         raise SystemExit(1)
 
 
@@ -481,8 +464,16 @@ def _find_scorpion_tool(name, fallback):
     return fallback
 
 
-def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=False):
-    """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file."""
+def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=False,
+                 exports=None):
+    """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file.
+    Please use it good! :):)
+
+    With pic=True the module is compiled with -fPIC and the final ELF is linked
+    with --emit-relocs so it can be converted to a dynamic (SEF v2) image via
+    WEW-scorpion/tools/elf2sef.py. `exports` names the symbols to mark as
+    exported for dynamic linking (libraries).
+    """
     import llvmlite.binding as binding
     binding.initialize_all_targets()
     binding.initialize_all_asmprinters()
@@ -514,6 +505,8 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
     cmd = [cc, '-c', '-O3', _SCORPION_ARCH, _SCORPION_ABI,
            '-nostdlib', '-ffreestanding',
            '-o', runtime_obj, _RUNTIME_SCORPION_C]
+    if pic:
+        cmd.append('-fPIC') # This must be done to be ran on microcontrollers.
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f'error compiling runtime_scorpion.c: {r.stderr}', file=sys.stderr)
@@ -528,25 +521,40 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
            '-nostdlib', '-nostartfiles',
            '-Wl,-e,main', '-Wl,--no-relax', '-Wl,-Ttext=0',
            '-o', elf_file] + objs + ['-lgcc']
+    if pic:
+        cmd += ['-Wl,-q', '-Wl,--unresolved-symbols=ignore-all']
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f'error linking: {r.stderr}', file=sys.stderr)
+        print_err(f'error linking: {r.stderr}')
         raise SystemExit(1)
 
-    # Convert ELF to SEF using mksef.py
-    mksef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
-                         '..', '..', 'WEW-scorpion', 'user', 'mksef.py')
-    if not os.path.isfile(mksef):
-        # Fallback: inline SEF generation using objdump/objcopy
-        _elf_to_sef(elf_file, output, 0)
-    else:
-        r = subprocess.run([sys.executable, mksef, elf_file, output],
-                           capture_output=True, text=True)
+    if pic:
+        # Dynamic SEF v2: relocation + import/export records
+        elf2sef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
+                               '..', '..', 'WEW-scorpion', 'tools', 'elf2sef.py')
+        cmd = [sys.executable, elf2sef, elf_file, output]
+        if exports:
+            for name in exports:
+                cmd += ['--export', name]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print(f'error converting to SEF: {r.stderr}', file=sys.stderr)
+            print_err(f'error converting to SEF: {r.stderr}')
             raise SystemExit(1)
+    else:
+        # Static SEF v1 via mksef.py
+        mksef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
+                             '..', '..', 'WEW-scorpion', 'user', 'mksef.py')
+        if not os.path.isfile(mksef):
+            # Fallback: inline SEF generation using objdump/objcopy
+            _elf_to_sef(elf_file, output, 0)
+        else:
+            r = subprocess.run([sys.executable, mksef, elf_file, output],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                print_err(f'error converting to SEF: {r.stderr}')
+                raise SystemExit(1)
 
-    print(f'Wrote {os.path.getsize(output)} bytes to {output}')
+    print_ok(f'Wrote {os.path.getsize(output)} bytes to {output}')
     return elf_file
 
 

@@ -106,6 +106,4 @@ _B64 = (
     '3OTnpuLsd0n2uzT7DRE6G6JZpCz7vQ3Ne/0vRmVVZQ=='
 )
 
-def load_runtime_bc():
-    data = zlib.decompress(base64.b64decode(_B64))
-    return binding.parse_bitcode(data)
+# Bruh, dead code.

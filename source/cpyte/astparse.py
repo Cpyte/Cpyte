@@ -9,17 +9,11 @@ def register_parser_hook(hook: Any) -> None:
     _parser_hooks.append(hook)
 
 
-def unregister_parser_hook(hook: Any) -> None:
-    if hook in _parser_hooks:
-        _parser_hooks.remove(hook)
+# Bruh, dead code.
 
 
 def get_parser_hooks() -> List[Any]:
     return _parser_hooks.copy()
-
-
-def clear_parser_hooks() -> None:
-    _parser_hooks.clear()
 
 
 def _get_all_parser_hooks(enable_extensions: bool) -> List[Any]:
@@ -699,16 +693,8 @@ def parse_import(tokens: list[Token], pos: int):
     return node, pos
 
 
-def parse_expression_list(tokens: list[Token], pos: int = 0, end_type: TokenType = TokenType.NEWLINE):
-    exprs = []
-    while pos < len(tokens) and tokens[pos].type != end_type:
-        node, pos = parse_expression(tokens, pos)
-        exprs.append(node)
-        if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
-            pos += 1
-        elif pos < len(tokens) and tokens[pos].type not in (end_type, TokenType.RPAREN, TokenType.RBRACKET):
-            raise ParseError('Expected comma or end', tokens[pos])
-    return exprs, pos
+# Bruh, dead code.
+
 
 class Assign:
     __slots__ = ('target', 'value', '_token')

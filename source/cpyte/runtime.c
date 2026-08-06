@@ -59,9 +59,7 @@ char* input_str(void) {
     return buf;
 }
 
-int __cpy_strcmp(const char *s1, const char *s2) {
-    return strcmp(s1, s2);
-}
+// Bruh, dead code.
 
 typedef struct {
     _Unwind_Exception base;

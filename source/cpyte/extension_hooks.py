@@ -470,7 +470,4 @@ def get_global_hook_registry() -> HookRegistry:
     """Get the global hook registry instance."""
     return _global_hook_registry
 
-
-def reset_global_hook_registry() -> None:
-    """Reset the global hook registry (useful for testing)."""
-    _global_hook_registry.clear()
+# Bruh, dead code.

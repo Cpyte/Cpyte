@@ -14,6 +14,7 @@ if __package__:
     from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from .extension_hooks import HookLoader, get_global_hook_registry
     from .sef import cmd_pack, cmd_check, cmd_dump, cmd_size
+    from .update_check import start_check, report_update
     from . import ui
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -29,11 +30,12 @@ else:
     from cpyte.package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
     from cpyte.sef import cmd_pack, cmd_check, cmd_dump, cmd_size
+    from cpyte.update_check import start_check, report_update
     from cpyte import ui
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
-       cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>
+       cpy build [--output O] [--debug] [--opt N] [--osize] [--no-userspace] [--pic] [--lto] <source.cpy>
        cpy format [--write] [--check] [--tab-size N] <source.cpy>
        cpy sef <subcommand> ...
 
@@ -308,12 +310,13 @@ def _collect_frameworks(nodes):
 
 def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto=False):
     if not args:
-        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--no-userspace] [--pic] [--lto] <source.cpy>')
+        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--no-userspace] [--pic] [--lto] <source.cpy>')
         sys.exit(1)
 
     output = None
     debug = False
     opt = 3
+    opt_size = False
     src_file = None
     i = 0
     while i < len(args):
@@ -337,6 +340,9 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
         elif a == '--lto':
             lto = True
             i += 1
+        elif a == '--osize' or a == '-OSize':
+            opt_size = True
+            i += 1
         elif a == '--opt' and i + 1 < len(args):
             opt = int(args[i + 1])
             i += 2
@@ -348,8 +354,14 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
             sys.exit(1)
 
     if not src_file:
-        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--pic] [--lto] <source.cpy>')
+        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--pic] [--lto] <source.cpy>')
         sys.exit(1)
+
+    if opt_size:
+        # -OSize ignores speed entirely; cap at O2 so the O3/O4 pipelines never run.
+        if opt > 2:
+            ui.print_warn('-OSize ignores speed; capping --opt to 2')
+            opt = 2
 
     with open(src_file) as f:
         source = f.read()
@@ -377,8 +389,8 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
     binding.link_modules(mod, gc_mod)
     mod.verify()
 
-    if lto:
-        optimize(mod, opt)
+    if lto or opt_size:
+        optimize(mod, opt, opt_size=opt_size)
         mod.verify()
 
     target = binding.Target.from_default_triple()
@@ -394,16 +406,16 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
 
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
-        l.compile_c(src, output=src_obj, opt_level=opt, debug=debug, pic=pic)
+        l.compile_c(src, output=src_obj, opt_level=opt, opt_size=opt_size, debug=debug, pic=pic)
         objs.append(src_obj)
 
     if not no_userspace:
         runtime_obj = out_base + '.runtime.o'
-        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, debug=debug, pic=pic, eh=True)
+        l.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=opt, opt_size=opt_size, debug=debug, pic=pic, eh=True)
         objs.append(runtime_obj)
 
     executable = output or out_base
-    l.link(objs, executable, libraries=['m'], opt_level=opt, debug=debug, frameworks=frameworks, pic=pic)
+    l.link(objs, executable, libraries=['m'], opt_level=opt, opt_size=opt_size, debug=debug, frameworks=frameworks, pic=pic)
     ui.print_ok(f'Wrote {executable}')
 
 
@@ -537,8 +549,9 @@ def cmd_sef(args):
 
 
 def main():
+    start_check(__version__)
     try:
-        return _main()
+        result = _main()
     except KeyboardInterrupt:
         ui.print_warn('interrupted')
         return 130
@@ -546,6 +559,9 @@ def main():
         ui.print_err('cpy error:')
         ui.print_traceback()
         return 1
+    sys.stdout.flush()
+    report_update()
+    return result
 
 
 def _main():

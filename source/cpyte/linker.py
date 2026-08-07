@@ -50,7 +50,7 @@ class Linker:
     def cc(self):
         return self._cc
 
-    def compile_c(self, src, output=None, opt_level=3, debug=False, pic=False, eh=False):
+    def compile_c(self, src, output=None, opt_level=3, opt_size=False, debug=False, pic=False, eh=False):
         if output is None:
             base = src.rsplit('.', 1)[0] if '.' in src else src
             output = base + '.o'
@@ -64,7 +64,9 @@ class Linker:
             cmd.append('-funwind-tables')
         if self._lto:
             cmd.append('-flto')
-        if opt_level is not None:
+        if opt_size:
+            cmd.append('-Oz')
+        elif opt_level is not None:
             cmd.append(f'-O{opt_level}')
         cmd.extend(['-o', output, src])
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -74,7 +76,7 @@ class Linker:
         return output
 
     def link(self, objects, output, libraries=None, library_paths=None,
-             shared=False, debug=False, opt_level=3, frameworks=None, pic=False):
+             shared=False, debug=False, opt_level=3, opt_size=False, frameworks=None, pic=False):
         cmd = [self._cc]
         if shared:
             cmd.append('-shared')
@@ -84,7 +86,9 @@ class Linker:
             cmd.append('-g')
         if self._lto:
             cmd.append('-flto')
-        if opt_level is not None:
+        if opt_size:
+            cmd.append('-Oz')
+        elif opt_level is not None:
             cmd.append(f'-O{opt_level}')
         cmd.extend(['-o', output] + list(objects))
         for lib in (libraries or []):

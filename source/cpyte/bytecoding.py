@@ -178,6 +178,77 @@ class LLVM:
             return True
         return False
 
+    @staticmethod
+    def _norm_signed(v, width):
+        mask = (1 << width) - 1
+        v &= mask
+        if v >= 1 << (width - 1):
+            v -= 1 << width
+        return v
+
+    @staticmethod
+    def _trunc_div(a, b):
+        q = abs(a) // abs(b)
+        return -q if (a < 0) != (b < 0) else q
+
+    def _emit_int_divmod(self, left, right, is_rem):
+        """Signed int division/remainder that stays well-defined in LLVM IR.
+
+        cpy ints wrap, so `INT_MIN // -1` yields INT_MIN and `INT_MIN % -1`
+        yields 0. Raw `sdiv`/`srem` on those operands is *poison* in LLVM and
+        the optimizer folds it into arbitrary values (opt0 vs opt3 diverge).
+        Division/remainder by zero still traps, matching the cpy runtime.
+        """
+        width = left.type.width if isinstance(left.type, ir.IntType) else 64
+        int_min = -(1 << (width - 1))
+
+        if isinstance(right, ir.Constant):
+            if self._is_ir_constant_zero(right):
+                raise ZeroDivisionError('division by zero')
+            if isinstance(left, ir.Constant):
+                l = self._norm_signed(left.constant, width)
+                r = self._norm_signed(right.constant, width)
+                if r == 0:
+                    raise ZeroDivisionError('division by zero')
+                if l == int_min and r == -1:
+                    return ir.Constant(left.type, 0 if is_rem else int_min)
+                if is_rem:
+                    q = self._trunc_div(l, r)
+                    return ir.Constant(left.type, l - q * r)
+                return ir.Constant(left.type, self._trunc_div(l, r))
+
+        is_zero = self.builder.icmp_signed('==', right, ir.Constant(right.type, 0))
+        trap_bb = self.builder.append_basic_block("div.trap")
+        guard_bb = self.builder.append_basic_block("div.guard")
+        self.builder.cbranch(is_zero, trap_bb, guard_bb)
+        self.builder.position_at_end(trap_bb)
+        self.builder.call(self._get_trap_fn(), [])
+        self.builder.unreachable()
+
+        self.builder.position_at_end(guard_bb)
+        is_min = self.builder.icmp_signed('==', left, ir.Constant(left.type, int_min))
+        is_neg1 = self.builder.icmp_signed('==', right, ir.Constant(right.type, -1))
+        overflow = self.builder.and_(is_min, is_neg1)
+        overflow_bb = self.builder.append_basic_block("div.overflow")
+        normal_bb = self.builder.append_basic_block("div.normal")
+        end_bb = self.builder.append_basic_block("div.end")
+        self.builder.cbranch(overflow, overflow_bb, normal_bb)
+
+        self.builder.position_at_end(overflow_bb)
+        self.builder.branch(end_bb)
+        self.builder.position_at_end(normal_bb)
+        if is_rem:
+            normal_val = self.builder.srem(left, right)
+        else:
+            normal_val = self.builder.sdiv(left, right)
+        self.builder.branch(end_bb)
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(left.type)
+        phi.add_incoming(ir.Constant(left.type, 0 if is_rem else int_min), overflow_bb)
+        phi.add_incoming(normal_val, normal_bb)
+        return phi
+
+
     def _clamp_shift_amount(self, val, bitwidth):
         zero = ir.Constant(val.type, 0)
         max_shift = ir.Constant(val.type, bitwidth - 1)
@@ -1392,6 +1463,8 @@ class LLVM:
         if val.type == target_ty:
             return val
         if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
+            if val.type.width == 1:
+                return self.builder.zext(val, target_ty)
             if val.type.width < target_ty.width:
                 return self.builder.sext(val, target_ty)
             if val.type.width > target_ty.width:
@@ -1545,47 +1618,11 @@ class LLVM:
             case TokenType.STAR:
                 return self.builder.mul(left, right)
             case TokenType.SLASH:
-                if self._is_ir_constant_zero(right):
-                    raise ZeroDivisionError('division by zero')
-                if not isinstance(right, ir.Constant):
-                    z = ir.Constant(right.type, 0)
-                    is_zero = self.builder.icmp_signed('==', right, z)
-                    trap_bb = self.builder.append_basic_block("div.trap")
-                    ok_bb = self.builder.append_basic_block("div.ok")
-                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
-                    self.builder.position_at_end(trap_bb)
-                    self.builder.call(self._get_trap_fn(), [])
-                    self.builder.unreachable()
-                    self.builder.position_at_end(ok_bb)
-                return self.builder.sdiv(left, right)
+                return self._emit_int_divmod(left, right, is_rem=False)
             case TokenType.SLASH_SLASH:
-                if self._is_ir_constant_zero(right):
-                    raise ZeroDivisionError('division by zero')
-                if not isinstance(right, ir.Constant):
-                    z = ir.Constant(right.type, 0)
-                    is_zero = self.builder.icmp_signed('==', right, z)
-                    trap_bb = self.builder.append_basic_block("div.trap")
-                    ok_bb = self.builder.append_basic_block("div.ok")
-                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
-                    self.builder.position_at_end(trap_bb)
-                    self.builder.call(self._get_trap_fn(), [])
-                    self.builder.unreachable()
-                    self.builder.position_at_end(ok_bb)
-                return self.builder.sdiv(left, right)
+                return self._emit_int_divmod(left, right, is_rem=False)
             case TokenType.PERCENT:
-                if self._is_ir_constant_zero(right):
-                    raise ZeroDivisionError('division by zero')
-                if not isinstance(right, ir.Constant):
-                    z = ir.Constant(right.type, 0)
-                    is_zero = self.builder.icmp_signed('==', right, z)
-                    trap_bb = self.builder.append_basic_block("div.trap")
-                    ok_bb = self.builder.append_basic_block("div.ok")
-                    self.builder.cbranch(is_zero, trap_bb, ok_bb)
-                    self.builder.position_at_end(trap_bb)
-                    self.builder.call(self._get_trap_fn(), [])
-                    self.builder.unreachable()
-                    self.builder.position_at_end(ok_bb)
-                return self.builder.srem(left, right)
+                return self._emit_int_divmod(left, right, is_rem=True)
             case TokenType.SHL:
                 left, right = self._bitwise_promote(left, right)
                 bitwidth = left.type.width

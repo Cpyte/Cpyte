@@ -123,6 +123,7 @@ def _canonicalize_module(mod) -> None:
 
 def compile_to_bitcode(c_path: str, target_triple: str | None = None,
                        cpu: str | None = None, opt_level: int = 3,
+                       opt_size: bool = False,
                        gmp_include: str | None = None,
                        canonicalize: bool = False) -> bytes:
     c_path = str(Path(c_path).resolve())
@@ -130,10 +131,14 @@ def compile_to_bitcode(c_path: str, target_triple: str | None = None,
     with tempfile.TemporaryDirectory() as tmp:
         ll_path = Path(tmp) / 'out.ll'
         cmd = [
-            'clang', f'-O{clang_opt}', '-S', '-emit-llvm',
+            'clang', '-S', '-emit-llvm',
             '-o', str(ll_path),
             '-fno-stack-protector',
         ]
+        if opt_size:
+            cmd.append('-Oz')
+        else:
+            cmd.append(f'-O{clang_opt}')
         if _needs_gmp_headers(str(c_path), gmp_include):
             inc = _find_gmp_include(gmp_include)
             if inc:
@@ -199,6 +204,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('module', nargs='?', help='module name (default: derived)')
     parser.add_argument('-O', '--opt', type=int, default=int(os.environ.get('CPYTE_BC_OPT_LEVEL', 3)),
                         help='clang optimization level 0-3 (default: 3, env CPYTE_BC_OPT_LEVEL)')
+    parser.add_argument('--osize', action='store_true',
+                        help='optimize the embedded module for size (-Oz), ignoring speed')
     parser.add_argument('--target', default=None, help='target triple (default: host)')
     parser.add_argument('--cpu', default=None, help='-mcpu value (e.g. apple-m1)')
     parser.add_argument('--gmp-include', default=os.environ.get('CPYTE_GMP_INCLUDE'),
@@ -212,7 +219,7 @@ def main(argv: list[str] | None = None) -> None:
     module_name = args.module or _default_module_name(args.output)
     make_module(
         args.source, args.output, module_name,
-        target_triple=args.target, cpu=args.cpu, opt_level=args.opt,
+        target_triple=args.target, cpu=args.cpu, opt_level=args.opt, opt_size=args.osize,
         gmp_include=args.gmp_include, canonicalize=args.canonicalize,
     )
 

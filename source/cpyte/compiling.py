@@ -89,20 +89,36 @@ def _runtime_input_str() -> bytes:
     return input().encode('utf-8')
 
 
-def optimize(mod, opt_level=3):
+def optimize(mod, opt_level=3, opt_size=False):
     from llvmlite import binding
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
-    if opt_level <= 0:
+    if opt_level <= 0 and not opt_size:
         return
     target = binding.Target.from_default_triple()
     target_machine = target.create_target_machine()
-    pto = binding.create_pipeline_tuning_options(speed_level=min(opt_level, 3))
 
-    heavy = opt_level >= 3
-    extra_heavy = opt_level >= 4
+    if opt_size:
+        # -OSize: optimize purely for code size, completely ignoring speed.
+        # Cap at O2 so the heavy O3/O4 speed passes never run, and disable every
+        # size-bloating transformation (loop unrolling/vectorization, high
+        # inlining). The default module pipeline then shrinks code.
+        effective = min(opt_level, 2)
+        pto = binding.create_pipeline_tuning_options(speed_level=0)
+        pto.inlining_threshold = 25
+        pto.loop_unrolling = False
+        pto.loop_vectorization = False
+        pto.slp_vectorization = False
+        pto.loop_interleaving = False
+    else:
+        effective = opt_level
+        pto = binding.create_pipeline_tuning_options(
+            speed_level=min(opt_level, 3))
 
-    if opt_level >= 2:
+    heavy = effective >= 3
+    extra_heavy = effective >= 4
+
+    if effective >= 2:
         pto.slp_vectorization = True
     if heavy:
         pto.inlining_threshold = 450 if extra_heavy else 275
@@ -121,7 +137,7 @@ def optimize(mod, opt_level=3):
 
     # Phase 2: aggressive per-function simplification. Promote allocas to SSA,
     # fold constants, remove dead stores/blocks, and specialise loops.
-    if opt_level >= 2:
+    if effective >= 2:
         fpm = pb.getFunctionPassManager()
         fpm.add_simplify_cfg_pass()
         fpm.add_sroa_pass()
@@ -137,6 +153,15 @@ def optimize(mod, opt_level=3):
             fpm.add_loop_strength_reduce_pass()
             fpm.add_sinking_pass()
             fpm.add_mem_copy_opt_pass()
+            fpm.add_dead_store_elimination_pass()
+            fpm.add_tail_call_elimination_pass()
+            fpm.add_aggressive_dce_pass()
+        elif opt_size:
+            # Size-friendly subset: fold constant branches, prune dead code and
+            # tail-call-eliminate, but never unroll or vectorize loops.
+            fpm.add_instruction_combine_pass()
+            fpm.add_sccp_pass()
+            fpm.add_jump_threading_pass()
             fpm.add_dead_store_elimination_pass()
             fpm.add_tail_call_elimination_pass()
             fpm.add_aggressive_dce_pass()
@@ -163,6 +188,16 @@ def optimize(mod, opt_level=3):
             mpm.add_always_inliner_pass()
             mpm.add_partial_inliner_pass()
             mpm.add_merge_functions_pass()
+        mpm.run(mod, pb)
+    elif opt_size:
+        # Size-oriented module phase: coalesce constants, eliminate dead globals
+        # and arguments, merge identical function bodies, drop unused prototypes.
+        mpm = pb.getModulePassManager()
+        mpm.add_constant_merge_pass()
+        mpm.add_global_dead_code_eliminate_pass()
+        mpm.add_dead_arg_elimination_pass()
+        mpm.add_merge_functions_pass()
+        mpm.add_strip_dead_prototype_pass()
         mpm.run(mod, pb)
 
     # Default module pipeline (includes inliner, GVN, DCE, loop and vectorization opts)

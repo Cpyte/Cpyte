@@ -60,6 +60,35 @@ class _EHBuilder(ir.IRBuilder):
                             fastmath=fastmath, attrs=attrs, arg_attrs=arg_attrs)
 
 
+def _emit_children(node) -> list:
+    """Child nodes that the pure emitters descend into, in emit order."""
+    if isinstance(node, BinOp):
+        return [node.left, node.right]
+    if isinstance(node, UnaryOp):
+        return [node.operand]
+    if isinstance(node, Deref):
+        return [node.operand]
+    if isinstance(node, AddrOf):
+        return [node.operand]
+    if isinstance(node, Index):
+        return [node.obj, node.index]
+    if isinstance(node, Attr):
+        return [node.obj]
+    if isinstance(node, NewExpr):
+        return [node.size] if node.size is not None else []
+    if isinstance(node, Call):
+        children = []
+        if isinstance(node.callee, Attr):
+            children.append(node.callee.obj)
+        children.extend(node.args)
+        return children
+    if isinstance(node, InlineAsm):
+        return [arg_expr for _, arg_expr in node.inputs]
+    if isinstance(node, ExprStmt):
+        return [node.expr]
+    return []
+
+
 class LLVM:
     def llvm_type(self, t: str):
         if t == 'int':
@@ -787,34 +816,6 @@ class LLVM:
             return node.op not in (TokenType.AND, TokenType.OR)
         return isinstance(node, self._EMIT_PURE_TYPES)
 
-    def _emit_children(self, node) -> list:
-        """Child nodes that the pure emitters descend into, in emit order."""
-        if isinstance(node, BinOp):
-            return [node.left, node.right]
-        if isinstance(node, UnaryOp):
-            return [node.operand]
-        if isinstance(node, Deref):
-            return [node.operand]
-        if isinstance(node, AddrOf):
-            return [node.operand]
-        if isinstance(node, Index):
-            return [node.obj, node.index]
-        if isinstance(node, Attr):
-            return [node.obj]
-        if isinstance(node, NewExpr):
-            return [node.size] if node.size is not None else []
-        if isinstance(node, Call):
-            children = []
-            if isinstance(node.callee, Attr):
-                children.append(node.callee.obj)
-            children.extend(node.args)
-            return children
-        if isinstance(node, InlineAsm):
-            return [arg_expr for _, arg_expr in node.inputs]
-        if isinstance(node, ExprStmt):
-            return [node.expr]
-        return []
-
     def _emit_combine(self, node):
         """Run the real recursive emitter for a pure node whose children were
         already emitted and memoized during the iterative traversal."""
@@ -915,7 +916,7 @@ class LLVM:
                     continue
                 if self._emit_is_pure(n):
                     if kind == 'visit':
-                        children = self._emit_children(n)
+                        children = _emit_children(n)
                         if children:
                             stack.append(('combine', n))
                             for c in reversed(children):
@@ -1362,11 +1363,16 @@ class LLVM:
             declared = self.local_types.get(node.name, '')
             if declared:
                 return self._base_type_name(declared)
-        if isinstance(node, Deref) and isinstance(node.operand, Variable):
-            declared = self.local_types.get(node.operand.name, '')
-            if declared.endswith('*'):
-                base = declared[:-1]
-                return self._base_type_name(base)
+        if isinstance(node, Deref):
+            if isinstance(node.operand, Variable):
+                declared = self.local_types.get(node.operand.name, '')
+                if declared.endswith('*'):
+                    base = declared[:-1]
+                    return self._base_type_name(base)
+            else:
+                sub = self._struct_name_from_node(node.operand)
+                if sub:
+                    return self._base_type_name(sub)
         if isinstance(node, Attr):
             parent_struct = self._struct_name_from_node(node.obj)
             if parent_struct and parent_struct in self.struct_fields:
@@ -1385,11 +1391,7 @@ class LLVM:
             # Try the full generic name first, then base name
             for sn in (struct_name, struct_name.split('<')[0]):
                 if sn and sn in self.struct_fields:
-                    var_name = getattr(node.obj, 'name', '')
-                    declared = self.local_types.get(var_name, '')
-                    if declared == sn + '*' or ('struct.' in declared and self._base_type_name(declared) == sn):
-                        obj_ptr = self.builder.load(obj_ptr)
-                    elif sn in self.structs and isinstance(self.structs.get(sn), ir.IdentifiedStructType):
+                    if isinstance(getattr(obj_ptr.type, 'pointee', None), ir.PointerType):
                         obj_ptr = self.builder.load(obj_ptr)
                     fields = self.struct_fields[sn]
                     for i, f in enumerate(fields):

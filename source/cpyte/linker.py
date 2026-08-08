@@ -1,11 +1,64 @@
 import subprocess
 import sys
 import os
+import re
 import shutil
 from .ui import print_err
 
 
 _CANDIDATES = ['cc', 'clang', 'gcc']
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+_ERR_HINTS = (
+    ': error:', ': fatal error:',
+    'error:', 'fatal error:',
+    'ld: ', 'Undefined symbols',
+    'framework not found', 'library not found',
+    'duplicate symbol', 'clang: error:',
+)
+
+
+def format_cc_diag(stderr, max_lines=12):
+    """Reduce a compiler/linker stderr dump to the actionable diagnostic lines.
+
+    Keeps the ``file:line:col: error:`` diagnostics (plus their source
+    snippet/caret context) and drops the surrounding noise, so a failed link
+    surfaces as a short, readable message instead of a huge clang dump.
+    """
+    text = _ANSI_RE.sub('', stderr or '').strip()
+    if not text:
+        return 'no output'
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+
+    def _is_context(ln):
+        stripped = ln.lstrip()
+        return (stripped.startswith('^') or stripped.startswith('~')
+                or (stripped and not stripped.endswith(':')
+                    and len(stripped) <= 100
+                    and 'error' not in stripped.lower()
+                    and ': ' not in ln))
+
+    shown = []
+    for i, ln in enumerate(lines):
+        if any(h in ln for h in _ERR_HINTS):
+            shown.append(ln)
+            nxt = i + 1
+            while nxt < len(lines) and len(shown) < max_lines and _is_context(lines[nxt]):
+                shown.append(lines[nxt])
+                nxt += 1
+    if not shown:
+        shown = lines
+    if len(shown) > max_lines:
+        shown = shown[:max_lines]
+        shown.append(f'... {len(lines) - max_lines} more line(s) suppressed '
+                     '(run with --verbose for the full output)')
+    return '\n'.join(shown)
+
+
+def _cc_error(prefix, stderr):
+    print(f'{prefix}{format_cc_diag(stderr)}', file=sys.stderr)
+    raise SystemExit(1)
 
 
 class LinkerNotFoundError(RuntimeError):
@@ -71,8 +124,7 @@ class Linker:
         cmd.extend(['-o', output, src])
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print(f'error compiling {src}: {r.stderr}', file=sys.stderr)
-            raise SystemExit(1)
+            _cc_error(f'error compiling {src}: ', r.stderr)
         return output
 
     def link(self, objects, output, libraries=None, library_paths=None,
@@ -101,8 +153,7 @@ class Linker:
             cmd.append('-lm')
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print(f'link error: {r.stderr}', file=sys.stderr)
-            raise SystemExit(1)
+            _cc_error('link error: ', r.stderr)
         return output
 
 

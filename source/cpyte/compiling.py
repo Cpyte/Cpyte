@@ -8,6 +8,7 @@ import warnings
 from ._bignum_bc import load_bignum_bc
 from ._gc_bc import load_gc_bc
 from .generate_bc import _remove_probe_stack_ir
+from .linker import format_cc_diag
 from .ui import print_err, print_ok
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
@@ -251,7 +252,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
                     capture_output=True, text=True)
 
                 if r.returncode != 0:
-                    print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
+                    print_err(f'error compiling {src}: {format_cc_diag(r.stderr)}')
                     raise SystemExit(1)
                 src_ir = r.stdout
             src_ir = _remove_probe_stack_ir(src_ir)
@@ -400,7 +401,7 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
     engine.add_global_mapping(fn, _libc_addr(name))
 
 
-def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False, lto=False):
+def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False, lto=False, frameworks=None):
     llvm_ir = str(module)
     import llvmlite.binding as binding
     binding.initialize_native_target()
@@ -439,7 +440,7 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
             capture_output=True, text=True
         )
         if r.returncode != 0:
-            print(f'error compiling {src}: {r.stderr}', file=__import__('sys').stderr)
+            print_err(f'error compiling {src}: {format_cc_diag(r.stderr)}')
             raise SystemExit(1)
         objs.append(src_obj)
     
@@ -461,6 +462,8 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
 
     out_name = output.rsplit('.', 1)[0] if '.' in output else output
     link_cmd = ['clang', '-O3', '-o', out_name] + objs + ['-lm']
+    for fw in (frameworks or []):
+        link_cmd.extend(['-framework', fw])
     if lto:
         link_cmd.insert(1, '-flto')
     r = subprocess.run(
@@ -468,7 +471,7 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
         capture_output=True, text=True
     )
     if r.returncode != 0:
-        print_err(f'error linking: {r.stderr}')
+        print_err(f'error linking: {format_cc_diag(r.stderr)}')
         raise SystemExit(1)
 
 
@@ -544,7 +547,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
         cmd.append('-fPIC') # This must be done to be ran on microcontrollers.
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f'error compiling runtime_scorpion.c: {r.stderr}', file=sys.stderr)
+        print_err(f'error compiling runtime_scorpion.c: {format_cc_diag(r.stderr)}')
         raise SystemExit(1)
     objs.append(runtime_obj)
 
@@ -560,7 +563,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
         cmd += ['-Wl,-q', '-Wl,--unresolved-symbols=ignore-all']
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print_err(f'error linking: {r.stderr}')
+        print_err(f'error linking: {format_cc_diag(r.stderr)}')
         raise SystemExit(1)
 
     if pic:
@@ -573,7 +576,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
                 cmd += ['--export', name]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print_err(f'error converting to SEF: {r.stderr}')
+            print_err(f'error converting to SEF: {format_cc_diag(r.stderr)}')
             raise SystemExit(1)
     else:
         # Static SEF v1 via mksef.py
@@ -586,7 +589,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
             r = subprocess.run([sys.executable, mksef, elf_file, output],
                                capture_output=True, text=True)
             if r.returncode != 0:
-                print_err(f'error converting to SEF: {r.stderr}')
+                print_err(f'error converting to SEF: {format_cc_diag(r.stderr)}')
                 raise SystemExit(1)
 
     print_ok(f'Wrote {os.path.getsize(output)} bytes to {output}')

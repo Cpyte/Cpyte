@@ -149,7 +149,8 @@ def compile_to_bitcode(c_path: str, target_triple: str | None = None,
         cmd.append(str(c_path))
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print(f'clang error: {r.stderr}', file=sys.stderr)
+            from .linker import format_cc_diag
+            print(f'clang error: {format_cc_diag(r.stderr)}', file=sys.stderr)
             raise SystemExit(r.returncode)
         text = ll_path.read_text()
         stripped = _remove_probe_stack_ir(text)

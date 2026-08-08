@@ -302,7 +302,7 @@ def parse_header_file(filepath, search_paths=None, _processed=None):
     if _processed is None:
         _processed = set()
     if filepath in _processed:
-        return {}, 'h', {}, None, set()
+        return {}, 'h', {}, set(), set()
     _processed.add(filepath)
 
     with open(filepath) as f:
@@ -338,24 +338,26 @@ def parse_header_file(filepath, search_paths=None, _processed=None):
     for name, desc in macros.items():
         symbols[name] = desc
 
+    frameworks = _framework_names_from_path(filepath)
+
     # Process includes recursively FIRST, so enum resolution can use their constants
     if search_paths:
         for m in _INCLUDE_PATTERN.finditer(content):
             inc_path = m.group(1)
             inc_file = _resolve_include(inc_path, filepath, search_paths)
             if inc_file:
-                sub_sym, _, sub_const, _, sub_vars = parse_header_file(inc_file, search_paths, _processed)
+                sub_sym, _, sub_const, sub_fw, sub_vars = parse_header_file(inc_file, search_paths, _processed)
                 for k, v in sub_sym.items():
                     symbols.setdefault(k, v)
                 var_names.update(sub_vars)
                 constants.update(sub_const)
+                frameworks.update(sub_fw)
 
     # Now extract enum constants from current file, with access to all merged constants
     enum_consts = _extract_enum_constants(content, constants)
     constants.update(enum_consts)
 
-    framework = _framework_name_from_path(filepath)
-    return symbols, 'h', constants, framework, var_names
+    return symbols, 'h', constants, frameworks, var_names
 
 
 def _extract_defines(content):
@@ -505,6 +507,21 @@ def _framework_name_from_path(filepath):
         if p.endswith('.framework'):
             return p[:-len('.framework')]
     return None
+
+
+def _framework_names_from_path(filepath):
+    """All framework names appearing in a header path (root + nested includes).
+
+    A header may live in one framework while transitively including headers
+    from others (e.g. ApplicationServices pulls in CoreFoundation/CoreGraphics).
+    Every such framework must be linked with `-framework` so the AOT linker can
+    resolve the symbols the program actually uses.
+    """
+    names = set()
+    for p in filepath.replace('\\', '/').split('/'):
+        if p.endswith('.framework'):
+            names.add(p[:-len('.framework')])
+    return names
 
 
 _C_TYPE_MAP = {

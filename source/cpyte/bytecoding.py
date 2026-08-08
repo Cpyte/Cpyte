@@ -241,12 +241,13 @@ class LLVM:
 
         if isinstance(right, ir.Constant):
             if self._is_ir_constant_zero(right):
-                raise ZeroDivisionError('division by zero')
-            if isinstance(left, ir.Constant):
+                # Division/remainder by a compile-time zero: fall through to the
+                # runtime trap path below (same semantics as a runtime div-by-zero)
+                # instead of aborting codegen mid-emission.
+                pass
+            elif isinstance(left, ir.Constant):
                 l = self._norm_signed(left.constant, width)
                 r = self._norm_signed(right.constant, width)
-                if r == 0:
-                    raise ZeroDivisionError('division by zero')
                 if l == int_min and r == -1:
                     return ir.Constant(left.type, 0 if is_rem else int_min)
                 if is_rem:
@@ -2233,6 +2234,10 @@ class LLVM:
                     val = self.builder.ptrtoint(val, expected)
                 if isinstance(val.type, ir.PointerType) and isinstance(expected, ir.PointerType) and val.type != expected:
                     val = self.builder.bitcast(val, expected)
+                if isinstance(val.type, ir.IntType) and isinstance(expected, ir.DoubleType):
+                    val = self.builder.sitofp(val, expected)
+                if isinstance(val.type, ir.DoubleType) and isinstance(expected, ir.IntType):
+                    val = self.builder.fptosi(val, expected)
             args.append(val)
         return self.builder.call(func, args)
 

@@ -287,9 +287,10 @@ def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extens
     c.generic_instantiations = generic_instantiations or {}
     try:
         prog, src_files = c.emit_program(parsed)
-    except Exception:
-        ui.print_err('codegen error:')
-        ui.print_traceback()
+    except SystemExit:
+        raise
+    except Exception as e:
+        ui.print_err(f'codegen error: {type(e).__name__}: {e}')
         sys.exit(1)
     return prog, src_files
 
@@ -652,7 +653,8 @@ def _main():
     elif mode == 'aot':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         obj_file = 'program.o'
-        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic, lto=lto)
+        frameworks = _collect_frameworks(parsed)
+        run_aot(prog, output=obj_file, src_files=src_files, no_userspace=no_userspace, pic=pic, lto=lto, frameworks=frameworks)
         ui.print_ok(f'Wrote {out_base}')
     elif mode == 'scorpion':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'

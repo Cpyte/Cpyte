@@ -1325,7 +1325,8 @@ def _looks_like_type(tokens, pos):
     # Constant syntax: <type> (NAME) = <value>
     if i < len(tokens) and tokens[i].type == TokenType.LPAREN:
         if (i + 2) < len(tokens) and tokens[i + 1].type == TokenType.IDENTIFIER and tokens[i + 2].type == TokenType.RPAREN:
-            return True
+            if (i + 3) < len(tokens) and tokens[i + 3].type == TokenType.EQUAL:
+                return True
     return i > pos + 1
 
 

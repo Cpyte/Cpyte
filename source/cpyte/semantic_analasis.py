@@ -3,21 +3,76 @@ import re
 import subprocess
 import sys
 
+def _get_multiarch():
+    for cc in ('cc', 'gcc', 'clang'):
+        try:
+            r = subprocess.run([cc, '-print-multiarch'], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
 def _get_sdk_paths():
+    """Auto-discover system include/SDK roots across macOS, Linux and Windows."""
     paths = []
-    try:
-        sdk = subprocess.run(['xcrun', '--show-sdk-path'], capture_output=True, text=True, timeout=5)
-        if sdk.returncode == 0 and sdk.stdout.strip():
-            paths.append(sdk.stdout.strip())
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    base = '/Library/Developer/CommandLineTools/SDKs'
-    if os.path.isdir(base):
-        for entry in sorted(os.listdir(base), reverse=True):
-            full = os.path.join(base, entry)
-            if os.path.isdir(full) and entry.startswith('MacOSX'):
-                if full not in paths:
-                    paths.append(full)
+
+    if sys.platform == 'darwin':
+        try:
+            sdk = subprocess.run(['xcrun', '--show-sdk-path'], capture_output=True, text=True, timeout=5)
+            if sdk.returncode == 0 and sdk.stdout.strip():
+                paths.append(sdk.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for base in (
+            '/Library/Developer/CommandLineTools/SDKs',
+            '/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs',
+        ):
+            if os.path.isdir(base):
+                for entry in sorted(os.listdir(base), reverse=True):
+                    full = os.path.join(base, entry)
+                    if os.path.isdir(full) and entry.startswith('MacOSX') and full not in paths:
+                        paths.append(full)
+        for p in ('/usr/local/include', '/usr/include'):
+            if os.path.isdir(p) and p not in paths:
+                paths.append(p)
+
+    elif sys.platform == 'win32':
+        roots = []
+        windows_sdk = os.environ.get('WindowsSdkDir')
+        if windows_sdk:
+            roots.append(os.path.join(windows_sdk, 'Include'))
+        pf = os.environ.get('ProgramFiles(x86)') or os.environ.get('ProgramFiles')
+        if pf:
+            roots.append(os.path.join(pf, 'Windows Kits', '10', 'Include'))
+            roots.append(os.path.join(pf, 'Windows Kits', '8.1', 'Include'))
+        vctools = os.environ.get('VCToolsInstallDir')
+        if vctools:
+            roots.append(os.path.join(vctools, 'include'))
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            versioned = [d for d in sorted(os.listdir(root), reverse=True)
+                         if re.match(r'^\d+(\.\d+)+', d)]
+            candidates = [os.path.join(root, d) for d in versioned] if versioned else [root]
+            for c in candidates:
+                if os.path.isdir(c) and c not in paths:
+                    paths.append(c)
+        for p in ('C:/msys64/usr/include', 'C:/msys2/usr/include'):
+            if os.path.isdir(p) and p not in paths:
+                paths.append(p)
+
+    else:
+        for p in ('/usr/local/include', '/usr/include'):
+            if os.path.isdir(p) and p not in paths:
+                paths.append(p)
+        multiarch = _get_multiarch()
+        if multiarch:
+            cand = os.path.join('/usr/include', multiarch)
+            if os.path.isdir(cand) and cand not in paths:
+                paths.append(cand)
+
     return paths
 
 from .lexar import Lexer, LexerError, register_keywords, unregister_keywords
@@ -30,7 +85,7 @@ from .astparse import (
     EnumDef, TypeAlias, ClassDef,
     parse_file, ParseError,
 )
-from .clib import resolve_library, parse_header_file, parse_c_source
+from .clib import resolve_library, parse_header_file, parse_c_source, _framework_name_from_path
 from .package_manifest import (
     ManifestParser, ManifestValidator, PackageManifest, 
     get_global_registry, reset_global_registry, iter_cpm_version_dirs
@@ -203,6 +258,9 @@ class SemanticAnalyzer:
         self._analyze_depth = 0
         self._infer_memo: dict[int, str] = {}
         self._in_iterative = False
+        self._lazy_imports: list[dict] = []
+        self._lazy_header_cache: dict[tuple, tuple] = {}
+        self._lazy_load_error: str | None = None
     
     def _load_package_manifest(self, package_dir: str, package_name: str) -> bool:
         """
@@ -407,6 +465,10 @@ class SemanticAnalyzer:
             if sym is None and self._enum_context_name:
                 sym = self.current_scope.lookup(f'{self._enum_context_name}.{node.name}')
             if sym is None:
+                sym = self._lazy_resolve(node.name)
+            if sym is None:
+                if self._report_lazy_load_error(node):
+                    return None
                 self.error(f'use of undeclared identifier `{node.name}`', node,
                            note=f'no definition found in this scope')
                 return None
@@ -767,6 +829,10 @@ class SemanticAnalyzer:
         if isinstance(callee, Variable):
             sym = self.current_scope.lookup(callee.name)
             if sym is None:
+                sym = self._lazy_resolve(callee.name)
+            if sym is None:
+                if self._report_lazy_load_error(callee):
+                    return None
                 self.error(f'use of undeclared identifier `{callee.name}`', callee,
                            note='call target must be a function defined in scope')
                 return None
@@ -918,7 +984,11 @@ class SemanticAnalyzer:
             return
 
         if resolved is None:
-            self.error(f'file not found: `{module}`', node)
+            note = None
+            if '/' in module and not node.sdk_path and not _get_sdk_paths():
+                note = ('no C SDK found on this system — install Xcode Command Line '
+                        'Tools, or point cpy at one with sdk("...")')
+            self.error(f'file not found: `{module}`', node, note=note)
             return
 
         search_paths = [node.sdk_path] if node.sdk_path else []
@@ -930,13 +1000,17 @@ class SemanticAnalyzer:
                 self._register_import_symbols(result[0], node)
             node.src_file = resolved
         elif module.endswith('.h'):
-            result = parse_header_file(resolved, search_paths)
-            symbols, _kind, constants, framework, var_names = result
-            node.constants = constants
+            framework = _framework_name_from_path(resolved)
             if framework:
                 node.frameworks.append(framework)
-            self._register_import_symbols(symbols, node, var_names)
-            self._register_import_constants(constants, node)
+            node.symbols = []
+            node.var_names = set()
+            self._lazy_imports.append({
+                'node': node,
+                'path': resolved,
+                'search_paths': search_paths,
+                'loaded': False,
+            })
             return
         elif module.endswith('.cpy'):
             result = self._import_cpy(resolved, node)
@@ -954,12 +1028,17 @@ class SemanticAnalyzer:
                 if result:
                     self._register_import_symbols(result[0], node)
             else:
-                result = parse_header_file(resolved, search_paths)
-                symbols, _kind, constants, framework, var_names = result
-                node.constants = constants
+                framework = _framework_name_from_path(resolved)
                 if framework:
                     node.frameworks.append(framework)
-                self._register_import_symbols(symbols, node, var_names)
+                node.symbols = []
+                node.var_names = set()
+                self._lazy_imports.append({
+                    'node': node,
+                    'path': resolved,
+                    'search_paths': search_paths,
+                    'loaded': False,
+                })
                 return
         else:
             result = None
@@ -986,6 +1065,87 @@ class SemanticAnalyzer:
                 sym = Symbol('variable', 'int', node)
                 sym.const_value = val
                 s.define(name, sym)
+
+    def _lazy_resolve(self, name):
+        """Resolve `name` from a lazily-imported header on first use.
+
+        Headers are parsed on demand (once per analyzer, cached) and only the
+        symbol actually referenced is registered, so `import "Framework.h"`
+        pulls in just the bytecode the program uses.
+        """
+        if not self._lazy_imports:
+            return None
+        for entry in self._lazy_imports:
+            if not entry.get('loaded'):
+                cache = self._lazy_header_cache
+                key = (entry['path'], tuple(entry['search_paths'] or ()))
+                if key not in cache:
+                    try:
+                        result = parse_header_file(entry['path'], entry['search_paths'])
+                    except Exception as e:
+                        entry['loaded'] = True
+                        if self._lazy_load_error is None:
+                            self._lazy_load_error = (
+                                f'could not load imported header `{entry["path"]}`: {e}')
+                        continue
+                    symbols, _kind, constants, frameworks, var_names = result
+                    cache[key] = (symbols, constants, var_names, frameworks)
+                (entry['symbols'], entry['constants'],
+                 entry['var_names'], entry['frameworks']) = cache[key]
+                entry['loaded'] = True
+                node = entry['node']
+                for fw in entry.get('frameworks', ()):
+                    if fw and fw not in node.frameworks:
+                        node.frameworks.append(fw)
+            symbols = entry.get('symbols', {})
+            if name in symbols:
+                return self._lazy_register_used(
+                    entry['node'], name, symbols[name], entry.get('var_names', set()))
+            constants = entry.get('constants', {})
+            if name in constants:
+                return self._lazy_register_const(entry['node'], name, constants[name])
+        return None
+
+    def _report_lazy_load_error(self, node) -> bool:
+        """Report a header load/parse failure once, at the first use site.
+
+        Returns True if a load error was reported (caller should skip its own
+        'undeclared identifier' diagnostic since the real root cause is the
+        broken import).
+        """
+        if self._lazy_load_error is None:
+            return False
+        self.error(self._lazy_load_error, node,
+                   note='the imported header could not be loaded or parsed')
+        self._lazy_load_error = None
+        return True
+
+    def _lazy_register_used(self, node, name, entry, var_names=()):
+        existing = self.globals.lookup_local(name)
+        if existing is not None:
+            return existing
+        ret_type, params, vararg = entry
+        kind = 'variable' if name in var_names else 'function'
+        sym = Symbol(kind, ret_type, node)
+        self.globals.define(name, sym)
+        if node.symbols is None:
+            node.symbols = []
+        if not any(fname == name for fname, _ in node.symbols):
+            node.symbols.append((name, entry))
+        if kind == 'variable':
+            if node.var_names is None:
+                node.var_names = set()
+            node.var_names.add(name)
+        return sym
+
+    def _lazy_register_const(self, node, name, value):
+        existing = self.globals.lookup_local(name)
+        if existing is not None:
+            return existing
+        sym = Symbol('variable', 'int', node)
+        sym.const_value = value
+        self.globals.define(name, sym)
+        return sym
 
     def _find_package_entry(self, search_dir: str, pkg_name: str) -> str | None:
         for dir_candidate in (search_dir, os.path.join(search_dir, 'src')):

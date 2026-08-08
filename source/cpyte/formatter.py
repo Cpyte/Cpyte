@@ -98,16 +98,16 @@ def _node_signature(node):
         return tuple(_node_signature(n) for n in node)
     cname = type(node).__name__
     if isinstance(node, astparse.Number):
-        return (cname, node.value)
+        return cname, node.value
     if isinstance(node, astparse.String):
-        return (cname, node.value)
+        return cname, node.value
     if isinstance(node, astparse.Variable):
-        return (cname, node.name)
+        return cname, node.name
     if isinstance(node, astparse.UnaryOp):
-        return (cname, getattr(node.op, 'name', node.op), _node_signature(node.operand))
+        return cname, getattr(node.op, 'name', node.op), _node_signature(node.operand)
     if isinstance(node, astparse.BinOp):
-        return (cname, getattr(node.op, 'name', node.op), _node_signature(node.left), _node_signature(node.right))
-    return (cname, _line(node))
+        return cname, getattr(node.op, 'name', node.op), _node_signature(node.left), _node_signature(node.right)
+    return cname, _line(node)
 
 
 class _Formatter:
@@ -333,7 +333,8 @@ class _Formatter:
     def _emit_funcdef(self, node, level: int):
         vis = f'{node.visibility} ' if node.visibility else ''
         generic = f'<{", ".join(node.generic_params)}>' if node.generic_params else ''
-        params = ', '.join(f'{n}: {t}' for n, t in node.params.items())
+        const_params = set(getattr(node, 'const_params', None) or ())
+        params = ', '.join(f'({n}): {t}' if n in const_params else f'{n}: {t}' for n, t in node.params.items())
         ret = f' -> {node.rettype}' if node.rettype else ''
         self._header(node, f'{vis}def {node.name}{generic}({params}){ret}:', level)
         self._emit_body(node.body, level + 1)

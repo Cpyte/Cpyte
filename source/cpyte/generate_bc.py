@@ -8,7 +8,7 @@ Optimization-friendly knobs
 embedded bitcode is pre-optimized:
 
 * ``-O0`` embeds raw, un-optimized IR. The per-program pipeline in
-  ``compiling.optimize`` then optimises the runtime together with the user
+  ``compiling.optimize`` then optimizes the runtime together with the user
   program after linking — the friendliest setup for whole-program inlining.
 * ``-O3`` (default) emits a fast, self-contained module.
 
@@ -41,9 +41,8 @@ from llvmlite import binding
 
 try:
     from .ui import print_ok
-except Exception:
+except ImportError as e:
     print_ok = print
-
 
 def _remove_probe_stack_ir(llvm_ir: str) -> str:
     return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
@@ -104,8 +103,8 @@ def _needs_gmp_headers(c_path: str, gmp_include: str | None) -> bool:
 def _canonicalize_module(mod) -> None:
     """Remove unused globals and merge identical constants from the module.
 
-    Only safe, non-behaviour-changing passes are used: externally-visible
-    (linkonce/weak/external) symbols are never internalised, so linked-in
+    Only safe, non-behavior-changing passes are used: externally-visible
+    (linkonce/weak/external) symbols are never internalized, so linked-in
     user modules can still resolve them.
     """
     binding.initialize_native_target()

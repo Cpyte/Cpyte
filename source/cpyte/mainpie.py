@@ -44,6 +44,7 @@ Global options:
   --strict            Enable strict semantic analysis
   --no-userspace      Compile without the userspace runtime
   --pic               Position-independent code
+  --export NAME       Export NAME as a library symbol (dynamic SEF; repeatable)
   --lto               Enable link-time optimization (requires clang)
   --ast               Print the parsed AST
   --emit-llvm         Print the generated LLVM IR
@@ -179,7 +180,9 @@ def pretty_ast(node, indent=0):
     if name == 'FuncDef':
         vis = f'{node.visibility} ' if node.visibility else ''
         ret = f' -> {node.rettype}' if node.rettype else ''
-        result = f'{pad}{vis}def {node.name}({", ".join(f"{k}: {v}" for k, v in node.params.items())}){ret}:'
+        const_params = set(getattr(node, 'const_params', None) or ())
+        params = ', '.join(f'({k}): {v}' if k in const_params else f'{k}: {v}' for k, v in node.params.items())
+        result = f'{pad}{vis}def {node.name}({params}){ret}:'
         for stmt in node.body:
             result += f'\n{pretty_ast(stmt, indent + 1)}'
         return result
@@ -573,6 +576,7 @@ def _main():
     no_userspace = False
     pic = False
     lto = False
+    exports = []
     while args and args[0].startswith('--'):
         flag = args.pop(0)
         if flag == '--tab-size':
@@ -583,6 +587,8 @@ def _main():
             no_userspace = True
         elif flag == '--pic':
             pic = True
+        elif flag == '--export':
+            exports.append(args.pop(0))
         elif flag == '--lto':
             lto = True
         elif flag == '--ast':
@@ -651,7 +657,7 @@ def _main():
     elif mode == 'scorpion':
         out_base = args[0].rsplit('.', 1)[0] if '.' in args[0] else 'program'
         sef_file = out_base + '.sef'
-        run_scorpion(prog, output=sef_file, src_files=src_files, pic=pic)
+        run_scorpion(prog, output=sef_file, src_files=src_files, pic=pic, exports=exports)
         ui.print_ok(f'Wrote {sef_file}')
     else:
         run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)

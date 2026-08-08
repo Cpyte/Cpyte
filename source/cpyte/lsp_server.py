@@ -28,6 +28,15 @@ def _uri_to_path(uri: str) -> str:
         path = path[1:]
     return path
 
+
+def _fmt_params(params, const_params=None):
+    """Render a signature parameter list, marking constant-view params."""
+    cvs = set(const_params or ())
+    return ', '.join(
+        f'({n}): {t}' if n in cvs else f'{n}: {t}'
+        for n, t in params.items()
+    )
+
 _KEYWORDS = [
     "def", "return", "if", "elif", "else", "while", "for", "break", "continue",
     "public", "private", "static",
@@ -441,7 +450,7 @@ def _member_completions(analyzer, parsed, base, prefix, cursor_line):
             seen.add(f.name)
     for m in getattr(node, 'methods', None) or []:
         if m.name.startswith(prefix) and m.name not in seen:
-            sig = ", ".join(f"{n}: {t}" for n, t in m.params.items() if n != 'this')
+            sig = _fmt_params(m.params, getattr(m, 'const_params', None))
             items.append(lsp.CompletionItem(
                 label=m.name,
                 kind=lsp.CompletionItemKind.Method,
@@ -558,7 +567,7 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
 
         for node in parsed:
             if isinstance(node, FuncDef) and node.name.startswith(prefix) and node.name not in seen:
-                sig = ", ".join(f"{n}: {t}" for n, t in node.params.items() if n != 'this')
+                sig = _fmt_params(node.params, getattr(node, 'const_params', None))
                 items.append(lsp.CompletionItem(
                     label=node.name,
                     kind=lsp.CompletionItemKind.Function,
@@ -668,7 +677,7 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
         else:
             for node in parsed:
                 if isinstance(node, FuncDef) and node.name == word:
-                    sig = ", ".join(f"{n}: {t}" for n, t in node.params.items())
+                    sig = _fmt_params(node.params, getattr(node, 'const_params', None))
                     ret = node.rettype or "void"
                     content = f"**`{node.name}({sig}) → {ret}`**"
                     if node.visibility:
@@ -771,7 +780,7 @@ def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
                 ),
             )
             if isinstance(node, FuncDef):
-                sig = f"({', '.join(f'{n}: {t}' for n, t in node.params.items() if n != 'this')})"
+                sig = f"({_fmt_params(node.params, getattr(node, 'const_params', None))})"
                 symbols.append(lsp.SymbolInformation(
                     name=f"{node.name}{sig}",
                     kind=lsp.SymbolKind.Function,
@@ -800,7 +809,7 @@ def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
                                              character=(mtok.column - 1 + len(mtok.value or "") if mtok else 0)),
                         ),
                     )
-                    sig = f"({', '.join(f'{n}: {t}' for n, t in m.params.items() if n != 'this')})"
+                    sig = f"({_fmt_params(m.params, getattr(m, 'const_params', None))})"
                     symbols.append(lsp.SymbolInformation(
                         name=f"{node.name}.{m.name}{sig}",
                         kind=lsp.SymbolKind.Method,

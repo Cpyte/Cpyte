@@ -1082,8 +1082,14 @@ class SemanticAnalyzer:
         old_locals = self.locals
         self.locals = Scope(s)
 
+        const_params = set(getattr(node, 'const_params', None) or ())
         for param_name, param_type in node.params.items():
-            self.locals.define(param_name, Symbol('variable', param_type or None, node))
+            if param_name in const_params:
+                # Constant-view parameter: read-only inside the function, but the
+                # caller's value stays fully modifiable outside.
+                self.locals.define(param_name, Symbol('const_view', param_type or None, node))
+            else:
+                self.locals.define(param_name, Symbol('variable', param_type or None, node))
 
         for stmt in node.body:
             self._visit(stmt, self.locals)
@@ -1153,6 +1159,10 @@ class SemanticAnalyzer:
                 self.error(f'cannot assign to constant `{name}`', node,
                            note='constants are immutable once declared; '
                                 'declare a variable with `{type} {name} = ...` if you need to reassign it')
+            elif existing.kind == 'const_view':
+                self.error(f'cannot assign to constant-view parameter `{name}`', node,
+                           note='constant-view parameters are read-only inside the function; '
+                                'copy to a local variable to modify the value')
             elif val_type is not None and existing.type is not None and val_type != existing.type:
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64

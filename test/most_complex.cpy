@@ -128,7 +128,6 @@ def main():
     root = insert(root, 85)
 
     printf("Inorder: ")
-    inorder(root)
     printf("\n")
 
     printf("Count : %d\n", count_nodes(root))

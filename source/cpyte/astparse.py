@@ -65,6 +65,11 @@ class Variable:
     def __repr__(self):
         return f'Variable({self.name})'
 
+    @property
+    def token(self):
+        return self._token
+
+
 class Call:
     __slots__ = ('callee', 'args', '_token')
     def __init__(self, callee, args: list, token=None):
@@ -428,10 +433,10 @@ def _parse_func_with_visibility(tokens: list[Token], pos: int, visibility: str |
     if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'def':
         pos += 1
     name, pos = _parse_func_name(tokens, pos)
-    params, pos = _parse_func_params(tokens, pos)
+    params, const_params, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return FuncDef(name, params, body, rettype, visibility, token=tok), pos
+    return FuncDef(name, params, body, rettype, visibility, const_params=const_params, token=tok), pos
 
 
 def _parse_func_name(tokens: list[Token], pos: int):
@@ -447,12 +452,26 @@ def _parse_func_params(tokens: list[Token], pos: int):
         raise ParseError('Expected "("', tokens[pos] if pos < len(tokens) else None)
     pos += 1
     params = {}
+    const_params = []
     while pos < len(tokens) and tokens[pos].type != TokenType.RPAREN:
-        if tokens[pos].type != TokenType.IDENTIFIER:
+        tok = tokens[pos]
+        is_const_view = tok.type == TokenType.LPAREN
+        if is_const_view:
+            # Constant-view parameter: `(name)` gives a read-only view of the
+            # argument. It is only const internally — it never becomes a module
+            # constant and never shadows a real one.
+            pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             pos += 1
             continue
         param_name = tokens[pos].value
         pos += 1
+        if is_const_view:
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                raise ParseError('Expected ")" to close constant-view parameter name',
+                                 tokens[pos] if pos < len(tokens) else tok)
+            pos += 1
+            const_params.append(param_name)
         if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
             pos += 1
         if pos < len(tokens) and tokens[pos].type not in (TokenType.COMMA, TokenType.RPAREN):
@@ -465,7 +484,7 @@ def _parse_func_params(tokens: list[Token], pos: int):
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
         raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else None)
-    return params, pos + 1
+    return params, const_params, pos + 1
 
 
 def _parse_func_rettype(tokens: list[Token], pos: int):
@@ -724,14 +743,15 @@ class If:
         return f'If({self.cond}, {self.body}, {self.orelse})'
 
 class FuncDef:
-    __slots__ = ('name', 'params', 'rettype', 'body', 'visibility', 'generic_params', '_token')
-    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, token=None):
+    __slots__ = ('name', 'params', 'const_params', 'rettype', 'body', 'visibility', 'generic_params', '_token')
+    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, const_params: list | None = None, token=None):
         self.name = name
         self.params = params
         self.rettype = rettype
         self.body = body
         self.visibility = visibility
         self.generic_params = generic_params or []
+        self.const_params = const_params or []
         self._token = token
     def __repr__(self):
         vis = f'{self.visibility} ' if self.visibility else ''
@@ -1464,10 +1484,10 @@ def parse_def(tokens: list[Token], pos: int):
     pos += 1
     name, pos = _parse_func_name(tokens, pos)
     generic_params, pos = parse_generic_params(tokens, pos)
-    params, pos = _parse_func_params(tokens, pos)
+    params, const_params, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return FuncDef(name, params, body, rettype, generic_params=generic_params, token=tok), pos
+    return FuncDef(name, params, body, rettype, generic_params=generic_params, const_params=const_params, token=tok), pos
 
 
 def _is_assignable(expr):

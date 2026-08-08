@@ -139,6 +139,45 @@ _PREC = {
 
 _BINARY_OPS = set(_PREC.keys())
 
+# Maximum nesting depth for recursive expression parsing. Past this limit the
+# parser switches to a fully-iterative Pratt fallback (_parse_expr_iterative)
+# so that pathologically deep expressions can never overflow the interpreter
+# stack. Kept well below Python's default recursion limit (1000): each nesting
+# level costs up to ~6 interpreter frames.
+_EXPR_DEPTH_LIMIT = 120
+
+_expr_depth = 0
+
+_UNARY_PREFIX_TYPES = {
+    TokenType.MINUS, TokenType.PLUS, TokenType.NOT, TokenType.TILDE,
+    TokenType.POW, TokenType.STAR, TokenType.AMPERSAND, TokenType.MINUS_MINUS,
+}
+
+
+def _skip_expr_newlines(tokens: list[Token], pos: int) -> int:
+    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+        pos += 1
+    return pos
+
+
+def _wrap_unary_prefixes(prefixes, node):
+    """Apply a collected run of unary prefix operators to a node, outside-in.
+
+    Mirrors the recursive _parse_unary wrapping exactly: the outermost prefix is
+    applied last. POW denotes the double-deref `**x`.
+    """
+    for op in reversed(prefixes):
+        if op.type == TokenType.STAR:
+            node = Deref(node, token=op)
+        elif op.type == TokenType.AMPERSAND:
+            node = AddrOf(node, token=op)
+        elif op.type == TokenType.POW:
+            inner = Deref(node)
+            node = Deref(inner)
+        else:
+            node = UnaryOp(op.type, node, token=op)
+    return node
+
 
 class ParseError(Exception):
     def __init__(self, msg: str, token: Token | None = None):
@@ -156,61 +195,41 @@ def parse_expression(tokens: list[Token], pos: int = 0):
 
 
 def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
-    left, pos = _parse_unary(tokens, pos)
+    global _expr_depth
+    _expr_depth += 1
+    try:
+        if _expr_depth > _EXPR_DEPTH_LIMIT:
+            return _parse_expr_iterative(tokens, pos, min_prec)
 
-    while pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= min_prec:
-        op = tokens[pos]
-        pos += 1
-        while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+        left, pos = _parse_unary(tokens, pos)
+
+        while pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= min_prec:
+            op = tokens[pos]
             pos += 1
-        next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
-        right, pos = _parse_binary(tokens, pos, next_prec)
-        left = BinOp(left, op.type, right, token=op)
+            while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                pos += 1
+            next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
+            right, pos = _parse_binary(tokens, pos, next_prec)
+            left = BinOp(left, op.type, right, token=op)
 
-    return left, pos
+        return left, pos
+    finally:
+        _expr_depth -= 1
 
 
 def _parse_unary(tokens: list[Token], pos: int):
-    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
-        pos += 1
+    pos = _skip_expr_newlines(tokens, pos)
     if pos >= len(tokens):
         raise ParseError('Unexpected end of expression')
 
-    if tokens[pos].type == TokenType.MINUS:
-        op = tokens[pos]
+    prefixes = []
+    while pos < len(tokens) and tokens[pos].type in _UNARY_PREFIX_TYPES:
+        prefixes.append(tokens[pos])
         pos += 1
-        operand, pos = _parse_unary(tokens, pos)
-        return _parse_postfix(tokens, pos, UnaryOp(op.type, operand, token=op))
-
-    if tokens[pos].type == TokenType.PLUS:
-        op = tokens[pos]
-        pos += 1
-        operand, pos = _parse_unary(tokens, pos)
-        return _parse_postfix(tokens, pos, UnaryOp(op.type, operand, token=op))
-
-    if tokens[pos].type in (TokenType.NOT, TokenType.TILDE):
-        op = tokens[pos]
-        pos += 1
-        operand, pos = _parse_unary(tokens, pos)
-        return _parse_postfix(tokens, pos, UnaryOp(op.type, operand, token=op))
-
-    if tokens[pos].type == TokenType.POW:
-        pos += 1
-        operand, pos = _parse_unary(tokens, pos)
-        inner = Deref(operand)
-        return _parse_postfix(tokens, pos, Deref(inner))
-    if tokens[pos].type in (TokenType.STAR, TokenType.AMPERSAND, TokenType.MINUS_MINUS):
-        op = tokens[pos]
-        pos += 1
-        operand, pos = _parse_unary(tokens, pos)
-        if op.type == TokenType.STAR:
-            return _parse_postfix(tokens, pos, Deref(operand, token=op))
-        elif op.type == TokenType.AMPERSAND:
-            return _parse_postfix(tokens, pos, AddrOf(operand, token=op))
-        return _parse_postfix(tokens, pos, UnaryOp(op.type, operand, token=op))
 
     node, pos = _parse_atom(tokens, pos)
-    return _parse_postfix(tokens, pos, node)
+    node, pos = _parse_postfix(tokens, pos, node)
+    return _wrap_unary_prefixes(prefixes, node), pos
 
 
 def _parse_atom(tokens: list[Token], pos: int):
@@ -337,6 +356,217 @@ def _parse_postfix(tokens: list[Token], pos: int, node):
             assert name is not None
             pos += 1
             node = Attr(node, name, token=tok)
+    return node, pos
+
+
+def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
+    """Fully-iterative Pratt parser used when recursion depth is exceeded.
+
+    Produces exactly the same AST as the recursive _parse_binary/_parse_unary/
+    _parse_postfix/_parse_atom combination (same associativity, precedence and
+    postfix wrapping), but never recurses into the interpreter: nested parens,
+    calls, indexes and right-associative chains are all handled through an
+    explicit continuation stack, so arbitrarily deep expressions are safe.
+    """
+    vals: list = []
+    frames: list = [('binary', min_prec)]
+
+    while frames:
+        frame = frames.pop()
+        kind = frame[0]
+
+        if kind == 'binary':
+            _, mp = frame
+            frames.append(('binary_loop', mp))
+            frames.append(('unary', []))
+
+        elif kind == 'unary':
+            prefixes = frame[1]
+            pos = _skip_expr_newlines(tokens, pos)
+            if pos >= len(tokens):
+                raise ParseError('Unexpected end of expression')
+            while pos < len(tokens) and tokens[pos].type in _UNARY_PREFIX_TYPES:
+                prefixes.append(tokens[pos])
+                pos += 1
+            frames.append(('postfix', prefixes))
+            frames.append(('atom',))
+
+        elif kind == 'atom':
+            tok = tokens[pos]
+            if tok.type == TokenType.NUMBER and tok.value == '67':
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                        raise ParseError('Expected ")" after 67()', tok)
+                    pos += 1
+                    vals.append(Signed67(token=tok))
+                    continue
+                vals.append(Number('67', token=tok))
+                continue
+            if tok.type == TokenType.NUMBER:
+                assert tok.value is not None
+                pos += 1
+                vals.append(Number(tok.value, token=tok))
+                continue
+            if tok.type == TokenType.STRING:
+                assert tok.value is not None
+                pos += 1
+                vals.append(String(tok.value, token=tok))
+                continue
+            if tok.type == TokenType.IDENTIFIER:
+                assert tok.value is not None
+                pos += 1
+                vals.append(Variable(tok.value, token=tok))
+                continue
+            if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'True', 'False', 'null'):
+                val = '1' if tok.value in ('true', 'True') else '0'
+                pos += 1
+                vals.append(Number(val, token=tok))
+                continue
+            if tok.type == TokenType.KEYWORD and tok.value == 'input':
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                        raise ParseError('Expected ")" after input()', tok)
+                    pos += 1
+                    vals.append(Input(token=tok))
+                    continue
+                raise ParseError('Expected "(" after input', tok)
+            if tok.type == TokenType.KEYWORD and tok.value == 'input_str':
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                        raise ParseError('Expected ")" after input_str()', tok)
+                    pos += 1
+                    vals.append(InputStr(token=tok))
+                    continue
+                raise ParseError('Expected "(" after input_str', tok)
+            if tok.type == TokenType.KEYWORD and tok.value == 'new':
+                pos += 1
+                base_type, pos = parse_type(tokens, pos)
+                type_str = _type_to_str(base_type) if isinstance(base_type, tuple) else base_type
+                if pos < len(tokens) and tokens[pos].type == TokenType.LBRACKET:
+                    pos += 1
+                    frames.append(('new_size_done', tok, type_str))
+                    frames.append(('binary', 0))
+                    continue
+                vals.append(NewExpr(type_str, None, token=tok))
+                continue
+            if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+                node, pos = parse_inline_asm(tokens, pos)
+                vals.append(node)
+                continue
+            if tok.type == TokenType.KEYWORD and tok.value == 'sizeof':
+                pos += 1
+                if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
+                    raise ParseError('Expected "("', tok)
+                pos += 1
+                type_expr, pos = parse_type(tokens, pos)
+                if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                    raise ParseError('Expected ")"', tok)
+                pos += 1
+                type_str = _type_to_str(type_expr) if isinstance(type_expr, tuple) else type_expr
+                vals.append(SizeOf(type_str, token=tok))
+                continue
+            if tok.type == TokenType.LPAREN:
+                pos += 1
+                frames.append(('paren_rparen', tok))
+                frames.append(('binary', 0))
+                continue
+            raise ParseError(f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok)
+
+        elif kind == 'paren_rparen':
+            tok = frame[1]
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                raise ParseError('Expected closing parenthesis', tok)
+            pos += 1
+
+        elif kind == 'new_size_done':
+            tok, type_str = frame[1], frame[2]
+            size = vals.pop()
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
+                raise ParseError('Expected "]"', tok)
+            pos += 1
+            vals.append(NewExpr(type_str, size, token=tok))
+
+        elif kind == 'postfix':
+            prefixes = frame[1]
+            node = vals.pop()
+            while pos < len(tokens) and tokens[pos].type in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.DOT):
+                ptok = tokens[pos]
+                if ptok.type == TokenType.LPAREN:
+                    pos += 1
+                    frames.append(('call_done', prefixes))
+                    frames.append(('callargs', node, [], ptok))
+                    break
+                elif ptok.type == TokenType.LBRACKET:
+                    pos += 1
+                    frames.append(('index_done', prefixes, node, ptok))
+                    frames.append(('binary', 0))
+                    break
+                else:
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+                        raise ParseError('Expected attribute name', tokens[pos] if pos < len(tokens) else None)
+                    name = tokens[pos].value
+                    assert name is not None
+                    pos += 1
+                    node = Attr(node, name, token=ptok)
+            else:
+                vals.append(_wrap_unary_prefixes(prefixes, node))
+
+        elif kind == 'call_done':
+            prefixes = frame[1]
+            frames.append(('postfix', prefixes))
+
+        elif kind == 'callargs':
+            callee, args, call_tok = frame[1], frame[2], frame[3]
+            if pos >= len(tokens):
+                raise ParseError('Expected ")" after arguments', None)
+            if tokens[pos].type == TokenType.RPAREN:
+                pos += 1
+                vals.append(Call(callee, args, token=call_tok))
+                continue
+            frames.append(('callarg_done', callee, args, call_tok))
+            frames.append(('binary', 0))
+
+        elif kind == 'callarg_done':
+            callee, args, call_tok = frame[1], frame[2], frame[3]
+            args.append(vals.pop())
+            if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                pos += 1
+            frames.append(('callargs', callee, args, call_tok))
+
+        elif kind == 'index_done':
+            prefixes, base, tok = frame[1], frame[2], frame[3]
+            index = vals.pop()
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
+                raise ParseError('Expected "]"', tokens[pos] if pos < len(tokens) else None)
+            pos += 1
+            vals.append(Index(base, index, token=tok))
+            frames.append(('postfix', prefixes))
+
+        elif kind == 'binary_loop':
+            mp = frame[1]
+            if pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= mp:
+                op = tokens[pos]
+                pos += 1
+                pos = _skip_expr_newlines(tokens, pos)
+                next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
+                frames.append(('binary_combine', mp, op))
+                frames.append(('binary', next_prec))
+
+        elif kind == 'binary_combine':
+            mp, op = frame[1], frame[2]
+            right = vals.pop()
+            left = vals.pop()
+            vals.append(BinOp(left, op.type, right, token=op))
+            frames.append(('binary_loop', mp))
+
+    node = vals.pop()
     return node, pos
 
 

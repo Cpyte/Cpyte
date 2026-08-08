@@ -173,6 +173,14 @@ def _is_compile_time_true(node) -> bool:
     return isinstance(node, Number) and not _is_compile_time_false(node)
 
 
+# When expression inference recurses deeper than this, the analyzer switches
+# to an iterative post-order replay so that arbitrarily deep expressions can
+# never blow the Python recursion limit. Each nesting level costs a small
+# constant number of interpreter frames, so this stays far below the default
+# recursion limit (1000) even combined with statement/visit frames.
+_ANALYZE_DEPTH_LIMIT = 120
+
+
 class SemanticAnalyzer:
     def __init__(self, source: str, filepath: str | None = None,
                  workspace_root: str | None = None, strict: bool = False, enable_extensions: bool = True):
@@ -192,6 +200,9 @@ class SemanticAnalyzer:
         self._loaded_packages: set[str] = set()
         self._manifest_registry = get_global_registry()
         self._hook_registry = get_global_hook_registry()
+        self._analyze_depth = 0
+        self._infer_memo: dict[int, str] = {}
+        self._in_iterative = False
     
     def _load_package_manifest(self, package_dir: str, package_name: str) -> bool:
         """
@@ -331,6 +342,20 @@ class SemanticAnalyzer:
         return True
 
     def _infer_type(self, node):
+        key = id(node)
+        if key in self._infer_memo:
+            return self._infer_memo[key]
+        if not self._in_iterative:
+            self._analyze_depth += 1
+            try:
+                if self._analyze_depth > _ANALYZE_DEPTH_LIMIT:
+                    return self._infer_type_iterative(node)
+                return self._infer_type_recursive(node)
+            finally:
+                self._analyze_depth -= 1
+        return self._infer_type_recursive(node)
+
+    def _infer_type_recursive(self, node):
         if isinstance(node, Number):
             # Check for hexadecimal literals (0x prefix) BEFORE float 'e' check,
             # since hex values legitimately contain the letter 'e' as a digit (0-9a-f)
@@ -675,6 +700,64 @@ class SemanticAnalyzer:
             return self._infer_type(node.expr)
 
         return None
+
+    def _infer_children(self, node) -> list:
+        """Child nodes that `_infer_type_recursive` descends into, in order."""
+        if isinstance(node, BinOp):
+            return [node.left, node.right]
+        if isinstance(node, UnaryOp):
+            return [node.operand]
+        if isinstance(node, Call):
+            return list(node.args)
+        if isinstance(node, Index):
+            return [node.obj, node.index]
+        if isinstance(node, Attr):
+            return [node.obj]
+        if isinstance(node, Deref):
+            return [node.operand]
+        if isinstance(node, AddrOf):
+            return [node.operand]
+        if isinstance(node, NewExpr):
+            return [node.size] if node.size is not None else []
+        if isinstance(node, InlineAsm):
+            return [arg_expr for _, arg_expr in node.inputs]
+        if isinstance(node, ExprStmt):
+            return [node.expr]
+        return []
+
+    def _infer_combine(self, node):
+        key = id(node)
+        if key in self._infer_memo:
+            return self._infer_memo[key]
+        self._in_iterative = True
+        try:
+            t = self._infer_type_recursive(node)
+        finally:
+            self._in_iterative = False
+        self._infer_memo[key] = t
+        return t
+
+    def _infer_type_iterative(self, node):
+        memo = self._infer_memo
+        if id(node) in memo:
+            return memo[id(node)]
+        stack = [('visit', node)]
+        while stack:
+            kind, n = stack.pop()
+            key = id(n)
+            if key in memo:
+                continue
+            if kind == 'visit':
+                children = self._infer_children(n)
+                if children:
+                    stack.append(('combine', n))
+                    for c in reversed(children):
+                        stack.append(('visit', c))
+                else:
+                    self._infer_combine(n)
+            else:
+                self._infer_combine(n)
+        return memo[id(node)]
 
     @property
     def current_scope(self) -> Scope:

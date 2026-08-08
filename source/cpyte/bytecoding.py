@@ -34,6 +34,14 @@ def register_emitter(node_type):
     return decorator
 
 
+# When IR emission recurses deeper than this, the code generator switches to an
+# iterative post-order replay so that arbitrarily deep expressions can never
+# blow the Python recursion limit. Each nesting level costs a small constant
+# number of interpreter frames, so this stays far below the default recursion
+# limit (1000) even combined with statement/visit frames.
+_EMIT_DEPTH_LIMIT = 120
+
+
 class _EHBuilder(ir.IRBuilder):
     def __init__(self, block):
         super().__init__(block)
@@ -324,6 +332,9 @@ class LLVM:
         self._hook_registry = get_global_hook_registry()
         self.generic_instantiations = {}  # name -> [(type_args_tuple, ...)]
         self._struct_nodes = {}  # name -> StructDef AST node (for generic resolution)
+        self._emit_depth = 0
+        self._emit_memo = {}
+        self._in_emit_iterative = False
         
         if not no_userspace:
             print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -752,6 +763,176 @@ class LLVM:
         return self.emit(node.expr)
 
     def emit(self, node: list[Token]) -> _IRValue:
+        key = id(node)
+        if key in self._emit_memo:
+            return self._emit_memo[key]
+        if not self._in_emit_iterative:
+            self._emit_depth += 1
+            try:
+                if self._emit_depth > _EMIT_DEPTH_LIMIT:
+                    return self._emit_iterative(node)
+                return self._emit_recursive(node)
+            finally:
+                self._emit_depth -= 1
+        return self._emit_recursive(node)
+
+    _EMIT_PURE_TYPES = (
+        Number, String, Variable, Signed67, Input, InputStr, SizeOf,
+        UnaryOp, Deref, AddrOf, Index, Attr, NewExpr, Call, InlineAsm,
+        ExprStmt,
+    )
+
+    def _emit_is_pure(self, node) -> bool:
+        if isinstance(node, BinOp):
+            return node.op not in (TokenType.AND, TokenType.OR)
+        return isinstance(node, self._EMIT_PURE_TYPES)
+
+    def _emit_children(self, node) -> list:
+        """Child nodes that the pure emitters descend into, in emit order."""
+        if isinstance(node, BinOp):
+            return [node.left, node.right]
+        if isinstance(node, UnaryOp):
+            return [node.operand]
+        if isinstance(node, Deref):
+            return [node.operand]
+        if isinstance(node, AddrOf):
+            return [node.operand]
+        if isinstance(node, Index):
+            return [node.obj, node.index]
+        if isinstance(node, Attr):
+            return [node.obj]
+        if isinstance(node, NewExpr):
+            return [node.size] if node.size is not None else []
+        if isinstance(node, Call):
+            children = []
+            if isinstance(node.callee, Attr):
+                children.append(node.callee.obj)
+            children.extend(node.args)
+            return children
+        if isinstance(node, InlineAsm):
+            return [arg_expr for _, arg_expr in node.inputs]
+        if isinstance(node, ExprStmt):
+            return [node.expr]
+        return []
+
+    def _emit_combine(self, node):
+        """Run the real recursive emitter for a pure node whose children were
+        already emitted and memoized during the iterative traversal."""
+        self._in_emit_iterative = True
+        try:
+            v = self._emit_recursive(node)
+        finally:
+            self._in_emit_iterative = True
+        self._emit_memo[id(node)] = v
+        return v
+
+    def _emit_in_place(self, node):
+        """Emit a non-pure node through its normal handler; its deep children
+        re-enter the guarded (iterative) path via self.emit."""
+        saved = self._in_emit_iterative
+        self._in_emit_iterative = False
+        try:
+            v = self._emit_recursive(node)
+        finally:
+            self._in_emit_iterative = saved
+        self._emit_memo[id(node)] = v
+        return v
+
+    def _emit_and_or_step(self, op, node, lhs):
+        """One short-circuit step, mirroring emit_binop's AND/OR branches."""
+        lhs_true = self._is_true(lhs)
+        entry_bb = self.builder.block
+        suffix = 'and' if op == TokenType.AND else 'or'
+        rhs_bb = self.builder.append_basic_block(f'{suffix}.rhs')
+        end_bb = self.builder.append_basic_block(f'{suffix}.end')
+        if op == TokenType.AND:
+            self.builder.cbranch(lhs_true, rhs_bb, end_bb)
+        else:
+            self.builder.cbranch(lhs_true, end_bb, rhs_bb)
+        self.builder.position_at_end(rhs_bb)
+        saved = self._in_emit_iterative
+        self._in_emit_iterative = False
+        try:
+            rhs = self.emit(node.right)
+        finally:
+            self._in_emit_iterative = saved
+        rhs_true = self._is_true(rhs)
+        actual_rhs_bb = self.builder.block
+        self.builder.branch(end_bb)
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(_i1)
+        if op == TokenType.AND:
+            phi.add_incoming(ir.Constant(_i1, 0), entry_bb)
+            phi.add_incoming(rhs_true, actual_rhs_bb)
+        else:
+            phi.add_incoming(ir.Constant(_i1, 1), entry_bb)
+            phi.add_incoming(rhs_true, actual_rhs_bb)
+        return phi
+
+    def _emit_and_or_chain(self, node):
+        """Emit a left-leaning run of same-op `and`/`or` short-circuit nodes
+        iteratively (down the left spine), producing the same phi structure as
+        the recursive emit_binop."""
+        chain = []
+        cur = node
+        while isinstance(cur, BinOp) and cur.op in (TokenType.AND, TokenType.OR):
+            chain.append(cur)
+            if isinstance(cur.left, BinOp) and cur.left.op == cur.op:
+                cur = cur.left
+            else:
+                break
+        base = chain[-1].left
+        saved = self._in_emit_iterative
+        self._in_emit_iterative = False
+        try:
+            lhs = self.emit(base)
+            for n in reversed(chain):
+                lhs = self._emit_and_or_step(n.op, n, lhs)
+        finally:
+            self._in_emit_iterative = saved
+        self._emit_memo[id(node)] = lhs
+        return lhs
+
+    def _emit_iterative(self, node):
+        """Fully iterative post-order expression emitter used when recursion
+        depth exceeds `_EMIT_DEPTH_LIMIT`. Pure nodes are combined in
+        post-order with memoized child values; `and`/`or` chains are emitted
+        iteratively to preserve short-circuit semantics. Memo entries are
+        scoped to this invocation so re-emitted nodes (loop conditions) never
+        reuse stale values."""
+        if id(node) in self._emit_memo:
+            return self._emit_memo[id(node)]
+        start = set(self._emit_memo)
+        try:
+            stack = [('visit', node)]
+            while stack:
+                kind, n = stack.pop()
+                key = id(n)
+                if key in self._emit_memo:
+                    continue
+                if isinstance(n, BinOp) and n.op in (TokenType.AND, TokenType.OR):
+                    self._emit_and_or_chain(n)
+                    continue
+                if self._emit_is_pure(n):
+                    if kind == 'visit':
+                        children = self._emit_children(n)
+                        if children:
+                            stack.append(('combine', n))
+                            for c in reversed(children):
+                                stack.append(('visit', c))
+                        else:
+                            self._emit_combine(n)
+                    else:
+                        self._emit_combine(n)
+                else:
+                    self._emit_in_place(n)
+            return self._emit_memo[id(node)]
+        finally:
+            for k in list(self._emit_memo):
+                if k not in start:
+                    del self._emit_memo[k]
+
+    def _emit_recursive(self, node: list[Token]) -> _IRValue:
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
             for hook in self._hook_registry.get_codegen_hooks():

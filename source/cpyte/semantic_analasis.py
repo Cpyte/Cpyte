@@ -77,11 +77,11 @@ def _get_sdk_paths():
 
 from .lexar import Lexer, LexerError, register_keywords, unregister_keywords
 from .astparse import (
-    _loc, Number, String, Variable, Call, Index, Attr,
+    _loc, Number, String, FString, Variable, Call, Index, Attr,
     UnaryOp, BinOp, Assign, Return, If, FuncDef, Print, ExprStmt,
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
-    InputStr, Signed67, Try, Raise, ExceptHandler, InlineAsm,
+    InputStr, InputBig, Signed67, Try, Raise, ExceptHandler, InlineAsm,
     EnumDef, TypeAlias, ClassDef,
     parse_file, ParseError,
 )
@@ -169,13 +169,15 @@ class Reporter:
 
 
 class Symbol:
-    __slots__ = ('kind', 'type', 'node', 'const_value')
+    __slots__ = ('kind', 'type', 'node', 'const_value', 'initialized')
 
-    def __init__(self, kind: str, type_: str | None = None, node=None):
+    def __init__(self, kind: str, type_: str | None = None, node=None,
+                 initialized: bool = True):
         self.kind = kind
         self.type = type_
         self.node = node
         self.const_value = None
+        self.initialized = bool(initialized)
 
 
 class Scope:
@@ -460,6 +462,13 @@ class SemanticAnalyzer:
             node.inferred_type = 'str'
             return 'str'
 
+        if isinstance(node, FString):
+            for kind, payload in node.parts:
+                if kind == 'expr':
+                    self._infer_type(payload)
+            node.inferred_type = 'str'
+            return 'str'
+
         if isinstance(node, Variable):
             sym = self.current_scope.lookup(node.name)
             if sym is None and self._enum_context_name:
@@ -484,6 +493,14 @@ class SemanticAnalyzer:
             if sym.kind == 'type_alias':
                 node.inferred_type = sym.type
                 return sym.type
+            if sym.kind == 'variable' and not sym.initialized:
+                self.error(
+                    f'use of uninitialized variable `{node.name}`',
+                    node,
+                    note='a variable declared without an initializer holds an '
+                         'unspecified value; assign one before reading it'
+                )
+                return None
             node.inferred_type = sym.type
             return sym.type
 
@@ -673,6 +690,9 @@ class SemanticAnalyzer:
 
         if isinstance(node, InputStr):
             return 'str'
+
+        if isinstance(node, InputBig):
+            return 'big'
 
         if isinstance(node, Signed67):
             return 'str'
@@ -917,12 +937,19 @@ class SemanticAnalyzer:
             pass
         elif isinstance(node, InlineAsm):
             for _, var_expr in node.outputs:
+                if isinstance(var_expr, Variable):
+                    sym = self.current_scope.lookup(var_expr.name)
+                    if sym is not None:
+                        sym.initialized = True
+            for _, var_expr in node.outputs:
                 self._infer_type(var_expr)
             for _, arg_expr in node.inputs:
                 self._infer_type(arg_expr)
         elif isinstance(node, Input):
             pass
         elif isinstance(node, InputStr):
+            pass
+        elif isinstance(node, InputBig):
             pass
         elif isinstance(node, Signed67):
             pass
@@ -1412,6 +1439,8 @@ class SemanticAnalyzer:
                 # Allow int literal 0 as null for any pointer type
                 # Allow float/double interchange (same LLVM type)
                 # Allow str/char* interchange (same LLVM type)
+                if existing.kind == 'variable':
+                    existing.initialized = True
                 narrowing = {
                     ('int64', 'int'), ('uint64', 'int'),
                     ('double', 'float'),
@@ -1445,7 +1474,17 @@ class SemanticAnalyzer:
                         f'cannot assign `{val_type}` to variable `{name}` of type `{existing.type}`',
                         node
                     )
+            elif existing.kind == 'variable':
+                existing.initialized = True
         elif isinstance(node.target, Attr):
+            obj = node.target.obj
+            if isinstance(obj, Variable):
+                s = scope or self.current_scope
+                obj_sym = s.lookup_local(obj.name)
+                if obj_sym is None:
+                    obj_sym = s.lookup(obj.name)
+                if obj_sym is not None and obj_sym.kind == 'variable':
+                    obj_sym.initialized = True
             obj_t = self._infer_type(node.target.obj)
             if obj_t:
                 lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
@@ -1531,7 +1570,9 @@ class SemanticAnalyzer:
                         node
                     )
         kind = 'const' if node.is_const else 'variable'
-        s.define(node.name, Symbol(kind, val_type, node))
+        is_global = s is self.globals
+        s.define(node.name, Symbol(kind, val_type, node,
+                                   initialized=(node.init is not None or is_global)))
 
     def _visit_break(self, node: Break):
         if self._loop_depth == 0:

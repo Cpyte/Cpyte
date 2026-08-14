@@ -68,6 +68,12 @@ def _runtime_print_uint64(n: int):
     print(n)
 
 
+def _runtime_print_hex(n: int):
+    if n < 0:
+        n = n & ((1 << 64) - 1)
+    print(f"0x{n:x}")
+
+
 def _runtime_print_double(d: float):
     print(f"{d:.6f}")
 
@@ -82,12 +88,55 @@ def _runtime_print_str(s: bytes):
             print(repr(s))
 
 
+def _runtime_cstr(s: str) -> int:
+    """Copy a Python string into a libc heap buffer, returning its address."""
+    raw = s.encode('utf-8')
+    size = len(raw) + 1
+    buf = ctypes.create_string_buffer(raw + b'\0')
+    ptr = _libc.malloc(size)
+    if not ptr:
+        return 0
+    ctypes.memmove(ptr, buf, size)
+    return ctypes.cast(ptr, ctypes.c_void_p).value or 0
+
+
+def _runtime_str_of_int64(n: int) -> int:
+    return _runtime_cstr(str(n))
+
+
+def _runtime_str_of_uint64(n: int) -> int:
+    if n < 0:
+        n = n & ((1 << 64) - 1)
+    return _runtime_cstr(str(n))
+
+
+def _runtime_str_of_ptr(n: int) -> int:
+    if n < 0:
+        n = n & ((1 << 64) - 1)
+    return _runtime_cstr(f"0x{n:x}")
+
+
+def _runtime_str_of_double(d: float) -> int:
+    return _runtime_cstr(f"{d:.6f}")
+
+
 def _runtime_input() -> int:
     return int(input())
 
 
 def _runtime_input_str() -> bytes:
     return input().encode('utf-8')
+
+
+_bigint_from_str_cb = None
+
+
+def _runtime_input_big():
+    try:
+        line = input()
+    except EOFError:
+        line = ''
+    return _bigint_from_str_cb(line.strip().encode('utf-8'))
 
 
 def optimize(mod, opt_level=3, opt_size=False):
@@ -307,6 +356,16 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_ulonglong)(_runtime_print_hex)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("print_hex"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
         cb = ctypes.CFUNCTYPE(None, ctypes.c_double)(_runtime_print_double)
         _callbacks.append(cb)
         try:
@@ -337,11 +396,61 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p)(_runtime_input_big)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("bigint_input"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
         cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(_runtime_print_str)
         _callbacks.append(cb)
         try:
             engine.add_global_mapping(
                 mod.get_function("print_str"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_longlong)(_runtime_str_of_int64)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("str_of_int64"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_ulonglong)(_runtime_str_of_uint64)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("str_of_uint64"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_ulonglong)(_runtime_str_of_ptr)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("str_of_ptr"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_double)(_runtime_str_of_double)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("str_of_double"),
                 ctypes.cast(cb, ctypes.c_void_p).value,
             )
         except NameError:
@@ -369,6 +478,11 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
 
     engine.finalize_object()
     engine.run_static_constructors()
+
+    global _bigint_from_str_cb
+    _bigint_from_str_cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(
+        engine.get_function_address("bigint_from_str")
+    )
 
     func_ptr = engine.get_function_address("main")
     _main_fn = ctypes.CFUNCTYPE(ctypes.c_int)(func_ptr)

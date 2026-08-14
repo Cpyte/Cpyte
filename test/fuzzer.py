@@ -498,7 +498,12 @@ def _assignable(vt: str, target: str | None) -> bool:
         # is a null deref at runtime, so the generator keeps str truly non-null.
         return vt == 'char' or vt == 'str'
     if type_is_ptr(target):
-        return vt in ('int', 'str') or vt == 'void*' or target == 'void*'
+        # Only genuinely pointer-typed sources (new/&/str/void*) may feed a
+        # pointer target. An int/float/etc. converted to a pointer points at a
+        # raw garbage address, and dereferencing it is runtime UB — the
+        # differential fuzzer would flag the opt=0 vs opt=3 mismatch as a
+        # (false) compiler bug.
+        return vt in ('str', 'void*')
     if target in ('float', 'double'):
         return vt in ('float', 'double')
     if target == 'char':

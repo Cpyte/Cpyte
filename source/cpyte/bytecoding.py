@@ -379,9 +379,24 @@ class LLVM:
             print_f_ty = ir.FunctionType(ir.VoidType(), [ir.DoubleType()])
             print_f_fn = ir.Function(self.module, print_f_ty, "print_double")
             self.functions["print_double"] = print_f_fn
+            print_x_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(64)])
+            print_x_fn = ir.Function(self.module, print_x_ty, "print_hex")
+            self.functions["print_hex"] = print_x_fn
             print_s_ty = ir.FunctionType(ir.VoidType(), [ir.PointerType(ir.IntType(8))])
             print_s_fn = ir.Function(self.module, print_s_ty, "print_str")
             self.functions["print_str"] = print_s_fn
+            str_i64_ty = ir.FunctionType(_i8ptr, [ir.IntType(64)])
+            str_i64_fn = ir.Function(self.module, str_i64_ty, "str_of_int64")
+            self.functions["str_of_int64"] = str_i64_fn
+            str_u64_ty = ir.FunctionType(_i8ptr, [ir.IntType(64)])
+            str_u64_fn = ir.Function(self.module, str_u64_ty, "str_of_uint64")
+            self.functions["str_of_uint64"] = str_u64_fn
+            str_p_ty = ir.FunctionType(_i8ptr, [ir.IntType(64)])
+            str_p_fn = ir.Function(self.module, str_p_ty, "str_of_ptr")
+            self.functions["str_of_ptr"] = str_p_fn
+            str_f_ty = ir.FunctionType(_i8ptr, [ir.DoubleType()])
+            str_f_fn = ir.Function(self.module, str_f_ty, "str_of_double")
+            self.functions["str_of_double"] = str_f_fn
             input_ty = ir.FunctionType(ir.IntType(32), [])
             input_fn = ir.Function(self.module, input_ty, "input_int")
             self.functions["input"] = input_fn
@@ -396,6 +411,7 @@ class LLVM:
             ('bigint_from_int', _i8ptr, [_i64]),
             ('bigint_from_uint64', _i8ptr, [_i64]),
             ('bigint_from_str', _i8ptr, [_i8ptr]),
+            ('bigint_input', _i8ptr, []),
             ('bigint_add', _i8ptr, [_i8ptr, _i8ptr]),
             ('bigint_sub', _i8ptr, [_i8ptr, _i8ptr]),
             ('bigint_mul', _i8ptr, [_i8ptr, _i8ptr]),
@@ -404,6 +420,7 @@ class LLVM:
             ('bigint_neg', _i8ptr, [_i8ptr]),
             ('bigint_cmp', _i32, [_i8ptr, _i8ptr]),
             ('bigint_print', _void, [_i8ptr]),
+            ('bigint_to_str', _i8ptr, [_i8ptr]),
         ]
         for name, ret, args in bignum_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
@@ -788,6 +805,64 @@ class LLVM:
 
         return self.module, self.import_src_files
 
+    @register_emitter(FString)
+    def emit_fstring(self, node):
+        parts = node.parts
+        strings = []
+        for kind, payload in parts:
+            if kind == 'lit':
+                strings.append(self._string_const(payload))
+            else:
+                val = self.emit(payload)
+                strings.append(self._stringify_value(payload, val))
+        result = strings[0] if strings else self._string_const('')
+        for s in strings[1:]:
+            result = self._concat_strings(result, s)
+        return result
+
+    def _stringify_value(self, node, val):
+        """Convert a runtime value into a heap string (i8*) for interpolation."""
+        if getattr(node, 'inferred_type', None) == 'str':
+            return val
+        if isinstance(node, Number) and (node.value.startswith('0x') or node.value.startswith('0X')):
+            as_i64 = self._extend_to_i64(val)
+            return self.builder.call(self.functions['str_of_ptr'], [as_i64])
+        if getattr(node, 'inferred_type', None) == 'big':
+            return self.builder.call(self.functions['bigint_to_str'], [val])
+        ty = val.type
+        if isinstance(ty, ir.PointerType):
+            as_i64 = self.builder.ptrtoint(val, _i64)
+            return self.builder.call(self.functions['str_of_ptr'], [as_i64])
+        if isinstance(ty, ir.DoubleType):
+            return self.builder.call(self.functions['str_of_double'], [val])
+        if isinstance(ty, ir.FloatType):
+            as_double = self.builder.fpext(val, ir.DoubleType())
+            return self.builder.call(self.functions['str_of_double'], [as_double])
+        if isinstance(ty, ir.IntType):
+            i64 = self._extend_to_i64(val)
+            if getattr(node, 'inferred_type', None) == 'uint64':
+                return self.builder.call(self.functions['str_of_uint64'], [i64])
+            return self.builder.call(self.functions['str_of_int64'], [i64])
+        as_i64 = self.builder.ptrtoint(val, _i64)
+        return self.builder.call(self.functions['str_of_ptr'], [as_i64])
+
+    def _concat_strings(self, left, right):
+        """Concatenate two heap strings (i8*), returning a new heap string."""
+        strlen_fn = self._get_strlen_fn()
+        malloc_fn = self._get_malloc_fn()
+        memcpy_fn = self._get_memcpy_fn()
+        left_len = self.builder.call(strlen_fn, [left])
+        right_len = self.builder.call(strlen_fn, [right])
+        total_len = self.builder.add(left_len, right_len)
+        plus_one = self.builder.add(total_len, ir.Constant(_i32, 1))
+        new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
+        self.builder.call(memcpy_fn, [new_str, left, left_len])
+        dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
+        self.builder.call(memcpy_fn, [dest_plus, right, right_len])
+        null_byte = self.builder.gep(new_str, [total_len], inbounds=True)
+        self.builder.store(ir.Constant(_i8, 0), null_byte)
+        return new_str
+
     @register_emitter(ExprStmt)
     def emit_exprstmt(self, node):
         return self.emit(node.expr)
@@ -807,7 +882,7 @@ class LLVM:
         return self._emit_recursive(node)
 
     _EMIT_PURE_TYPES = (
-        Number, String, Variable, Signed67, Input, InputStr, SizeOf,
+        Number, String, Variable, Signed67, Input, InputStr, InputBig, SizeOf,
         UnaryOp, Deref, AddrOf, Index, Attr, NewExpr, Call, InlineAsm,
         ExprStmt,
     )
@@ -1753,17 +1828,25 @@ class LLVM:
                     cmp = self.builder.call(self.functions['bigint_cmp'], [left, right])
                     return self.builder.icmp_signed('>=', cmp, ir.Constant(_i32, 0))
 
-        # String equality via strcmp (content, not pointer comparison)
-        if node.op in (TokenType.EQ_EQ, TokenType.NOT_EQ):
-            left_str = getattr(node.left, 'inferred_type', None) == 'str'
-            right_str = getattr(node.right, 'inferred_type', None) == 'str'
-            if left_str and right_str:
-                cmp = self.builder.call(self._strcmp_fn, [left, right])
-                zero = ir.Constant(_i32, 0)
-                if node.op == TokenType.EQ_EQ:
+        # String comparison via strcmp (content, not pointer comparison)
+        left_str = getattr(node.left, 'inferred_type', None) == 'str'
+        right_str = getattr(node.right, 'inferred_type', None) == 'str'
+        if left_str and right_str:
+            cmp = self.builder.call(self._strcmp_fn, [left, right])
+            zero = ir.Constant(_i32, 0)
+            match node.op:
+                case TokenType.EQ_EQ:
                     return self.builder.icmp_signed('==', cmp, zero)
-                else:
+                case TokenType.NOT_EQ:
                     return self.builder.icmp_signed('!=', cmp, zero)
+                case TokenType.LESS:
+                    return self.builder.icmp_signed('<', cmp, zero)
+                case TokenType.GREATER:
+                    return self.builder.icmp_signed('>', cmp, zero)
+                case TokenType.LESS_EQ:
+                    return self.builder.icmp_signed('<=', cmp, zero)
+                case TokenType.GREATER_EQ:
+                    return self.builder.icmp_signed('>=', cmp, zero)
 
         left, right = self._promote(left, right)
         is_float = isinstance(left.type, ir.DoubleType) or isinstance(right.type, ir.DoubleType)
@@ -1890,20 +1973,7 @@ class LLVM:
     def _emit_string_concat(self, node):
         left = self.emit(node.left)
         right = self.emit(node.right)
-        strlen_fn = self._get_strlen_fn()
-        malloc_fn = self._get_malloc_fn()
-        memcpy_fn = self._get_memcpy_fn()
-        left_len = self.builder.call(strlen_fn, [left])
-        right_len = self.builder.call(strlen_fn, [right])
-        total_len = self.builder.add(left_len, right_len)
-        plus_one = self.builder.add(total_len, ir.Constant(_i32, 1))
-        new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
-        self.builder.call(memcpy_fn, [new_str, left, left_len])
-        dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
-        self.builder.call(memcpy_fn, [dest_plus, right, right_len])
-        null_byte = self.builder.gep(new_str, [total_len], inbounds=True)
-        self.builder.store(ir.Constant(_i8, 0), null_byte)
-        return new_str
+        return self._concat_strings(left, right)
 
     def _get_strlen_fn(self):
         fn = self._strlen_fn
@@ -2291,10 +2361,10 @@ class LLVM:
         if isinstance(value.type, ir.IntType) and value.type.width < 32:
             value = self.builder.zext(value, _i32)
             return self.builder.call(self.functions["print_int"], [value])
-        # Handle non-string pointers: convert to int64 and print
+        # Handle non-string pointers: convert to int64 and print as hex
         if isinstance(value.type, ir.PointerType):
             value = self.builder.ptrtoint(value, _i64)
-            return self.builder.call(self.functions["print_int64"], [value])
+            return self.builder.call(self.functions["print_hex"], [value])
         # Handle i32 — call print_int directly
         if isinstance(value.type, ir.IntType):
             return self.builder.call(self.functions["print_int"], [value])
@@ -2302,7 +2372,7 @@ class LLVM:
         if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
             return self.builder.call(self.functions["print_double"], [value])
         if isinstance(value.type, ir.PointerType):
-            return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
+            return self.builder.call(self.functions["print_hex"], [self.builder.ptrtoint(value, _i64)])
         return self.builder.call(self.functions["print_int64"], [self.builder.ptrtoint(value, _i64)])
 
     @register_emitter(Input)
@@ -2319,6 +2389,14 @@ class LLVM:
             # In no-userspace mode, input_str returns null pointer
             return ir.Constant(_i8ptr, None)
         func = self.functions["input_str"]
+        return self.builder.call(func, [])
+
+    @register_emitter(InputBig)
+    def emit_inputbig(self, node):
+        if self.no_userspace:
+            # In no-userspace mode, input_big returns a zero bignum
+            return self.builder.call(self.functions["bigint_from_int"], [ir.Constant(_i64, 0)])
+        func = self.functions["bigint_input"]
         return self.builder.call(func, [])
 
     @register_emitter(Signed67)

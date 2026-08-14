@@ -167,12 +167,90 @@ void print_double(double d) {
     print_int(n);
 }
 
+void print_hex(long long n) {
+    char buf[64];
+    unsigned long len = 0;
+    unsigned long long u = (unsigned long long)n;
+    const char *hex = "0123456789abcdef";
+    buf[len++] = '0';
+    buf[len++] = 'x';
+    char tmp[20];
+    int i = 0;
+    if (u == 0) tmp[i++] = '0';
+    while (u > 0) {
+        tmp[i++] = hex[u & 0xf];
+        u >>= 4;
+    }
+    while (i > 0) buf[len++] = tmp[--i];
+    buf[len] = '\0';
+    scorpion_putc(buf, len);
+}
+
 void print_str(const char *s) {
     if (!s) {
         scorpion_putc("(null)", 6);
         return;
     }
     scorpion_putc(s, strlen(s));
+}
+
+static char *ull_to_str_alloc(unsigned long long u, int neg) {
+    char tmp[24];
+    int i = 0;
+    if (u == 0) tmp[i++] = '0';
+    while (u > 0) {
+        tmp[i++] = '0' + (u % 10);
+        u /= 10;
+    }
+    char *buf = (char*)malloc(i + (neg ? 1 : 0) + 1);
+    if (!buf) return (char*)0;
+    int len = 0;
+    if (neg) buf[len++] = '-';
+    while (i > 0) buf[len++] = tmp[--i];
+    buf[len] = '\0';
+    return buf;
+}
+
+char *str_of_int64(long long n) {
+    unsigned long long u;
+    int neg = 0;
+    if (n < 0) {
+        neg = 1;
+        u = (unsigned long long)(-(n + 1)) + 1;
+    } else {
+        u = (unsigned long long)n;
+    }
+    return ull_to_str_alloc(u, neg);
+}
+
+char *str_of_uint64(unsigned long long n) {
+    return ull_to_str_alloc(n, 0);
+}
+
+char *str_of_ptr(long long n) {
+    unsigned long long u = (unsigned long long)n;
+    const char *hex = "0123456789abcdef";
+    char tmp[20];
+    int i = 0;
+    if (u == 0) tmp[i++] = '0';
+    while (u > 0) {
+        tmp[i++] = hex[u & 0xf];
+        u >>= 4;
+    }
+    char *buf = (char*)malloc(i + 3);
+    if (!buf) return (char*)0;
+    int len = 0;
+    buf[len++] = '0';
+    buf[len++] = 'x';
+    while (i > 0) buf[len++] = tmp[--i];
+    buf[len] = '\0';
+    return buf;
+}
+
+char *str_of_double(double d) {
+    /* integer part only, matching print_double */
+    int n = (int)d;
+    return ull_to_str_alloc((unsigned long long)(n < 0 ? -(long long)n : n), n < 0);
 }
 
 int input_int(void) {

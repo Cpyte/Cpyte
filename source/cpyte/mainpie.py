@@ -79,6 +79,9 @@ def pretty_ast(node, indent=0):
     if name == 'String':
         return f"{pad}'{node.value}'"
 
+    if name == 'FString':
+        return f"{pad}f-string: {node.parts}"
+
     if name == 'Variable':
         return f'{pad}{node.name}'
 
@@ -104,6 +107,12 @@ def pretty_ast(node, indent=0):
 
     if name == 'Input':
         return f'{pad}input()'
+
+    if name == 'InputStr':
+        return f'{pad}input_str()'
+
+    if name == 'InputBig':
+        return f'{pad}input_big()'
 
     if name == 'Break':
         return f'{pad}break'

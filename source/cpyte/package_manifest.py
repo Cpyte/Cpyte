@@ -59,7 +59,7 @@ class ManifestValidator:
         'while', 'for', 'in', 'break', 'continue',
         'public', 'private', 'static', 'virtual', 'override',
         'import', 'true', 'false', 'null', 'True', 'False',
-        'and', 'or', 'not', 'print', 'input', 'input_str',
+        'and', 'or', 'not', 'print', 'input', 'input_str', 'input_big',
         'switch', 'case', 'default', 'new', 'struct', 'sizeof',
         'ref', 'int64', 'uint64', 'let', 'try', 'except',
         'raise', 'asm',

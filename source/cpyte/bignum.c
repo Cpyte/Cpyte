@@ -467,3 +467,48 @@ void bigint_print(void* p) {
     printf("%s", buf + pos);
     free(buf);
 }
+
+char* bigint_to_str(void* p) {
+    BigNum* b = (BigNum*)p;
+    if (!b) return (char*)0;
+    size_t max_digits = b->used * 20 + 1;
+    char* buf = malloc(max_digits);
+    if (!buf) _bn_fail("bigint_to_str: alloc failed");
+    if (b->used == 1 && b->limbs[0] == 0) {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return buf;
+    }
+
+    BigNum tmp;
+    tmp.limbs = malloc(b->used * sizeof(uint64_t));
+    if (!tmp.limbs) _bn_fail("bigint_to_str: alloc failed");
+    memcpy(tmp.limbs, b->limbs, b->used * sizeof(uint64_t));
+    tmp.used = b->used;
+    tmp.len = b->used;
+    tmp.negative = 0;
+
+    size_t pos = max_digits;
+    buf[--pos] = '\0';
+    while (!(tmp.used == 1 && tmp.limbs[0] == 0)) {
+        uint64_t carry = 0;
+        for (size_t i = tmp.used; i > 0; i--) {
+            __uint128_t v = (__uint128_t)carry << 64 | tmp.limbs[i - 1];
+            tmp.limbs[i - 1] = (uint64_t)(v / 10);
+            carry = (uint64_t)(v % 10);
+        }
+        buf[--pos] = (char)('0' + carry);
+        _bn_trim(&tmp);
+    }
+    free(tmp.limbs);
+
+    size_t digits = max_digits - pos - 1;
+    char* out = malloc(digits + (b->negative ? 1 : 0) + 1);
+    if (!out) _bn_fail("bigint_to_str: alloc failed");
+    size_t o = 0;
+    if (b->negative) out[o++] = '-';
+    memcpy(out + o, buf + pos, digits);
+    out[o + digits] = '\0';
+    free(buf);
+    return out;
+}

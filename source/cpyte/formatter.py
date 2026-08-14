@@ -101,6 +101,8 @@ def _node_signature(node):
         return cname, node.value
     if isinstance(node, astparse.String):
         return cname, node.value
+    if isinstance(node, astparse.FString):
+        return cname, repr(node.parts)
     if isinstance(node, astparse.Variable):
         return cname, node.name
     if isinstance(node, astparse.UnaryOp):
@@ -177,6 +179,23 @@ class _Formatter:
             return prefix + ' ' + operand_text
         return prefix + operand_text
 
+    def _fstring_text(self, node):
+        out = []
+        for kind, payload in node.parts:
+            if kind == 'lit':
+                text = ''
+                for ch in payload:
+                    if ch in _STRING_ESCAPES:
+                        text += _STRING_ESCAPES[ch]
+                    elif ch in '{}':
+                        text += ch * 2
+                    else:
+                        text += ch
+                out.append(text)
+            else:
+                out.append('{' + self._expr(payload) + '}')
+        return 'f"' + ''.join(out) + '"'
+
     def _postfix_base(self, node):
         if isinstance(node, (astparse.BinOp, astparse.UnaryOp, astparse.Deref, astparse.AddrOf)):
             return '(' + self._expr(node) + ')'
@@ -187,6 +206,8 @@ class _Formatter:
             return node.value
         if isinstance(node, astparse.String):
             return _escape_string(node.value)
+        if isinstance(node, astparse.FString):
+            return self._fstring_text(node)
         if isinstance(node, astparse.Variable):
             return node.name
         if isinstance(node, astparse.Call):
@@ -214,6 +235,8 @@ class _Formatter:
             return 'input()'
         if isinstance(node, astparse.InputStr):
             return 'input_str()'
+        if isinstance(node, astparse.InputBig):
+            return 'input_big()'
         if isinstance(node, astparse.Signed67):
             return '67()'
         self._error(f'unsupported expression node {type(node).__name__}')

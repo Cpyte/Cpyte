@@ -43,7 +43,7 @@ _KEYWORDS = [
     "import", "struct", "new", "sizeof",
     "true", "false", "null",
     "switch", "case", "default",
-    "print", "input", "input_str",
+    "print", "input", "input_str", "input_big",
 ]
 
 _TYPES = ["int", "int64", "uint64", "float", "str", "void", "bool"]
@@ -74,6 +74,7 @@ _KEYWORD_DESC = {
     "print": "Write a string representation to stdout",
     "input": "Read a line of text from stdin",
     "input_str": "Read a line of text from stdin and return it as a string",
+    "input_big": "Read a line of text from stdin and return it as an arbitrary-precision big integer",
 }
 
 _TYPE_DESC = {

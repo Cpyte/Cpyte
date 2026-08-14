@@ -7,6 +7,7 @@ class TokenType(Enum):
     KEYWORD = auto()
     NUMBER = auto()
     STRING = auto()
+    FSTRING = auto()
 
     PLUS = auto()
     MINUS = auto()
@@ -65,7 +66,7 @@ _BASE_KEYWORDS = {
     'import', 'true', 'false', 'null', 'True', 'False',
     'and', 'or', 'not',
     'print',
-    'input', 'input_str',
+    'input', 'input_str', 'input_big',
     'switch', 'case', 'default',
     'new', 'struct', 'sizeof', 'ref',
     'int64', 'uint64',
@@ -109,13 +110,14 @@ KEYWORDS = get_keywords()
 
 
 class Token:
-    __slots__ = ('type', 'value', 'line', 'column')
+    __slots__ = ('type', 'value', 'line', 'column', 'raw')
 
-    def __init__(self, type_: TokenType, value: str | None = None, line: int = 0, column: int = 0):
+    def __init__(self, type_: TokenType, value: str | None = None, line: int = 0, column: int = 0, raw: bool = False):
         self.type = type_
         self.value = value
         self.line = line
         self.column = column
+        self.raw = raw
 
     def __repr__(self):
         return f'Token({self.type.name}, {self.value!r}, L{self.line}:{self.column})'
@@ -126,6 +128,79 @@ class LexerError(Exception):
         self.line = line
         self.column = column
         super().__init__(f'LexerError at {line}:{column}: {message}')
+
+
+_ESCAPE_MAP = {
+    'n': '\n',
+    't': '\t',
+    'r': '\r',
+    '\\': '\\',
+    '"': '"',
+    "'": "'",
+    '0': '\0',
+}
+
+
+def _unescape_char(esc: str, lexer: '_LineLexer') -> str:
+    """Decode a single escape sequence after the backslash."""
+    if esc == 'x':
+        digits = ''
+        while len(digits) < 2 and not lexer.at_end() and (lexer.peek().isdigit() or lexer.peek().lower() in 'abcdef'):
+            digits += lexer.advance()
+        if digits:
+            return chr(int(digits, 16))
+        return '\\x'
+    if esc == 'u':
+        digits = ''
+        while len(digits) < 4 and not lexer.at_end() and (lexer.peek().isdigit() or lexer.peek().lower() in 'abcdef'):
+            digits += lexer.advance()
+        if len(digits) == 4:
+            return chr(int(digits, 16))
+        return '\\u'
+    return _ESCAPE_MAP.get(esc, esc)
+
+
+def _unescape_run(text: str) -> str:
+    """Decode escape sequences in a run of f-string literal text."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\\' and i + 1 < n:
+            esc = text[i + 1]
+            if esc == 'x':
+                digits = ''
+                j = i + 2
+                while len(digits) < 2 and j < n and (text[j].isdigit() or text[j].lower() in 'abcdef'):
+                    digits += text[j]
+                    j += 1
+                if digits:
+                    out.append(chr(int(digits, 16)))
+                    i = j
+                    continue
+                out.append('\\x')
+                i += 2
+                continue
+            if esc == 'u':
+                digits = ''
+                j = i + 2
+                while len(digits) < 4 and j < n and (text[j].isdigit() or text[j].lower() in 'abcdef'):
+                    digits += text[j]
+                    j += 1
+                if len(digits) == 4:
+                    out.append(chr(int(digits, 16)))
+                    i = j
+                    continue
+                out.append('\\u')
+                i += 2
+                continue
+            out.append(_ESCAPE_MAP.get(esc, '\\' + esc))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 class _LineLexer:
@@ -173,7 +248,7 @@ class _LineLexer:
         value = self.line[start:self.pos]
         return Token(TokenType.NUMBER, value, self.line_number, start_col)
 
-    def scan_string(self, quote: str) -> Token:
+    def scan_string(self, quote: str, raw: bool = False) -> Token:
         start_col = self.column
         start_line = self.line_number
         self.advance()
@@ -185,18 +260,63 @@ class _LineLexer:
                 if self.pos >= len(self.line):
                     raise LexerError('Unterminated string escape', start_line, start_col)
                 esc = self.advance()
-                escape_map = {
-                    'n': '\n',
-                    't': '\t',
-                    'r': '\r',
-                    '\\': '\\',
-                    '"': '"',
-                    "'": "'",
-                    '0': '\0',
-                }
-                chars.append(escape_map.get(esc, esc))
+                if raw:
+                    chars.append('\\')
+                    chars.append(esc)
+                else:
+                    chars.append(_unescape_char(esc, self))
             elif ch == quote:
                 return Token(TokenType.STRING, ''.join(chars), start_line, start_col)
+            else:
+                chars.append(ch)
+
+        raise LexerError('Unterminated string literal', start_line, start_col)
+
+    def scan_fstring(self, quote: str) -> Token:
+        start_col = self.column
+        start_line = self.line_number
+        self.advance()
+        chars = []
+        depth = 0
+        expr_quote = None  # quote char of a string literal inside {expr}
+
+        while self.pos < len(self.line):
+            ch = self.advance()
+            if expr_quote is not None:
+                chars.append(ch)
+                if ch == '\\':
+                    if self.pos >= len(self.line):
+                        raise LexerError('Unterminated string escape', start_line, start_col)
+                    chars.append(self.advance())
+                elif ch == expr_quote:
+                    expr_quote = None
+                continue
+            if depth > 0:
+                chars.append(ch)
+                if ch in ('"', "'"):
+                    expr_quote = ch
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                continue
+            if ch == '\\':
+                if self.pos >= len(self.line):
+                    raise LexerError('Unterminated string escape', start_line, start_col)
+                chars.append('\\')
+                chars.append(self.advance())
+            elif ch == quote:
+                return Token(TokenType.FSTRING, ''.join(chars), start_line, start_col)
+            elif ch == '{':
+                chars.append(ch)
+                if self.pos < len(self.line) and self.peek() == '{':
+                    chars.append(self.advance())
+                else:
+                    depth += 1
+            elif ch == '}':
+                chars.append(ch)
+                if self.pos < len(self.line) and self.peek() == '}':
+                    chars.append(self.advance())
             else:
                 chars.append(ch)
 
@@ -323,6 +443,34 @@ class _LineLexer:
 
             if ch in '"\'':
                 tokens.append(self.scan_string(ch))
+                continue
+
+            if ch in 'fr' and self.pos + 1 < len(self.line) and self.peek(1) in '"\'':
+                prefix = self.advance()
+                quote = self.peek()
+                if prefix == 'f':
+                    tokens.append(self.scan_fstring(quote))
+                else:
+                    tokens.append(self.scan_string(quote, raw=True))
+                continue
+
+            if (
+                ch in 'fr'
+                and self.pos + 1 < len(self.line)
+                and self.peek(1) in 'fr'
+                and self.pos + 2 < len(self.line)
+                and self.peek(2) in '"\'' 
+            ):
+                is_f = ch == 'f' or self.peek(1) == 'f'
+                self.advance()
+                self.advance()
+                quote = self.peek()
+                if is_f:
+                    tok = self.scan_fstring(quote)
+                    tok.raw = True
+                    tokens.append(tok)
+                else:
+                    tokens.append(self.scan_string(quote, raw=True))
                 continue
 
             if ch.isalpha() or ch == '_':

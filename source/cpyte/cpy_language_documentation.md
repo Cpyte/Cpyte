@@ -135,6 +135,53 @@ The following reserved words cannot be used as identifiers:
 "Escaped characters: \n\t\r\\\""
 ```
 
+##### Escape Sequences
+
+```cpy
+"\n"    # newline
+"\t"    # tab
+"\r"    # carriage return
+"\x41"  # hex escape: 'A'
+"\u00e9" # unicode escape: 'é'
+"\\"    # backslash
+"\""    # double quote
+```
+
+##### Raw Strings
+
+```cpy
+r"C:\path\to\file\n"   # backslashes kept verbatim: C:\path\to\file\n
+```
+
+##### F-Strings (String Interpolation)
+
+`f"..."` interpolates expressions inside `{...}`. Literal text is kept as-is and
+each embedded expression is evaluated and converted to its string form
+(numbers as decimal, hex literals as hex, pointers as `0x...`, big integers as
+decimal). Use `{{` and `}}` to emit literal braces.
+
+```cpy
+name = "World"
+print(f"hello {name}!")              # hello World!
+x = 42
+print(f"{x} + {x} = {x + x}")        # 42 + 42 = 84
+print(f"hex = {0xdeadbeef}")         # hex = 0xdeadbeef
+print(f"{{braces}}")                 # {braces}
+```
+
+Raw f-strings combine both: `fr"..."` / `rf"..."` keep backslashes verbatim in
+literal runs while still interpolating expressions.
+
+```cpy
+print(fr"path {name}\n")   # path World\n  (backslash kept, expression expanded)
+```
+
+Expressions may nest string literals and call functions:
+
+```cpy
+print(f"Hello, {name + "!"}")        # Hello, World!
+```
+
 #### Boolean and Null Literals
 
 ```cpy
@@ -1202,7 +1249,13 @@ print(x + y)
 
 ```cpy
 int value = input()
+str line = input_str()
+big huge = input_big()
 ```
+
+- `input()` reads a line from stdin and returns it as a 32-bit `int`.
+- `input_str()` reads a line from stdin and returns it as a `str`.
+- `input_big()` reads a line from stdin and returns it as an arbitrary-precision `big` integer (no 32-bit truncation).
 
 ### Mathematical Operations
 
@@ -1507,7 +1560,8 @@ multiplicative ::= power {("*" | "/" | "//" | "%") power}
 power          ::= unary ["**" power]
 unary          ::= ("+" | "-" | "not" | "~" | "*" | "&") unary | postfix
 postfix        ::= primary {("()" | "[]" | "." IDENTIFIER)}
-primary        ::= NUMBER | STRING | IDENTIFIER | "(" expression ")" | "new" type | "sizeof" "(" type ")"
+primary        ::= NUMBER | STRING | FSTRING | IDENTIFIER | "(" expression ")" | "new" type | "sizeof" "(" type ")"
+FSTRING        ::= ("f" | "fr" | "rf")? STRING   -- with "{" expression "}" interpolation and "{{"/"}}" escapes
 type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void" | type "*" | type "[]"
 ```
 
@@ -1517,5 +1571,7 @@ type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void
 NUMBER         ::= [0-9]+ ("." [0-9]+)? ([eE][+-]?[0-9]+)?
 HEX_NUMBER     ::= "0x" [0-9A-Fa-f]+
 STRING         ::= '"' ([^"\\] | "\\" .)* '"'
+RAW_STRING     ::= ("r" | "fr" | "rf") STRING   -- backslash sequences kept verbatim
+FSTRING_LIT    ::= ("f" | "fr" | "rf") '"' ([^"\\{] | "{" expression "}" | "{{" | "}}")* '"'
 IDENTIFIER     ::= [a-zA-Z_] [a-zA-Z0-9_]*
 ```

@@ -1,4 +1,4 @@
-from .lexar import Token, TokenType
+from .lexar import Token, TokenType, Lexer, _unescape_run
 from typing import Optional, Dict, Any, List
 
 
@@ -55,6 +55,14 @@ class String:
         self._token = token
     def __repr__(self):
         return f'String({self.value})'
+
+class FString:
+    __slots__ = ('parts', '_token', 'inferred_type')
+    def __init__(self, parts: list, token=None):
+        self.parts = parts
+        self._token = token
+    def __repr__(self):
+        return f'FString({self.parts})'
 
 class Variable:
     __slots__ = ('name', '_token', 'const_value', 'inferred_type')
@@ -253,6 +261,18 @@ def _parse_atom(tokens: list[Token], pos: int):
         assert tok.value is not None
         return String(tok.value, token=tok), pos + 1
 
+    if tok.type == TokenType.FSTRING:
+        assert tok.value is not None
+        parts = []
+        for kind, payload in _split_fstring(tok.value):
+            if kind == 'lit':
+                parts.append(('lit', payload if getattr(tok, 'raw', False) else _unescape_run(payload)))
+            else:
+                expr_tokens = Lexer(payload + '\n').get_tokens()
+                expr_node, _ = parse_expression(expr_tokens, 0)
+                parts.append(('expr', expr_node))
+        return FString(parts, token=tok), pos + 1
+
     if tok.type == TokenType.IDENTIFIER:
         assert tok.value is not None
         return Variable(tok.value, token=tok), pos + 1
@@ -283,6 +303,15 @@ def _parse_atom(tokens: list[Token], pos: int):
                 raise ParseError('Expected ")" after input_str()', tok)
             return InputStr(token=tok), pos + 1
         raise ParseError('Expected "(" after input_str', tok)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'input_big':
+        pos += 1
+        if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+            pos += 1
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                raise ParseError('Expected ")" after input_big()', tok)
+            return InputBig(token=tok), pos + 1
+        raise ParseError('Expected "(" after input_big', tok)
 
     if tok.type == TokenType.KEYWORD and tok.value == 'new':
         pos += 1
@@ -320,6 +349,86 @@ def _parse_atom(tokens: list[Token], pos: int):
         return node, pos + 1
 
     raise ParseError(f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok)
+
+
+def _split_fstring(content: str) -> list:
+    """Split raw f-string content into parts.
+
+    Returns a list mixing tuples:
+      ('lit', literal_text)      -- verbatim text
+      ('expr', expression_text)  -- raw source of an interpolated {expr}
+    Handles {{ }} escaping and brace-balanced expressions containing strings.
+    """
+    parts: list = []
+    literal: list[str] = []
+    i = 0
+    n = len(content)
+
+    def flush_literal():
+        if literal:
+            parts.append(('lit', ''.join(literal)))
+            literal.clear()
+
+    while i < n:
+        ch = content[i]
+        if ch == '{':
+            if i + 1 < n and content[i + 1] == '{':
+                literal.append('{')
+                i += 2
+                continue
+            flush_literal()
+            expr_chars: list[str] = []
+            depth = 1
+            i += 1
+            expr_quote = None
+            while i < n:
+                c = content[i]
+                if expr_quote is not None:
+                    expr_chars.append(c)
+                    if c == '\\' and i + 1 < n:
+                        expr_chars.append(content[i + 1])
+                        i += 2
+                        continue
+                    if c == expr_quote:
+                        expr_quote = None
+                    i += 1
+                    continue
+                if c in ('"', "'"):
+                    expr_quote = c
+                    expr_chars.append(c)
+                    i += 1
+                    continue
+                if c == '{':
+                    depth += 1
+                    expr_chars.append(c)
+                    i += 1
+                    continue
+                if c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                    expr_chars.append(c)
+                    i += 1
+                    continue
+                expr_chars.append(c)
+                i += 1
+            expr = ''.join(expr_chars).strip()
+            parts.append(('expr', expr))
+            continue
+        if ch == '}':
+            if i + 1 < n and content[i + 1] == '}':
+                literal.append('}')
+                i += 2
+                continue
+            literal.append(ch)
+            i += 1
+            continue
+        literal.append(ch)
+        i += 1
+
+    flush_literal()
+    return parts
 
 
 def _parse_call_args(tokens: list[Token], pos: int, callee):
@@ -444,6 +553,16 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     vals.append(InputStr(token=tok))
                     continue
                 raise ParseError('Expected "(" after input_str', tok)
+            if tok.type == TokenType.KEYWORD and tok.value == 'input_big':
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                        raise ParseError('Expected ")" after input_big()', tok)
+                    pos += 1
+                    vals.append(InputBig(token=tok))
+                    continue
+                raise ParseError('Expected "(" after input_big', tok)
             if tok.type == TokenType.KEYWORD and tok.value == 'new':
                 pos += 1
                 base_type, pos = parse_type(tokens, pos)
@@ -1009,6 +1128,14 @@ class InputStr:
         self._token = token
     def __repr__(self):
         return 'InputStr()'
+
+
+class InputBig:
+    __slots__ = ('_token',)
+    def __init__(self, token=None):
+        self._token = token
+    def __repr__(self):
+        return 'InputBig()'
 
 
 class Signed67:

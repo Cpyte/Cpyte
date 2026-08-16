@@ -43,6 +43,7 @@ Global options:
   --tab-size N        Set tab size (default 4)
   --strict            Enable strict semantic analysis
   --no-userspace      Compile without the userspace runtime
+  --nogc              Disable automatic GC and add the free() builtin
   --pic               Position-independent code
   --export NAME       Export NAME as a library symbol (dynamic SEF; repeatable)
   --lto               Enable link-time optimization (requires clang)
@@ -272,7 +273,7 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
             ui.print_warn(f"Failed to load package manifest for '{package_name}': {e}")
 
 
-def _compile(source, tab_size=4, strict=False, enable_extensions=True):
+def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=False):
     # Pre-load package manifests if extensions are enabled
     if enable_extensions:
         _load_package_manifests_from_source(os.getcwd())
@@ -284,11 +285,27 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True):
     except (LexerError, ParseError) as e:
         ui.print_err(f'parse error: {e}')
         sys.exit(1)
-    result, generic_instantiations = analyze(source, parsed, strict=strict, workspace_root=os.getcwd(), enable_extensions=enable_extensions)
+    result, generic_instantiations = analyze(source, parsed, strict=strict, workspace_root=os.getcwd(), enable_extensions=enable_extensions, no_gc=no_gc)
     if result:
         ui.print_err(result)
         sys.exit(1)
     return parsed, generic_instantiations
+
+
+def _detect_nogc(source: str) -> tuple[str, bool]:
+    """Look for a `#nogc` directive on the first non-blank line.
+
+    The directive disables automatic garbage collection (see --nogc). It is
+    stripped from the source before lexing so it never reaches the parser.
+    """
+    lines = source.split('\n')
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    if idx < len(lines) and lines[idx].strip() == '#nogc':
+        lines[idx] = ''
+        return '\n'.join(lines), True
+    return source, False
 
 
 def _emit(parsed, generic_instantiations=None, no_userspace=False, enable_extensions=True, no_gc=False, target_triple=None, use_native_eh=False):
@@ -321,9 +338,9 @@ def _collect_frameworks(nodes):
     return list(set(frameworks))
 
 
-def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto=False):
+def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto=False, no_gc=False):
     if not args:
-        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--no-userspace] [--pic] [--lto] <source.cpy>')
+        ui.print_usage('Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--no-userspace] [--nogc] [--pic] [--lto] <source.cpy>')
         sys.exit(1)
 
     output = None
@@ -346,6 +363,9 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
             i += 1
         elif a == '--no-userspace':
             no_userspace = True
+            i += 1
+        elif a == '--nogc':
+            no_gc = True
             i += 1
         elif a == '--pic':
             pic = True
@@ -379,13 +399,15 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
     with open(src_file) as f:
         source = f.read()
 
-    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
+    source, no_gc = _detect_nogc(source) if not no_gc else (source, True)
+
+    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace, no_gc=no_gc)
 
     frameworks = _collect_frameworks(parsed)
 
     ui.print_status(f'Compiling {src_file} ...')
 
-    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, use_native_eh=True)
+    prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=no_gc, use_native_eh=True)
 
     out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
     obj_file = out_base + '.o'
@@ -569,7 +591,7 @@ def main():
         ui.print_warn('interrupted')
         return 130
     except Exception:
-        ui.print_err('cpy error:')
+        ui.print_err('Cpyte got an error :(. The following tracebacks:')
         ui.print_traceback()
         return 1
     sys.stdout.flush()
@@ -586,6 +608,7 @@ def _main():
     no_userspace = False
     pic = False
     lto = False
+    no_gc = False
     exports = []
     while args and args[0].startswith('--'):
         flag = args.pop(0)
@@ -595,6 +618,8 @@ def _main():
             strict = True
         elif flag == '--no-userspace':
             no_userspace = True
+        elif flag == '--nogc':
+            no_gc = True
         elif flag == '--pic':
             pic = True
         elif flag == '--export':
@@ -630,7 +655,7 @@ def _main():
         sys.exit(1)
 
     if args[0] == 'build':
-        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic, lto=lto)
+        cmd_build(args[1:], tab_size=tab_size, strict=strict, no_userspace=no_userspace, pic=pic, lto=lto, no_gc=no_gc)
         return
 
     if args[0] == 'format':
@@ -644,7 +669,9 @@ def _main():
     with open(args[0]) as f:
         source = f.read()
 
-    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace)
+    source, no_gc = _detect_nogc(source) if not no_gc else (source, True)
+
+    parsed, generic_instantiations = _compile(source, tab_size=tab_size, strict=strict, enable_extensions=not no_userspace, no_gc=no_gc)
 
     if mode == 'ast':
         print(pretty_ast(parsed))
@@ -653,9 +680,9 @@ def _main():
     if mode == 'scorpion':
         prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=True, target_triple='riscv32-unknown-elf')
     elif mode == 'aot':
-        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, use_native_eh=True)
+        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=no_gc, use_native_eh=True)
     else:
-        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace)
+        prog, src_files = _emit(parsed, generic_instantiations=generic_instantiations, no_userspace=no_userspace, enable_extensions=not no_userspace, no_gc=no_gc)
 
     if mode == 'emit-llvm':
         print(prog)

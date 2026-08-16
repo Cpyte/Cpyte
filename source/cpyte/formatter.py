@@ -298,7 +298,11 @@ class _Formatter:
         self._emit_simple(node, text, level)
 
     def _emit_print(self, node, level: int):
-        self._emit_simple(node, f'print({self._expr(node.value)})', level)
+        args = node.value
+        if not isinstance(args, list):
+            args = [args]
+        text = f'print({", ".join(self._expr(a) for a in args)})'
+        self._emit_simple(node, text, level)
 
     def _emit_break(self, node, level: int):
         self._emit_simple(node, 'break', level)

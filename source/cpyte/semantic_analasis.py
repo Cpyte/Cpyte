@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 def _get_multiarch():
     for cc in ('cc', 'gcc', 'clang'):
@@ -82,10 +83,10 @@ from .astparse import (
     VarDecl, Break, Continue, Switch, Import, While,
     NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
     InputStr, InputBig, Signed67, Try, Raise, ExceptHandler, InlineAsm,
-    EnumDef, TypeAlias, ClassDef,
+    EnumDef, TypeAlias, ClassDef, ListLit, CCode, Llvm,
     parse_file, ParseError,
 )
-from .clib import resolve_library, parse_header_file, parse_c_source, _framework_name_from_path
+from .clib import resolve_library, parse_header_file, parse_c_source, parse_llvm_ir_text, _framework_name_from_path
 from .package_manifest import (
     ManifestParser, ManifestValidator, PackageManifest, 
     get_global_registry, reset_global_registry, iter_cpm_version_dirs
@@ -169,7 +170,7 @@ class Reporter:
 
 
 class Symbol:
-    __slots__ = ('kind', 'type', 'node', 'const_value', 'initialized')
+    __slots__ = ('kind', 'type', 'node', 'const_value', 'initialized', 'dynamic')
 
     def __init__(self, kind: str, type_: str | None = None, node=None,
                  initialized: bool = True):
@@ -178,6 +179,7 @@ class Symbol:
         self.node = node
         self.const_value = None
         self.initialized = bool(initialized)
+        self.dynamic = False
 
 
 class Scope:
@@ -240,7 +242,8 @@ _ANALYZE_DEPTH_LIMIT = 120
 
 class SemanticAnalyzer:
     def __init__(self, source: str, filepath: str | None = None,
-                 workspace_root: str | None = None, strict: bool = False, enable_extensions: bool = True):
+                 workspace_root: str | None = None, strict: bool = False, enable_extensions: bool = True,
+                 no_gc: bool = False):
         self.reporter = Reporter(source)
         self.globals = Scope()
         self.current_func: FuncDef | None = None
@@ -254,6 +257,9 @@ class SemanticAnalyzer:
         self._enum_context_name: str | None = None
         self.strict = strict
         self.enable_extensions = enable_extensions
+        self.no_gc = no_gc
+        if no_gc:
+            self.globals.define('free', Symbol('builtin_func', 'void', None, initialized=True))
         self._loaded_packages: set[str] = set()
         self._manifest_registry = get_global_registry()
         self._hook_registry = get_global_hook_registry()
@@ -263,6 +269,7 @@ class SemanticAnalyzer:
         self._lazy_imports: list[dict] = []
         self._lazy_header_cache: dict[tuple, tuple] = {}
         self._lazy_load_error: str | None = None
+        self._promoted_vars: set[str] = set()
     
     def _load_package_manifest(self, package_dir: str, package_name: str) -> bool:
         """
@@ -368,6 +375,7 @@ class SemanticAnalyzer:
     _INT_TYPES = ('int', 'int64', 'uint64', 'char')
     _FLOAT_TYPES = ('float', 'double')
     _WIDE_INT_TYPES = ('int64', 'uint64')
+    _CONV_BUILTINS = {'str': 'str', 'int': 'int', 'float': 'float', 'double': 'float'}
 
     def _numeric_promote(self, t1: str | None, t2: str | None) -> str | None:
         """C-like usual arithmetic conversions for numeric types.
@@ -397,9 +405,78 @@ class SemanticAnalyzer:
     def analyze(self, nodes: list) -> bool:
         for node in nodes:
             self._visit(node)
+        if self._promoted_vars:
+            self._stamp_dynamic(nodes)
         if self.reporter.has_errors():
             return False
         return True
+
+    def _stamp_dynamic(self, nodes: list) -> None:
+        """Mark every AST node referencing a promoted variable as dynamic.
+
+        A variable may be promoted to ``dynamic`` (its type changes across
+        assignments) after some read/write sites have already been analyzed.
+        Code generation needs the *final* dynamic status at every site, so we
+        walk the whole AST once analysis is complete and stamp the nodes.
+        """
+        visited: set[int] = set()
+        stack: list = list(nodes)
+        while stack:
+            item = stack.pop()
+            if id(item) in visited:
+                continue
+            visited.add(id(item))
+            if isinstance(item, Variable):
+                if item.name in self._promoted_vars:
+                    item.dynamic = True
+                continue
+            if isinstance(item, VarDecl):
+                if item.name in self._promoted_vars:
+                    item.dynamic = True
+                if item.init is not None:
+                    stack.append(item.init)
+                continue
+            if isinstance(item, Assign):
+                target = item.target
+                if isinstance(target, Variable):
+                    if target.name in self._promoted_vars:
+                        item.dynamic = True
+                        target.dynamic = True
+                    stack.append(target)
+                elif isinstance(target, str) and target in self._promoted_vars:
+                    item.dynamic = True
+                else:
+                    stack.append(target)
+                stack.append(item.value)
+                continue
+            if isinstance(item, (list, tuple)):
+                for child in item:
+                    stack.append(child)
+                continue
+            if isinstance(item, dict):
+                for child in item.values():
+                    stack.append(child)
+                continue
+            slots = getattr(type(item), '__slots__', ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot.startswith('_'):
+                    continue
+                try:
+                    child = getattr(item, slot)
+                except AttributeError:
+                    continue
+                if child is None:
+                    continue
+                if isinstance(child, (list, tuple)):
+                    for c in child:
+                        stack.append(c)
+                elif isinstance(child, dict):
+                    for c in child.values():
+                        stack.append(c)
+                else:
+                    stack.append(child)
 
     def _infer_type(self, node):
         key = id(node)
@@ -501,6 +578,7 @@ class SemanticAnalyzer:
                          'unspecified value; assign one before reading it'
                 )
                 return None
+            node.dynamic = sym.dynamic
             node.inferred_type = sym.type
             return sym.type
 
@@ -521,6 +599,12 @@ class SemanticAnalyzer:
                 return 'bool'
 
             right_t = self._infer_type(node.right)
+
+            if left_t == 'dynamic' or right_t == 'dynamic':
+                # One side is runtime-typed: defer the whole operation to the
+                # runtime dispatcher (`dyn_op`), which inspects kinds at run time.
+                node.inferred_type = 'dynamic'
+                return 'dynamic'
 
             if node.op.name in ('EQ_EQ', 'NOT_EQ', 'LESS', 'GREATER', 'LESS_EQ', 'GREATER_EQ'):
                 if left_t is not None and right_t is not None and left_t != right_t:
@@ -647,6 +731,9 @@ class SemanticAnalyzer:
 
         if isinstance(node, UnaryOp):
             operand_t = self._infer_type(node.operand)
+            if operand_t == 'dynamic':
+                node.inferred_type = 'dynamic'
+                return 'dynamic'
             if node.op.name == 'NOT':
                 node.inferred_type = 'int'
                 return 'int'
@@ -677,11 +764,43 @@ class SemanticAnalyzer:
             return operand_t
 
         if isinstance(node, Call):
+            if isinstance(node.callee, Variable):
+                if node.callee.name in self._CONV_BUILTINS:
+                    for arg in node.args:
+                        self._infer_type(arg)
+                    if len(node.args) != 1:
+                        self.error(
+                            f'{node.callee.name}() expects exactly 1 argument',
+                            node,
+                            note=f'got {len(node.args)}'
+                        )
+                        return None
+                    target = self._CONV_BUILTINS[node.callee.name]
+                    node.inferred_type = target
+                    return target
+                if node.callee.name == 'range':
+                    # Python-style builtin: range(stop) / range(start, stop) /
+                    # range(start, stop, step) producing an int64 array.
+                    # A user-defined `def range(...)` shadows the builtin.
+                    user_sym = self.current_scope.lookup('range')
+                    if user_sym is None or user_sym.kind != 'function':
+                        for arg in node.args:
+                            self._infer_type(arg)
+                        if not 1 <= len(node.args) <= 3:
+                            self.error(
+                                'range() expects 1 to 3 arguments',
+                                node,
+                                note=f'got {len(node.args)}'
+                            )
+                            return None
+                        node.inferred_type = 'int64[]'
+                        return 'int64[]'
             sym = self._resolve_callee(node.callee)
             if sym is not None:
                 for arg in node.args:
                     self._infer_type(arg)
                 self._check_call_args(node, sym)
+                node.inferred_type = sym.type
                 return sym.type
             return None
 
@@ -697,14 +816,26 @@ class SemanticAnalyzer:
         if isinstance(node, Signed67):
             return 'str'
 
+        if isinstance(node, ListLit):
+            for item in node.items:
+                self._infer_type(item)
+            node.inferred_type = 'dynamic[]'
+            return 'dynamic[]'
+
         if isinstance(node, Index):
             obj_t = self._infer_type(node.obj)
             self._infer_type(node.index)
+            if obj_t == 'dynamic':
+                node.inferred_type = 'dynamic'
+                return 'dynamic'
             if obj_t and obj_t.endswith('[]'):
+                node.inferred_type = obj_t[:-2]
                 return obj_t[:-2]
             if obj_t == 'str':
+                node.inferred_type = 'char'
                 return 'char'
             if obj_t and obj_t.endswith('*'):
+                node.inferred_type = obj_t[:-1]
                 return obj_t[:-1]
             if obj_t is not None:
                 self.error(
@@ -865,9 +996,11 @@ class SemanticAnalyzer:
 
     def _check_call_args(self, call: Call, sym: Symbol):
         expected_count = 0
+        if sym.kind == 'builtin_func':
+            return
         if sym.node and isinstance(sym.node, FuncDef):
             expected_count = len(sym.node.params)
-        elif sym.node and isinstance(sym.node, Import):
+        elif sym.node and isinstance(sym.node, (Import, CCode, Llvm)):
             for fname, (_, params, vararg) in sym.node.symbols:
                 if fname == call.callee.name:
                     expected_count = len(params)
@@ -945,6 +1078,10 @@ class SemanticAnalyzer:
                 self._infer_type(var_expr)
             for _, arg_expr in node.inputs:
                 self._infer_type(arg_expr)
+        elif isinstance(node, CCode):
+            self._visit_ccode(node)
+        elif isinstance(node, Llvm):
+            self._visit_llvm(node)
         elif isinstance(node, Input):
             pass
         elif isinstance(node, InputStr):
@@ -1092,6 +1229,61 @@ class SemanticAnalyzer:
                 sym = Symbol('variable', 'int', node)
                 sym.const_value = val
                 s.define(name, sym)
+
+    def _visit_ccode(self, node):
+        """Register functions defined by an embedded `ccode:` block.
+
+        The C body is scanned the same way `import "file.c"` scans its source
+        (via clib.parse_c_source) so every non-static, non-`main` function is
+        callable from cpyte and its signature is known for arg checks. The
+        emitted symbols are cached on the node for the bytecoder to declare.
+        """
+        if getattr(node, 'symbols', None) is not None:
+            return
+        if not node.value:
+            node.symbols = []
+            node.var_names = set()
+            return
+        fd, path = tempfile.mkstemp(suffix='.c', prefix='ccode_sem_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(node.value)
+            result = parse_c_source(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if not result:
+            node.symbols = []
+            node.var_names = set()
+            return
+        node.symbols = list(result[0].items())
+        node.var_names = set()
+        self._register_import_symbols(result[0], node)
+
+    def _visit_llvm(self, node):
+        """Register functions defined by an embedded `llvm:` block.
+
+        Safe `llvm:` blocks are scanned for their `define`d function
+        signatures so calls from cpyte are type-checked like any other call.
+        `unsafe llvm:` blocks are literal copy-paste: no signatures are
+        registered, so their functions are not directly callable from cpyte.
+        """
+        if getattr(node, 'symbols', None) is not None:
+            return
+        if node.unsafe or not node.value:
+            node.symbols = []
+            node.var_names = set()
+            return
+        result = parse_llvm_ir_text(node.value)
+        if not result:
+            node.symbols = []
+            node.var_names = set()
+            return
+        node.symbols = list(result[0].items())
+        node.var_names = set()
+        self._register_import_symbols(result[0], node)
 
     def _lazy_resolve(self, name):
         """Resolve `name` from a lazily-imported header on first use.
@@ -1359,7 +1551,10 @@ class SemanticAnalyzer:
                 # caller's value stays fully modifiable outside.
                 self.locals.define(param_name, Symbol('const_view', param_type or None, node))
             else:
-                self.locals.define(param_name, Symbol('variable', param_type or None, node))
+                psym = Symbol('variable', param_type or None, node)
+                if param_type == 'dynamic':
+                    psym.dynamic = True
+                self.locals.define(param_name, psym)
 
         for stmt in node.body:
             self._visit(stmt, self.locals)
@@ -1386,7 +1581,7 @@ class SemanticAnalyzer:
             val_type = self._infer_type(node.value)
             if self.current_func:
                 expected = self.current_func.rettype
-                if expected and val_type and expected != val_type:
+                if expected and val_type and expected != val_type and expected != 'dynamic' and val_type != 'dynamic':
                     valid_conversions = [
                         ('int', 'int64'), ('int', 'uint64'),
                         ('int64', 'int'), ('uint64', 'int'),
@@ -1433,6 +1628,18 @@ class SemanticAnalyzer:
                 self.error(f'cannot assign to constant-view parameter `{name}`', node,
                            note='constant-view parameters are read-only inside the function; '
                                 'copy to a local variable to modify the value')
+            elif existing.type == 'dynamic':
+                # Dynamically-typed variable: accepts values of any type.
+                existing.dynamic = True
+                existing.initialized = True
+                node.dynamic = True
+                if isinstance(node.target, Variable):
+                    node.target.dynamic = True
+            elif val_type == 'dynamic':
+                # Assigning a dynamically-typed value into a concrete variable:
+                # the runtime kind is checked/coerced at run time.
+                if existing.kind == 'variable':
+                    existing.initialized = True
             elif val_type is not None and existing.type is not None and val_type != existing.type:
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64
@@ -1470,10 +1677,22 @@ class SemanticAnalyzer:
                         note='use 0 literal for null pointer'
                     )
                 if not ok:
-                    self.error(
-                        f'cannot assign `{val_type}` to variable `{name}` of type `{existing.type}`',
-                        node
-                    )
+                    if (existing.kind == 'variable'
+                            and existing.node is not None
+                            and isinstance(existing.node, (VarDecl, Assign))):
+                        # Promote the variable to dynamic: once a variable holds
+                        # a value of a different type it becomes a runtime-typed
+                        # (dynamic) variable. Subsequent assignments of any type
+                        # are then allowed.
+                        existing.dynamic = True
+                        existing.initialized = True
+                        self._promoted_vars.add(name)
+                        existing.node.dynamic = True
+                    else:
+                        self.error(
+                            f'cannot assign `{val_type}` to variable `{name}` of type `{existing.type}`',
+                            node
+                        )
             elif existing.kind == 'variable':
                 existing.initialized = True
         elif isinstance(node.target, Attr):
@@ -1519,16 +1738,21 @@ class SemanticAnalyzer:
             self._check_generic_type(val_type)
         s = scope or self.current_scope
         existing = s.lookup_local(node.name)
-        if existing:
+        if existing and existing.kind not in ('variable', 'const'):
             self.error(f'redeclaration of `{node.name}`', node,
-                       note=f'variable already exists in this scope')
-            return
+                       note=f'another symbol with this name already exists in this scope')
         if node.is_const and node.init is None:
             self.error(f'constant `{node.name}` requires an initializer', node,
                        note=f'declare it as `{node.var_type} ({node.name}) = <value>`')
         if node.init is not None:
             init_type = self._infer_type(node.init)
-            if init_type is not None and val_type is not None and init_type != val_type:
+            if val_type == 'dynamic':
+                # Dynamically-typed variable: accepts any initializer type.
+                node.dynamic = True
+            elif init_type == 'dynamic':
+                # Dynamically-typed initializer coerced to the declared type at run time.
+                pass
+            elif init_type is not None and val_type is not None and init_type != val_type:
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64
                 # Allow int literal 0 as null for any pointer type
@@ -1571,8 +1795,11 @@ class SemanticAnalyzer:
                     )
         kind = 'const' if node.is_const else 'variable'
         is_global = s is self.globals
-        s.define(node.name, Symbol(kind, val_type, node,
-                                   initialized=(node.init is not None or is_global)))
+        sym = Symbol(kind, val_type, node,
+                     initialized=(node.init is not None or is_global))
+        if val_type == 'dynamic':
+            sym.dynamic = True
+        s.define(node.name, sym)
 
     def _visit_break(self, node: Break):
         if self._loop_depth == 0:
@@ -1583,15 +1810,23 @@ class SemanticAnalyzer:
             self.error('continue outside loop', node)
 
     def _visit_switch(self, node: Switch, scope: Scope | None = None):
-        self._infer_type(node.value)
+        val_t = self._infer_type(node.value)
         for val, body in node.cases:
             if val is not None:
-                self._infer_type(val)
+                case_t = self._infer_type(val)
+                if val_t == 'str' and case_t != 'str':
+                    self.error(
+                        f'case value must be a string when switching on a string',
+                        val,
+                        note='string switch cases are shell-style glob patterns '
+                             '(e.g. `a-*` matches any string starting with "a-")'
+                    )
             for stmt in body:
                 self._visit(stmt, scope)
 
     def _visit_print(self, node: Print):
-        self._infer_type(node.value)
+        for expr in node.value:
+            self._infer_type(expr)
 
     def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals
@@ -1844,10 +2079,34 @@ class SemanticAnalyzer:
     def _visit_for(self, node: dict, scope: Scope | None = None):
         s = scope or self.current_scope
         loop_scope = Scope(s)
-        loop_scope.define(node['var'], Symbol('variable', 'char', node))
         iterable = node.get('iter')
-        if iterable is not None:
-            self._infer_type(iterable)
+        iter_t = self._infer_type(iterable) if iterable is not None else None
+        if iter_t is not None and iter_t.endswith('[]'):
+            var_t = iter_t[:-2]
+            if var_t == 'void':
+                self.error('cannot iterate a void array', node,
+                           note='array element type `void` has no values')
+                var_t = 'char'
+        elif iter_t == 'dynamic':
+            # Runtime-typed iterable: assume a dynamic list at run time.
+            var_t = 'dynamic'
+        elif iter_t == 'str':
+            var_t = 'char'
+        elif iter_t is not None:
+            self.error(
+                f'cannot iterate value of type `{iter_t}`',
+                iterable,
+                note='for loops require a string or an array type (`T[]`)'
+            )
+            var_t = 'char'
+        else:
+            var_t = 'char'
+        node['iter_type'] = iter_t or 'str'
+        node['var_type'] = var_t
+        loop_sym = Symbol('variable', var_t, node)
+        if var_t == 'dynamic':
+            loop_sym.dynamic = True
+        loop_scope.define(node['var'], loop_sym)
         old_locals = self.locals
         self.locals = loop_scope
         self._loop_depth += 1
@@ -1865,8 +2124,8 @@ class SemanticAnalyzer:
         return type_name
 
 
-def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True):
-    analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root, enable_extensions=enable_extensions)
+def analyze(source: str, nodes: list, strict: bool = False, workspace_root: str | None = None, enable_extensions: bool = True, no_gc: bool = False):
+    analyzer = SemanticAnalyzer(source, strict=strict, workspace_root=workspace_root, enable_extensions=enable_extensions, no_gc=no_gc)
     # Pre-load CPM package manifests before analysis
     if enable_extensions:
         analyzer._load_cpm_package_manifests()

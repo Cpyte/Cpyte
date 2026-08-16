@@ -11,7 +11,6 @@ piped output stays clean. Standard conventions are honoured:
 import os
 import sys
 import traceback
-
 _RESET = '\x1b[0m'
 
 _CODES = {

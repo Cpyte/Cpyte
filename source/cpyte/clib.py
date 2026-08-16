@@ -797,3 +797,114 @@ _C_SRC_RE = re.compile(
     r'([\w\s\*]+?)\s+'
     r'(\w+)\s*\(([^)]*)\)\s*(?:\[[^\]]*\])?\s*\{'
 )
+
+_LLVM_DEF_RE = re.compile(r'define\s+(.*?)\s@(\w+)\s*\(([^)]*)\)')
+
+_LLVM_RET_PREFIX_KEYWORDS = frozenset({
+    'dso_local', 'dso_preemptable', 'external', 'private', 'internal',
+    'available_externally', 'linkonce', 'linkonce_odr', 'weak', 'weak_odr',
+    'common', 'appending', 'extern_weak', 'global', 'hidden', 'protected',
+    'default', 'dllimport', 'dllexport', 'thread_local', 'local_unnamed_addr',
+    'unnamed_addr', 'nocomdat', 'preemptable',
+})
+
+
+def parse_llvm_ir_text(text):
+    """Extract function signatures from raw LLVM IR text.
+
+    Mirrors parse_c_source: returns (symbols, 'llvm') where symbols maps each
+    `define`d function name to (ret_type, [(pname, ptype), ...], vararg). Only
+    defined (not merely declared) functions are registered, and signatures
+    whose types have no cpyte equivalent are skipped.
+    """
+    symbols = {}
+    for m in _LLVM_DEF_RE.finditer(text):
+        ret_tokens = m.group(1).strip().split()
+        while ret_tokens and ret_tokens[0] in _LLVM_RET_PREFIX_KEYWORDS:
+            ret_tokens.pop(0)
+        raw_ret = ' '.join(ret_tokens)
+        fname = m.group(2).strip()
+        raw_params = m.group(3).strip()
+
+        ret_type = _ir_type_to_lang(raw_ret)
+        if ret_type is None:
+            continue
+
+        params = []
+        vararg = False
+        ok = True
+        if raw_params and raw_params != '...':
+            for p in _split_ir_params(raw_params):
+                p = p.strip()
+                if p == '...':
+                    vararg = True
+                    continue
+                ptype = _ir_param_type_to_lang(p)
+                if ptype is None:
+                    ok = False
+                    break
+                params.append((f'p{len(params)}', ptype))
+        if not ok:
+            continue
+        symbols[fname] = (ret_type, params, vararg)
+    return symbols, 'llvm'
+
+
+def _split_ir_params(raw):
+    parts = []
+    depth = 0
+    cur = []
+    for ch in raw:
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur or raw:
+        parts.append(''.join(cur))
+    return parts
+
+
+def _ir_param_type_to_lang(param):
+    parts = param.split()
+    idx = None
+    for i, t in enumerate(parts):
+        if t.startswith('%'):
+            idx = i
+            break
+    if idx is None:
+        raw = param
+    else:
+        raw = ' '.join(parts[:idx])
+    return _ir_type_to_lang(raw)
+
+
+def _ir_type_to_lang(t):
+    t = t.strip()
+    if t == 'void':
+        return 'void'
+    if t == 'i1':
+        return 'bool'
+    if t == 'i8':
+        return 'char'
+    if t == 'i32':
+        return 'int'
+    if t == 'i64':
+        return 'int64'
+    if t == 'double':
+        return 'float'
+    if t == 'i8*':
+        return 'str'
+    if t == 'ptr':
+        return 'void*'
+    if t == 'i64*':
+        return 'int64*'
+    if t == 'i32*':
+        return 'int*'
+    if t == 'float':
+        return None
+    return None

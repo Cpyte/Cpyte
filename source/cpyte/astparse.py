@@ -65,7 +65,7 @@ class FString:
         return f'FString({self.parts})'
 
 class Variable:
-    __slots__ = ('name', '_token', 'const_value', 'inferred_type')
+    __slots__ = ('name', '_token', 'const_value', 'inferred_type', 'dynamic')
     def __init__(self, name: str, token=None):
         self.name = name
         self._token = token
@@ -77,9 +77,18 @@ class Variable:
     def token(self):
         return self._token
 
+class ListLit:
+    __slots__ = ('items', '_token', 'inferred_type')
+    def __init__(self, items: list, token=None):
+        self.items = items
+        self._token = token
+        self.inferred_type = None
+    def __repr__(self):
+        return f'ListLit({self.items})'
+
 
 class Call:
-    __slots__ = ('callee', 'args', '_token')
+    __slots__ = ('callee', 'args', '_token', 'inferred_type')
     def __init__(self, callee, args: list, token=None):
         self.callee = callee
         self.args = args
@@ -88,11 +97,13 @@ class Call:
         return f'Call({self.callee}, {self.args})'
 
 class Index:
-    __slots__ = ('obj', 'index', '_token')
+    inferred_type: Optional[str]
+    __slots__ = ('obj', 'index', '_token', 'inferred_type')
     def __init__(self, obj, index, token=None):
         self.obj = obj
         self.index = index
         self._token = token
+        self.inferred_type = None
     def __repr__(self):
         return f'Index({self.obj}, {self.index})'
 
@@ -129,6 +140,43 @@ class BinOp:
     def __repr__(self):
         return f'BinOp({self.left}, {self.op.name}, {self.right})'
 
+class CCode:
+    inferred_type: Optional[str]
+    __slots__ = ('value','_token', 'inferred_type', 'symbols', 'var_names')
+    def __init__(self, value : str, token=None):
+        self.value = value
+        self._token = token
+        self.inferred_type = None
+        self.symbols = None
+        self.var_names = None
+    def __repr__(self):
+        return f'CCode({self.value!r})'
+
+class LLVMblock:
+    inferred_type: Optional[str]
+    __slots__ = ('value', "is_unsafe", '_token', 'inferred_type')
+
+    def __init__(self, value: str, is_unsafe : bool, token=None):
+        self.value = value
+        self._token = token
+        self.is_unsafe = is_unsafe
+        self.inferred_type = None
+
+    def __repr__(self):
+        return f'CCode({self.value!r})'
+
+class Llvm:
+    inferred_type: Optional[str]
+    __slots__ = ('value', 'unsafe', '_token', 'inferred_type', 'symbols', 'var_names')
+    def __init__(self, value: str, unsafe: bool = False, token=None):
+        self.value = value
+        self.unsafe = unsafe
+        self._token = token
+        self.inferred_type = None
+        self.symbols = None
+        self.var_names = None
+    def __repr__(self):
+        return f'Llvm({self.value!r}, unsafe={self.unsafe})'
 
 _PREC = {
     TokenType.POW: 80,
@@ -348,7 +396,33 @@ def _parse_atom(tokens: list[Token], pos: int):
             raise ParseError('Expected closing parenthesis', tok)
         return node, pos + 1
 
+    if tok.type == TokenType.LBRACKET:
+        return _parse_list_literal(tokens, pos, tok)
+
     raise ParseError(f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok)
+
+
+def _parse_list_literal(tokens, pos, tok):
+    """Parse a `[item, item, ...]` literal starting at the opening bracket."""
+    pos += 1
+    items = []
+    if pos < len(tokens) and tokens[pos].type != TokenType.RBRACKET:
+        while True:
+            item, pos = parse_expression(tokens, pos)
+            items.append(item)
+            if pos >= len(tokens):
+                raise ParseError('Unterminated list literal', tok)
+            if tokens[pos].type == TokenType.COMMA:
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.RBRACKET:
+                    break
+                continue
+            if tokens[pos].type == TokenType.RBRACKET:
+                break
+            raise ParseError('Expected "," or "]" in list literal', tokens[pos])
+    if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
+        raise ParseError('Expected "]"', tok)
+    return ListLit(items, token=tok), pos + 1
 
 
 def _split_fstring(content: str) -> list:
@@ -590,6 +664,11 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                 type_str = _type_to_str(type_expr) if isinstance(type_expr, tuple) else type_expr
                 vals.append(SizeOf(type_str, token=tok))
                 continue
+            if tok.type == TokenType.LBRACKET:
+                node, pos = _parse_list_literal(tokens, pos, tok)
+                vals.append(node)
+                continue
+
             if tok.type == TokenType.LPAREN:
                 pos += 1
                 frames.append(('paren_rparen', tok))
@@ -749,6 +828,14 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
         node, pos = parse_break(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == 'continue':
         node, pos = parse_continue(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'asm':
+        node, pos = parse_inline_asm(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'ccode':
+        node, pos = parse_ccode(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'llvm':
+        node, pos = parse_llvm(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'unsafe':
+        node, pos = parse_llvm(tokens, pos, unsafe=True)
     elif tok.type == TokenType.KEYWORD and tok.value == 'switch':
         node, pos = parse_switch(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == 'try':
@@ -1065,7 +1152,7 @@ def parse_import(tokens: list[Token], pos: int):
 
 
 class Assign:
-    __slots__ = ('target', 'value', '_token')
+    __slots__ = ('target', 'value', '_token', 'dynamic')
     def __init__(self, target, value, token=None):
         self.target = target
         self.value = value
@@ -1163,7 +1250,7 @@ class ExprStmt:
         return f'ExprStmt({self.expr})'
 
 class VarDecl:
-    __slots__ = ('name', 'var_type', 'init', 'is_const', '_token')
+    __slots__ = ('name', 'var_type', 'init', 'is_const', '_token', 'dynamic')
     def __init__(self, name: str, var_type: str | None = None, init=None, is_const: bool = False, token=None):
         self.name = name
         self.var_type = var_type
@@ -1310,6 +1397,73 @@ class ClassDef:
         return f'ClassDef({self.name}, base={self.base}, fields={self.fields}, methods={self.methods})'
 
 
+def parse_ccode(tokens: list[Token], pos: int):
+    """Parse a `ccode:` block holding raw C source.
+
+    The lexer captures the indented C text as a single STRING token, so the
+    grammar here is simply: ccode COLON NEWLINE INDENT STRING NEWLINE DEDENT.
+    """
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+        raise ParseError('Expected ":" after ccode', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
+        raise ParseError('Expected a newline after "ccode:"', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
+        raise ParseError('Expected an indented C block after "ccode:"',
+                         tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+        raise ParseError('Expected C source in ccode block', tokens[pos] if pos < len(tokens) else tok)
+    value = tokens[pos].value
+    pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+        pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
+        pos += 1
+    return CCode(value or '', token=tok), pos
+
+
+def parse_llvm(tokens: list[Token], pos: int, unsafe: bool = False):
+    """Parse an `llvm:` or `unsafe llvm:` block holding raw LLVM IR.
+
+    Grammar: [unsafe] llvm COLON NEWLINE INDENT STRING NEWLINE DEDENT.
+    The block body is captured by the lexer as a single STRING token.
+    """
+    tok = tokens[pos]
+    if unsafe:
+        if tok.type != TokenType.KEYWORD or tok.value != 'unsafe':
+            raise ParseError('Expected "unsafe"', tokens[pos] if pos < len(tokens) else tok)
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.KEYWORD or tokens[pos].value != 'llvm':
+            raise ParseError('Expected "llvm" after unsafe', tokens[pos] if pos < len(tokens) else tok)
+    else:
+        if tok.type != TokenType.KEYWORD or tok.value != 'llvm':
+            raise ParseError('Expected "llvm"', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+        raise ParseError('Expected ":" after llvm', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
+        raise ParseError('Expected a newline after "llvm:"', tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
+        raise ParseError('Expected an indented LLVM IR block after "llvm:"',
+                         tokens[pos] if pos < len(tokens) else tok)
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
+        raise ParseError('Expected LLVM IR in llvm block', tokens[pos] if pos < len(tokens) else tok)
+    value = tokens[pos].value
+    pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+        pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
+        pos += 1
+    return Llvm(value or '', unsafe=unsafe, token=tok), pos
+
+
 def parse_inline_asm(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
@@ -1415,7 +1569,7 @@ def parse_suite(tokens: list[Token], pos: int):
     return body, pos
 
 
-_TYPE_NAMES = {'int', 'int64', 'uint64', 'float', 'double', 'bool', 'str', 'char', 'void', 'auto', 'string', 'unsigned', 'long', 'short', 'signed', 'size_t'}
+_TYPE_NAMES = {'int', 'int64', 'uint64', 'float', 'double', 'bool', 'str', 'char', 'void', 'auto', 'string', 'unsigned', 'long', 'short', 'signed', 'size_t', 'dynamic'}
 
 
 def _looks_like_type(tokens, pos):
@@ -1585,6 +1739,15 @@ def parse_statement(tokens: list[Token], pos: int):
     if tok.type == TokenType.KEYWORD and tok.value == 'asm':
         return parse_inline_asm(tokens, pos)
 
+    if tok.type == TokenType.KEYWORD and tok.value == 'ccode':
+        return parse_ccode(tokens, pos)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'llvm':
+        return parse_llvm(tokens, pos)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'unsafe':
+        return parse_llvm(tokens, pos, unsafe=True)
+
     if tok.type == TokenType.IDENTIFIER:
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
             try:
@@ -1614,9 +1777,28 @@ def parse_return(tokens: list[Token], pos: int):
 def parse_print(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
-    value, pos = parse_expression(tokens, pos)
+    values = []
+    if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+        pos += 1
+        if pos < len(tokens) and tokens[pos].type != TokenType.RPAREN:
+            while True:
+                expr, pos = parse_expression(tokens, pos)
+                values.append(expr)
+                if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                    pos += 1
+                    continue
+                break
+        if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+            raise ParseError(
+                'Expected ")" after print arguments',
+                tokens[pos] if pos < len(tokens) else None
+            )
+        pos += 1
+    else:
+        expr, pos = parse_expression(tokens, pos)
+        values.append(expr)
     _expect_newline(tokens, pos, tok)
-    return Print(value, token=tok), pos
+    return Print(values, token=tok), pos
 
 
 def parse_if(tokens: list[Token], pos: int):

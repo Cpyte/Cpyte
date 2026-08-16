@@ -2,7 +2,7 @@ import hmac
 import hashlib
 from typing import Any, Protocol
 
-from llvmlite import ir
+from llvmlite import ir, binding
 from llvmlite.ir import instructions
 
 from .lexar import Token, TokenType
@@ -22,6 +22,43 @@ _i1 = ir.IntType(1)
 _double = ir.DoubleType()
 _void = ir.VoidType()
 _i8ptr = ir.PointerType(_i8)
+
+# Runtime kinds for dynamic variables (mirrors runtime.c)
+_DYN_NONE = 0
+_DYN_INT = 1
+_DYN_INT64 = 2
+_DYN_UINT64 = 3
+_DYN_CHAR = 4
+_DYN_BOOL = 5
+_DYN_DOUBLE = 6
+_DYN_STR = 7
+_DYN_BIG = 8
+_DYN_PTR = 9
+_DYN_LIST = 10
+
+# Runtime slot-value layout for dynamic dispatch (mirrors runtime.c DynValue)
+_DynValue = ir.LiteralStructType([_i32, _i64])
+_DynValuePtr = ir.PointerType(_DynValue)
+
+# Runtime dispatch opcodes (mirrors runtime.c DYNOP_*)
+_DYNOP_ADD = 0
+_DYNOP_SUB = 1
+_DYNOP_MUL = 2
+_DYNOP_DIV = 3
+_DYNOP_MOD = 4
+_DYNOP_EQ = 5
+_DYNOP_NE = 6
+_DYNOP_LT = 7
+_DYNOP_LE = 8
+_DYNOP_GT = 9
+_DYNOP_GE = 10
+_DYNOP_NEG = 11
+_DYNOP_NOT = 12
+_DYNOP_BAND = 13
+_DYNOP_BOR = 14
+_DYNOP_BXOR = 15
+_DYNOP_SHL = 16
+_DYNOP_SHR = 17
 
 # Registry-based visitor: node type -> emit handler
 _EMIT_REGISTRY = {}
@@ -111,6 +148,9 @@ class LLVM:
             return ir.PointerType(ir.IntType(8))
         if t == 'big':
             return ir.PointerType(ir.IntType(8))
+        if t == 'dynamic':
+            # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
+            return _DynValue
         if t.endswith('[]'):
             base = self.llvm_type(t[:-2])
             return ir.PointerType(base)
@@ -426,6 +466,42 @@ class LLVM:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
 
+        # Dynamic variable runtime (name-keyed tagged values)
+        dyn_fns = [
+            ('assign', _void, [_i8ptr, _i32, _i64]),
+            ('dyn_as', _i64, [_i8ptr, _i32]),
+            ('dyn_truthy', _i32, [_i8ptr]),
+            ('dyn_print', _void, [_i8ptr]),
+            ('dyn_str', _i8ptr, [_i8ptr]),
+            # Slot-indexed dynamic values + polymorphic dispatch
+            ('dyn_slot_ptr', _DynValuePtr, [_i32]),
+            ('dyn_set', _void, [_i32, _i32, _i64]),
+            ('dyn_kind', _i32, [_i32]),
+            ('dyn_get', _i64, [_i32, _i32]),
+            ('dyn_as_v', _i64, [_i32, _i64, _i32]),
+            ('dyn_truthy_v', _i32, [_i32, _i64]),
+            ('dyn_print_v', _void, [_i32, _i64]),
+            ('dyn_str_v', _i8ptr, [_i32, _i64]),
+            ('dyn_op', _void, [_DynValuePtr, _i32, _i32, _i64, _i32, _i64]),
+            ('dyn_op1', _void, [_DynValuePtr, _i32, _i32, _i64]),
+            ('dyn_list_get', _DynValuePtr, [_i64, _i64]),
+        ]
+        for name, ret, args in dyn_fns:
+            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+            self.functions[name] = fn
+
+        # Array length registry (side table for `new T[n]` iteration)
+        arr_fns = [
+            ('cpyte_array_register', _void, [_i8ptr, _i64]),
+            ('cpyte_array_len', _i64, [_i8ptr]),
+            ('cpyte_array_unregister', _void, [_i8ptr]),
+        ]
+        for name, ret, args in arr_fns:
+            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+            self.functions[name] = fn
+
+        self.dyn_types = {}
+
         # Concurrent tri-color GC runtime functions (ugc-based)
         if not self.no_gc:
             gc_fns = [
@@ -484,8 +560,17 @@ class LLVM:
                     break
         self.functions['strcmp'] = self._strcmp_fn
 
+        # Shell-style glob matching for string switch cases (always in runtime.c)
+        glob_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
+        self.functions['glob_match'] = ir.Function(self.module, glob_ty, "glob_match")
+
     @register_emitter(Switch)
     def emit_switch(self, node):
+        val_ty = getattr(node.value, 'inferred_type', None)
+        if val_ty == 'str':
+            return self._emit_switch_glob(node)
+        if not self.no_userspace and (val_ty == 'dynamic' or self._is_dynamic_expr(node.value)):
+            return self._emit_switch_dynamic(node)
         value = self.emit(node.value)
         if not isinstance(value.type, ir.IntType):
             value = self._is_true(value)
@@ -560,6 +645,105 @@ class LLVM:
             if not self._block_terminated():
                 self.builder.branch(end_blk)
 
+        self.builder.position_at_start(end_blk)
+
+    def _emit_switch_glob(self, node):
+        """String switch: each case value is a shell-style glob pattern."""
+        value = self.emit(node.value)
+        end_blk = self.builder.append_basic_block(name="sw_end")
+        default_bodies = []
+        for i, (case_val, body) in enumerate(node.cases):
+            if case_val is None:
+                default_bodies.append(body)
+                continue
+            pat = self.emit(case_val)
+            res = self.builder.call(self.functions['glob_match'], [pat, value])
+            is_match = self.builder.icmp_signed('!=', res, ir.Constant(_i32, 0))
+            case_blk = self.builder.append_basic_block(name="sw_case")
+            nxt_blk = self.builder.append_basic_block(name="sw_next")
+            self.builder.cbranch(is_match, case_blk, nxt_blk)
+            self.builder.position_at_start(case_blk)
+            self._push_scope()
+            for stmt in body:
+                self.emit(stmt)
+            self._pop_scope()
+            if not self._block_terminated():
+                self.builder.branch(end_blk)
+            self.builder.position_at_start(nxt_blk)
+        if default_bodies:
+            default_blk = self.builder.append_basic_block(name="sw_default")
+            self.builder.branch(default_blk)
+            self.builder.position_at_start(default_blk)
+            for body in default_bodies:
+                self._push_scope()
+                for stmt in body:
+                    self.emit(stmt)
+                self._pop_scope()
+                if not self._block_terminated():
+                    self.builder.branch(end_blk)
+        else:
+            self.builder.branch(end_blk)
+        self.builder.position_at_start(end_blk)
+
+    def _emit_switch_dynamic(self, node):
+        """Dynamic switch: string case patterns use glob matching, other case
+        values dispatch through the runtime equality operator."""
+        k, b = self._dyn_pair(node.value)
+        end_blk = self.builder.append_basic_block(name="sw_end")
+        default_bodies = []
+        for case_val, body in node.cases:
+            if case_val is None:
+                default_bodies.append(body)
+                continue
+            case_ty = getattr(case_val, 'inferred_type', None)
+            if case_ty == 'str':
+                pat = self.emit(case_val)
+                str_ptr = self.builder.inttoptr(b, _i8ptr)
+                is_str = self.builder.icmp_signed('==', k, ir.Constant(_i32, _DYN_STR))
+                safe_ptr = self.builder.select(is_str, str_ptr, self._string_const(''))
+                res = self.builder.call(self.functions['glob_match'], [pat, safe_ptr])
+                glob_hit = self.builder.icmp_signed('!=', res, ir.Constant(_i32, 0))
+                is_match = self.builder.and_(is_str, glob_hit)
+            else:
+                cv = self.emit(case_val)
+                if cv.type == _DynValue:
+                    ck = self.builder.extract_value(cv, 0)
+                    cb = self.builder.extract_value(cv, 1)
+                else:
+                    ck_i, cb_i = self._box_dyn(cv, case_ty or 'int')
+                    ck = ir.Constant(_i32, ck_i)
+                    cb = cb_i
+                out_ptr = self._alloca(_DynValue, name='dyn.swcase')
+                self.builder.call(
+                    self.functions['dyn_op'],
+                    [out_ptr, ir.Constant(_i32, _DYNOP_EQ), k, b, ck, cb])
+                out = self.builder.load(out_ptr)
+                out_bits = self.builder.extract_value(out, 1)
+                is_match = self.builder.trunc(out_bits, _i1)
+            case_blk = self.builder.append_basic_block(name="sw_case")
+            nxt_blk = self.builder.append_basic_block(name="sw_next")
+            self.builder.cbranch(is_match, case_blk, nxt_blk)
+            self.builder.position_at_start(case_blk)
+            self._push_scope()
+            for stmt in body:
+                self.emit(stmt)
+            self._pop_scope()
+            if not self._block_terminated():
+                self.builder.branch(end_blk)
+            self.builder.position_at_start(nxt_blk)
+        if default_bodies:
+            default_blk = self.builder.append_basic_block(name="sw_default")
+            self.builder.branch(default_blk)
+            self.builder.position_at_start(default_blk)
+            for body in default_bodies:
+                self._push_scope()
+                for stmt in body:
+                    self.emit(stmt)
+                self._pop_scope()
+                if not self._block_terminated():
+                    self.builder.branch(end_blk)
+        else:
+            self.builder.branch(end_blk)
         self.builder.position_at_start(end_blk)
 
     _JMP_BUF_SIZE = 200
@@ -812,6 +996,8 @@ class LLVM:
         for kind, payload in parts:
             if kind == 'lit':
                 strings.append(self._string_const(payload))
+            elif isinstance(payload, Variable) and getattr(payload, 'dynamic', False) and not self.no_userspace:
+                strings.append(self.builder.call(self.functions['dyn_str'], [self._dyn_name(payload.name)]))
             else:
                 val = self.emit(payload)
                 strings.append(self._stringify_value(payload, val))
@@ -822,6 +1008,12 @@ class LLVM:
 
     def _stringify_value(self, node, val):
         """Convert a runtime value into a heap string (i8*) for interpolation."""
+        if val.type == _DynValue and not self.no_userspace:
+            k = self.builder.extract_value(val, 0)
+            b = self.builder.extract_value(val, 1)
+            return self.builder.call(self.functions['dyn_str_v'], [k, b])
+        if isinstance(node, Variable) and getattr(node, 'dynamic', False) and not self.no_userspace:
+            return self.builder.call(self.functions['dyn_str'], [self._dyn_name(node.name)])
         if getattr(node, 'inferred_type', None) == 'str':
             return val
         if isinstance(node, Number) and (node.value.startswith('0x') or node.value.startswith('0X')):
@@ -892,6 +1084,92 @@ class LLVM:
             return node.op not in (TokenType.AND, TokenType.OR)
         return isinstance(node, self._EMIT_PURE_TYPES)
 
+    @register_emitter(CCode)
+    def emit_ccode(self, node : CCode):
+        """Link an embedded `ccode:` block as C and declare its functions.
+
+        The block's C body is written to a temp .c file appended to
+        `import_src_files` so both the JIT and AOT paths compile and link it
+        alongside the C runtime. Each function the semantic pass registered on
+        the node is declared as an extern LLVM function so cpyte call sites
+        resolve to it.
+        """
+        import tempfile
+        import os
+        if getattr(self, '_ccode_emitted', None) is None:
+            self._ccode_emitted = set()
+        key = id(node)
+        if key in self._ccode_emitted:
+            return None
+        self._ccode_emitted.add(key)
+        symbols = getattr(node, 'symbols', None)
+        if symbols:
+            var_names = getattr(node, 'var_names', set()) or set()
+            for fname, (ret_type, params, vararg) in symbols:
+                if fname in self.functions or fname in self.global_vars:
+                    continue
+                if fname in var_names:
+                    var_ty = self.llvm_type(ret_type)
+                    if isinstance(var_ty, ir.VoidType):
+                        continue
+                    gv = ir.GlobalVariable(self.module, var_ty, name=fname)
+                    gv.linkage = 'extern_weak'
+                    self.global_vars[fname] = gv
+                else:
+                    ret_ty = self.llvm_type(ret_type)
+                    if isinstance(ret_ty, ir.VoidType) and not params and not vararg:
+                        param_tys = []
+                    else:
+                        param_tys = [self.llvm_type(t) for _, t in params]
+                    fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
+                    func = ir.Function(self.module, fnty, name=fname)
+                    self.functions[fname] = func
+        if node.value:
+            fd, tmp_path = tempfile.mkstemp(suffix='.c', prefix='ccode_')
+            with os.fdopen(fd, 'w') as f:
+                f.write(node.value)
+            self.import_src_files.append(tmp_path)
+        return None
+
+    @register_emitter(Llvm)
+    def emit_llvm(self, node: Llvm):
+        """Link an embedded `llvm:` block's IR and declare its functions.
+
+        The block body is written to a temp .ll file appended to
+        `import_src_files` so both the JIT and AOT paths link it. For safe
+        `llvm:` blocks the semantic pass registers each `define`d function, so
+        an extern declaration matching its signature is created here and cpyte
+        call sites resolve to it. Unsafe blocks register nothing but are still
+        linked verbatim.
+        """
+        import tempfile
+        import os
+        if getattr(self, '_llvm_emitted', None) is None:
+            self._llvm_emitted = set()
+        key = id(node)
+        if key in self._llvm_emitted:
+            return None
+        self._llvm_emitted.add(key)
+        symbols = getattr(node, 'symbols', None)
+        if symbols:
+            for fname, (ret_type, params, vararg) in symbols:
+                if fname in self.functions or fname in self.global_vars:
+                    continue
+                ret_ty = self.llvm_type(ret_type)
+                if isinstance(ret_ty, ir.VoidType) and not params and not vararg:
+                    param_tys = []
+                else:
+                    param_tys = [self.llvm_type(t) for _, t in params]
+                fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
+                func = ir.Function(self.module, fnty, name=fname)
+                self.functions[fname] = func
+        if node.value:
+            fd, tmp_path = tempfile.mkstemp(suffix='.ll', prefix='llvm_')
+            with os.fdopen(fd, 'w') as f:
+                f.write(node.value)
+            self.import_src_files.append(tmp_path)
+        return None
+
     def _emit_combine(self, node):
         """Run the real recursive emitter for a pure node whose children were
         already emitted and memoized during the iterative traversal."""
@@ -902,6 +1180,13 @@ class LLVM:
             self._in_emit_iterative = True
         self._emit_memo[id(node)] = v
         return v
+
+    @register_emitter(LLVMblock)
+    def emit_llvmblock(self, node : LLVMblock):
+        llvm = node.value
+        module = binding.parse_assembly(llvm)
+        if not node.is_unsafe:
+            module.verify()
 
     def _emit_in_place(self, node):
         """Emit a non-pure node through its normal handler; its deep children
@@ -917,7 +1202,7 @@ class LLVM:
 
     def _emit_and_or_step(self, op, node, lhs):
         """One short-circuit step, mirroring emit_binop's AND/OR branches."""
-        lhs_true = self._is_true(lhs)
+        lhs_true = self._truthy_expr(node.left)
         entry_bb = self.builder.block
         suffix = 'and' if op == TokenType.AND else 'or'
         rhs_bb = self.builder.append_basic_block(f'{suffix}.rhs')
@@ -933,7 +1218,7 @@ class LLVM:
             rhs = self.emit(node.right)
         finally:
             self._in_emit_iterative = saved
-        rhs_true = self._is_true(rhs)
+        rhs_true = self._truthy_expr(node.right)
         actual_rhs_bb = self.builder.block
         self.builder.branch(end_bb)
         self.builder.position_at_end(end_bb)
@@ -1214,6 +1499,44 @@ class LLVM:
         malloc_fn = self._get_malloc_fn()
         ptr = self.builder.call(malloc_fn, [total_size])
         ptr = self.builder.bitcast(ptr, malloc_ty)
+        # Register the element count so `for x in arr` can iterate this array.
+        if node.size is not None:
+            reg_fn = self.functions.get('cpyte_array_register')
+            if reg_fn is not None and not self.no_userspace:
+                arr8 = ptr
+                if arr8.type != _i8ptr:
+                    arr8 = self.builder.bitcast(arr8, _i8ptr)
+                self.builder.call(reg_fn, [arr8, count])
+        return ptr
+
+    @register_emitter(ListLit)
+    def emit_listlit(self, node):
+        n = len(node.items)
+        elem_size = self._sizeof_type(_DynValue)
+        count = ir.Constant(_i64, n)
+        total_size = self.builder.mul(count, self.builder.zext(elem_size, _i64))
+        malloc_fn = self._get_malloc_fn()
+        ptr = self.builder.call(malloc_fn, [total_size])
+        ptr = self.builder.bitcast(ptr, _DynValuePtr)
+        reg_fn = self.functions.get('cpyte_array_register')
+        if reg_fn is not None and not self.no_userspace:
+            arr8 = self.builder.bitcast(ptr, _i8ptr)
+            self.builder.call(reg_fn, [arr8, count])
+        for i, item in enumerate(node.items):
+            value = self.emit(item)
+            if value.type == _DynValue:
+                elem = value
+            else:
+                kind, bits = self._box_dyn(value, getattr(item, 'inferred_type', None) or 'int')
+                elem = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+                elem = self.builder.insert_value(elem, bits, 1)
+            elem_ptr = self.builder.gep(ptr, [ir.Constant(_i64, i)], inbounds=True)
+            self.builder.store(elem, elem_ptr)
+            if not self.no_gc and isinstance(value.type, ir.PointerType):
+                self._emit_write_barrier(
+                    self.builder.bitcast(elem_ptr, _i8ptr),
+                    self.builder.bitcast(value, _i8ptr),
+                )
         return ptr
 
     def _get_malloc_fn(self):
@@ -1376,8 +1699,52 @@ class LLVM:
 
     @register_emitter(Index)
     def emit_index(self, node: Index):
+        if not self.no_userspace:
+            obj_t = getattr(node.obj, 'inferred_type', None)
+            if obj_t == 'dynamic' or obj_t == 'dynamic[]' or self._is_dynamic_expr(node.obj):
+                return self._emit_dyn_index(node)
         ptr = self._emit_lvalue(node)
         return self.builder.load(ptr)
+
+    def _emit_dyn_list_ptr(self, node, idx_node):
+        """Compute a _DynValue* element pointer for a dynamic list index."""
+        if self._is_dynamic_expr(node):
+            k, b = self._dyn_pair(node)
+            fn = self.functions.get('dyn_list_get')
+            idx = self.emit(idx_node)
+            if isinstance(idx.type, ir.PointerType):
+                idx = self.builder.ptrtoint(idx, _i64)
+            elif isinstance(idx.type, (ir.DoubleType, ir.FloatType)):
+                idx = self.builder.fptosi(idx, _i64)
+            idx64 = self._extend_to_i64(idx) if idx.type.width < 64 else idx
+            return self.builder.call(fn, [b, idx64])
+        arr = self.emit(node)
+        if arr.type != _DynValuePtr:
+            arr = self.builder.bitcast(arr, _DynValuePtr)
+        idx = self.emit(idx_node)
+        if isinstance(idx.type, ir.PointerType):
+            idx = self.builder.ptrtoint(idx, _i64)
+        elif isinstance(idx.type, (ir.DoubleType, ir.FloatType)):
+            idx = self.builder.fptosi(idx, _i64)
+        idx64 = self._extend_to_i64(idx) if idx.type.width < 64 else idx
+        return self.builder.gep(arr, [idx64], inbounds=True)
+
+    def _emit_dyn_index(self, node: Index):
+        elem_ptr = self._emit_dyn_list_ptr(node.obj, node.index)
+        return self.builder.load(elem_ptr)
+
+    def _emit_dyn_index_store(self, node: Assign):
+        target = node.target
+        elem_ptr = self._emit_dyn_list_ptr(target.obj, target.index)
+        value = self.emit(node.value)
+        if value.type == _DynValue:
+            self.builder.store(value, elem_ptr)
+            return None
+        kind, bits = self._box_dyn(value, getattr(node.value, 'inferred_type', None) or 'int')
+        s = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+        s = self.builder.insert_value(s, bits, 1)
+        self.builder.store(s, elem_ptr)
+        return None
 
     def _emit_lvalue_index(self, node: Index):
         obj = self.emit(node.obj)
@@ -1552,6 +1919,10 @@ class LLVM:
                     self.builder.call(gc_shutdown_fn, [])
             if isinstance(ret_ty, ir.VoidType):
                 self.builder.ret_void()
+            elif ret_ty == _DynValue:
+                out = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, _DYN_NONE), 0)
+                out = self.builder.insert_value(out, ir.Constant(_i64, 0), 1)
+                self.builder.ret(out)
             elif isinstance(ret_ty, ir.PointerType):
                 self.builder.ret(ir.Constant(ret_ty, None))
             else:
@@ -1577,6 +1948,13 @@ class LLVM:
         if node.value is not None:
             value = self.emit(node.value)
             ret_ty = self.builder.function.ftype.return_type
+            if ret_ty == _DynValue:
+                if value.type != _DynValue:
+                    kind, bits = self._box_dyn(value, getattr(node.value, 'inferred_type', None))
+                    value = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+                    value = self.builder.insert_value(value, bits, 1)
+                self.builder.ret(value)
+                return None
             if value.type != ret_ty:
                 if isinstance(value.type, ir.IntType) and isinstance(ret_ty, ir.IntType):
                     if value.type.width < ret_ty.width:
@@ -1609,7 +1987,8 @@ class LLVM:
                 return False
             if not isinstance(n.cond, BinOp) or n.cond.op != TokenType.EQ_EQ:
                 return False
-            if not isinstance(n.cond.left, Variable) or not isinstance(n.cond.right, Number):
+            if not isinstance(n.cond.left, Variable) or getattr(n.cond.left, 'dynamic', False) \
+                    or not isinstance(n.cond.right, Number):
                 return False
             if var_name is None:
                 var_name = n.cond.left.name
@@ -1637,9 +2016,7 @@ class LLVM:
         if sw is not None:
             self.emit_switch(sw)
             return
-        cond = self.emit(node.cond)
-        if cond.type != ir.IntType(1):
-            cond = self._is_true(cond)
+        cond = self._truthy_expr(node.cond)
         then_bb = self.builder.append_basic_block("then")
 
         if node.orelse:
@@ -1741,6 +2118,174 @@ class LLVM:
             return self.builder.fcmp_unordered('!=', val, ir.Constant(val.type, 0.0))
         return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
 
+    # ------------------------------------------------------------------
+    # Dynamic variable helpers
+    # ------------------------------------------------------------------
+
+    def _dyn_kind_for(self, ty):
+        """Map a cpy type name to its runtime dynamic kind id."""
+        if ty == 'dynamic':
+            return _DYN_NONE
+        if ty == 'dynamic[]':
+            return _DYN_LIST
+        if ty == 'int':
+            return _DYN_INT
+        if ty == 'int64':
+            return _DYN_INT64
+        if ty == 'uint64':
+            return _DYN_UINT64
+        if ty == 'char':
+            return _DYN_CHAR
+        if ty == 'bool':
+            return _DYN_BOOL
+        if ty in ('float', 'double'):
+            return _DYN_DOUBLE
+        if ty == 'str':
+            return _DYN_STR
+        if ty == 'big':
+            return _DYN_BIG
+        if ty.endswith('*') or ty.endswith('&'):
+            return _DYN_PTR
+        return _DYN_INT
+
+    def _box_dyn(self, value, ty):
+        """Box a runtime value into (kind, uint64 bits) for dynamic storage."""
+        t = value.type
+        if isinstance(t, ir.IntType):
+            if t.width == 1:
+                return _DYN_BOOL, self.builder.zext(value, _i64)
+            if t.width == 8:
+                return _DYN_CHAR, self.builder.zext(value, _i64)
+            if t.width == 32:
+                return _DYN_INT, self.builder.sext(value, _i64)
+            if ty == 'uint64':
+                return _DYN_UINT64, value
+            return _DYN_INT64, value
+        if isinstance(t, (ir.FloatType, ir.DoubleType)):
+            d = value if isinstance(t, ir.DoubleType) else self.builder.fpext(value, _double)
+            return _DYN_DOUBLE, self.builder.bitcast(d, _i64)
+        if isinstance(t, ir.PointerType):
+            p = self.builder.ptrtoint(value, _i64)
+            if ty == 'dynamic[]':
+                return _DYN_LIST, p
+            if ty == 'big':
+                return _DYN_BIG, p
+            if isinstance(t.pointee, ir.IntType) and t.pointee.width == 8:  # type: ignore[attr-defined]
+                return _DYN_STR, p
+            return _DYN_PTR, p
+        if ty == 'uint64':
+            return _DYN_UINT64, value
+        return _DYN_INT64, value
+
+    def _unbox_dyn(self, bits, ty):
+        """Convert the i64 bits of a dynamic value back to the declared type."""
+        if ty == 'int':
+            return self.builder.trunc(bits, _i32)
+        if ty in ('int64', 'uint64'):
+            return bits
+        if ty == 'char':
+            return self.builder.trunc(bits, _i8)
+        if ty == 'bool':
+            return self.builder.trunc(bits, _i1)
+        if ty in ('float', 'double'):
+            return self.builder.bitcast(bits, _double)
+        if ty in ('str', 'big', 'void*'):
+            return self.builder.inttoptr(bits, _i8ptr)
+        if ty.endswith('*') or ty.endswith('&'):
+            ptr_ty = self.llvm_type(ty)
+            if isinstance(ptr_ty, ir.PointerType):
+                return self.builder.inttoptr(bits, ptr_ty)
+        return bits
+
+    def _dyn_name(self, name):
+        return self._string_const(name)
+
+    def _is_dynamic_expr(self, node):
+        """True when a node carries a runtime-typed (dynamic) value."""
+        if getattr(node, 'inferred_type', None) == 'dynamic':
+            return True
+        if isinstance(node, Variable) and getattr(node, 'dynamic', False):
+            return True
+        return False
+
+    def _dyn_local_ptr(self, name):
+        """Return (creating if needed) the {i32,i64} slot that backs a dynamic local."""
+        ptr = self.locals.get(name)
+        if ptr is not None and getattr(ptr.type, 'pointee', None) == _DynValue:
+            return ptr
+        ptr = self._alloca(_DynValue, name=f'dyn.{name}')
+        self.locals[name] = ptr
+        self.local_types[name] = 'dynamic'
+        return ptr
+
+    def _dyn_struct(self, node):
+        """Evaluate an expression and return it as a {i32,i64} DynValue struct."""
+        if isinstance(node, Variable) and getattr(node, 'dynamic', False):
+            ptr = self._dyn_local_ptr(node.name)
+            return self.builder.load(ptr, node.name)
+        val = self.emit(node)
+        if val.type == _DynValue:
+            return val
+        kind, bits = self._box_dyn(val, getattr(node, 'inferred_type', None) or 'int')
+        out = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+        out = self.builder.insert_value(out, bits, 1)
+        return out
+
+    def _dyn_pair(self, node):
+        """Return (kind: i32, bits: i64) for a dynamically-typed expression."""
+        s = self._dyn_struct(node)
+        k = self.builder.extract_value(s, 0)
+        b = self.builder.extract_value(s, 1)
+        return k, b
+
+    def _unbox_dyn_to(self, node, want_ty):
+        """Coerce a dynamically-typed expression to a concrete declared type."""
+        k, b = self._dyn_pair(node)
+        want = self._dyn_kind_for(want_ty)
+        fn = self.functions.get('dyn_as_v')
+        bits = self.builder.call(fn, [k, b, ir.Constant(_i32, want)])
+        return self._unbox_dyn(bits, want_ty)
+
+    def _emit_dyn_load(self, node):
+        name = node.name
+        ty = getattr(node, 'inferred_type', None) or 'int'
+        if ty == 'dynamic':
+            return self._dyn_struct(node)
+        ptr = self.locals.get(name)
+        if ptr is not None and getattr(ptr.type, 'pointee', None) == _DynValue:
+            return self._unbox_dyn_to(node, ty)
+        kind = self._dyn_kind_for(ty)
+        fn = self.functions.get('dyn_as')
+        bits = self.builder.call(fn, [self._dyn_name(name), ir.Constant(_i32, kind)])
+        return self._unbox_dyn(bits, ty)
+
+    def _emit_dyn_store(self, name, value, value_ty):
+        if value.type == _DynValue:
+            self.builder.store(value, self._dyn_local_ptr(name))
+        else:
+            kind, bits = self._box_dyn(value, value_ty or 'int')
+            out = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+            out = self.builder.insert_value(out, bits, 1)
+            self.builder.store(out, self._dyn_local_ptr(name))
+        self.ssa_values.pop(name, None)
+        self.ssa_types.pop(name, None)
+
+    def _truthy_expr(self, node):
+        """Evaluate an expression to an i1 truth value, dispatching dynamic vars."""
+        if not self.no_userspace and self._is_dynamic_expr(node):
+            k, b = self._dyn_pair(node)
+            fn = self.functions.get('dyn_truthy_v')
+            c = self.builder.call(fn, [k, b])
+            return self.builder.trunc(c, _i1)
+        if isinstance(node, Variable) and getattr(node, 'dynamic', False) and not self.no_userspace:
+            name_ptr = self._dyn_name(node.name)
+            c = self.builder.call(self.functions.get('dyn_truthy'), [name_ptr])
+            return self.builder.trunc(c, _i1)
+        val = self.emit(node)
+        if val.type != ir.IntType(1):
+            val = self._is_true(val)
+        return val
+
     def _block_terminated(self) -> bool:
         block = self.builder.block
         if block is None:
@@ -1752,17 +2297,26 @@ class LLVM:
         if node.op == TokenType.PLUS and self._is_string_concat(node):
             return self._emit_string_concat(node)
 
+        # Runtime dispatch when either operand is dynamically typed.
+        if not self.no_userspace and (self._is_dynamic_expr(node.left) or self._is_dynamic_expr(node.right)):
+            if node.op in (TokenType.PLUS, TokenType.MINUS, TokenType.STAR,
+                           TokenType.SLASH, TokenType.SLASH_SLASH,
+                           TokenType.PERCENT, TokenType.EQ_EQ, TokenType.NOT_EQ,
+                           TokenType.LESS, TokenType.GREATER,
+                           TokenType.LESS_EQ, TokenType.GREATER_EQ,
+                           TokenType.AMPERSAND, TokenType.PIPE,
+                           TokenType.CARET, TokenType.SHL, TokenType.SHR):
+                return self._emit_dyn_binop(node)
+
         match node.op:
             case TokenType.AND:
-                lhs = self.emit(node.left)
-                lhs_true = self._is_true(lhs)
+                lhs_true = self._truthy_expr(node.left)
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("and.rhs")
                 end_bb = self.builder.append_basic_block("and.end")
                 self.builder.cbranch(lhs_true, rhs_bb, end_bb)
                 self.builder.position_at_end(rhs_bb)
-                rhs = self.emit(node.right)
-                rhs_true = self._is_true(rhs)
+                rhs_true = self._truthy_expr(node.right)
                 actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
@@ -1772,15 +2326,13 @@ class LLVM:
                 return phi
 
             case TokenType.OR:
-                lhs = self.emit(node.left)
-                lhs_true = self._is_true(lhs)
+                lhs_true = self._truthy_expr(node.left)
                 entry_bb = self.builder.block
                 rhs_bb = self.builder.append_basic_block("or.rhs")
                 end_bb = self.builder.append_basic_block("or.end")
                 self.builder.cbranch(lhs_true, end_bb, rhs_bb)
                 self.builder.position_at_end(rhs_bb)
-                rhs = self.emit(node.right)
-                rhs_true = self._is_true(rhs)
+                rhs_true = self._truthy_expr(node.right)
                 actual_rhs_bb = self.builder.block
                 self.builder.branch(end_bb)
                 self.builder.position_at_end(end_bb)
@@ -1970,6 +2522,35 @@ class LLVM:
             return True
         return False
 
+    def _emit_dyn_binop(self, node):
+        dynop_map = {
+            TokenType.PLUS: _DYNOP_ADD,
+            TokenType.MINUS: _DYNOP_SUB,
+            TokenType.STAR: _DYNOP_MUL,
+            TokenType.SLASH: _DYNOP_DIV,
+            TokenType.SLASH_SLASH: _DYNOP_DIV,
+            TokenType.PERCENT: _DYNOP_MOD,
+            TokenType.EQ_EQ: _DYNOP_EQ,
+            TokenType.NOT_EQ: _DYNOP_NE,
+            TokenType.LESS: _DYNOP_LT,
+            TokenType.LESS_EQ: _DYNOP_LE,
+            TokenType.GREATER: _DYNOP_GT,
+            TokenType.GREATER_EQ: _DYNOP_GE,
+            TokenType.AMPERSAND: _DYNOP_BAND,
+            TokenType.PIPE: _DYNOP_BOR,
+            TokenType.CARET: _DYNOP_BXOR,
+            TokenType.SHL: _DYNOP_SHL,
+            TokenType.SHR: _DYNOP_SHR,
+        }
+        op = dynop_map[node.op]
+        k1, b1 = self._dyn_pair(node.left)
+        k2, b2 = self._dyn_pair(node.right)
+        fn = self.functions.get('dyn_op')
+        out_ptr = self._alloca(_DynValue, name='dyn.binop')
+        self.builder.call(
+            fn, [out_ptr, ir.Constant(_i32, op), k1, b1, k2, b2])
+        return self.builder.load(out_ptr)
+
     def _emit_string_concat(self, node):
         left = self.emit(node.left)
         right = self.emit(node.right)
@@ -2003,6 +2584,19 @@ class LLVM:
 
     @register_emitter(UnaryOp)
     def emit_unaryop(self, node: UnaryOp):
+        if not self.no_userspace and self._is_dynamic_expr(node.operand):
+            if node.op == TokenType.NOT:
+                k, b = self._dyn_pair(node.operand)
+                fn = self.functions.get('dyn_truthy_v')
+                c = self.builder.call(fn, [k, b])
+                return self.builder.icmp_unsigned('==', c, ir.Constant(_i32, 0))
+            if node.op == TokenType.MINUS:
+                k, b = self._dyn_pair(node.operand)
+                fn = self.functions.get('dyn_op1')
+                out_ptr = self._alloca(_DynValue, name='dyn.unop')
+                self.builder.call(
+                    fn, [out_ptr, ir.Constant(_i32, _DYNOP_NEG), k, b])
+                return self.builder.load(out_ptr)
         match node.op:
             case TokenType.PLUS:
                 return self.emit(node.operand)
@@ -2075,6 +2669,13 @@ class LLVM:
             if -2**31 <= val < 2**31:
                 return ir.Constant(ir.IntType(32), val)
             return ir.Constant(ir.IntType(64), val)
+
+        # Dynamic variable (promoted because its type changed at runtime)
+        if getattr(node, 'dynamic', False) and not self.no_userspace:
+            ptr = self.locals.get(node.name)
+            if ptr is not None and getattr(ptr.type, 'pointee', None) == _DynValue:
+                return self.builder.load(ptr, node.name)
+            return self._emit_dyn_load(node)
 
         ptr = self.locals.get(node.name)
         if ptr is not None:
@@ -2180,6 +2781,10 @@ class LLVM:
 
     @register_emitter(Assign)
     def emit_assign(self, node):
+        if isinstance(node.target, Index) and not self.no_userspace:
+            obj_t = getattr(node.target.obj, 'inferred_type', None)
+            if obj_t == 'dynamic' or obj_t == 'dynamic[]' or self._is_dynamic_expr(node.target.obj):
+                return self._emit_dyn_index_store(node)
         if isinstance(node.target, Variable):
             name = node.target.name
 
@@ -2187,9 +2792,17 @@ class LLVM:
             if name in self.const_vars:
                 raise Exception(f"Cannot assign to constant '{name}' at L{node._token.line}:{node._token.column}")
 
+            if getattr(node, 'dynamic', False) and not self.no_userspace:
+                value = self.emit(node.value)
+                self._emit_dyn_store(name, value, getattr(node.value, 'inferred_type', None))
+                return None
+
             ptr = self.locals.get(name)
             if ptr is not None:
-                value = self.emit(node.value)
+                if self._is_dynamic_expr(node.value):
+                    value = self._unbox_dyn_to(node.value, self.local_types.get(name) or 'int')
+                else:
+                    value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
                     if self.local_types.get(name) == 'big' and not self._is_big(node.value):
@@ -2215,9 +2828,17 @@ class LLVM:
             if name in self.const_vars:
                 raise Exception(f"Cannot assign to constant '{name}' at L{node._token.line}:{node._token.column}")
 
+            if getattr(node, 'dynamic', False) and not self.no_userspace:
+                value = self.emit(node.value)
+                self._emit_dyn_store(name, value, getattr(node.value, 'inferred_type', None))
+                return None
+
             ptr = self.locals.get(name)
             if ptr is not None:
-                value = self.emit(node.value)
+                if self._is_dynamic_expr(node.value):
+                    value = self._unbox_dyn_to(node.value, self.local_types.get(name) or 'int')
+                else:
+                    value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
                     if self.local_types.get(name) == 'big' and not self._is_big(node.value):
@@ -2275,6 +2896,28 @@ class LLVM:
                         args.append(self.emit(arg))
                     return self.builder.call(func, args)
 
+        # Builtin conversion functions (Python-style): str()/int()/float()/double()
+        # and free() (available under #nogc)
+        if (isinstance(node.callee, Variable)
+                and node.callee.name in ('str', 'int', 'float', 'double', 'free')
+                and ('free' not in self.functions or node.callee.name != 'free')):
+            name = node.callee.name
+            arg = node.args[0]
+            if name == 'free':
+                return self._emit_builtin_free(arg)
+            if name == 'str':
+                return self._emit_builtin_str(arg)
+            if name == 'int':
+                return self._emit_builtin_int(arg)
+            return self._emit_builtin_float(arg)
+
+        # Builtin range() — Python-style range returning a registered int64 array.
+        # Falls through to a user-defined `def range(...)` when present.
+        if (isinstance(node.callee, Variable)
+                and node.callee.name == 'range'
+                and 'range' not in self.functions):
+            return self._emit_builtin_range(node)
+
         # Handle known macro functions by inlining
         if node.callee.name == 'CGEventMaskBit':
             arg = self.emit(node.args[0])
@@ -2295,9 +2938,33 @@ class LLVM:
             val = self.emit(arg)
             if i < len(func.function_type.args):
                 expected = func.function_type.args[i]
+                if expected == _DynValue and val.type != _DynValue:
+                    kind, bits = self._box_dyn(val, getattr(arg, 'inferred_type', None))
+                    val = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
+                    val = self.builder.insert_value(val, bits, 1)
+                elif val.type == _DynValue and expected != _DynValue:
+                    kind_v = self.builder.extract_value(val, 0)
+                    data_v = self.builder.extract_value(val, 1)
+                    if isinstance(expected, (ir.FloatType, ir.DoubleType)):
+                        want = _DYN_DOUBLE
+                    elif expected == _i8:
+                        want = _DYN_CHAR
+                    elif isinstance(expected, ir.IntType):
+                        want = _DYN_INT
+                    else:
+                        want = _DYN_PTR
+                    val = self.builder.call(
+                        self.functions['dyn_as_v'],
+                        [kind_v, data_v, ir.Constant(_i32, want)],
+                    )
                 if isinstance(val, ir.Constant) and val.constant == 0 and isinstance(val.type, ir.IntType):
                     if isinstance(expected, ir.PointerType):
                         val = ir.Constant(expected, None)
+                if isinstance(val.type, ir.IntType) and isinstance(expected, ir.IntType) and val.type.width != expected.width:
+                    if val.type.width < expected.width:
+                        val = self.builder.sext(val, expected)
+                    else:
+                        val = self.builder.trunc(val, expected)
                 if isinstance(val.type, ir.IntType) and isinstance(expected, ir.PointerType):
                     val = self.builder.inttoptr(val, expected)
                 if isinstance(val.type, ir.PointerType) and isinstance(expected, ir.IntType):
@@ -2311,16 +2978,206 @@ class LLVM:
             args.append(val)
         return self.builder.call(func, args)
 
+    def _get_or_create_fn(self, name, ret, args):
+        """Return an existing declaration with `name` or declare a fresh extern."""
+        for f in self.module.functions:
+            if f.name == name:
+                return f
+        return ir.Function(self.module, ir.FunctionType(ret, args), name)
+
+    def _emit_builtin_str(self, arg):
+        if not self.no_userspace and self._is_dynamic_expr(arg):
+            k, b = self._dyn_pair(arg)
+            return self.builder.call(self.functions['dyn_str_v'], [k, b])
+        val = self.emit(arg)
+        return self._stringify_value(arg, val)
+
+    def _emit_builtin_int(self, arg):
+        if not self.no_userspace and self._is_dynamic_expr(arg):
+            k, b = self._dyn_pair(arg)
+            bits = self.builder.call(self.functions['dyn_as_v'], [k, b, ir.Constant(_i32, _DYN_INT)])
+            return self.builder.trunc(bits, _i32)
+        val = self.emit(arg)
+        if getattr(arg, 'inferred_type', None) == 'big':
+            s = self.builder.call(self.functions['bigint_to_str'], [val])
+            atoi = self._get_or_create_fn('atoi', _i32, [_i8ptr])
+            return self.builder.call(atoi, [s])
+        if isinstance(val.type, ir.PointerType):
+            atoi = self._get_or_create_fn('atoi', _i32, [_i8ptr])
+            if val.type != _i8ptr:
+                val = self.builder.bitcast(val, _i8ptr)
+            return self.builder.call(atoi, [val])
+        if isinstance(val.type, ir.DoubleType):
+            return self.builder.fptosi(val, _i32)
+        if isinstance(val.type, ir.IntType):
+            if val.type.width > 32:
+                return self.builder.trunc(val, _i32)
+            if val.type.width < 32:
+                return self.builder.sext(val, _i32)
+            return val
+        raise Exception(f'cannot convert {val.type} to int')
+
+    def _emit_builtin_float(self, arg):
+        if not self.no_userspace and self._is_dynamic_expr(arg):
+            k, b = self._dyn_pair(arg)
+            bits = self.builder.call(self.functions['dyn_as_v'], [k, b, ir.Constant(_i32, _DYN_DOUBLE)])
+            return self.builder.bitcast(bits, ir.DoubleType())
+        val = self.emit(arg)
+        if getattr(arg, 'inferred_type', None) == 'big':
+            s = self.builder.call(self.functions['bigint_to_str'], [val])
+            atof = self._get_or_create_fn('atof', ir.DoubleType(), [_i8ptr])
+            return self.builder.call(atof, [s])
+        if isinstance(val.type, ir.PointerType):
+            atof = self._get_or_create_fn('atof', ir.DoubleType(), [_i8ptr])
+            if val.type != _i8ptr:
+                val = self.builder.bitcast(val, _i8ptr)
+            return self.builder.call(atof, [val])
+        if isinstance(val.type, ir.DoubleType):
+            return val
+        if isinstance(val.type, ir.IntType):
+            if val.type.width < 64:
+                val = self.builder.sext(val, _i64)
+            return self.builder.sitofp(val, ir.DoubleType())
+        raise Exception(f'cannot convert {val.type} to float')
+
+    def _emit_builtin_range(self, node):
+        """range(stop) / range(start, stop) / range(start, stop, step).
+
+        Returns a gc_malloc'd int64 array registered in the array-length side
+        table, so `for x in range(...)` iterates it and indexing/len/free all
+        behave exactly like a `new int64[n]` array. Mirrors Python's range
+        semantics: step != 0, empty for out-of-bounds, negative steps allowed.
+        """
+        args = node.args
+        if not 1 <= len(args) <= 3:
+            raise Exception(
+                f"range() expects 1 to 3 arguments, got {len(args)} "
+                f"at L{node._token.line}:{node._token.column}"
+            )
+
+        def _as_i64(val):
+            if isinstance(val.type, ir.PointerType):
+                return self.builder.ptrtoint(val, _i64)
+            if isinstance(val.type, (ir.FloatType, ir.DoubleType)):
+                return self.builder.fptosi(val, _i64)
+            if isinstance(val.type, ir.IntType):
+                return self._extend_to_i64(val)
+            return val
+
+        if len(args) == 1:
+            start = ir.Constant(_i64, 0)
+            stop = _as_i64(self.emit(args[0]))
+            step = ir.Constant(_i64, 1)
+        else:
+            start = _as_i64(self.emit(args[0]))
+            stop = _as_i64(self.emit(args[1]))
+            step = ir.Constant(_i64, 1) if len(args) == 2 else _as_i64(self.emit(args[2]))
+
+        # Python semantics: values start, start+step, ... while val < stop
+        # (positive step) or val > stop (negative step). step == 0 is an error.
+        zero = ir.Constant(_i64, 0)
+        one = ir.Constant(_i64, 1)
+
+        # Trap on step == 0 BEFORE any arithmetic (Python raises ValueError).
+        trap_fn = self._get_trap_fn()
+        with self.builder.if_then(self.builder.icmp_signed('==', step, zero)):
+            self.builder.call(trap_fn, [])
+
+        step_pos = self.builder.icmp_signed('>', step, zero)
+        # For a negative step the sequence must be strictly descending.
+        num = self.builder.select(step_pos, self.builder.sub(stop, start),
+                                  self.builder.sub(start, stop))
+        dist = self.builder.select(step_pos, step, self.builder.sub(zero, step))
+        count = self.builder.sdiv(self.builder.add(self.builder.sub(num, one), dist), dist)
+        count = self.builder.select(
+            self.builder.icmp_signed('>', count, zero), count, zero)
+
+        malloc_fn = self._get_malloc_fn()
+        eight = ir.Constant(_i64, 8)
+        total = self.builder.mul(count, eight)
+        buf = self.builder.call(malloc_fn, [total])
+        buf8 = buf
+        if buf8.type != _i8ptr:
+            buf8 = self.builder.bitcast(buf8, _i8ptr)
+        i64arr = self.builder.bitcast(buf8, ir.PointerType(_i64))
+
+        i_ptr = self._alloca(_i64, name="range.i")
+        self.builder.store(zero, i_ptr)
+        cond_bb = self.builder.append_basic_block("range.cond")
+        body_bb = self.builder.append_basic_block("range.body")
+        end_bb = self.builder.append_basic_block("range.end")
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+        i = self.builder.load(i_ptr)
+        self.builder.cbranch(self.builder.icmp_signed('<', i, count), body_bb, end_bb)
+        self.builder.position_at_end(body_bb)
+        i_body = self.builder.load(i_ptr)
+        val = self.builder.add(start, self.builder.mul(i_body, step))
+        self.builder.store(val, self.builder.gep(i64arr, [i_body], inbounds=True))
+        self.builder.store(self.builder.add(i_body, one), i_ptr)
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(end_bb)
+
+        # Stop iteration from collecting this while the registry still needs it:
+        # register the length exactly like `new int64[n]`.
+        if not self.no_userspace:
+            reg_fn = self.functions.get('cpyte_array_register')
+            if reg_fn is not None:
+                self.builder.call(reg_fn, [buf8, count])
+        return i64arr
+
+    def _emit_builtin_free(self, arg):
+        val = self.emit(arg)
+        if isinstance(val.type, ir.IntType):
+            val = self.builder.inttoptr(val, _i8ptr)
+        elif val.type != _i8ptr:
+            val = self.builder.bitcast(val, _i8ptr)
+        if not self.no_userspace:
+            unreg_fn = self.functions.get('cpyte_array_unregister')
+            if unreg_fn is not None:
+                self.builder.call(unreg_fn, [val])
+        free_fn = self._get_or_create_fn('free', _void, [_i8ptr])
+        return self.builder.call(free_fn, [val])
+
     @register_emitter(Print)
     def emit_print(self, node):
+        values = node.value
+        if not values:
+            if self.no_userspace:
+                return None
+            return self.builder.call(self.functions["print_str"], [self._string_const('')])
         if self.no_userspace:
             # In no-userspace mode, print statements become no-ops
             # Still emit the value for side effects, but don't call print function
-            self.emit(node.value)
+            for expr in values:
+                self.emit(expr)
             return None
-        
-        value = self.emit(node.value)
-        if self._is_big(node.value):
+        if len(values) == 1:
+            return self._emit_print_value(values[0])
+        # Multi-argument print: stringify each value, join with single spaces,
+        # and print once (Python-style: print("a", 1) -> "a 1").
+        parts = []
+        for expr in values:
+            val = self.emit(expr)
+            parts.append(self._stringify_value(expr, val))
+        acc = parts[0]
+        space = self._string_const(' ')
+        for part in parts[1:]:
+            acc = self._concat_strings(acc, space)
+            acc = self._concat_strings(acc, part)
+        return self.builder.call(self.functions["print_str"], [acc])
+
+    def _emit_print_value(self, expr):
+        if not self.no_userspace and self._is_dynamic_expr(expr):
+            k, b = self._dyn_pair(expr)
+            return self.builder.call(self.functions["dyn_print_v"], [k, b])
+
+        value = self.emit(expr)
+        if value.type == _DynValue and not self.no_userspace:
+            k = self.builder.extract_value(value, 0)
+            b = self.builder.extract_value(value, 1)
+            return self.builder.call(self.functions["dyn_print_v"], [k, b])
+        if self._is_big(expr):
             return self.builder.call(self.functions["bigint_print"], [value])
         if isinstance(value.type, ir.DoubleType):
             return self.builder.call(self.functions["print_double"], [value])
@@ -2331,23 +3188,23 @@ class LLVM:
         # Handle 64-bit integers
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
             is_uint64 = False
-            if isinstance(node.value, Variable):
-                var_type = self.local_types.get(node.value.name)
+            if isinstance(expr, Variable):
+                var_type = self.local_types.get(expr.name)
                 if var_type == 'uint64':
                     is_uint64 = True
-            elif hasattr(node.value, 'inferred_type') and node.value.inferred_type == 'uint64':
+            elif hasattr(expr, 'inferred_type') and expr.inferred_type == 'uint64':
                 is_uint64 = True
-            elif isinstance(node.value, BinOp):
+            elif isinstance(expr, BinOp):
                 left_type = None
                 right_type = None
-                if isinstance(node.value.left, Variable):
-                    left_type = self.local_types.get(node.value.left.name)
-                elif hasattr(node.value.left, 'inferred_type'):
-                    left_type = node.value.left.inferred_type
-                if isinstance(node.value.right, Variable):
-                    right_type = self.local_types.get(node.value.right.name)
-                elif hasattr(node.value.right, 'inferred_type'):
-                    right_type = node.value.right.inferred_type
+                if isinstance(expr.left, Variable):
+                    left_type = self.local_types.get(expr.left.name)
+                elif hasattr(expr.left, 'inferred_type'):
+                    left_type = expr.left.inferred_type
+                if isinstance(expr.right, Variable):
+                    right_type = self.local_types.get(expr.right.name)
+                elif hasattr(expr.right, 'inferred_type'):
+                    right_type = expr.right.inferred_type
                 if left_type == 'uint64' or right_type == 'uint64':
                     is_uint64 = True
             if is_uint64:
@@ -2414,9 +3271,7 @@ class LLVM:
         self.builder.branch(cond_bb)
         self.builder.position_at_end(cond_bb)
 
-        cond = self.emit(node.cond)
-        if cond.type != ir.IntType(1):
-            cond = self._is_true(cond)
+        cond = self._truthy_expr(node.cond)
         self.builder.cbranch(cond, body_bb, end_bb)
         self.builder.position_at_end(body_bb)
 
@@ -2451,8 +3306,16 @@ class LLVM:
         var_name = node['var']
         iterable = node['iter']
         body = node['body']
+        iter_type = node.get('iter_type') or 'str'
+        var_type = node.get('var_type') or 'char'
 
         iter_ptr = self.emit(iterable)
+
+        if iter_type == 'dynamic' and not self.no_userspace:
+            return self._emit_for_dynamic(node, var_name, iterable, body)
+
+        if iter_type.endswith('[]') and not self.no_userspace:
+            return self._emit_for_array(node, var_name, iter_ptr, var_type, body)
 
         char_ptr_ty = ir.PointerType(_i8)
         if iter_ptr.type != char_ptr_ty:
@@ -2498,6 +3361,110 @@ class LLVM:
         self.builder.position_at_end(inc_bb)
         idx_inc = self.builder.load(idx_ptr)
         idx_next = self.builder.add(idx_inc, ir.Constant(_i32, 1))
+        self.builder.store(idx_next, idx_ptr)
+        self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(end_bb)
+        self._pop_scope()
+
+    def _emit_for_dynamic(self, node, var_name, iterable, body):
+        k, b = self._dyn_pair(iterable)
+        arr = self.builder.inttoptr(b, _DynValuePtr)
+        arr8 = self.builder.bitcast(arr, _i8ptr)
+        length = self.builder.call(self.functions['cpyte_array_len'], [arr8])
+        is_list = self.builder.icmp_unsigned('==', k, ir.Constant(_i32, _DYN_LIST))
+        length = self.builder.select(is_list, length, ir.Constant(_i64, 0))
+
+        idx_ptr = self._alloca(_i64, name=f"{var_name}.idx")
+        self.builder.store(ir.Constant(_i64, 0), idx_ptr)
+
+        self._push_scope()
+        var_ptr = self._dyn_local_ptr(var_name)
+
+        cond_bb = self.builder.append_basic_block(f"for.{var_name}.cond")
+        body_bb = self.builder.append_basic_block(f"for.{var_name}.body")
+        inc_bb = self.builder.append_basic_block(f"for.{var_name}.inc")
+        end_bb = self.builder.append_basic_block(f"for.{var_name}.end")
+
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+
+        idx = self.builder.load(idx_ptr)
+        cmp = self.builder.icmp_signed('<', idx, length)
+        self.builder.cbranch(cmp, body_bb, end_bb)
+
+        self.builder.position_at_end(body_bb)
+        idx_body = self.builder.load(idx_ptr)
+        elem_ptr = self.builder.gep(arr, [idx_body], inbounds=True)
+        elem_val = self.builder.load(elem_ptr)
+        self.builder.store(elem_val, var_ptr)
+
+        self.loop_stack.append((inc_bb, end_bb))
+        for stmt in body:
+            if not self._block_terminated():
+                self.emit(stmt)
+        self.loop_stack.pop()
+
+        if not self._block_terminated():
+            self.builder.branch(inc_bb)
+
+        self.builder.position_at_end(inc_bb)
+        idx_inc = self.builder.load(idx_ptr)
+        idx_next = self.builder.add(idx_inc, ir.Constant(_i64, 1))
+        self.builder.store(idx_next, idx_ptr)
+        self.builder.branch(cond_bb)
+
+        self.builder.position_at_end(end_bb)
+        self._pop_scope()
+
+    def _emit_for_array(self, node, var_name, arr_ptr, var_type, body):
+        if not isinstance(arr_ptr.type, ir.PointerType):
+            raise Exception(f"cannot iterate non-pointer value of type {arr_ptr.type}")
+
+        arr8 = arr_ptr
+        if arr8.type != _i8ptr:
+            arr8 = self.builder.bitcast(arr8, _i8ptr)
+        len_fn = self.functions['cpyte_array_len']
+        length = self.builder.call(len_fn, [arr8])
+
+        idx_ptr = self._alloca(_i64, name=f"{var_name}.idx")
+        self.builder.store(ir.Constant(_i64, 0), idx_ptr)
+
+        self._push_scope()
+        var_ty = self.llvm_type(var_type)
+        var_ptr = self._alloca(var_ty, name=var_name)
+        self._declare_local(var_name, var_ptr, var_type)
+
+        cond_bb = self.builder.append_basic_block(f"for.{var_name}.cond")
+        body_bb = self.builder.append_basic_block(f"for.{var_name}.body")
+        inc_bb = self.builder.append_basic_block(f"for.{var_name}.inc")
+        end_bb = self.builder.append_basic_block(f"for.{var_name}.end")
+
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+
+        idx = self.builder.load(idx_ptr)
+        cmp = self.builder.icmp_signed('<', idx, length)
+        self.builder.cbranch(cmp, body_bb, end_bb)
+
+        self.builder.position_at_end(body_bb)
+        idx_body = self.builder.load(idx_ptr)
+        elem_ptr = self.builder.gep(arr_ptr, [idx_body], inbounds=True)
+        elem_val = self.builder.load(elem_ptr)
+        self.builder.store(elem_val, var_ptr)
+
+        self.loop_stack.append((inc_bb, end_bb))
+        for stmt in body:
+            if not self._block_terminated():
+                self.emit(stmt)
+        self.loop_stack.pop()
+
+        if not self._block_terminated():
+            self.builder.branch(inc_bb)
+
+        self.builder.position_at_end(inc_bb)
+        idx_inc = self.builder.load(idx_ptr)
+        idx_next = self.builder.add(idx_inc, ir.Constant(_i64, 1))
         self.builder.store(idx_next, idx_ptr)
         self.builder.branch(cond_bb)
 
@@ -2644,7 +3611,20 @@ class LLVM:
 
     @register_emitter(VarDecl)
     def emit_vardecl(self, node):
+        if getattr(node, 'dynamic', False) and not self.no_userspace:
+            if node.init:
+                value = self.emit(node.init)
+                self._emit_dyn_store(node.name, value, getattr(node.init, 'inferred_type', None) or node.var_type)
+            else:
+                out = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, _DYN_NONE), 0)
+                out = self.builder.insert_value(out, ir.Constant(_i64, 0), 1)
+                self.builder.store(out, self._dyn_local_ptr(node.name))
+                self.ssa_values.pop(node.name, None)
+                self.ssa_types.pop(node.name, None)
+            return None
         ty = self.llvm_type(node.var_type)
+        if self.no_userspace and node.var_type == 'dynamic':
+            ty = _i32
         if node.is_const:
             if node.init:
                 value = self.emit(node.init)
@@ -2664,7 +3644,10 @@ class LLVM:
         ptr = self._alloca(ty, name=node.name)
         self._declare_local(node.name, ptr, node.var_type)
         if node.init:
-            value = self.emit(node.init)
+            if not self.no_userspace and self._is_dynamic_expr(node.init):
+                value = self._unbox_dyn_to(node.init, node.var_type)
+            else:
+                value = self.emit(node.init)
             if node.var_type == 'big' and not self._is_big(node.init):
                 value = self._promote_to_big(value)
             elif self._is_big(node.init) and node.var_type != 'big':
@@ -2672,6 +3655,11 @@ class LLVM:
             elif node.var_type in ('int64', 'uint64'):
                 value = self._extend_to_i64(value)
             if value.type != ty:
+                if self.no_userspace and value.type == _DynValue:
+                    raise Exception(
+                        '`dynamic` values require the userspace runtime; '
+                        'not available under --no-userspace'
+                    )
                 if isinstance(value.type, ir.IntType) and isinstance(ty, ir.PointerType):
                     if self._is_i8_to_str(value, ty):
                         value = self._char_to_str(value)

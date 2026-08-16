@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.util
 import os
+import struct
 import subprocess
 import sys
 import warnings
@@ -126,6 +127,154 @@ def _runtime_input() -> int:
 
 def _runtime_input_str() -> bytes:
     return input().encode('utf-8')
+
+
+# Array length registry (mirrors runtime.c side table).
+_arr_registry: dict[int, int] = {}
+
+
+def _runtime_array_register(ptr: int, n: int):
+    _arr_registry[ptr] = n
+
+
+def _runtime_array_len(ptr: int) -> int:
+    return _arr_registry.get(ptr, 0)
+
+
+def _runtime_array_unregister(ptr: int):
+    _arr_registry.pop(ptr, None)
+
+
+# Dynamic variable runtime (name-keyed tagged values).
+_DYN_NONE, _DYN_INT, _DYN_INT64, _DYN_UINT64, _DYN_CHAR, _DYN_BOOL, \
+    _DYN_DOUBLE, _DYN_STR, _DYN_BIG, _DYN_PTR = range(10)
+
+_dyn_table: dict[bytes, tuple[int, int]] = {}
+
+
+def _dyn_is_numeric(kind: int) -> bool:
+    return kind in (_DYN_INT, _DYN_INT64, _DYN_UINT64, _DYN_CHAR, _DYN_BOOL, _DYN_DOUBLE)
+
+
+def _dyn_bits_to_double(bits: int) -> float:
+    return struct.unpack('<d', struct.pack('<Q', bits))[0]
+
+
+def _dyn_double_to_bits(v: float) -> int:
+    return struct.unpack('<Q', struct.pack('<d', v))[0]
+
+
+def _runtime_assign(name: bytes, kind: int, data: int):
+    _dyn_table[name] = (kind, data & ((1 << 64) - 1))
+
+
+def _runtime_dyn_as(name: bytes, want_kind: int) -> int:
+    entry = _dyn_table.get(name)
+    if entry is None or entry[0] == _DYN_NONE:
+        print(f"dynamic variable '{name}' has no value", file=sys.stderr)
+        os.abort()
+    k, data = entry
+    if k == want_kind:
+        return data
+    if _dyn_is_numeric(k) and _dyn_is_numeric(want_kind):
+        if k != _DYN_DOUBLE and want_kind != _DYN_DOUBLE:
+            return data
+        if k == _DYN_DOUBLE:
+            v = _dyn_bits_to_double(data)
+            return ctypes.c_int64(int(v)).value & ((1 << 64) - 1)
+        if k == _DYN_UINT64:
+            v = float(data)
+        else:
+            v = float(ctypes.c_int64(data).value)
+        return _dyn_double_to_bits(v)
+    if (k in (_DYN_STR, _DYN_PTR)) and (want_kind in (_DYN_STR, _DYN_PTR)):
+        return data
+    print(f"dynamic variable '{name}' type mismatch ({k} -> {want_kind})", file=sys.stderr)
+    os.abort()
+
+
+# Bigint helpers for the dynamic runtime, resolved lazily after JIT finalize.
+_dyn_bigint_print = [None]
+_dyn_bigint_to_str = [None]
+
+
+def _runtime_dyn_truthy(name: bytes) -> int:
+    entry = _dyn_table.get(name)
+    if entry is None or entry[0] == _DYN_NONE:
+        return 0
+    k, data = entry
+    if k == _DYN_DOUBLE:
+        return 1 if _dyn_bits_to_double(data) != 0.0 else 0
+    return 1 if data != 0 else 0
+
+
+def _runtime_dyn_print(name: bytes):
+    entry = _dyn_table.get(name)
+    if entry is None or entry[0] == _DYN_NONE:
+        print(0)
+        return
+    k, data = entry
+    if k == _DYN_INT:
+        print(ctypes.c_int32(data).value)
+    elif k == _DYN_INT64:
+        print(ctypes.c_int64(data).value)
+    elif k == _DYN_UINT64:
+        print(data)
+    elif k == _DYN_CHAR:
+        print(ctypes.c_int8(data & 0xff).value)
+    elif k == _DYN_BOOL:
+        print(1 if data else 0)
+    elif k == _DYN_DOUBLE:
+        print(f"{_dyn_bits_to_double(data):.6f}")
+    elif k == _DYN_STR:
+        if data == 0:
+            print("(null)")
+        else:
+            try:
+                print(ctypes.string_at(data).decode('utf-8'))
+            except UnicodeDecodeError:
+                print(repr(ctypes.string_at(data)))
+    elif k == _DYN_BIG:
+        cb = _dyn_bigint_print[0]
+        if cb is not None:
+            cb(data)
+        else:
+            print(data)
+    elif k == _DYN_PTR:
+        print(f"0x{data:x}")
+    else:
+        print(0)
+
+
+def _runtime_dyn_str(name: bytes) -> int:
+    entry = _dyn_table.get(name)
+    if entry is None or entry[0] == _DYN_NONE:
+        return _runtime_cstr("0")
+    k, data = entry
+    if k == _DYN_INT:
+        return _runtime_cstr(str(ctypes.c_int32(data).value))
+    if k == _DYN_INT64:
+        return _runtime_cstr(str(ctypes.c_int64(data).value))
+    if k == _DYN_UINT64:
+        return _runtime_cstr(str(data))
+    if k == _DYN_CHAR:
+        return _runtime_cstr(str(ctypes.c_int8(data & 0xff).value))
+    if k == _DYN_BOOL:
+        return _runtime_cstr("1" if data else "0")
+    if k == _DYN_DOUBLE:
+        return _runtime_cstr(f"{_dyn_bits_to_double(data):.6f}")
+    if k == _DYN_STR:
+        if data == 0:
+            return _runtime_cstr("")
+        return _runtime_cstr(ctypes.string_at(data).decode('utf-8', 'replace'))
+    if k == _DYN_BIG:
+        cb = _dyn_bigint_to_str[0]
+        if cb is not None:
+            return cb(data)
+        return _runtime_cstr(str(data))
+    if k == _DYN_PTR:
+        return _runtime_cstr(f"0x{data:x}")
+    return _runtime_cstr("0")
 
 
 _bigint_from_str_cb = None
@@ -308,6 +457,19 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
             src_mod = binding.parse_assembly(src_ir)
             binding.link_modules(mod, src_mod)
 
+    # Link the C runtime (print/assign/dynamic dispatch/array registry) so the
+    # JIT can resolve native helpers that have no Python callback mirror.
+    target = binding.Target.from_default_triple()
+    r = subprocess.run(
+        ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
+         '-fno-stack-protector', '-o', '-', _RUNTIME_C],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print_err(f'error compiling {_RUNTIME_C}: {format_cc_diag(r.stderr)}')
+        raise SystemExit(1)
+    runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    binding.link_modules(mod, runtime_mod)
+
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
 
@@ -456,6 +618,86 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64)(_runtime_assign)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("assign"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int)(_runtime_dyn_as)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("dyn_as"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)(_runtime_dyn_truthy)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("dyn_truthy"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(_runtime_dyn_print)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("dyn_print"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(_runtime_dyn_str)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("dyn_str"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_longlong)(_runtime_array_register)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("cpyte_array_register"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p)(_runtime_array_len)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("cpyte_array_len"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(_runtime_array_unregister)
+        _callbacks.append(cb)
+        try:
+            engine.add_global_mapping(
+                mod.get_function("cpyte_array_unregister"),
+                ctypes.cast(cb, ctypes.c_void_p).value,
+            )
+        except NameError:
+            pass
+
     _map_libc_fn(engine, mod, 'malloc', ctypes.c_size_t, ctypes.c_void_p)
     _map_libc_fn(engine, mod, 'free', None, None, argtypes=[ctypes.c_void_p])
     _map_libc_fn(engine, mod, 'realloc', ctypes.c_void_p, ctypes.c_void_p,
@@ -465,6 +707,8 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     _map_libc_fn(engine, mod, 'strlen', ctypes.c_char_p, ctypes.c_int)
     _map_libc_fn(engine, mod, 'memcpy', None, ctypes.c_void_p,
                  argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int])
+    _map_libc_fn(engine, mod, 'atoi', ctypes.c_char_p, ctypes.c_int)
+    _map_libc_fn(engine, mod, 'atof', ctypes.c_char_p, ctypes.c_double)
 
     try:
         fn = mod.get_function('strcmp')
@@ -483,6 +727,19 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     _bigint_from_str_cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(
         engine.get_function_address("bigint_from_str")
     )
+
+    try:
+        _dyn_bigint_print[0] = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(
+            engine.get_function_address("bigint_print")
+        )
+    except (NameError, RuntimeError):
+        _dyn_bigint_print[0] = None
+    try:
+        _dyn_bigint_to_str[0] = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(
+            engine.get_function_address("bigint_to_str")
+        )
+    except (NameError, RuntimeError):
+        _dyn_bigint_to_str[0] = None
 
     func_ptr = engine.get_function_address("main")
     _main_fn = ctypes.CFUNCTYPE(ctypes.c_int)(func_ptr)

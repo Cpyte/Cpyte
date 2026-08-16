@@ -179,10 +179,15 @@ static void gc_release_cb(ugc_t* g, ugc_header_t* hdr) {
     (void)g;
     cpyte_obj_t* obj = (cpyte_obj_t*)hdr;
     obj_untrack(obj);
+    cpyte_array_unregister(TO_USER(obj));
     free(obj);
 }
 
 /* ── Public API (called from generated code) ────────────────────── */
+
+/* Array length registry (defined in runtime.c): unregister arrays when their
+ * object is collected so stale length entries can never be reused. */
+extern void cpyte_array_unregister(void* arr);
 
 void gc_init(void) {
     memset(obj_table, 0, sizeof(obj_table));

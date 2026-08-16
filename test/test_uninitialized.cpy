@@ -1,0 +1,4 @@
+def main() -> int:
+    int x
+    print(x)
+    return 0

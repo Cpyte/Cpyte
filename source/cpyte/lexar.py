@@ -73,6 +73,8 @@ _BASE_KEYWORDS = {
     'let',
     'try', 'except', 'raise',
     'asm',
+    'ccode',
+    'llvm',
     'enum', 'type',
 }
 
@@ -556,11 +558,14 @@ class Lexer:
 
         bracket_depth = 0
         continuation = False
-        for i, norm_line in enumerate(norm_lines):
+        i = 0
+        while i < len(norm_lines):
+            norm_line = norm_lines[i]
             line_number = i + 1
             stripped = norm_line.lstrip(' \t')
 
             if not stripped or stripped.startswith('#'):
+                i += 1
                 continue
 
             trimmed = stripped.rstrip()
@@ -578,6 +583,19 @@ class Lexer:
                     indent_stack.append(indent)
                     self.tokens.append(Token(TokenType.INDENT, None, line_number, 1))
 
+            if not is_continuation and trimmed in ('ccode:', 'llvm:', 'unsafe llvm:'):
+                if trimmed == 'unsafe llvm:':
+                    header_parts = ['unsafe', 'llvm']
+                elif trimmed == 'llvm:':
+                    header_parts = ['llvm']
+                else:
+                    header_parts = ['ccode']
+                i, last_non_blank = self._emit_raw_block(
+                    norm_lines, i, indent, line_number, header_parts,
+                )
+                continuation = False
+                continue
+
             line_lexer = _LineLexer(norm_line, line_number)
             line_tokens = line_lexer.tokenize()
 
@@ -594,12 +612,61 @@ class Lexer:
                 last_non_blank = line_number
 
             continuation = ends_with_bs
+            i += 1
 
         while len(indent_stack) > 1:
             indent_stack.pop()
             self.tokens.append(Token(TokenType.DEDENT, None, last_non_blank, 1))
 
         self.tokens.append(Token(TokenType.EOF, None, last_non_blank, 1))
+
+    def _emit_raw_block(self, norm_lines, i, indent, line_number, header_parts):
+        """Emit a raw-source block (ccode:/llvm:/unsafe llvm:).
+
+        The block header keyword tokens (plus COLON/NEWLINE) are emitted, then
+        the whole indented body is captured as a single STRING token. The
+        body dedents by its first non-blank line's column; a following line
+        with indentation <= the header's ends the block. Returns (new_i,
+        last_non_blank).
+        """
+        hdr = ' '.join(header_parts)
+        for value in header_parts:
+            self.tokens.append(Token(TokenType.KEYWORD, value, line_number, indent + 1))
+        self.tokens.append(Token(TokenType.COLON, ':', line_number, indent + len(hdr) + 1))
+        self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_lines[i]) + 1))
+
+        c_lines = []
+        block_indent = None
+        i += 1
+        while i < len(norm_lines):
+            raw = norm_lines[i]
+            ls = raw.lstrip(' \t')
+            if not ls:
+                c_lines.append(raw)
+                i += 1
+                continue
+            if block_indent is None:
+                block_indent = len(raw) - len(ls)
+            if len(raw) - len(ls) <= indent:
+                break
+            c_lines.append(raw)
+            i += 1
+
+        if block_indent:
+            out = []
+            pad = ' ' * block_indent
+            for raw_line in c_lines:
+                if raw_line.startswith(pad):
+                    out.append(raw_line[block_indent:])
+                else:
+                    out.append(raw_line.lstrip())
+            c_lines = out
+
+        self.tokens.append(Token(TokenType.INDENT, None, i + 1, 1))
+        self.tokens.append(Token(TokenType.STRING, '\n'.join(c_lines), i + 1, 1))
+        self.tokens.append(Token(TokenType.NEWLINE, None, i + 1, 1))
+        self.tokens.append(Token(TokenType.DEDENT, None, i + 1, 1))
+        return i, i + 1
 
     def get_tokens(self) -> list[Token]:
         return self.tokens

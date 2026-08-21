@@ -1,14 +1,13 @@
-import hmac
 import hashlib
+import hmac
 from typing import Any, Protocol
 
-from llvmlite import ir, binding
+from llvmlite import binding, ir
 from llvmlite.ir import instructions
 
-from .lexar import Token, TokenType
 from .astparse import *
-from .extension_hooks import get_global_hook_registry
-from .extension_hooks import HookLoadError
+from .extension_hooks import HookLoadError, get_global_hook_registry
+from .lexar import Token, TokenType
 
 
 class _IRValue(Protocol):
@@ -810,7 +809,6 @@ class LLVM:
             self.builder.branch(after_blk)
 
         self.builder.position_at_end(after_blk)
-        return None
 
     def _emit_try_native(self, node):
         fn = self.builder.function
@@ -872,7 +870,6 @@ class LLVM:
             self.builder.unreachable()
 
         self.builder.position_at_end(after_blk)
-        return None
 
     @register_emitter(Raise)
     def emit_raise(self, node):
@@ -886,14 +883,12 @@ class LLVM:
         buf = self.builder.load(self._exc_buf_ptr)
         self.builder.call(self._longjmp_fn, [buf, ir.Constant(_i32, 1)])
         self.builder.unreachable()
-        return None
 
     def _emit_raise_native(self, node):
         exc_type_str = self._string_const(node.exc_type)
         msg = self.emit(node.message)
         self.builder.call(self._raise_exception_fn, [exc_type_str, msg])
         self.builder.unreachable()
-        return None
 
     def emit_program(self, ast):
         structs = []
@@ -918,8 +913,8 @@ class LLVM:
         
         # Collect runtime code from extension hooks
         if self.enable_extensions:
-            import tempfile
             import os
+            import tempfile
             for hook in self._hook_registry.get_runtime_hooks():
                 try:
                     runtime_code = hook.get_runtime_code()
@@ -1094,13 +1089,13 @@ class LLVM:
         the node is declared as an extern LLVM function so cpyte call sites
         resolve to it.
         """
-        import tempfile
         import os
+        import tempfile
         if getattr(self, '_ccode_emitted', None) is None:
             self._ccode_emitted = set()
         key = id(node)
         if key in self._ccode_emitted:
-            return None
+            return
         self._ccode_emitted.add(key)
         symbols = getattr(node, 'symbols', None)
         if symbols:
@@ -1129,7 +1124,7 @@ class LLVM:
             with os.fdopen(fd, 'w') as f:
                 f.write(node.value)
             self.import_src_files.append(tmp_path)
-        return None
+        return
 
     @register_emitter(Llvm)
     def emit_llvm(self, node: Llvm):
@@ -1142,13 +1137,13 @@ class LLVM:
         call sites resolve to it. Unsafe blocks register nothing but are still
         linked verbatim.
         """
-        import tempfile
         import os
+        import tempfile
         if getattr(self, '_llvm_emitted', None) is None:
             self._llvm_emitted = set()
         key = id(node)
         if key in self._llvm_emitted:
-            return None
+            return
         self._llvm_emitted.add(key)
         symbols = getattr(node, 'symbols', None)
         if symbols:
@@ -1168,7 +1163,7 @@ class LLVM:
             with os.fdopen(fd, 'w') as f:
                 f.write(node.value)
             self.import_src_files.append(tmp_path)
-        return None
+        return
 
     def _emit_combine(self, node):
         """Run the real recursive emitter for a pure node whose children were
@@ -1618,8 +1613,7 @@ class LLVM:
                 total = 0
                 for el in ty.elements:
                     el_sz, el_align = self._type_abi_info(el)
-                    if el_align > max_align:
-                        max_align = el_align
+                    max_align = max(max_align, el_align)
                     if el_align > 0 and total % el_align != 0:
                         total += el_align - (total % el_align)
                     total += el_sz
@@ -1739,12 +1733,12 @@ class LLVM:
         value = self.emit(node.value)
         if value.type == _DynValue:
             self.builder.store(value, elem_ptr)
-            return None
+            return
         kind, bits = self._box_dyn(value, getattr(node.value, 'inferred_type', None) or 'int')
         s = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
         s = self.builder.insert_value(s, bits, 1)
         self.builder.store(s, elem_ptr)
-        return None
+        return
 
     def _emit_lvalue_index(self, node: Index):
         obj = self.emit(node.obj)
@@ -1933,12 +1927,11 @@ class LLVM:
         self.ssa_values = old_ssa
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
-        return None
 
     @register_emitter(Return)
     def emit_return(self, node: Return):
         if self._block_terminated():
-            return None
+            return
         # Shutdown GC before main returns
         fn_name = self.builder.function.name
         if fn_name == 'main' and not self.no_gc:
@@ -1954,7 +1947,7 @@ class LLVM:
                     value = self.builder.insert_value(ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0)
                     value = self.builder.insert_value(value, bits, 1)
                 self.builder.ret(value)
-                return None
+                return
             if value.type != ret_ty:
                 if isinstance(value.type, ir.IntType) and isinstance(ret_ty, ir.IntType):
                     if value.type.width < ret_ty.width:
@@ -1974,7 +1967,7 @@ class LLVM:
                 self.builder.ret(ir.Constant(ret_ty, None))
             else:
                 self.builder.ret(ir.Constant(ret_ty, 0))
-        return None
+        return
 
     @staticmethod
     def _switchable_if(node):
@@ -2882,8 +2875,7 @@ class LLVM:
                 obj_type_name = node.callee.obj._inferred_type
             if obj_type_name:
                 # Strip pointer
-                if obj_type_name.endswith('*'):
-                    obj_type_name = obj_type_name[:-1]
+                obj_type_name = obj_type_name.removesuffix('*')
                 # Resolve generic types
                 resolved = self._resolve_generic_type(obj_type_name)
                 if resolved is not None:
@@ -3291,14 +3283,14 @@ class LLVM:
     @register_emitter(Break)
     def emit_break(self, node):
         if not self.loop_stack:
-            return None
+            return
         _, end_bb = self.loop_stack[-1]
         self.builder.branch(end_bb)
 
     @register_emitter(Continue)
     def emit_continue(self, node):
         if not self.loop_stack:
-            return None
+            return
         cond_bb, _ = self.loop_stack[-1]
         self.builder.branch(cond_bb)
 
@@ -3621,7 +3613,7 @@ class LLVM:
                 self.builder.store(out, self._dyn_local_ptr(node.name))
                 self.ssa_values.pop(node.name, None)
                 self.ssa_types.pop(node.name, None)
-            return None
+            return
         ty = self.llvm_type(node.var_type)
         if self.no_userspace and node.var_type == 'dynamic':
             ty = _i32
@@ -3640,7 +3632,7 @@ class LLVM:
                     self._declare_const(node.name, ptr)
             else:
                 self._declare_const(node.name, ir.Constant(ty, 0))
-            return None
+            return
         ptr = self._alloca(ty, name=node.name)
         self._declare_local(node.name, ptr, node.var_type)
         if node.init:

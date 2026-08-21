@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 
+
 def _get_multiarch():
     for cc in ('cc', 'gcc', 'clang'):
         try:
@@ -76,26 +77,63 @@ def _get_sdk_paths():
 
     return paths
 
-from .lexar import Lexer, LexerError, register_keywords, unregister_keywords
 from .astparse import (
-    _loc, Number, String, FString, Variable, Call, Index, Attr,
-    UnaryOp, BinOp, Assign, Return, If, FuncDef, Print, ExprStmt,
-    VarDecl, Break, Continue, Switch, Import, While,
-    NewExpr, Deref, AddrOf, SizeOf, StructDef, Field, Input,
-    InputStr, InputBig, Signed67, Try, Raise, ExceptHandler, InlineAsm,
-    EnumDef, TypeAlias, ClassDef, ListLit, CCode, Llvm,
-    parse_file, ParseError,
+    AddrOf,
+    Assign,
+    Attr,
+    BinOp,
+    Break,
+    Call,
+    CCode,
+    ClassDef,
+    Continue,
+    Deref,
+    EnumDef,
+    ExprStmt,
+    FString,
+    FuncDef,
+    If,
+    Import,
+    Index,
+    InlineAsm,
+    Input,
+    InputBig,
+    InputStr,
+    ListLit,
+    Llvm,
+    NewExpr,
+    Number,
+    ParseError,
+    Print,
+    Raise,
+    Return,
+    Signed67,
+    SizeOf,
+    String,
+    StructDef,
+    Switch,
+    Try,
+    TypeAlias,
+    UnaryOp,
+    VarDecl,
+    Variable,
+    While,
+    parse_file,
 )
-from .clib import resolve_library, parse_header_file, parse_c_source, parse_llvm_ir_text, _framework_name_from_path
-from .package_manifest import (
-    ManifestParser, ManifestValidator, PackageManifest, 
-    get_global_registry, reset_global_registry, iter_cpm_version_dirs
+from .clib import (
+    _framework_name_from_path,
+    parse_c_source,
+    parse_header_file,
+    parse_llvm_ir_text,
+    resolve_library,
 )
-from .extension_hooks import HookRegistry, HookLoader, get_global_hook_registry
+from .extension_hooks import HookLoader, get_global_hook_registry
+from .lexar import Lexer, LexerError, register_keywords
+from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
 
 
 class Diagnostic:
-    __slots__ = ('message', 'token', 'note', 'level')
+    __slots__ = ('level', 'message', 'note', 'token')
 
     def __init__(self, message: str, token=None, note: str | None = None, level: str = 'error'):
         self.message = message
@@ -170,7 +208,7 @@ class Reporter:
 
 
 class Symbol:
-    __slots__ = ('kind', 'type', 'node', 'const_value', 'initialized', 'dynamic')
+    __slots__ = ('const_value', 'dynamic', 'initialized', 'kind', 'node', 'type')
 
     def __init__(self, kind: str, type_: str | None = None, node=None,
                  initialized: bool = True):
@@ -556,7 +594,7 @@ class SemanticAnalyzer:
                 if self._report_lazy_load_error(node):
                     return None
                 self.error(f'use of undeclared identifier `{node.name}`', node,
-                           note=f'no definition found in this scope')
+                           note='no definition found in this scope')
                 return None
             if sym.const_value is not None:
                 node.const_value = sym.const_value
@@ -669,7 +707,7 @@ class SemanticAnalyzer:
                     self.error(
                         f'division by zero in `{node.op.name}`',
                         node,
-                        note=f'cannot divide or mod by zero'
+                        note='cannot divide or mod by zero'
                     )
                 # Type promotion for mixed integer types
                 if left_t == 'big' or right_t == 'big':
@@ -689,7 +727,7 @@ class SemanticAnalyzer:
                     self.error(
                         f'operator `{node.op.name}` not supported for string operands',
                         node,
-                        note=f'strings only support `+` (concatenation)'
+                        note='strings only support `+` (concatenation)'
                     )
                     result = left_t if left_t is not None else right_t
                     node.inferred_type = result
@@ -698,9 +736,9 @@ class SemanticAnalyzer:
                     int_types = ('int', 'int64', 'uint64')
                     if left_t in int_types and right_t in int_types and _is_literal_zero(node.right):
                         self.error(
-                            f'division by zero',
+                            'division by zero',
                             node,
-                            note=f'cannot divide integer by zero'
+                            note='cannot divide integer by zero'
                         )
                 if left_t is not None and right_t is not None and left_t != right_t:
                     # Usual arithmetic conversions: promote to the widest type
@@ -848,7 +886,7 @@ class SemanticAnalyzer:
         if isinstance(node, Attr):
             obj_t = self._infer_type(node.obj)
             if obj_t:
-                lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
+                lookup_t = obj_t.removesuffix('*')
                 sym = self.current_scope.lookup(lookup_t)
                 if sym and sym.kind == 'enum':
                     member_sym = self.current_scope.lookup(f'{lookup_t}.{node.name}')
@@ -1060,11 +1098,7 @@ class SemanticAnalyzer:
             self._visit_try(node, scope)
         elif isinstance(node, Raise):
             self._visit_raise(node)
-        elif isinstance(node, Deref):
-            self._infer_type(node)
-        elif isinstance(node, AddrOf):
-            self._infer_type(node)
-        elif isinstance(node, NewExpr):
+        elif isinstance(node, Deref) or isinstance(node, AddrOf) or isinstance(node, NewExpr):
             self._infer_type(node)
         elif isinstance(node, SizeOf):
             pass
@@ -1082,13 +1116,7 @@ class SemanticAnalyzer:
             self._visit_ccode(node)
         elif isinstance(node, Llvm):
             self._visit_llvm(node)
-        elif isinstance(node, Input):
-            pass
-        elif isinstance(node, InputStr):
-            pass
-        elif isinstance(node, InputBig):
-            pass
-        elif isinstance(node, Signed67):
+        elif isinstance(node, Input) or isinstance(node, InputStr) or isinstance(node, InputBig) or isinstance(node, Signed67):
             pass
         elif isinstance(node, dict):
             self._visit_dict(node, scope)
@@ -1706,7 +1734,7 @@ class SemanticAnalyzer:
                     obj_sym.initialized = True
             obj_t = self._infer_type(node.target.obj)
             if obj_t:
-                lookup_t = obj_t[:-1] if obj_t.endswith('*') else obj_t
+                lookup_t = obj_t.removesuffix('*')
                 struct_sym = scope.lookup(lookup_t) if scope else self.current_scope.lookup(lookup_t)
                 if struct_sym and struct_sym.kind == 'struct' and struct_sym.node:
                     for field in struct_sym.node.fields:
@@ -1740,7 +1768,7 @@ class SemanticAnalyzer:
         existing = s.lookup_local(node.name)
         if existing and existing.kind not in ('variable', 'const'):
             self.error(f'redeclaration of `{node.name}`', node,
-                       note=f'another symbol with this name already exists in this scope')
+                       note='another symbol with this name already exists in this scope')
         if node.is_const and node.init is None:
             self.error(f'constant `{node.name}` requires an initializer', node,
                        note=f'declare it as `{node.var_type} ({node.name}) = <value>`')
@@ -1816,7 +1844,7 @@ class SemanticAnalyzer:
                 case_t = self._infer_type(val)
                 if val_t == 'str' and case_t != 'str':
                     self.error(
-                        f'case value must be a string when switching on a string',
+                        'case value must be a string when switching on a string',
                         val,
                         note='string switch cases are shell-style glob patterns '
                              '(e.g. `a-*` matches any string starting with "a-")'

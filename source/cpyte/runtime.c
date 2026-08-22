@@ -1096,6 +1096,70 @@ dyn_list_get(uint64_t list_bits, int64_t idx) {
     return &arr[idx];
 }
 
+/* str_split(str, sep) — split a string by a separator into a DynValue list.
+ * Returns a malloc'd DynValue[] array of DYN_STR elements, registered in the
+ * array-length table so `for x in list` works.  The empty string yields a
+ * single-element list containing "". */
+DynValue *
+str_split(const char *str, const char *sep) {
+    if (str == NULL) {
+        fprintf(stderr, "split: NULL string argument\n");
+        abort();
+    }
+    if (sep == NULL || sep[0] == '\0') {
+        fprintf(stderr, "split: NULL or empty separator\n");
+        abort();
+    }
+
+    size_t sep_len = strlen(sep);
+
+    /* First pass: count parts. */
+    size_t count = 1;
+    const char *p = str;
+    while (1) {
+        const char *hit = strstr(p, sep);
+        if (hit == NULL) break;
+        count++;
+        p = hit + sep_len;
+    }
+
+    /* Allocate DynValue array. */
+    DynValue *arr = (DynValue *)malloc(sizeof(DynValue) * count);
+    if (arr == NULL) {
+        fprintf(stderr, "split: allocation failed\n");
+        abort();
+    }
+
+    /* Second pass: fill elements. */
+    size_t idx = 0;
+    const char *start = str;
+    while (1) {
+        const char *hit = strstr(start, sep);
+        size_t part_len;
+        if (hit == NULL) {
+            part_len = strlen(start);
+        } else {
+            part_len = (size_t)(hit - start);
+        }
+        char *part = (char *)malloc(part_len + 1);
+        if (part == NULL) {
+            fprintf(stderr, "split: allocation failed\n");
+            abort();
+        }
+        memcpy(part, start, part_len);
+        part[part_len] = '\0';
+        arr[idx].kind = DYN_STR;
+        arr[idx].data = (uint64_t)(uintptr_t)part;
+        idx++;
+        if (hit == NULL) break;
+        start = hit + sep_len;
+    }
+
+    /* Register the array so for-in iteration works. */
+    cpyte_array_register(arr, (int64_t)count);
+    return arr;
+}
+
 /* Shell glob matching: `*` (any run), `?` (single char) and `[...]` /
  * `[!...]` char classes (with `a-z` ranges). Case-sensitive, no allocation. */
 int

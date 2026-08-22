@@ -1,5 +1,4 @@
 from enum import Enum, auto
-from typing import Set
 
 
 class TokenType(Enum):
@@ -70,6 +69,7 @@ _BASE_KEYWORDS = {
     'switch', 'case', 'default',
     'new', 'struct', 'sizeof', 'ref',
     'int64', 'uint64',
+    'assert',
     'let',
     'try', 'except', 'raise',
     'asm',
@@ -79,10 +79,10 @@ _BASE_KEYWORDS = {
 }
 
 # Additional keywords registered by packages
-_additional_keywords: Set[str] = set()
+_additional_keywords: set[str] = set()
 
 
-def register_keywords(keywords: Set[str]) -> None:
+def register_keywords(keywords: set[str]) -> None:
     """Register additional keywords from packages."""
     _additional_keywords.update(keywords)
     # Update legacy KEYWORDS for backward compatibility
@@ -90,7 +90,7 @@ def register_keywords(keywords: Set[str]) -> None:
     KEYWORDS = get_keywords()
 
 
-def unregister_keywords(keywords: Set[str]) -> None:
+def unregister_keywords(keywords: set[str]) -> None:
     """Unregister keywords from packages."""
     _additional_keywords.difference_update(keywords)
     # Update legacy KEYWORDS for backward compatibility
@@ -98,7 +98,7 @@ def unregister_keywords(keywords: Set[str]) -> None:
     KEYWORDS = get_keywords()
 
 
-def get_keywords() -> Set[str]:
+def get_keywords() -> set[str]:
     """Get the complete set of keywords (base + additional)."""
     return _BASE_KEYWORDS | _additional_keywords
 
@@ -112,7 +112,7 @@ KEYWORDS = get_keywords()
 
 
 class Token:
-    __slots__ = ('type', 'value', 'line', 'column', 'raw')
+    __slots__ = ('column', 'line', 'raw', 'type', 'value')
 
     def __init__(self, type_: TokenType, value: str | None = None, line: int = 0, column: int = 0, raw: bool = False):
         self.type = type_
@@ -494,12 +494,12 @@ class Lexer:
         self._tokenize()
     
     @staticmethod
-    def register_package_keywords(keywords: Set[str]) -> None:
+    def register_package_keywords(keywords: set[str]) -> None:
         """Register keywords from a package."""
         register_keywords(keywords)
     
     @staticmethod  
-    def unregister_package_keywords(keywords: Set[str]) -> None:
+    def unregister_package_keywords(keywords: set[str]) -> None:
         """Unregister keywords from a package."""
         unregister_keywords(keywords)
 

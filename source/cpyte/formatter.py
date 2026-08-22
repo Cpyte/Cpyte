@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
-from .lexar import Lexer, LexerError, TokenType
 from . import astparse
+from .lexar import Lexer, LexerError, TokenType
 
 
 class FormatError(Exception):
@@ -310,6 +310,15 @@ class _Formatter:
     def _emit_continue(self, node, level: int):
         self._emit_simple(node, 'continue', level)
 
+    def _emit_assert(self, node, level: int):
+        pad = '    ' * level
+        cond_str = self._expr(node.cond)
+        if node.message:
+            msg_str = self._expr(node.message)
+            self.result.append(f'{pad}assert {cond_str}, {msg_str}\n')
+        else:
+            self.result.append(f'{pad}assert {cond_str}\n')
+
     def _emit_exprstmt(self, node, level: int):
         self._emit_simple(node, self._expr(node.expr), level)
 
@@ -455,6 +464,7 @@ class _Formatter:
 
 
 import re as _re
+
 _IDENT_RE = _re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
@@ -479,6 +489,7 @@ _STATEMENT_HANDLERS = {
     'Print': _Formatter._emit_print,
     'Break': _Formatter._emit_break,
     'Continue': _Formatter._emit_continue,
+    'Assert': _Formatter._emit_assert,
     'ExprStmt': _Formatter._emit_exprstmt,
     'Import': _Formatter._emit_import,
     'If': _Formatter._emit_if,

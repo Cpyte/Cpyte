@@ -1,37 +1,43 @@
-import sys
 import os
+import sys
 
 if __package__:
-    from . import __version__
-    from .lexar import Lexer, LexerError, register_keywords
-    from .astparse import parse_file, ParseError, Import
-    from .semantic_analasis import analyze
-    from .bytecoding import LLVM
-    from .compiling import run_jit, run_aot, run_scorpion, optimize, _RUNTIME_C
-    from .linker import Linker, find_linker, LinkerNotFoundError
+    from . import __version__, ui
     from ._bignum_bc import load_bignum_bc
     from ._gc_bc import load_gc_bc
-    from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
+    from .astparse import Import, ParseError, parse_file
+    from .bytecoding import LLVM
+    from .compiling import _RUNTIME_C, optimize, run_aot, run_jit, run_scorpion
     from .extension_hooks import HookLoader, get_global_hook_registry
-    from .sef import cmd_pack, cmd_check, cmd_dump, cmd_size
-    from .update_check import start_check, report_update
-    from . import ui
+    from .lexar import Lexer, LexerError, register_keywords
+    from .linker import Linker
+    from .package_manifest import (
+        ManifestParser,
+        get_global_registry,
+        iter_cpm_version_dirs,
+    )
+    from .sef import cmd_check, cmd_dump, cmd_pack, cmd_size
+    from .semantic_analasis import analyze
+    from .update_check import report_update, start_check
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from cpyte import __version__
-    from cpyte.lexar import Lexer, LexerError, register_keywords
-    from cpyte.astparse import parse_file, ParseError, Import
-    from cpyte.semantic_analasis import analyze
-    from cpyte.bytecoding import LLVM
-    from cpyte.compiling import run_jit, run_aot, run_scorpion, optimize, _RUNTIME_C
-    from cpyte.linker import Linker, find_linker, LinkerNotFoundError
+    from cpyte import __version__, ui
     from cpyte._bignum_bc import load_bignum_bc
     from cpyte._gc_bc import load_gc_bc
-    from cpyte.package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
+    from cpyte.astparse import Import, ParseError, parse_file
+    from cpyte.bytecoding import LLVM
+    from cpyte.compiling import _RUNTIME_C, optimize, run_aot, run_jit, run_scorpion
     from cpyte.extension_hooks import HookLoader, get_global_hook_registry
-    from cpyte.sef import cmd_pack, cmd_check, cmd_dump, cmd_size
-    from cpyte.update_check import start_check, report_update
-    from cpyte import ui
+    from cpyte.lexar import Lexer, LexerError, register_keywords
+    from cpyte.linker import Linker
+    from cpyte.package_manifest import (
+        ManifestParser,
+        get_global_registry,
+        iter_cpm_version_dirs,
+    )
+    from cpyte.sef import cmd_check, cmd_dump, cmd_pack, cmd_size
+    from cpyte.semantic_analasis import analyze
+    from cpyte.update_check import report_update, start_check
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
@@ -120,6 +126,12 @@ def pretty_ast(node, indent=0):
 
     if name == 'Continue':
         return f'{pad}continue'
+
+    if name == 'Assert':
+        result = f'{pad}assert {pretty_ast(node.cond, indent)}'
+        if node.message:
+            result += f', {pretty_ast(node.message, indent)}'
+        return result
 
     if name == 'If':
         result = f'{pad}if\n{pretty_ast(node.cond, indent + 1)}'
@@ -412,7 +424,7 @@ def cmd_build(args, tab_size=4, strict=False, no_userspace=False, pic=False, lto
     out_base = src_file.rsplit('.', 1)[0] if '.' in src_file else 'a'
     obj_file = out_base + '.o'
 
-    import llvmlite.binding as binding
+    from llvmlite import binding
 
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()

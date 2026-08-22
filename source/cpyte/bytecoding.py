@@ -832,7 +832,6 @@ class LLVM:
                     self.builder.branch(after_blk)
 
                 self.builder.position_at_end(next_blk)
-                last_blk = next_blk
             else:
                 self.builder.store(old_buf, self._exc_buf_ptr)
                 for stmt in handler.body:
@@ -840,7 +839,6 @@ class LLVM:
                         self.emit(stmt)
                 if not self._block_terminated():
                     self.builder.branch(after_blk)
-                last_blk = self.builder.block
 
         if not self._block_terminated():
             self.builder.store(old_buf, self._exc_buf_ptr)
@@ -1037,7 +1035,7 @@ class LLVM:
                     )
                 )
             else:
-                val = self.emit(payload)
+                val = self.emit(payload) # pyright: ignore[reportArgumentType]
                 strings.append(self._stringify_value(payload, val))
         result = strings[0] if strings else self._string_const("")
         for s in strings[1:]:
@@ -1105,7 +1103,7 @@ class LLVM:
     def emit_exprstmt(self, node):
         return self.emit(node.expr)
 
-    def emit(self, node: list[Token]) -> _IRValue:
+    def emit(self, node: Any) -> _IRValue:
         key = id(node)
         if key in self._emit_memo:
             return self._emit_memo[key]
@@ -1356,7 +1354,7 @@ class LLVM:
                 if k not in start:
                     del self._emit_memo[k]
 
-    def _emit_recursive(self, node: list[Token]) -> _IRValue:
+    def _emit_recursive(self, node: Any) -> _IRValue:
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
             for hook in self._hook_registry.get_codegen_hooks():
@@ -3626,6 +3624,25 @@ class LLVM:
             return
         cond_bb, _ = self.loop_stack[-1]
         self.builder.branch(cond_bb)
+
+    @register_emitter(Assert)
+    def emit_assert(self, node):
+        cond = self._truthy_expr(node.cond)
+        trap_fn = self._get_trap_fn()
+        ok_bb = self.builder.append_basic_block("assert.ok")
+        fail_bb = self.builder.append_basic_block("assert.fail")
+        self.builder.cbranch(cond, ok_bb, fail_bb)
+        self.builder.position_at_end(fail_bb)
+        if node.message is not None:
+            msg_val = self.emit(node.message)
+            if msg_val.type != _i8ptr:
+                msg_val = self.builder.bitcast(msg_val, _i8ptr)
+            self.builder.call(self.functions["print_str"], [msg_val])
+        fflush_fn = self._get_or_create_fn("fflush", _i32, [_i8ptr])
+        self.builder.call(fflush_fn, [ir.Constant(_i8ptr, None)])
+        self.builder.call(trap_fn, [])
+        self.builder.unreachable()
+        self.builder.position_at_end(ok_bb)
 
     def emit_for(self, node):
         var_name = node["var"]

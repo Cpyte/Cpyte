@@ -93,6 +93,7 @@ def _get_sdk_paths():
 
 from .astparse import (
     AddrOf,
+    Assert,
     Assign,
     Attr,
     BinOp,
@@ -1185,6 +1186,8 @@ class SemanticAnalyzer:
             self._visit_break(node)
         elif isinstance(node, Continue):
             self._visit_continue(node)
+        elif isinstance(node, Assert):
+            self._visit_assert(node)
         elif isinstance(node, While):
             self._visit_while(node, scope)
         elif isinstance(node, Switch):
@@ -2115,6 +2118,11 @@ class SemanticAnalyzer:
     def _visit_continue(self, node: Continue):
         if self._loop_depth == 0:
             self.error("continue outside loop", node)
+
+    def _visit_assert(self, node: Assert):
+        self._infer_type(node.cond)
+        if node.message is not None:
+            self._infer_type(node.message)
 
     def _visit_switch(self, node: Switch, scope: Scope | None = None):
         val_t = self._infer_type(node.value)

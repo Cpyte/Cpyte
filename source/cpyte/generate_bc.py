@@ -41,7 +41,7 @@ from llvmlite import binding
 
 try:
     from .ui import print_ok
-except ImportError as e:
+except ImportError:
     print_ok = print
 
 def _remove_probe_stack_ir(llvm_ir: str) -> str:

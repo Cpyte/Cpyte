@@ -1,10 +1,9 @@
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'source'))
-from cpyte.linker import (
-    Linker, find_linker, build as _build, LinkerNotFoundError
-)
+from cpyte.linker import LinkerNotFoundError, find_linker
+from cpyte.linker import build as _build
 
 
 def main():

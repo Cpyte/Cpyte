@@ -1,4 +1,5 @@
-import sys, os
+import sys
+
 sys.path.insert(0, '/Users/main/PycharmProjects/WEW/source')
 from cpyte._bignum_bc import load_bignum_bc
 from cpyte._runtime_bc import _B64
@@ -55,6 +56,7 @@ engine.run_static_constructors()
 
 print("Getting function address...", flush=True)
 import ctypes
+
 fn = ctypes.CFUNCTYPE(ctypes.c_int)(engine.get_function_address('main'))
 print("Running main...", flush=True)
 result = fn()

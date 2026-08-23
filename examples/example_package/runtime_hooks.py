@@ -3,8 +3,9 @@ Example runtime hooks for the example_package.
 
 This demonstrates how packages can extend the runtime with additional code.
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
 from cpyte.extension_hooks import RuntimeHook
 
@@ -48,7 +49,6 @@ void resolve_promise(Promise* p, void* value) {
     
     def initialize(self, context):
         """Initialize the runtime hook."""
-        pass
 
 
 def get_hooks():

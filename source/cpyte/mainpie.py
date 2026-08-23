@@ -200,11 +200,16 @@ def pretty_ast(node, indent=0):
         return f'{pad}.{node.name}\n{pretty_ast(node.obj, indent + 1)}'
 
     if name == 'FuncDef':
+        decorators = getattr(node, 'decorators', None) or []
+        lines = []
+        for dec in decorators:
+            lines.append(f'{pad}@{pretty_ast(dec, 0)}')
         vis = f'{node.visibility} ' if node.visibility else ''
         ret = f' -> {node.rettype}' if node.rettype else ''
         const_params = set(getattr(node, 'const_params', None) or ())
         params = ', '.join(f'({k}): {v}' if k in const_params else f'{k}: {v}' for k, v in node.params.items())
-        result = f'{pad}{vis}def {node.name}({params}){ret}:'
+        lines.append(f'{pad}{vis}def {node.name}({params}){ret}:')
+        result = '\n'.join(lines)
         for stmt in node.body:
             result += f'\n{pretty_ast(stmt, indent + 1)}'
         return result

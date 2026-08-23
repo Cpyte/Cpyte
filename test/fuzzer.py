@@ -1,22 +1,18 @@
-import sys
-import os
-import re
-import random
-import traceback
-import signal
-import io
 import contextlib
-import string
+import io
 import multiprocessing as mp
+import os
+import random
+import re
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'source'))
 
-from cpyte.lexar import Lexer, LexerError
-from cpyte.astparse import parse_file, ParseError
-from cpyte.semantic_analasis import analyze
+from cpyte.astparse import ParseError, parse_file
 from cpyte.bytecoding import LLVM
 from cpyte.compiling import run_jit
-
+from cpyte.lexar import Lexer, LexerError
+from cpyte.semantic_analasis import analyze
 
 TIMEOUT_S = 30
 
@@ -1103,9 +1099,7 @@ def gen_program(state: FuzzerState) -> str:
         # Track known-truthy globals to avoid infinite while loops
         if type_is_ptr(ty):
             pass  # null is a common pointer initializer
-        elif ty == 'str' and _is_nonempty_str_literal(init_text):
-            state.known_truthy_globals.add(name)
-        elif ty != 'str' and init_text.strip() not in ('0', 'null', 'false', "''", '""', '0.0') and expr_is_always_truthy(init_text):
+        elif ty == 'str' and _is_nonempty_str_literal(init_text) or ty != 'str' and init_text.strip() not in ('0', 'null', 'false', "''", '""', '0.0') and expr_is_always_truthy(init_text):
             state.known_truthy_globals.add(name)
     if lines and lines[-1] != '':
         lines.append('')
@@ -1178,7 +1172,7 @@ def run_test(source, label=''):
     try:
         tokens = Lexer(source).get_tokens()
         parsed, _ = parse_file(tokens)
-    except (LexerError, ParseError, Exception) as e:
+    except (LexerError, ParseError, Exception):
         REJECT_COUNT += 1
         return
 

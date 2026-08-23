@@ -1,42 +1,23 @@
 struct S1:
+    int64 ptr
     char next
-    str ptr
-    char right
-    big data
+    big left
+    float data
+    int64 name
 
 struct S2:
-    float left
-    double name
+    str ptr
+    int64 prev
+    int64 head
+    big x
 
-struct S3:
-    int prev
-    str next
-    char z
-    big value
-    uint64 ptr
-
-big g4 = 293214873781412733337453408536
+uint64 g3 = (9986878981914450176 // ~910186917)
+int64 g4 = 8249889284554525894
+int64 g5 = 315401734454565295
+char g6 = "a"
 
 def main() -> int:
-    big v5 = g4
-    if ((-97013.042648 - 1.5) or (13890435509728846021 < 14215479744395276387)):
-        g4 = (~(4294967296 >> sizeof(int64)) | (11434878168256015562 + (733078552844160736 & 100)))
-        int w6 = 3
-        while ((((9223372036854775808 * (-16328747384809358211 * (2350764050653372376 + 5))) // not (29549021 >> (11516042025807259935 * 18446744073709551615)))) and (w6 > 0)):
-            w6 = w6 - 1
-            int w7 = 1
-            while (((g4 <= v5)) and (w7 > 0)):
-                w7 = w7 - 1
-                if (v5 >= 959620414986713320260963380013):
-                    if (10000000000000000000 << 1393450740):
-                        g4 = v5
-                        print(v5)
-                        print(v5)
-                    else:
-                        v5 /= v5
-                    if *(new double):
-                        for v8 in 'abc':
-                            print(v5)
-                            int w9 = 2
-                            while ((v5) and (w9 > 0)):
-                                w9 = w9 - 1
+    g4 = 2317986340137805024
+    (1000000000000 % not g6)
+    ((2079818699 + g5) >> 1000000)
+    return 0

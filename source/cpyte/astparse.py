@@ -1,5 +1,4 @@
 from typing import Any
-from enum import Enum, auto
 
 from .lexar import Lexer, Token, TokenType, _unescape_run
 
@@ -39,7 +38,13 @@ def _loc(node):
     return '<unknown>'
 
 
-class Number:
+class Node:
+    """Base class for all AST nodes."""
+
+    __slots__ = ()
+
+
+class Number(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', 'value')
     def __init__(self, value: str, token=None):
@@ -49,7 +54,7 @@ class Number:
     def __repr__(self):
         return f'Number({self.value})'
 
-class String:
+class String(Node):
     __slots__ = ('_token', 'inferred_type', 'value')
     def __init__(self, value: str, token=None):
         self.value = value
@@ -57,7 +62,7 @@ class String:
     def __repr__(self):
         return f'String({self.value})'
 
-class FString:
+class FString(Node):
     __slots__ = ('_token', 'inferred_type', 'parts')
     def __init__(self, parts: list, token=None):
         self.parts = parts
@@ -65,7 +70,7 @@ class FString:
     def __repr__(self):
         return f'FString({self.parts})'
 
-class Variable:
+class Variable(Node):
     __slots__ = ('_token', 'const_value', 'dynamic', 'inferred_type', 'name')
     def __init__(self, name: str, token=None):
         self.name = name
@@ -78,7 +83,7 @@ class Variable:
     def token(self):
         return self._token
 
-class ListLit:
+class ListLit(Node):
     __slots__ = ('_token', 'inferred_type', 'items')
     def __init__(self, items: list, token=None):
         self.items = items
@@ -88,7 +93,7 @@ class ListLit:
         return f'ListLit({self.items})'
 
 
-class Call:
+class Call(Node):
     __slots__ = ('_token', 'args', 'callee', 'inferred_type')
     def __init__(self, callee, args: list, token=None):
         self.callee = callee
@@ -97,7 +102,7 @@ class Call:
     def __repr__(self):
         return f'Call({self.callee}, {self.args})'
 
-class Index:
+class Index(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'index', 'inferred_type', 'obj')
     def __init__(self, obj, index, token=None):
@@ -108,7 +113,7 @@ class Index:
     def __repr__(self):
         return f'Index({self.obj}, {self.index})'
 
-class Attr:
+class Attr(Node):
     __slots__ = ('_enum_member_value', '_token', 'name', 'obj')
     def __init__(self, obj, name: str, token=None):
         self.obj = obj
@@ -118,7 +123,7 @@ class Attr:
     def __repr__(self):
         return f'Attr({self.obj}, {self.name})'
 
-class UnaryOp:
+class UnaryOp(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', 'op', 'operand')
     def __init__(self, op: TokenType, operand, token=None):
@@ -129,7 +134,7 @@ class UnaryOp:
     def __repr__(self):
         return f'UnaryOp({self.op.name}, {self.operand})'
 
-class BinOp:
+class BinOp(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', 'left', 'op', 'right')
     def __init__(self, left, op: TokenType, right, token=None):
@@ -141,7 +146,7 @@ class BinOp:
     def __repr__(self):
         return f'BinOp({self.left}, {self.op.name}, {self.right})'
 
-class CCode:
+class CCode(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', 'symbols', 'value', 'var_names')
     def __init__(self, value : str, token=None):
@@ -153,7 +158,7 @@ class CCode:
     def __repr__(self):
         return f'CCode({self.value!r})'
 
-class LLVMblock:
+class LLVMblock(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', "is_unsafe", 'value')
 
@@ -166,16 +171,7 @@ class LLVMblock:
     def __repr__(self):
         return f'LLVM({self.value!r})'
 
-class Decorator:
-    inferred_type: str | None
-    __slots__ = ('_token', "container", 'inferred_type', 'value')
-    def __init__(self, container : TokenType, token=None):
-
-        self._token = token
-        self.container = container
-        self.inferred_type = None
-
-class Llvm:
+class Llvm(Node):
     inferred_type: str | None
     __slots__ = ('_token', 'inferred_type', 'symbols', 'unsafe', 'value', 'var_names')
     def __init__(self, value: str, unsafe: bool = False, token=None):
@@ -187,54 +183,6 @@ class Llvm:
         self.var_names = None
     def __repr__(self):
         return f'Llvm({self.value!r}, unsafe={self.unsafe})'
-
-class Astnodes(Enum):
-    # Expressions
-    NUMBER = auto()
-    STRING = auto()
-    FSTRING = auto()
-    VARIABLE = auto()
-    LIST_LIT = auto()
-    CALL = auto()
-    INDEX = auto()
-    ATTR = auto()
-    UNARY_OP = auto()
-    BIN_OP = auto()
-    C_CODE = auto()
-    LLVM_BLOCK = auto()
-    DECORATOR = auto()
-    LLVM = auto()
-
-    # Statements and definitions
-    ASSIGN = auto()
-    RETURN = auto()
-    IF = auto()
-    FUNC_DEF = auto()
-    PRINT = auto()
-    INPUT = auto()
-    INPUT_STR = auto()
-    INPUT_BIG = auto()
-    SIGNED_67 = auto()
-    WHILE = auto()
-    EXPR_STMT = auto()
-    VAR_DECL = auto()
-    IMPORT = auto()
-    EXCEPT_HANDLER = auto()
-    TRY = auto()
-    RAISE = auto()
-    NEW_EXPR = auto()
-    DEREF = auto()
-    ADDR_OF = auto()
-    SIZE_OF = auto()
-    STRUCT_DEF = auto()
-    FIELD = auto()
-    INLINE_ASM = auto()
-    CLASS_DEF = auto()
-    BREAK = auto()
-    CONTINUE = auto()
-    SWITCH = auto()
-    ENUM_DEF = auto()
-    TYPE_ALIAS = auto()
 
 _PREC = {
     TokenType.POW: 80,
@@ -862,7 +810,9 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
 def _parse_standard_statement(tokens: list[Token], pos: int):
     """Parse a statement using standard grammar (non-hooked)."""
     tok = tokens[pos]
-    if tok.type == TokenType.KEYWORD and tok.value == 'def':
+    if tok.type == TokenType.AT_SIGN:
+        node, pos = parse_at_def(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == 'def':
         node, pos = parse_def(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value in ('public', 'private', 'static', 'virtual', 'override'):
         node, pos = parse_decorated_def(tokens, pos)
@@ -1211,7 +1161,7 @@ def parse_import(tokens: list[Token], pos: int):
 # Bruh, dead code.
 
 
-class Assign:
+class Assign(Node):
     __slots__ = ('_token', 'dynamic', 'target', 'value')
     def __init__(self, target, value, token=None):
         self.target = target
@@ -1220,7 +1170,7 @@ class Assign:
     def __repr__(self):
         return f'Assign({self.target}, {self.value})'
 
-class Return:
+class Return(Node):
     __slots__ = ('_token', 'value')
     def __init__(self, value, token=None):
         self.value = value
@@ -1228,7 +1178,7 @@ class Return:
     def __repr__(self):
         return f'Return({self.value})'
 
-class If:
+class If(Node):
     __slots__ = ('_token', 'body', 'cond', 'orelse')
     def __init__(self, cond, body, orelse=None, token=None):
         self.cond = cond
@@ -1238,9 +1188,9 @@ class If:
     def __repr__(self):
         return f'If({self.cond}, {self.body}, {self.orelse})'
 
-class FuncDef:
-    __slots__ = ('_token', 'body', 'const_params', 'generic_params', 'name', 'params', 'rettype', 'visibility')
-    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, const_params: list | None = None, token=None):
+class FuncDef(Node):
+    __slots__ = ('_token', 'body', 'const_params', 'decorators', 'generic_params', 'name', 'params', 'rettype', 'visibility')
+    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, const_params: list | None = None, decorators: list | None = None, token=None):
         self.name = name
         self.params = params
         self.rettype = rettype
@@ -1248,12 +1198,32 @@ class FuncDef:
         self.visibility = visibility
         self.generic_params = generic_params or []
         self.const_params = const_params or []
+        self.decorators = decorators or []
         self._token = token
     def __repr__(self):
         vis = f'{self.visibility} ' if self.visibility else ''
-        return f'FuncDef({vis}{self.name}, {self.params}, ->{self.rettype}, {self.body})'
+        decs = f', decorators={self.decorators}' if self.decorators else ''
+        return f'FuncDef({vis}{self.name}, {self.params}, ->{self.rettype}, {self.body}{decs})'
 
-class Print:
+class Decorator(Node):
+    inferred_type: str | None
+    __slots__ = ('_token', "container", 'inferred_type')
+    def __init__(self, container : FuncDef, token=None):
+
+        self._token = token
+        self.container = container
+        self.inferred_type = None
+
+class Decorated(Node):
+    inferred_type: str | None
+    __slots__ = ('_token', "function", 'inferred_type')
+    def __init__(self, function : FuncDef, token=None):
+
+        self._token = token
+        self.function = function
+        self.inferred_type = None
+
+class Print(Node):
     __slots__ = ('_token', 'value')
     def __init__(self, value, token=None):
         self.value = value
@@ -1261,7 +1231,7 @@ class Print:
     def __repr__(self):
         return f'Print({self.value})'
 
-class Input:
+class Input(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
@@ -1269,7 +1239,7 @@ class Input:
         return 'Input()'
 
 
-class InputStr:
+class InputStr(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
@@ -1277,7 +1247,7 @@ class InputStr:
         return 'InputStr()'
 
 
-class InputBig:
+class InputBig(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
@@ -1285,14 +1255,14 @@ class InputBig:
         return 'InputBig()'
 
 
-class Signed67:
+class Signed67(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
     def __repr__(self):
         return 'Signed67()'
 
-class While:
+class While(Node):
     __slots__ = ('_token', 'body', 'cond')
     def __init__(self, cond, body, token=None):
         self.cond = cond
@@ -1301,7 +1271,7 @@ class While:
     def __repr__(self):
         return f'While({self.cond}, {self.body})'
 
-class ExprStmt:
+class ExprStmt(Node):
     __slots__ = ('_token', 'expr')
     def __init__(self, expr, token=None):
         self.expr = expr
@@ -1309,7 +1279,7 @@ class ExprStmt:
     def __repr__(self):
         return f'ExprStmt({self.expr})'
 
-class VarDecl:
+class VarDecl(Node):
     __slots__ = ('_token', 'dynamic', 'init', 'is_const', 'name', 'var_type')
     def __init__(self, name: str, var_type: str | None = None, init=None, is_const: bool = False, token=None):
         self.name = name
@@ -1320,7 +1290,7 @@ class VarDecl:
     def __repr__(self):
         return f'VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})'
 
-class Import:
+class Import(Node):
     src_file: str | None
     sub_ast: list | None
     sdk_path: str | None
@@ -1343,7 +1313,7 @@ class Import:
         return f'Import({self.module})'
 
 
-class ExceptHandler:
+class ExceptHandler(Node):
     __slots__ = ('_token', 'body', 'type_name')
     def __init__(self, type_name: str | None, body: list, token=None):
         self.type_name = type_name
@@ -1353,7 +1323,7 @@ class ExceptHandler:
         return f'ExceptHandler({self.type_name})'
 
 
-class Try:
+class Try(Node):
     __slots__ = ('_token', 'body', 'handlers')
     def __init__(self, body: list, handlers: list[ExceptHandler], token=None):
         self.body = body
@@ -1363,7 +1333,7 @@ class Try:
         return f'Try({self.body}, handlers={self.handlers})'
 
 
-class Raise:
+class Raise(Node):
     __slots__ = ('_token', 'exc_type', 'message')
     def __init__(self, exc_type: str, message, token=None):
         self.exc_type = exc_type
@@ -1372,7 +1342,7 @@ class Raise:
     def __repr__(self):
         return f'Raise({self.exc_type}, {self.message})'
 
-class NewExpr:
+class NewExpr(Node):
     __slots__ = ('_token', 'size', 'type_expr')
     def __init__(self, type_expr, size=None, token=None):
         self.type_expr = type_expr
@@ -1382,7 +1352,7 @@ class NewExpr:
         return f'NewExpr({self.type_expr}, {self.size})'
 
 
-class Deref:
+class Deref(Node):
     __slots__ = ('_token', 'operand')
     def __init__(self, operand, token=None):
         self.operand = operand
@@ -1391,7 +1361,7 @@ class Deref:
         return f'Deref({self.operand})'
 
 
-class AddrOf:
+class AddrOf(Node):
     __slots__ = ('_token', 'operand')
     def __init__(self, operand, token=None):
         self.operand = operand
@@ -1400,7 +1370,7 @@ class AddrOf:
         return f'AddrOf({self.operand})'
 
 
-class SizeOf:
+class SizeOf(Node):
     __slots__ = ('_token', 'type_expr')
     def __init__(self, type_expr, token=None):
         self.type_expr = type_expr
@@ -1409,7 +1379,7 @@ class SizeOf:
         return f'SizeOf({self.type_expr})'
 
 
-class StructDef:
+class StructDef(Node):
     __slots__ = ('_token', 'fields', 'generic_params', 'name')
     def __init__(self, name: str, fields: list, generic_params: list | None = None, token=None):
         self.name = name
@@ -1420,7 +1390,7 @@ class StructDef:
         return f'StructDef({self.name}, {self.fields})'
 
 
-class Field:
+class Field(Node):
     __slots__ = ('_token', 'name', 'type_expr')
     def __init__(self, name: str, type_expr, token=None):
         self.name = name
@@ -1430,7 +1400,7 @@ class Field:
         return f'Field({self.name}: {self.type_expr})'
 
 
-class InlineAsm:
+class InlineAsm(Node):
     __slots__ = ('_token', 'clobbers', 'inputs', 'outputs', 'template', 'volatile')
     def __init__(self, template: str, outputs=None, inputs=None, clobbers=None, volatile=False, token=None):
         self.template = template
@@ -1443,7 +1413,7 @@ class InlineAsm:
         return f'InlineAsm({self.template}, volatile={self.volatile})'
 
 
-class ClassDef:
+class ClassDef(Node):
     __slots__ = ('_token', 'base', 'fields', 'generic_params', 'methods', 'name')
     def __init__(self, name: str, base: str | None = None, fields: list | None = None,
                  methods: list | None = None, generic_params: list | None = None, token=None):
@@ -1768,6 +1738,9 @@ def parse_statement(tokens: list[Token], pos: int):
     if tok.type == TokenType.KEYWORD and tok.value == 'return':
         return parse_return(tokens, pos)
 
+    if tok.type == TokenType.AT_SIGN:
+        return parse_at_def(tokens, pos)
+
     if tok.type == TokenType.KEYWORD and tok.value == 'if':
         return parse_if(tokens, pos)
 
@@ -1890,7 +1863,7 @@ def parse_if(tokens: list[Token], pos: int):
     return If(cond, body, orelse, token=tok), pos
 
 
-class Break:
+class Break(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
@@ -1898,7 +1871,7 @@ class Break:
         return 'Break()'
 
 
-class Continue:
+class Continue(Node):
     __slots__ = ('_token',)
     def __init__(self, token=None):
         self._token = token
@@ -1906,7 +1879,7 @@ class Continue:
         return 'Continue()'
 
 
-class Assert:
+class Assert(Node):
     __slots__ = ('_token', 'cond', 'message')
     def __init__(self, cond, message=None, token=None):
         self.cond = cond
@@ -1944,7 +1917,7 @@ def parse_assert(tokens: list[Token], pos: int):
     return Assert(cond, message, token=tok), pos
 
 
-class Switch:
+class Switch(Node):
     def __init__(self, value, cases, token=None):
         self.value = value
         self.cases = cases
@@ -1953,7 +1926,7 @@ class Switch:
         return f'Switch({self.value}, {self.cases})'
 
 
-class EnumDef:
+class EnumDef(Node):
     __slots__ = ('_token', 'members', 'name')
     def __init__(self, name: str, members: list, token=None):
         self.name = name
@@ -1963,7 +1936,7 @@ class EnumDef:
         return f'EnumDef({self.name}, {self.members})'
 
 
-class TypeAlias:
+class TypeAlias(Node):
     __slots__ = ('_token', 'name', 'target_type')
     def __init__(self, name: str, target_type, token=None):
         self.name = name
@@ -2104,6 +2077,22 @@ def parse_type_alias(tokens: list[Token], pos: int):
     if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
         pos += 1
     return TypeAlias(name, target_type_str, token=tok), pos
+
+
+def parse_at_def(tokens: list[Token], pos: int):
+    tok = tokens[pos]
+    decorators = []
+    while pos < len(tokens) and tokens[pos].type == TokenType.AT_SIGN:
+        pos += 1
+        expr, pos = parse_expression(tokens, pos)
+        decorators.append(expr)
+    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+        pos += 1
+    if pos >= len(tokens) or not (tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'def'):
+        raise ParseError('Expected "def" after decorator(s)', tokens[pos] if pos < len(tokens) else tok)
+    node, pos = parse_def(tokens, pos)
+    node.decorators = decorators
+    return node, pos
 
 
 def parse_def(tokens: list[Token], pos: int):

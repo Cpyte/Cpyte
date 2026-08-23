@@ -774,7 +774,7 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
 
 def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False, lto=False, frameworks=None):
     llvm_ir = str(module)
-    import llvmlite.binding as binding
+    from llvmlite import binding
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
 
@@ -883,7 +883,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
     WEW-scorpion/tools/elf2sef.py. `exports` names the symbols to mark as
     exported for dynamic linking (libraries).
     """
-    import llvmlite.binding as binding
+    from llvmlite import binding
     binding.initialize_all_targets()
     binding.initialize_all_asmprinters()
 

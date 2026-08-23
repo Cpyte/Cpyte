@@ -16,20 +16,51 @@ Examples:
   python cpy_test_harness.py all 3000
 """
 
-import sys, os, random, traceback, io, contextlib, string, re, copy, itertools
+import contextlib
+import io
 import multiprocessing as mp
+import os
+import random
+import re
+import string
+import sys
+import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'source'))
 
-from cpyte.lexar import Lexer, LexerError
-from cpyte.astparse import parse_file, ParseError, Token, TokenType, BinOp, UnaryOp, Number, String, Variable, Assign, Print, Return, VarDecl, FuncDef, StructDef, Field, If, While, Call, NewExpr, SizeOf, Index, Attr
-from cpyte.semantic_analasis import analyze
+from cpyte.astparse import (
+    Assign,
+    Attr,
+    BinOp,
+    Call,
+    Field,
+    FuncDef,
+    If,
+    Index,
+    NewExpr,
+    Number,
+    ParseError,
+    Print,
+    Return,
+    SizeOf,
+    String,
+    StructDef,
+    TokenType,
+    UnaryOp,
+    VarDecl,
+    Variable,
+    While,
+    parse_file,
+)
 from cpyte.bytecoding import LLVM
 from cpyte.compiling import run_jit
+from cpyte.lexar import Lexer, LexerError
+from cpyte.semantic_analasis import analyze
 
 # The syntax-aware generator lives in fuzzer.py; its programs are lex/parse/
 # analyze-clean, so fuzz mode compiles and executes only valid programs.
-from fuzzer import FuzzerState as GenState, gen_program as fuzz_gen_program
+from fuzzer import FuzzerState as GenState
+from fuzzer import gen_program as fuzz_gen_program
 
 TIMEOUT_S = 30
 CRASH_DIR = os.path.join(os.path.dirname(__file__), 'crashes')
@@ -352,7 +383,7 @@ def gen_for(state, depth=0):
     chars = ''.join(rng.choices(string.ascii_lowercase + '\t\n ', k=length))
     body = gen_body(state, depth + 1)
     state.loop_depth -= 1
-    parts = [f"for {state.fresh('i')} in {repr(chars)}:"]
+    parts = [f"for {state.fresh('i')} in {chars!r}:"]
     parts.extend(f'    {s}' for s in body)
     return '\n'.join(parts)
 

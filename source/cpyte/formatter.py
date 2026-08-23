@@ -367,6 +367,9 @@ class _Formatter:
         self._emit_body(node['body'], level + 1)
 
     def _emit_funcdef(self, node, level: int):
+        decorators = getattr(node, 'decorators', None) or []
+        for dec in decorators:
+            self._header(node, f'@{self._expr(dec)}', level)
         vis = f'{node.visibility} ' if node.visibility else ''
         generic = f'<{", ".join(node.generic_params)}>' if node.generic_params else ''
         const_params = set(getattr(node, 'const_params', None) or ())

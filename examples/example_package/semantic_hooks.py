@@ -3,8 +3,9 @@ Example semantic hooks for the example_package.
 
 This demonstrates how packages can extend semantic analysis with custom type checking.
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
 from cpyte.extension_hooks import SemanticHook
 
@@ -52,7 +53,6 @@ class AsyncSemanticHook(SemanticHook):
     
     def initialize(self, context):
         """Initialize the semantic hook."""
-        pass
 
 
 def get_hooks():

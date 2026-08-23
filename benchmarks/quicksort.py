@@ -1,4 +1,3 @@
-import sys
 import random
 
 n = 100000

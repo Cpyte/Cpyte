@@ -7,27 +7,27 @@ extension capabilities like keywords, operators, tags, and parser hooks.
 
 import json
 import os
-from typing import Dict, List, Optional, Set, Any
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
 class CapabilityDeclaration:
     """Represents a package's extension capabilities."""
-    keywords: Set[str] = field(default_factory=set)
-    operators: Set[str] = field(default_factory=set)
-    tags: Set[str] = field(default_factory=set)
-    macros: Set[str] = field(default_factory=set)
-    custom_types: Set[str] = field(default_factory=set)
+    keywords: set[str] = field(default_factory=set)
+    operators: set[str] = field(default_factory=set)
+    tags: set[str] = field(default_factory=set)
+    macros: set[str] = field(default_factory=set)
+    custom_types: set[str] = field(default_factory=set)
 
 
 @dataclass
 class ExtensionHooks:
     """Represents extension hook files provided by a package."""
-    parser_hooks: List[str] = field(default_factory=list)
-    semantic_hooks: List[str] = field(default_factory=list)
-    codegen_hooks: List[str] = field(default_factory=list)
-    runtime_hooks: List[str] = field(default_factory=list)
+    parser_hooks: list[str] = field(default_factory=list)
+    semantic_hooks: list[str] = field(default_factory=list)
+    codegen_hooks: list[str] = field(default_factory=list)
+    runtime_hooks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -37,17 +37,16 @@ class PackageManifest:
     version: str
     capabilities: CapabilityDeclaration = field(default_factory=CapabilityDeclaration)
     extensions: ExtensionHooks = field(default_factory=ExtensionHooks)
-    dependencies: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    dependencies: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     
     # Path information
-    package_dir: Optional[str] = None
-    manifest_path: Optional[str] = None
+    package_dir: str | None = None
+    manifest_path: str | None = None
 
 
 class ManifestError(Exception):
     """Raised when manifest parsing or validation fails."""
-    pass
 
 
 class ManifestValidator:
@@ -77,7 +76,7 @@ class ManifestValidator:
     }
     
     @classmethod
-    def validate_manifest(cls, manifest: PackageManifest) -> List[str]:
+    def validate_manifest(cls, manifest: PackageManifest) -> list[str]:
         """
         Validate a package manifest and return list of validation errors.
         
@@ -185,13 +184,13 @@ class ManifestParser:
                 data = json.load(f)
         except json.JSONDecodeError as e:
             raise ManifestError(f"Invalid JSON in manifest: {e}")
-        except IOError as e:
+        except OSError as e:
             raise ManifestError(f"Failed to read manifest: {e}")
         
         return ManifestParser.parse_dict(data, manifest_path)
     
     @staticmethod
-    def parse_dict(data: Dict[str, Any], manifest_path: Optional[str] = None) -> PackageManifest:
+    def parse_dict(data: dict[str, Any], manifest_path: str | None = None) -> PackageManifest:
         """
         Parse manifest data from a dictionary.
         
@@ -300,10 +299,10 @@ class ManifestRegistry:
     """
     
     def __init__(self):
-        self._manifests: Dict[str, PackageManifest] = {}
-        self._keywords: Dict[str, str] = {}  # keyword -> package_name
-        self._operators: Dict[str, str] = {}  # operator -> package_name
-        self._tags: Dict[str, str] = {}  # tag -> package_name
+        self._manifests: dict[str, PackageManifest] = {}
+        self._keywords: dict[str, str] = {}  # keyword -> package_name
+        self._operators: dict[str, str] = {}  # operator -> package_name
+        self._tags: dict[str, str] = {}  # tag -> package_name
     
     def register(self, manifest: PackageManifest) -> None:
         """
@@ -352,7 +351,7 @@ class ManifestRegistry:
         for tag in manifest.capabilities.tags:
             self._tags[tag] = package_name
     
-    def get_manifest(self, package_name: str) -> Optional[PackageManifest]:
+    def get_manifest(self, package_name: str) -> PackageManifest | None:
         """Get a manifest by package name."""
         return self._manifests.get(package_name)
     
@@ -360,31 +359,31 @@ class ManifestRegistry:
         """Check if a package manifest is already loaded."""
         return package_name in self._manifests
     
-    def get_all_manifests(self) -> Dict[str, PackageManifest]:
+    def get_all_manifests(self) -> dict[str, PackageManifest]:
         """Get all registered manifests."""
         return self._manifests.copy()
     
-    def get_keywords(self) -> Set[str]:
+    def get_keywords(self) -> set[str]:
         """Get all registered keywords."""
         return set(self._keywords.keys())
     
-    def get_operators(self) -> Set[str]:
+    def get_operators(self) -> set[str]:
         """Get all registered operators."""
         return set(self._operators.keys())
     
-    def get_tags(self) -> Set[str]:
+    def get_tags(self) -> set[str]:
         """Get all registered tags."""
         return set(self._tags.keys())
     
-    def get_keyword_owner(self, keyword: str) -> Optional[str]:
+    def get_keyword_owner(self, keyword: str) -> str | None:
         """Get the package name that owns a keyword."""
         return self._keywords.get(keyword)
     
-    def get_operator_owner(self, operator: str) -> Optional[str]:
+    def get_operator_owner(self, operator: str) -> str | None:
         """Get the package name that owns an operator."""
         return self._operators.get(operator)
     
-    def get_tag_owner(self, tag: str) -> Optional[str]:
+    def get_tag_owner(self, tag: str) -> str | None:
         """Get the package name that owns a tag."""
         return self._tags.get(tag)
     
@@ -424,7 +423,7 @@ def iter_cpm_version_dirs(cpm_root: str):
     if not os.path.isdir(cpm_root):
         return
 
-    def _versions(entry_dir: str) -> List[str]:
+    def _versions(entry_dir: str) -> list[str]:
         return sorted(
             (d for d in os.listdir(entry_dir)
              if os.path.isdir(os.path.join(entry_dir, d))),

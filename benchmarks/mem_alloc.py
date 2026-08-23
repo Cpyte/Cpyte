@@ -1,4 +1,3 @@
-import sys
 
 for i in range(500000):
     p = bytearray(64)

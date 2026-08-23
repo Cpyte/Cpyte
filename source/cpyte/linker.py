@@ -1,10 +1,9 @@
-import subprocess
-import sys
-import os
 import re
 import shutil
-from .ui import print_err
+import subprocess
+import sys
 
+from .ui import print_err
 
 _CANDIDATES = ['cc', 'clang', 'gcc']
 

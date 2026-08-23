@@ -32,9 +32,7 @@ it can be embedded directly into another tool's CLI.
 """
 
 import json
-import os
 import struct
-import sys
 
 SEF_MAGIC = 0x00464553
 SEF_MAX_SEGMENTS = 8

@@ -1,4 +1,3 @@
-import sys
 
 s = ""
 for i in range(10000):

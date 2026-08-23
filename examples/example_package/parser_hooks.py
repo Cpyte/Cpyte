@@ -3,8 +3,9 @@ Example parser hooks for the example_package.
 
 This demonstrates how packages can extend the parser with custom syntax.
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
 from cpyte.extension_hooks import ParserHook
 
@@ -38,7 +39,6 @@ class AsyncParserHook(ParserHook):
     
     def initialize(self, context):
         """Initialize the parser hook."""
-        pass
 
 
 def get_hooks():

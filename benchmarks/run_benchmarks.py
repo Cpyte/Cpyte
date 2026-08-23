@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import os
-import subprocess
-import time
-import sys
 import shutil
+import subprocess
+import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -88,7 +88,7 @@ def main():
         shutil.copy2(src_runtime, RUNTIME_C)
 
     print(f"\n{'='*70}")
-    print(f"  Compiling benchmarks...")
+    print("  Compiling benchmarks...")
     print(f"{'='*70}\n")
 
     for bm in ALL_BENCHMARKS:
@@ -109,7 +109,7 @@ def main():
         print()
 
     print(f"{'='*70}")
-    print(f"  Running benchmarks (3 trials, no averaging)...")
+    print("  Running benchmarks (3 trials, no averaging)...")
     print(f"{'='*70}\n")
 
     results = {}
@@ -160,7 +160,7 @@ def main():
         print()
 
     print(f"{'='*70}")
-    print(f"  Results (raw ns per trial, no averaging)")
+    print("  Results (raw ns per trial, no averaging)")
     print(f"{'='*70}\n")
 
     rows = []

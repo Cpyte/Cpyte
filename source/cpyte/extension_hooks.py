@@ -5,13 +5,13 @@ This module provides the hook system that allows packages to extend the compiler
 at various stages: lexing, parsing, semantic analysis, and code generation.
 """
 
+import importlib.util
 import os
 import sys
-import importlib.util
-from typing import Dict, List, Optional, Callable, Any, Set, Generic, TypeVar
-from dataclasses import dataclass
 from abc import ABC, abstractmethod
-
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
 
 # =============================================================================
 # Hook Base Classes
@@ -20,15 +20,14 @@ from abc import ABC, abstractmethod
 class CompilerHook(ABC):
     """Base class for all compiler hooks."""
     
-    def __init__(self, package_name: str, hook_path: Optional[str] = None):
+    def __init__(self, package_name: str, hook_path: str | None = None):
         self.package_name = package_name
         self.hook_path = hook_path
         self.enabled = True
     
     @abstractmethod
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the hook with compiler context."""
-        pass
     
     def disable(self) -> None:
         """Disable this hook."""
@@ -42,11 +41,11 @@ class CompilerHook(ABC):
 class LexerHook(CompilerHook):
     """Hook for extending the lexer with custom tokens and keywords."""
     
-    def get_additional_keywords(self) -> Set[str]:
+    def get_additional_keywords(self) -> set[str]:
         """Return set of additional keywords this hook provides."""
         return set()
     
-    def get_additional_operators(self) -> Set[str]:
+    def get_additional_operators(self) -> set[str]:
         """Return set of additional operators this hook provides."""
         return set()
     
@@ -54,23 +53,22 @@ class LexerHook(CompilerHook):
         """Return True if this hook wants to customize a given token."""
         return False
     
-    def customize_token(self, token_type: str, token_value: str, line: int, column: int) -> Optional[Dict[str, Any]]:
+    def customize_token(self, token_type: str, token_value: str, line: int, column: int) -> dict[str, Any] | None:
         """Customize a token, returning modified token data or None to keep original."""
         return None
     
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the lexer hook with compiler context."""
-        pass
 
 
 class ParserHook(CompilerHook):
     """Hook for extending the parser with custom syntax."""
     
-    def should_handle_expression(self, tokens: List[Any], pos: int) -> bool:
+    def should_handle_expression(self, tokens: list[Any], pos: int) -> bool:
         """Return True if this hook wants to handle expression parsing at current position."""
         return False
     
-    def parse_expression(self, tokens: List[Any], pos: int, context: Dict[str, Any]) -> tuple:
+    def parse_expression(self, tokens: list[Any], pos: int, context: dict[str, Any]) -> tuple:
         """
         Parse a custom expression.
         
@@ -79,11 +77,11 @@ class ParserHook(CompilerHook):
         """
         raise NotImplementedError("Parser hook must implement parse_expression")
     
-    def should_handle_statement(self, tokens: List[Any], pos: int) -> bool:
+    def should_handle_statement(self, tokens: list[Any], pos: int) -> bool:
         """Return True if this hook wants to handle statement parsing at current position."""
         return False
     
-    def parse_statement(self, tokens: List[Any], pos: int, context: Dict[str, Any]) -> tuple:
+    def parse_statement(self, tokens: list[Any], pos: int, context: dict[str, Any]) -> tuple:
         """
         Parse a custom statement.
         
@@ -92,9 +90,8 @@ class ParserHook(CompilerHook):
         """
         raise NotImplementedError("Parser hook must implement parse_statement")
     
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the parser hook with compiler context."""
-        pass
 
 
 class SemanticHook(CompilerHook):
@@ -104,7 +101,7 @@ class SemanticHook(CompilerHook):
         """Return True if this hook wants to analyze a specific node type."""
         return False
     
-    def visit_node(self, node: Any, context: Dict[str, Any]) -> Optional[List[str]]:
+    def visit_node(self, node: Any, context: dict[str, Any]) -> list[str] | None:
         """
         Analyze a node and return list of error messages, or None if no errors.
         
@@ -113,13 +110,12 @@ class SemanticHook(CompilerHook):
         """
         return None
     
-    def get_custom_type_rules(self) -> Dict[str, Callable]:
+    def get_custom_type_rules(self) -> dict[str, Callable]:
         """Return custom type checking rules."""
         return {}
     
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the semantic hook with compiler context."""
-        pass
 
 
 class CodegenHook(CompilerHook):
@@ -129,7 +125,7 @@ class CodegenHook(CompilerHook):
         """Return True if this hook wants to handle code generation for a node."""
         return False
     
-    def emit_node(self, node: Any, builder: Any, context: Dict[str, Any]) -> Any:
+    def emit_node(self, node: Any, builder: Any, context: dict[str, Any]) -> Any:
         """
         Generate custom IR for a node.
         
@@ -142,29 +138,26 @@ class CodegenHook(CompilerHook):
         """Return True if this hook wants to add custom optimization passes."""
         return False
     
-    def add_module_passes(self, pass_manager: Any, context: Dict[str, Any]) -> None:
+    def add_module_passes(self, pass_manager: Any, context: dict[str, Any]) -> None:
         """Add custom optimization passes to the pass manager."""
-        pass
     
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the codegen hook with compiler context."""
-        pass
 
 
 class RuntimeHook(CompilerHook):
     """Hook for extending runtime behavior."""
     
-    def get_runtime_code(self) -> Optional[str]:
+    def get_runtime_code(self) -> str | None:
         """Return additional runtime code as string, or None."""
         return None
     
-    def get_runtime_libraries(self) -> List[str]:
+    def get_runtime_libraries(self) -> list[str]:
         """Return list of additional runtime libraries to link."""
         return []
     
-    def initialize(self, context: Dict[str, Any]) -> None:
+    def initialize(self, context: dict[str, Any]) -> None:
         """Initialize the runtime hook with compiler context."""
-        pass
 
 
 # =============================================================================
@@ -180,7 +173,7 @@ class HookRegistration(Generic[H]):
     hook: H
     priority: int  # Higher priority hooks run first
     package_name: str
-    hook_path: Optional[str] = None
+    hook_path: str | None = None
 
 
 class HookRegistry:
@@ -192,15 +185,15 @@ class HookRegistry:
     """
     
     def __init__(self):
-        self._lexer_hooks: List[HookRegistration[LexerHook]] = []
-        self._parser_hooks: List[HookRegistration[ParserHook]] = []
-        self._semantic_hooks: List[HookRegistration[SemanticHook]] = []
-        self._codegen_hooks: List[HookRegistration[CodegenHook]] = []
-        self._runtime_hooks: List[HookRegistration[RuntimeHook]] = []
+        self._lexer_hooks: list[HookRegistration[LexerHook]] = []
+        self._parser_hooks: list[HookRegistration[ParserHook]] = []
+        self._semantic_hooks: list[HookRegistration[SemanticHook]] = []
+        self._codegen_hooks: list[HookRegistration[CodegenHook]] = []
+        self._runtime_hooks: list[HookRegistration[RuntimeHook]] = []
         
-        self._context: Dict[str, Any] = {}
+        self._context: dict[str, Any] = {}
     
-    def set_context(self, context: Dict[str, Any]) -> None:
+    def set_context(self, context: dict[str, Any]) -> None:
         """Set the compiler context for hooks."""
         self._context = context.copy()
     
@@ -208,7 +201,7 @@ class HookRegistry:
         """Update a specific context value."""
         self._context[key] = value
     
-    def get_context(self) -> Dict[str, Any]:
+    def get_context(self) -> dict[str, Any]:
         """Get the current compiler context."""
         return self._context.copy()
     
@@ -280,23 +273,23 @@ class HookRegistry:
         self._runtime_hooks.append(registration)
         self._runtime_hooks.sort(key=lambda r: r.priority, reverse=True)
     
-    def get_lexer_hooks(self) -> List[LexerHook]:
+    def get_lexer_hooks(self) -> list[LexerHook]:
         """Get all registered lexer hooks in priority order."""
         return [reg.hook for reg in self._lexer_hooks if reg.hook.enabled]
     
-    def get_parser_hooks(self) -> List[ParserHook]:
+    def get_parser_hooks(self) -> list[ParserHook]:
         """Get all registered parser hooks in priority order."""
         return [reg.hook for reg in self._parser_hooks if reg.hook.enabled]
     
-    def get_semantic_hooks(self) -> List[SemanticHook]:
+    def get_semantic_hooks(self) -> list[SemanticHook]:
         """Get all registered semantic hooks in priority order."""
         return [reg.hook for reg in self._semantic_hooks if reg.hook.enabled]
     
-    def get_codegen_hooks(self) -> List[CodegenHook]:
+    def get_codegen_hooks(self) -> list[CodegenHook]:
         """Get all registered codegen hooks in priority order."""
         return [reg.hook for reg in self._codegen_hooks if reg.hook.enabled]
     
-    def get_runtime_hooks(self) -> List[RuntimeHook]:
+    def get_runtime_hooks(self) -> list[RuntimeHook]:
         """Get all registered runtime hooks in priority order."""
         return [reg.hook for reg in self._runtime_hooks if reg.hook.enabled]
     
@@ -324,7 +317,6 @@ class HookRegistry:
 
 class HookLoadError(Exception):
     """Raised when hook loading fails."""
-    pass
 
 
 class HookLoader:
@@ -334,9 +326,9 @@ class HookLoader:
     def load_hooks_from_package(
         package_name: str,
         package_dir: str,
-        hook_files: List[str],
+        hook_files: list[str],
         registry: HookRegistry,
-        context: Dict[str, Any]
+        context: dict[str, Any]
     ) -> int:
         """
         Load hooks from a package's hook files.
@@ -390,7 +382,7 @@ class HookLoader:
         return loaded_count
     
     @staticmethod
-    def _load_hook_file(hook_path: str, package_name: str) -> List[CompilerHook]:
+    def _load_hook_file(hook_path: str, package_name: str) -> list[CompilerHook]:
         """
         Load hooks from a single hook file.
         
@@ -429,7 +421,7 @@ class HookLoader:
                 f"Hook file {hook_path} must define a get_hooks() function"
             )
         
-        get_hooks_func = getattr(module, 'get_hooks')
+        get_hooks_func = module.get_hooks
         if not callable(get_hooks_func):
             raise HookLoadError(
                 f"get_hooks in {hook_path} must be a callable"

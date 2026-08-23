@@ -8,7 +8,7 @@ from llvmlite.ir import instructions
 
 from .astparse import *
 from .extension_hooks import HookLoadError, get_global_hook_registry
-from .lexar import Token, TokenType
+from .lexar import TokenType
 from .ui import *
 
 
@@ -179,6 +179,9 @@ class LLVM:
             return ir.PointerType(ir.IntType(8))
         if t == "dynamic":
             # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
+            return _DynValue
+        if t == "decorated":
+            # Decorator return type: uses DynValue like dynamic.
             return _DynValue
         if t.endswith("[]"):
             base = self.llvm_type(t[:-2])
@@ -597,6 +600,12 @@ class LLVM:
         # Shell-style glob matching for string switch cases (always in runtime.c)
         glob_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
         self.functions["glob_match"] = ir.Function(self.module, glob_ty, "glob_match")
+
+        # Decorator support: code() function pointer + result slot
+        self._code_fn_ptr = ir.GlobalVariable(self.module, _i8ptr, name="__code_fn")
+        self._code_fn_ptr.initializer = ir.Constant(_i8ptr, None)  # type: ignore[attr-defined]
+        self._code_result = ir.GlobalVariable(self.module, _DynValue, name="__code_result")
+        self._code_result.initializer = ir.Constant(_DynValue, (ir.Constant(_i32, _DYN_NONE), ir.Constant(_i64, 0)))  # type: ignore[attr-defined]
 
     @register_emitter(Switch)
     def emit_switch(self, node):
@@ -1103,7 +1112,7 @@ class LLVM:
     def emit_exprstmt(self, node):
         return self.emit(node.expr)
 
-    def emit(self, node: Any) -> _IRValue:
+    def emit(self, node: Node | dict) -> _IRValue:
         key = id(node)
         if key in self._emit_memo:
             return self._emit_memo[key]
@@ -1354,7 +1363,7 @@ class LLVM:
                 if k not in start:
                     del self._emit_memo[k]
 
-    def _emit_recursive(self, node: Any) -> _IRValue:
+    def _emit_recursive(self, node: Node | dict) -> _IRValue:
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
             for hook in self._hook_registry.get_codegen_hooks():
@@ -1952,6 +1961,8 @@ class LLVM:
 
     @register_emitter(FuncDef)
     def emit_funcdef(self, node: FuncDef):
+        if node.decorators and node.name != "main":
+            return self._emit_decorated_funcdef(node)
         ret_ty = self.llvm_type(node.rettype or "int")
         param_tys = [self.llvm_type(t) for t in node.params.values()]
 
@@ -2022,6 +2033,114 @@ class LLVM:
         self.ssa_values = old_ssa
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
+
+    def _emit_decorated_funcdef(self, node: FuncDef):
+        """Emit a decorated function: original as __name, trampoline, and wrapper."""
+        orig_name = f"__{node.name}"
+        trampoline_name = f"__{node.name}_trampoline"
+        ret_ty = self.llvm_type(node.rettype or "int")
+        param_tys = [self.llvm_type(t) for t in node.params.values()]
+
+        # 1. Compile original function body as __name
+        orig_func = ir.Function(
+            self.module, ir.FunctionType(ret_ty, param_tys), name=orig_name
+        )
+        self.functions[orig_name] = orig_func
+
+        entry = orig_func.append_basic_block("entry")
+        self.builder = ir.IRBuilder(entry)
+        self.builder.position_at_end(entry)
+
+        old_locals = self.locals
+        old_local_types = self.local_types
+        old_ssa = self.ssa_values
+        old_ssa_types = self.ssa_types
+        old_scope_stack = self.scope_stack
+        self.locals = {}
+        self.local_types = {}
+        self.ssa_values = {}
+        self.ssa_types = {}
+        self.scope_stack = [{}]
+        for llvm_arg, (pname, ptype) in zip(orig_func.args, node.params.items()):
+            ptr = self.builder.alloca(llvm_arg.type, name=pname)
+            self.builder.store(llvm_arg, ptr)
+            self.locals[pname] = ptr
+            self.local_types[pname] = ptype
+
+        for stmt in node.body:
+            if not self._block_terminated():
+                self.emit(stmt)
+
+        if not self._block_terminated():
+            if isinstance(ret_ty, ir.VoidType):
+                self.builder.ret_void()
+            elif node.decorators:
+                # Decorator function: auto-return @__code_result
+                result_val = self.builder.load(self._code_result, "dec_result")
+                self.builder.ret(result_val)
+            elif ret_ty == _DynValue:
+                out = self.builder.insert_value(
+                    ir.Constant(_DynValue, ir.Undefined),
+                    ir.Constant(_i32, _DYN_NONE), 0,
+                )
+                out = self.builder.insert_value(out, ir.Constant(_i64, 0), 1)
+                self.builder.ret(out)
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(ir.Constant(ret_ty, None))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+
+        self.locals = old_locals
+        self.local_types = old_local_types
+        self.ssa_values = old_ssa
+        self.ssa_types = old_ssa_types
+        self.scope_stack = old_scope_stack
+
+        # 2. Generate trampoline: calls __name and returns DynValue
+        tramp_fnty = ir.FunctionType(_DynValue, [])
+        tramp = ir.Function(self.module, tramp_fnty, trampoline_name)
+        self.functions[trampoline_name] = tramp
+        tramp_entry = tramp.append_basic_block("entry")
+        self.builder = ir.IRBuilder(tramp_entry)
+        self.builder.position_at_end(tramp_entry)
+
+        args = list(tramp.args)
+        call_result = self.builder.call(orig_func, args)
+        if call_result.type == _DynValue:
+            self.builder.store(call_result, self._code_result)
+            self.builder.ret(call_result)
+        else:
+            kind, bits = self._box_dyn(call_result, node.rettype)
+            dyn_val = self.builder.insert_value(
+                ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0
+            )
+            dyn_val = self.builder.insert_value(dyn_val, bits, 1)
+            self.builder.store(dyn_val, self._code_result)
+            self.builder.ret(dyn_val)
+
+        # 3. Generate wrapper: same name/signature as original
+        wrapper_fnty = ir.FunctionType(ret_ty, param_tys)
+        wrapper = ir.Function(self.module, wrapper_fnty, node.name)
+        self.functions[node.name] = wrapper
+        wrap_entry = wrapper.append_basic_block("entry")
+        self.builder = ir.IRBuilder(wrap_entry)
+        self.builder.position_at_end(wrap_entry)
+
+        # Store trampoline pointer into __code_fn
+        tramp_i8 = self.builder.bitcast(tramp, _i8ptr)
+        self.builder.store(tramp_i8, self._code_fn_ptr)
+
+        # Call each decorator
+        for dec_expr in node.decorators:
+            self.emit(dec_expr)
+
+        # Load __code_result and return it
+        result_val = self.builder.load(self._code_result, "dec_result")
+        ret_val = self._unbox_dyn(
+            self.builder.extract_value(result_val, 1),
+            node.rettype or "int",
+        )
+        self.builder.ret(ret_val)
 
     @register_emitter(Return)
     def emit_return(self, node: Return):
@@ -2363,6 +2482,8 @@ class LLVM:
 
     def _dyn_struct(self, node):
         """Evaluate an expression and return it as a {i32,i64} DynValue struct."""
+        if isinstance(node, Variable) and node.name == "result":
+            return self.builder.load(self._code_result, "result")
         if isinstance(node, Variable) and getattr(node, "dynamic", False):
             ptr = self._dyn_local_ptr(node.name)
             return self.builder.load(ptr, node.name)
@@ -2855,6 +2976,9 @@ class LLVM:
     # Is it good man?
     @register_emitter(Variable)
     def emit_variable(self, node):
+        if node.name == "result":
+            return self.builder.load(self._code_result, "result")
+
         const = self.const_vars.get(node.name)
         if const is not None:
             # Compile-time constant
@@ -3005,6 +3129,16 @@ class LLVM:
 
     @register_emitter(Assign)
     def emit_assign(self, node):
+        if isinstance(node.target, Variable) and node.target.name == "result":
+            value = self.emit(node.value)
+            if value.type != _DynValue:
+                kind, bits = self._box_dyn(value, getattr(node.value, "inferred_type", None))
+                value = self.builder.insert_value(
+                    ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0
+                )
+                value = self.builder.insert_value(value, bits, 1)
+            self.builder.store(value, self._code_result)
+            return None
         if isinstance(node.target, Index) and not self.no_userspace:
             obj_t = getattr(node.target.obj, "inferred_type", None)
             if (
@@ -3171,6 +3305,13 @@ class LLVM:
             and node.callee.name == "str_split"
         ):
             return self._emit_builtin_str_split(node)
+
+        # Builtin code() — call the original function through __code_fn pointer.
+        if (
+            isinstance(node.callee, Variable)
+            and node.callee.name == "code"
+        ):
+            return self._emit_builtin_code(node)
 
         # Handle known macro functions by inlining
         if node.callee.name == "CGEventMaskBit":
@@ -3451,6 +3592,17 @@ class LLVM:
             )
             self.functions["str_split"] = fn
         return self.builder.call(fn, [str_val, sep_val])
+
+    def _emit_builtin_code(self, node):
+        """code() — call the original function via __code_fn pointer and store result in __code_result."""
+        # Load the stored function pointer
+        fn_ptr = self.builder.load(self._code_fn_ptr, "code_fn_ptr")
+        # The pointer is a raw i8*; we cast to a DynValue()-function type and call
+        code_fnty = ir.FunctionType(_DynValue, [])
+        fn_typed = self.builder.bitcast(fn_ptr, ir.PointerType(code_fnty))
+        result = self.builder.call(fn_typed, [])
+        self.builder.store(result, self._code_result)
+        return result
 
     @register_emitter(Print)
     def emit_print(self, node):

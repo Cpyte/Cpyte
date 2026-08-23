@@ -1,7 +1,14 @@
-public ok(a:int, b:int) -> str:
-    if a > b:
-        print(12)
+int a = input()
+
+moneys = [1, 2, 5, 10, 20, 50, 100]
+n = 6
+int count = 0
+
+while a != 0:
+    if a >= moneys[n]:
+        a -= moneys[n]
+        count+=1
     else:
-        print(0)
-    return "123"
-ok(2,1)
+        n -= 1
+
+print(count)

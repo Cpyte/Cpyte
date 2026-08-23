@@ -626,6 +626,10 @@ class SemanticAnalyzer:
             return "str"
 
         if isinstance(node, Variable):
+            if node.name == "result":
+                node.inferred_type = "dynamic"
+                node.dynamic = True
+                return "dynamic"
             sym = self.current_scope.lookup(node.name)
             if sym is None and self._enum_context_name:
                 sym = self.current_scope.lookup(
@@ -937,6 +941,18 @@ class SemanticAnalyzer:
                             return None
                         node.inferred_type = "dynamic[]"
                         return "dynamic[]"
+                if node.callee.name == "code":
+                    for arg in node.args:
+                        self._infer_type(arg)
+                    if len(node.args) != 0:
+                        self.error(
+                            "code() expects no arguments",
+                            node,
+                            note=f"got {len(node.args)}",
+                        )
+                        return None
+                    node.inferred_type = "dynamic"
+                    return "dynamic"
             sym = self._resolve_callee(node.callee)
             if sym is not None:
                 for arg in node.args:
@@ -1744,6 +1760,22 @@ class SemanticAnalyzer:
             )
             return
 
+        if node.rettype == "decorated":
+            has_code = any(
+                isinstance(stmt, ExprStmt)
+                and isinstance(stmt.expr, Call)
+                and isinstance(stmt.expr.callee, Variable)
+                and stmt.expr.callee.name == "code"
+                for stmt in node.body
+            )
+            if not has_code:
+                self.error(
+                    "decorator function with return type `decorated` must call code()",
+                    node,
+                    note="code() invokes the original function; "
+                    "without it the decorator has no effect",
+                )
+
         sym = Symbol("function", node.rettype or "void", node)
         s.define(node.name, sym)
 
@@ -1850,6 +1882,11 @@ class SemanticAnalyzer:
             name = (
                 node.target.name if isinstance(node.target, Variable) else node.target
             )
+            if name == "result":
+                if isinstance(node.target, Variable):
+                    node.target.inferred_type = "dynamic"
+                    node.target.dynamic = True
+                return
             s = scope or self.current_scope
             existing = s.lookup_local(name)
             if existing is None:

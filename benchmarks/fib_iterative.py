@@ -1,5 +1,5 @@
-import sys
 import ctypes
+
 
 def fib(n):
     a = ctypes.c_int32(0)

@@ -1,4 +1,3 @@
-import sys
 
 def fib(n):
     if n <= 1:

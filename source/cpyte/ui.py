@@ -11,6 +11,7 @@ piped output stays clean. Standard conventions are honoured:
 import os
 import sys
 import traceback
+
 _RESET = '\x1b[0m'
 
 _CODES = {
@@ -109,9 +110,7 @@ def paint_usage(text, stream=None):
     lines = text.rstrip('\n').split('\n')
     painted = []
     for i, ln in enumerate(lines):
-        if i == 0:
-            painted.append(paint(ln, 'bright_cyan', 'bold', stream=stream))
-        elif ln.endswith(':'):
+        if i == 0 or ln.endswith(':'):
             painted.append(paint(ln, 'bright_cyan', 'bold', stream=stream))
         elif ln.startswith('  '):
             painted.append(paint(ln, 'dim', stream=stream))

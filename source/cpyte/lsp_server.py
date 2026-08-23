@@ -10,8 +10,17 @@ from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
 from .astparse import (
-    parse_file, ParseError,
-    FuncDef, StructDef, ClassDef, EnumDef, VarDecl, If, While, Switch, Try,
+    ClassDef,
+    EnumDef,
+    FuncDef,
+    If,
+    ParseError,
+    StructDef,
+    Switch,
+    Try,
+    VarDecl,
+    While,
+    parse_file,
 )
 from .formatter import format_source
 from .lexar import Lexer, LexerError, TokenType

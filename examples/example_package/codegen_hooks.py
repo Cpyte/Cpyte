@@ -3,8 +3,9 @@ Example codegen hooks for the example_package.
 
 This demonstrates how packages can extend code generation with custom IR emission.
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
 from cpyte.extension_hooks import CodegenHook
 
@@ -38,11 +39,9 @@ class AsyncCodegenHook(CodegenHook):
         """Add custom optimization passes for async code."""
         # Add async-specific optimization passes
         # This would integrate with coroutine optimization
-        pass
     
     def initialize(self, context):
         """Initialize the codegen hook."""
-        pass
 
 
 def get_hooks():

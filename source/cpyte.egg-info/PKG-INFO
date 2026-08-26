@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cpyte
-Version: 3.2.0
+Version: 3.3.1
 Summary: The Cpyte programming language compiler
 Author: Hoang Duy Tung
 License: MIT
@@ -16,7 +16,7 @@ Check out the official documentation [here](https://gitea.5gnew.io.vn/Cpyte-Proj
 Cpyte supports a package extension system that allows packages to extend the compiler with custom keywords, operators, and compiler hooks. Packages can provide:
 
 - **Custom Keywords**: Add new language keywords via `package.json`
-- **Custom Operators**: Define new operators for syntax extensions  
+- **Custom Operators**: Define new operators for syntax extensions
 - **Compiler Hooks**: Extend lexing, parsing, semantic analysis, and code generation
 - **Runtime Extensions**: Add runtime code and libraries
 

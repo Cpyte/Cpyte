@@ -1,27 +1,49 @@
-name: Qodana
+name: Cpyte CI
+
 on:
-  workflow_dispatch:
-  pull_request:
   push:
-    branches: # Specify your branches here
-      - main # The 'main' branch
+  pull_request:
 
 jobs:
-  qodana:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      checks: write
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Ubuntu
+            arch: x86_64
+            runner: ubuntu-24.04
+
+          - os: Ubuntu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - os: macOS
+            arch: arm64
+            runner: macos-14
+
+          - os: macOS
+            arch: x86_64
+            runner: macos-13
+
+          - os: Windows
+            arch: x86_64
+            runner: windows-2025
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}  # to check out the actual pull request commit, not the merge commit
-          fetch-depth: 0  # a full history is required for pull request analysis
-      - name: 'Qodana Scan'
-        uses: JetBrains/qodana-action@v2026.1
-        with:
-          pr-mode: false
-        env:
-          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
-          QODANA_ENDPOINT: 'https://qodana.cloud'
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run Cpyte tests
+        run: python scripts/test_cpy.py

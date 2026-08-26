@@ -2,9 +2,41 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <unwind.h>
-#include <pthread.h>
 #include <math.h>
+
+/* --- Platform-specific headers --- */
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+typedef CRITICAL_SECTION cpy_mutex_t;
+#  define CPY_MUTEX_INIT(ctx) do { InitializeCriticalSection(&(ctx)); } while(0)
+#  define CPY_MUTEX_LOCK(ctx)   EnterCriticalSection(ctx)
+#  define CPY_MUTEX_UNLOCK(ctx) LeaveCriticalSection(ctx)
+#else
+#  include <unistd.h>
+#  include <pthread.h>
+typedef pthread_mutex_t cpy_mutex_t;
+#  define CPY_MUTEX_INIT(ctx) do { (ctx) = (cpy_mutex_t)PTHREAD_MUTEX_INITIALIZER; } while(0)
+#  define CPY_MUTEX_LOCK(ctx)   pthread_mutex_lock(ctx)
+#  define CPY_MUTEX_UNLOCK(ctx) pthread_mutex_unlock(ctx)
+#endif
+
+/* --- Unwind API (Itanium ABI: GCC / Clang on Linux / macOS / BSD) --- */
+/* On Windows (MSVC), structured exception handling is used instead;      */
+/* <unwind.h> does not exist there, so the entire section is compiled out */
+/* and replaced with stubs that abort if意外ly called.                    */
+#ifndef _WIN32
+#include <unwind.h>
+typedef _Unwind_Reason_Code           cpy_unwind_reason_t;
+typedef struct _Unwind_Exception  cpy_unwind_exc_t;
+typedef struct _Unwind_Context    cpy_unwind_ctx_t;
+#else
+/* Minimal forward declarations so the type names exist for stubs. */
+typedef struct cpy_unwind_exc_stub { int dummy; } cpy_unwind_exc_t;
+typedef struct cpy_unwind_ctx_stub { int dummy; } cpy_unwind_ctx_t;
+typedef int cpy_unwind_reason_t;
+#define _URC_FATAL_PHASE1_ERROR 3
+#endif
 
 
 //Fixed for Non-POSIX os support (ISO C)
@@ -132,6 +164,7 @@ input_str(void) {
     }
     int c;
     while ((c = getchar()) != EOF && c != '\n') {
+        if (c == '\r') continue;   /* tolerate CRLF input */
         if (len + 1 >= cap) {
             cap *= 2;
             char *tmp = realloc(buf, cap);
@@ -150,17 +183,32 @@ input_str(void) {
 
 // Bruh, dead code.
 
+#ifndef _WIN32
 typedef struct {
-    _Unwind_Exception base;
+    cpy_unwind_exc_t base;
     const char *type_name;
     const char *message;
 } cpy_exception;
 
 static void
-cpy_exception_cleanup(_Unwind_Reason_Code reason, _Unwind_Exception *e) {
+cpy_exception_cleanup(cpy_unwind_reason_t reason, cpy_unwind_exc_t *e) {
     (void)reason;
     free(e);
 }
+#else
+typedef struct {
+    int dummy;
+} cpy_exception;
+
+static void
+cpy_exception_cleanup(int reason, cpy_unwind_exc_t *e) {
+    (void)reason;
+    (void)e;
+}
+#endif
+
+#ifndef _WIN32
+/* ---- Itanium ABI unwind helpers (GCC / Clang on POSIX) ---- */
 
 #define DW_EH_PE_omit     0xff
 #define DW_EH_PE_absptr   0x00
@@ -280,7 +328,7 @@ typedef struct {
 } cpy_call_site;
 
 static void
-cpy_find_call_site(_Unwind_Context *context, cpy_call_site *out) {
+cpy_find_call_site(cpy_unwind_ctx_t *context, cpy_call_site *out) {
     out->landing_pad = 0;
     out->found = 0;
     out->is_handler = 0;
@@ -323,7 +371,7 @@ cpy_find_call_site(_Unwind_Context *context, cpy_call_site *out) {
 _Unwind_Reason_Code
 cpy_personality(
     int version, _Unwind_Action actions, uint64_t exception_class,
-    struct _Unwind_Exception *exception_object, struct _Unwind_Context *context) {
+    cpy_unwind_exc_t *exception_object, cpy_unwind_ctx_t *context) {
     (void)version;
     (void)exception_class;
     cpy_call_site m;
@@ -346,16 +394,49 @@ cpy_raise_exception(const char *type_name, const char *message) {
     exc->base.exception_cleanup = cpy_exception_cleanup;
     exc->type_name = type_name;
     exc->message = message;
-    _Unwind_Reason_Code rc = _Unwind_RaiseException(&exc->base);
+    cpy_unwind_reason_t rc = _Unwind_RaiseException(&exc->base);
     fprintf(stderr, "uncaught exception (%d): %s: %s\n", (int)rc, type_name, message);
     abort();
 }
 
 void
 cpy_resume(void *exception_object) {
-    _Unwind_Resume((_Unwind_Exception *)exception_object);
+    _Unwind_Resume((cpy_unwind_exc_t *)exception_object);
     abort();
 }
+
+#else /* _WIN32 — Windows stubs */
+
+static void
+cpy_find_call_site(cpy_unwind_ctx_t *context, cpy_call_site *out) {
+    (void)context;
+    out->landing_pad = 0;
+    out->found = 0;
+    out->is_handler = 0;
+}
+
+cpy_unwind_reason_t
+cpy_personality(
+    int version, int actions, uint64_t exception_class,
+    cpy_unwind_exc_t *exception_object, cpy_unwind_ctx_t *context) {
+    (void)version; (void)actions; (void)exception_class;
+    (void)exception_object; (void)context;
+    return _URC_FATAL_PHASE1_ERROR;
+}
+
+void
+cpy_raise_exception(const char *type_name, const char *message) {
+    fprintf(stderr, "uncaught exception: %s: %s\n", type_name, message);
+    abort();
+}
+
+void
+cpy_resume(void *exception_object) {
+    (void)exception_object;
+    abort();
+}
+
+#endif /* !_WIN32 */
 
 // The big big support for dynamic vars!!!!!
 // Happy? :):):)
@@ -635,7 +716,17 @@ typedef struct arr_entry_s {
 } arr_entry_t;
 
 static arr_entry_t        *arr_table[ARR_TABLE_SIZE];
-static pthread_mutex_t     arr_lock = PTHREAD_MUTEX_INITIALIZER;
+static cpy_mutex_t         arr_lock;
+#ifdef _WIN32
+static volatile long       arr_lock_inited;
+static void arr_lock_init_once(void) {
+    if (InterlockedCompareExchange(&arr_lock_inited, 1, 0) == 0)
+        InitializeCriticalSection(&arr_lock);
+}
+#  define ARR_LOCK_INIT() arr_lock_init_once()
+#else
+#  define ARR_LOCK_INIT() (void)0
+#endif
 
 static unsigned long
 hash_arr_ptr(const void *p) {
@@ -647,13 +738,14 @@ hash_arr_ptr(const void *p) {
 void
 cpyte_array_register(void *arr, int64_t n) {
     if (arr == NULL) return;
+    ARR_LOCK_INIT();
     unsigned long h = hash_arr_ptr(arr);
-    pthread_mutex_lock(&arr_lock);
+    CPY_MUTEX_LOCK(&arr_lock);
     arr_entry_t *e = arr_table[h];
     while (e) {
         if (e->arr == arr) {
             e->len = (size_t)n;
-            pthread_mutex_unlock(&arr_lock);
+            CPY_MUTEX_UNLOCK(&arr_lock);
             return;
         }
         e = e->next;
@@ -665,32 +757,34 @@ cpyte_array_register(void *arr, int64_t n) {
         e->next = arr_table[h];
         arr_table[h] = e;
     }
-    pthread_mutex_unlock(&arr_lock);
+    CPY_MUTEX_UNLOCK(&arr_lock);
 }
 
 int64_t
 cpyte_array_len(void *arr) {
     if (arr == NULL) return 0;
+    ARR_LOCK_INIT();
     unsigned long h = hash_arr_ptr(arr);
-    pthread_mutex_lock(&arr_lock);
+    CPY_MUTEX_LOCK(&arr_lock);
     arr_entry_t *e = arr_table[h];
     while (e) {
         if (e->arr == arr) {
             int64_t n = (int64_t)e->len;
-            pthread_mutex_unlock(&arr_lock);
+            CPY_MUTEX_UNLOCK(&arr_lock);
             return n;
         }
         e = e->next;
     }
-    pthread_mutex_unlock(&arr_lock);
+    CPY_MUTEX_UNLOCK(&arr_lock);
     return 0;
 }
 
 void
 cpyte_array_unregister(void *arr) {
     if (arr == NULL) return;
+    ARR_LOCK_INIT();
     unsigned long h = hash_arr_ptr(arr);
-    pthread_mutex_lock(&arr_lock);
+    CPY_MUTEX_LOCK(&arr_lock);
     arr_entry_t **pp = &arr_table[h];
     while (*pp != NULL) {
         if ((*pp)->arr == arr) {
@@ -701,7 +795,7 @@ cpyte_array_unregister(void *arr) {
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&arr_lock);
+    CPY_MUTEX_UNLOCK(&arr_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -870,17 +964,43 @@ dyn_print_v(int k, uint64_t b) {
 
 char *
 dyn_str_v(int k, uint64_t b) {
-    char *buf = NULL;
-    size_t sz = 0;
-    FILE *f = open_memstream(&buf, &sz);
-    if (f == NULL)
+    char tmp[256];
+    if (k == DYN_NONE) {
         return cpyte_strdup("0");
-    if (k == DYN_NONE)
-        fprintf(f, "0");
-    else
-        dyn_elem_to_file(f, k, b);
-    fclose(f);
-    return buf;
+    }
+    switch (k) {
+    case DYN_INT:
+        snprintf(tmp, sizeof(tmp), "%d", (int32_t)b);
+        return cpyte_strdup(tmp);
+    case DYN_INT64:
+        snprintf(tmp, sizeof(tmp), "%lld", (long long)(int64_t)b);
+        return cpyte_strdup(tmp);
+    case DYN_UINT64:
+        snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)b);
+        return cpyte_strdup(tmp);
+    case DYN_CHAR:
+        snprintf(tmp, sizeof(tmp), "%d", (int)(int8_t)(uint8_t)b);
+        return cpyte_strdup(tmp);
+    case DYN_BOOL:
+        return cpyte_strdup(b ? "1" : "0");
+    case DYN_DOUBLE: {
+        double v;
+        memcpy(&v, &b, sizeof(v));
+        snprintf(tmp, sizeof(tmp), "%f", v);
+        return cpyte_strdup(tmp);
+    }
+    case DYN_STR:
+        return cpyte_strdup((const char *)(uintptr_t)b);
+    case DYN_BIG: {
+        char *s = bigint_to_str((void *)(uintptr_t)b);
+        return s ? s : cpyte_strdup("0");
+    }
+    case DYN_PTR:
+        snprintf(tmp, sizeof(tmp), "0x%llx", (unsigned long long)b);
+        return cpyte_strdup(tmp);
+    default:
+        return cpyte_strdup("0");
+    }
 }
 
 enum {
@@ -889,7 +1009,8 @@ enum {
     DYNOP_GE = 10,
     DYNOP_NEG = 11, DYNOP_NOT = 12,
     DYNOP_BAND = 13, DYNOP_BOR = 14, DYNOP_BXOR = 15, DYNOP_SHL = 16,
-    DYNOP_SHR = 17
+    DYNOP_SHR = 17,
+    DYNOP_FLOOR_DIV = 18
 };
 
 static double
@@ -988,6 +1109,7 @@ dyn_op(DynValue *out, int op, int k1, uint64_t b1, int k2, uint64_t b2) {
             case DYNOP_MUL: r = a * c; break;
             case DYNOP_DIV: r = a / c; break;
             case DYNOP_MOD: r = fmod(a, c); break;
+            case DYNOP_FLOOR_DIV: r = floor(a / c); break;
             default:        r = 0.0; break;
             }
             out->kind = DYN_DOUBLE;
@@ -1002,6 +1124,7 @@ dyn_op(DynValue *out, int op, int k1, uint64_t b1, int k2, uint64_t b2) {
             case DYNOP_MUL: r = a * c; break;
             case DYNOP_DIV: r = a / c; break;
             case DYNOP_MOD: r = a % c; break;
+            case DYNOP_FLOOR_DIV: r = a / c; break;
             case DYNOP_BAND: r = a & c; break;
             case DYNOP_BOR:  r = a | c; break;
             case DYNOP_BXOR: r = a ^ c; break;
@@ -1020,6 +1143,10 @@ dyn_op(DynValue *out, int op, int k1, uint64_t b1, int k2, uint64_t b2) {
         case DYNOP_MUL: r = a * c; break;
         case DYNOP_DIV: r = a / c; break;
         case DYNOP_MOD: r = a % c; break;
+        case DYNOP_FLOOR_DIV:
+            r = a / c;
+            if ((a % c != 0) && ((a < 0) != (c < 0))) r -= 1;
+            break;
         case DYNOP_BAND: r = a & c; break;
         case DYNOP_BOR:  r = a | c; break;
         case DYNOP_BXOR: r = a ^ c; break;

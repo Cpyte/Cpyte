@@ -1,6 +1,9 @@
 import ast
 import os
 import re
+import subprocess
+import sys
+import tempfile
 
 # Function descriptor: (return_type, [(param_name, type), ...], vararg=bool)
 # vararg defaults to False
@@ -108,6 +111,169 @@ C_LIBRARIES = {
     },
 }
 
+# Maps bare import names to their C header files for system header parsing
+_BUILTIN_LIB_HEADERS = {
+    'stdio': 'stdio.h',
+    'stdlib': 'stdlib.h',
+    'math': 'math.h',
+    'string': 'string.h',
+    'time': 'time.h',
+    'fcntl': 'fcntl.h',
+    'unistd': 'unistd.h',
+    'sys/stat': 'sys/stat.h',
+    'sys/types': 'sys/types.h',
+    'sys/socket': 'sys/socket.h',
+    'sys/mman': 'sys/mman.h',
+    'signal': 'signal.h',
+    'errno': 'errno.h',
+    'assert': 'assert.h',
+    'ctype': 'ctype.h',
+    'dirent': 'dirent.h',
+    'dlfcn': 'dlfcn.h',
+    'glob': 'glob.h',
+    'pthread': 'pthread.h',
+    'pwd': 'pwd.h',
+    'setjmp': 'setjmp.h',
+    'stdarg': 'stdarg.h',
+    'stdint': 'stdint.h',
+    'stddef': 'stddef.h',
+    'limits': 'limits.h',
+    'float': 'float.h',
+    'locale': 'locale.h',
+    'tar': 'tar.h',
+    'zlib': 'zlib.h',
+    'sys/time': 'sys/time.h',
+    'sys/wait': 'sys/wait.h',
+    'sys/resource': 'sys/resource.h',
+    'sys/ioctl': 'sys/ioctl.h',
+    'sys/un': 'sys/un.h',
+    'netdb': 'netdb.h',
+    'netinet/in': 'netinet/in.h',
+    'netinet/tcp': 'netinet/tcp.h',
+    'arpa/inet': 'arpa/inet.h',
+}
+
+# Cache for parsed system headers (header_name -> symbols dict)
+_parsed_system_header_cache = {}
+
+# Minimal SDK path discovery (avoids circular import with semantic_analasis)
+_sdk_paths_cache = None
+
+def _find_sdk_paths():
+    """Find system include paths. Cached after first call."""
+    global _sdk_paths_cache
+    if _sdk_paths_cache is not None:
+        return _sdk_paths_cache
+
+    paths = []
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["xcrun", "--show-sdk-path"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                paths.append(r.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for base in (
+            "/Library/Developer/CommandLineTools/SDKs",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
+        ):
+            if os.path.isdir(base):
+                for entry in sorted(os.listdir(base), reverse=True):
+                    full = os.path.join(base, entry)
+                    if os.path.isdir(full) and entry.startswith("MacOSX") and full not in paths:
+                        paths.append(full)
+    else:
+        for p in ("/usr/local/include", "/usr/include"):
+            if os.path.isdir(p) and p not in paths:
+                paths.append(p)
+
+    _sdk_paths_cache = paths
+    return paths
+
+
+def _parse_system_header(header_name):
+    """Parse a C system header using libclang for full symbol extraction.
+
+    Returns a dict of {func_name: (ret_type, [(param_name, param_type), ...], vararg)}.
+    Falls back to None if libclang is unavailable or parsing fails.
+    """
+    if header_name in _parsed_system_header_cache:
+        return _parsed_system_header_cache[header_name]
+
+    if not _init_libclang():
+        _parsed_system_header_cache[header_name] = None
+        return None
+
+    import clang.cindex as ci  # type: ignore[reportMissingImports]
+
+    search_paths = _find_sdk_paths()
+    include_args = []
+    for p in search_paths:
+        include_args.extend(["-I", os.path.join(p, "usr/include")])
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".c", prefix="cpyte_sysheader_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"#include <{header_name}>\n")
+
+        try:
+            idx = ci.Index.create()
+            tu = idx.parse(
+                tmp_path,
+                args=["-x", "c"] + include_args,
+            )
+        except Exception:
+            _parsed_system_header_cache[header_name] = None
+            return None
+
+        symbols = {}
+        for c in tu.cursor.get_children():
+            if c.kind != ci.CursorKind.FUNCTION_DECL:
+                continue
+            if c.spelling in _C_KEYWORDS:
+                continue
+
+            ret_type = _c_type_to_lang(c.result_type.spelling)
+            if ret_type is None:
+                continue
+
+            vararg = False
+            try:
+                vararg = c.type.is_function_variadic()
+            except Exception:
+                pass
+
+            params = []
+            for p in c.get_arguments():
+                raw = p.type.spelling
+                # Skip function pointer params (e.g. qsort comparator) —
+                # map them to void* since cpyte doesn't have function pointer types.
+                if '(' in raw and ')' in raw:
+                    ptype = 'void*'
+                else:
+                    ptype = _c_type_to_lang(raw)
+                if ptype is None:
+                    continue
+                pname = p.spelling or f'p{len(params)}'
+                params.append((pname, ptype))
+
+            symbols[c.spelling] = (ret_type, params, vararg)
+
+        _parsed_system_header_cache[header_name] = symbols
+        return symbols
+
+    except Exception:
+        _parsed_system_header_cache[header_name] = None
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
 _HEADER_PATTERN = re.compile(
     r'(?:CG_EXTERN|CF_EXPORT|EXTERN_C|extern)\s+'
     r'([\w\s\*]+?)\s+'          # return type (lazy)
@@ -189,6 +355,30 @@ _CONST_VAR_PATTERN = re.compile(
 
 
 def resolve_library(name):
+    """Resolve a bare import name (e.g. 'stdlib') to (symbols_dict, 'c').
+
+    Tries parsing the actual system header via libclang for full C compatibility.
+    Falls back to the hardcoded C_LIBRARIES when libclang is unavailable or the
+    header can't be found.
+    """
+    header_name = _BUILTIN_LIB_HEADERS.get(name)
+    if header_name is not None:
+        # Try parsing the real system header for complete symbol coverage
+        parsed = _parse_system_header(header_name)
+        if parsed is not None:
+            # Merge with hardcoded C_LIBRARIES as fallback for any symbols
+            # the parser missed (function pointers, macros, etc.)
+            hardcoded = C_LIBRARIES.get(name, {})
+            for fname, desc in hardcoded.items():
+                if fname not in parsed:
+                    ret_type = desc[0]
+                    params = desc[1]
+                    vararg = len(desc) > 2 and desc[2]
+                    parsed[fname] = (ret_type, params, vararg)
+            if parsed:
+                return parsed, 'c'
+        # If libclang unavailable or parsing failed, fall through to hardcoded
+
     resolved = C_LIBRARIES.get(name)
     if resolved is None:
         return None

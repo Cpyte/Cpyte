@@ -62,6 +62,7 @@ _DYNOP_BOR = 14
 _DYNOP_BXOR = 15
 _DYNOP_SHL = 16
 _DYNOP_SHR = 17
+_DYNOP_FLOOR_DIV = 18
 
 # Registry-based visitor: node type -> emit handler
 _EMIT_REGISTRY = {}
@@ -208,6 +209,26 @@ class LLVM:
             if base_name in self.structs:
                 return self.structs[base_name]
         return ir.IntType(32)
+
+    @staticmethod
+    def _codegen_error(msg: str, node=None):
+        """Raise a clear codegen error instead of a bare llvmlite assertion."""
+        loc = ""
+        if node is not None:
+            tok = getattr(node, '_token', None)
+            if tok is not None and getattr(tok, 'line', None) is not None:
+                loc = f" at line {tok.line}:{tok.column}"
+        raise RuntimeError(f"codegen error{loc}: {msg}")
+
+    def _check_params_no_void(self, param_tys, param_names, node=None):
+        """Check that no function parameter has void type."""
+        for ty, name in zip(param_tys, param_names):
+            if isinstance(ty, ir.VoidType):
+                self._codegen_error(
+                    f"parameter `{name}` has type `void`; "
+                    f"use a pointer type like `void*` instead",
+                    node,
+                )
 
     def _base_type_name(self, t: str) -> str:
         while t.endswith("[]"):
@@ -358,6 +379,31 @@ class LLVM:
         phi.add_incoming(normal_val, normal_bb)
         return phi
 
+    def _emit_floor_div(self, left, right):
+        """Floor division: truncates toward negative infinity (Python-style //).
+
+        result = trunc_div - (trunc_rem != 0 && (sign(a) != sign(b)))
+        """
+        q = self._emit_int_divmod(left, right, is_rem=False)
+        r = self._emit_int_divmod(left, right, is_rem=True)
+        zero = ir.Constant(left.type, 0)
+        r_ne_zero = self.builder.icmp_signed("!=", r, zero)
+        left_neg = self.builder.icmp_signed("<", left, zero)
+        right_neg = self.builder.icmp_signed("<", right, zero)
+        diff_signs = self.builder.xor(left_neg, right_neg)
+        needs_fix = self.builder.and_(r_ne_zero, diff_signs)
+        one = ir.Constant(left.type, 1)
+        fix = self.builder.select(needs_fix, one, zero)
+        return self.builder.sub(q, fix)
+
+    def _get_floor_fn(self):
+        for f in self.module.functions:
+            if f.name == "llvm.floor.f64":
+                return f
+        fnty = ir.FunctionType(ir.DoubleType(), [ir.DoubleType()])
+        fn = ir.Function(self.module, fnty, "llvm.floor.f64")
+        return fn
+
     def _clamp_shift_amount(self, val, bitwidth):
         zero = ir.Constant(val.type, 0)
         max_shift = ir.Constant(val.type, bitwidth - 1)
@@ -379,9 +425,7 @@ class LLVM:
                 val = self.builder.sext(val, _i64)
             else:
                 val = self.builder.zext(val, _i64)
-        if isinstance(val.type, ir.IntType) and "i64" in str(val.type):
-            fn = self.functions["bigint_from_uint64"]
-        elif isinstance(val.type, ir.IntType):
+        if isinstance(val.type, ir.IntType) and "i64" in str(val.type) or isinstance(val.type, ir.IntType):
             fn = self.functions["bigint_from_int"]
         else:
             return val
@@ -495,11 +539,13 @@ class LLVM:
             ("bigint_sub", _i8ptr, [_i8ptr, _i8ptr]),
             ("bigint_mul", _i8ptr, [_i8ptr, _i8ptr]),
             ("bigint_div", _i8ptr, [_i8ptr, _i8ptr]),
+            ("bigint_floor_div", _i8ptr, [_i8ptr, _i8ptr]),
             ("bigint_mod", _i8ptr, [_i8ptr, _i8ptr]),
             ("bigint_neg", _i8ptr, [_i8ptr]),
             ("bigint_cmp", _i32, [_i8ptr, _i8ptr]),
             ("bigint_print", _void, [_i8ptr]),
             ("bigint_to_str", _i8ptr, [_i8ptr]),
+            ("bigint_pow", _i8ptr, [_i8ptr, _i8ptr]),
         ]
         for name, ret, args in bignum_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
@@ -987,6 +1033,18 @@ class LLVM:
         for node in imports:
             self.emit(node)
 
+        # Emit all ccode blocks before function definitions so that
+        # ccode-declared functions are available to every function body.
+        def _collect_ccodes(nodes):
+            for node in nodes:
+                if isinstance(node, CCode):
+                    self.emit(node)
+                elif isinstance(node, FuncDef):
+                    _collect_ccodes(getattr(node, 'body', None) or [])
+
+        _collect_ccodes(toplevel)
+        _collect_ccodes(funcdefs)
+
         user_main = None
         for node in funcdefs:
             if getattr(node, "name", None) == "main":
@@ -998,7 +1056,7 @@ class LLVM:
             toplevel = []
 
         wrapper_builder = None
-        if toplevel:
+        if user_main is None:
             main = ir.Function(self.module, ir.FunctionType(ir.IntType(32), []), "main")
             entry = main.append_basic_block("entry")
             wrapper_builder = ir.IRBuilder(entry)
@@ -1189,6 +1247,7 @@ class LLVM:
                         param_tys = []
                     else:
                         param_tys = [self.llvm_type(t) for _, t in params]
+                    self._check_params_no_void(param_tys, [n for n, _ in params])
                     fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
                     func = ir.Function(self.module, fnty, name=fname)
                     self.functions[fname] = func
@@ -1562,6 +1621,11 @@ class LLVM:
         else:
             count = ir.Constant(_i64, 1)
         elem_ty = self.llvm_type(node.type_expr)
+        if isinstance(elem_ty, ir.VoidType):
+            self._codegen_error(
+                f"cannot allocate `new void` (use `new void*` for a pointer to void)",
+                node,
+            )
         if node.type_expr.endswith("[]"):
             elem_ty = self.llvm_type(node.type_expr[:-2])
         malloc_ty = ir.PointerType(elem_ty)
@@ -1738,6 +1802,35 @@ class LLVM:
     def emit_sizeof(self, node: SizeOf):
         ty = self.llvm_type(node.type_expr)
         return self._sizeof_type(ty)
+
+    @register_emitter(CastExpr)
+    def emit_cast(self, node: CastExpr):
+        val = self.emit(node.expr)
+        target = self.llvm_type(node.type_expr)
+        if val.type == target:
+            return val
+        if isinstance(val.type, ir.IntType) and isinstance(target, ir.IntType):
+            if val.type.width < target.width:
+                return self.builder.sext(val, target)
+            elif val.type.width > target.width:
+                return self.builder.trunc(val, target)
+            return val
+        if isinstance(val.type, ir.IntType) and isinstance(target, ir.DoubleType):
+            return self.builder.sitofp(val, target)
+        if isinstance(val.type, ir.DoubleType) and isinstance(target, ir.IntType):
+            return self.builder.fptosi(val, target)
+        if isinstance(val.type, ir.PointerType) and isinstance(target, ir.PointerType):
+            return self.builder.bitcast(val, target)
+        if isinstance(val.type, ir.PointerType) and isinstance(target, ir.IntType):
+            return self.builder.ptrtoint(val, target)
+        if isinstance(val.type, ir.IntType) and isinstance(target, ir.PointerType):
+            return self.builder.inttoptr(val, target)
+        if isinstance(target, ir.VoidType):
+            self._codegen_error(
+                f"cannot cast to type `void` (use `void*` for a pointer to void)",
+                node,
+            )
+        return self.builder.bitcast(val, target)
 
     @register_emitter(InlineAsm)
     def emit_inlineasm(self, node: InlineAsm):
@@ -1965,6 +2058,7 @@ class LLVM:
             return self._emit_decorated_funcdef(node)
         ret_ty = self.llvm_type(node.rettype or "int")
         param_tys = [self.llvm_type(t) for t in node.params.values()]
+        self._check_params_no_void(param_tys, list(node.params.keys()), node)
 
         if node.name in self.functions:
             func = self.functions[node.name]
@@ -1998,6 +2092,12 @@ class LLVM:
         self.ssa_types = {}
         self.scope_stack = [{}]
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
+            if isinstance(llvm_arg.type, ir.VoidType):
+                self._codegen_error(
+                    f"parameter `{name}` has type `void`; "
+                    f"use a pointer type like `void*` instead",
+                    node,
+                )
             ptr = self.builder.alloca(llvm_arg.type, name=name)
             self.builder.store(llvm_arg, ptr)
             self.locals[name] = ptr
@@ -2040,6 +2140,7 @@ class LLVM:
         trampoline_name = f"__{node.name}_trampoline"
         ret_ty = self.llvm_type(node.rettype or "int")
         param_tys = [self.llvm_type(t) for t in node.params.values()]
+        self._check_params_no_void(param_tys, list(node.params.keys()), node)
 
         # 1. Compile original function body as __name
         orig_func = ir.Function(
@@ -2649,13 +2750,21 @@ class LLVM:
                     return self.builder.call(
                         self.functions["bigint_mul"], [left, right]
                     )
-                case TokenType.SLASH | TokenType.SLASH_SLASH:
+                case TokenType.SLASH:
                     return self.builder.call(
                         self.functions["bigint_div"], [left, right]
+                    )
+                case TokenType.SLASH_SLASH:
+                    return self.builder.call(
+                        self.functions["bigint_floor_div"], [left, right]
                     )
                 case TokenType.PERCENT:
                     return self.builder.call(
                         self.functions["bigint_mod"], [left, right]
+                    )
+                case TokenType.POW:
+                    return self.builder.call(
+                        self.functions["bigint_pow"], [left, right]
                     )
                 case TokenType.EQ_EQ:
                     cmp = self.builder.call(self.functions["bigint_cmp"], [left, right])
@@ -2711,7 +2820,8 @@ class LLVM:
                 case TokenType.SLASH:
                     return self.builder.fdiv(left, right)
                 case TokenType.SLASH_SLASH:
-                    return self.builder.fdiv(left, right)
+                    div = self.builder.fdiv(left, right)
+                    return self.builder.call(self._get_floor_fn(), [div])
                 case TokenType.PERCENT:
                     return self.builder.frem(left, right)
                 case TokenType.GREATER:
@@ -2737,7 +2847,7 @@ class LLVM:
             case TokenType.SLASH:
                 return self._emit_int_divmod(left, right, is_rem=False)
             case TokenType.SLASH_SLASH:
-                return self._emit_int_divmod(left, right, is_rem=False)
+                return self._emit_floor_div(left, right)
             case TokenType.PERCENT:
                 return self._emit_int_divmod(left, right, is_rem=True)
             case TokenType.SHL:
@@ -2842,7 +2952,7 @@ class LLVM:
             TokenType.MINUS: _DYNOP_SUB,
             TokenType.STAR: _DYNOP_MUL,
             TokenType.SLASH: _DYNOP_DIV,
-            TokenType.SLASH_SLASH: _DYNOP_DIV,
+            TokenType.SLASH_SLASH: _DYNOP_FLOOR_DIV,
             TokenType.PERCENT: _DYNOP_MOD,
             TokenType.EQ_EQ: _DYNOP_EQ,
             TokenType.NOT_EQ: _DYNOP_NE,
@@ -4031,6 +4141,10 @@ class LLVM:
         return value
 
     def _alloca(self, ty, name=""):
+        if isinstance(ty, ir.VoidType):
+            self._codegen_error(
+                f"cannot allocate variable of type `void` (use `void*` for a pointer to void)"
+            )
         entry_block = self.builder.function.entry_basic_block
         saved_block = self.builder.block
         self.builder.position_at_start(entry_block)
@@ -4127,6 +4241,12 @@ class LLVM:
                 self.ssa_types.pop(node.name, None)
             return
         ty = self.llvm_type(node.var_type)
+        if isinstance(ty, ir.VoidType):
+            self._codegen_error(
+                f"cannot declare variable `{node.name}` of type `void` "
+                f"(use `void*` for a pointer to void)",
+                node,
+            )
         if self.no_userspace and node.var_type == "dynamic":
             ty = _i32
         if node.is_const:

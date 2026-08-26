@@ -9,7 +9,7 @@ import warnings
 from ._bignum_bc import load_bignum_bc
 from ._gc_bc import load_gc_bc
 from .generate_bc import _remove_probe_stack_ir
-from .linker import format_cc_diag
+from .linker import format_cc_diag, find_linker, LinkerNotFoundError, Linker
 from .ui import print_err, print_ok
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
@@ -20,6 +20,42 @@ if getattr(sys, 'frozen', False):
     _RUNTIME_C = os.path.join(getattr(sys, '_MEIPASS', ''), 'runtime.c')
 else:
     _RUNTIME_C = os.path.join(os.path.dirname(__file__), 'runtime.c')
+
+_llvm_cc_cache = None
+
+
+def _find_llvm_cc():
+    """Find a C compiler that supports -emit-llvm for JIT compilation.
+
+    Tries clang first, then falls back to other compilers on PATH.
+    Returns the compiler path or raises SystemExit with a clear message.
+    """
+    global _llvm_cc_cache
+    if _llvm_cc_cache is not None:
+        return _llvm_cc_cache
+    import shutil
+    for name in ('clang', 'cc', 'gcc'):
+        exe = shutil.which(name)
+        if exe:
+            try:
+                r = subprocess.run(
+                    [exe, '-S', '-emit-llvm', '-O0', '-o', '/dev/null', '-xc', '-'],
+                    input='int __x = 0;',
+                    capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    _llvm_cc_cache = exe
+                    return exe
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    print_err(
+        'error: no C compiler found that supports -emit-llvm (needed for JIT).\n'
+        '  Install clang, or use --aot mode which works with gcc.\n'
+        '  On macOS: xcode-select --install\n'
+        '  On Ubuntu/Debian: sudo apt install clang\n'
+        '  On Fedora/RHEL: sudo dnf install clang'
+    )
+    raise SystemExit(1)
+
 
 _callbacks: list = []
 
@@ -437,6 +473,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
 
     llvm_ir = str(module)
     mod = binding.parse_assembly(llvm_ir)
+    llvm_cc = _find_llvm_cc()
     if src_files:
         target = binding.Target.from_default_triple()
         for src in src_files:
@@ -445,7 +482,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
                     src_ir = f.read()
             else:
                 r = subprocess.run(
-                    ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
+                    [llvm_cc, '-S', '-emit-llvm', '-O0', '-target', target.triple,
                      '-fno-stack-protector', '-o', '-', src],
                     capture_output=True, text=True)
 
@@ -461,7 +498,7 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     # JIT can resolve native helpers that have no Python callback mirror.
     target = binding.Target.from_default_triple()
     r = subprocess.run(
-        ['clang', '-S', '-emit-llvm', '-O0', '-target', target.triple,
+        [llvm_cc, '-S', '-emit-llvm', '-O0', '-target', target.triple,
          '-fno-stack-protector', '-o', '-', _RUNTIME_C],
         capture_output=True, text=True)
     if r.returncode != 0:
@@ -742,6 +779,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         _dyn_bigint_to_str[0] = None
 
     func_ptr = engine.get_function_address("main")
+    if not func_ptr:
+        print_err("no `main` function defined")
+        return 0
     _main_fn = ctypes.CFUNCTYPE(ctypes.c_int)(func_ptr)
     _callbacks.append(_main_fn)
     ret = _main_fn()
@@ -799,51 +839,24 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
         f.write(obj)
 
     objs = [output]
+    try:
+        linker = Linker(lto=lto)
+    except LinkerNotFoundError as e:
+        print_err(f'error: {e}')
+        raise SystemExit(1)
+
     for src in (src_files or []):
         src_obj = src.rsplit('.', 1)[0] + '.o'
-        cmd = ['clang', '-c', '-O3', '-o', src_obj, src]
-        if lto:
-            cmd.append('-flto')
-        if pic:
-            cmd.append('-fPIC')
-        r = subprocess.run(
-            cmd,
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            print_err(f'error compiling {src}: {format_cc_diag(r.stderr)}')
-            raise SystemExit(1)
+        linker.compile_c(src, output=src_obj, opt_level=3, pic=pic)
         objs.append(src_obj)
-    
+
     if not no_userspace:
         runtime_obj = output + '.runtime.o'
-        cmd = ['clang', '-c', '-O3', '-o', runtime_obj, _RUNTIME_C]
-        cmd.append('-fexceptions')
-        cmd.append('-funwind-tables')
-        if lto:
-            cmd.append('-flto')
-        if pic:
-            cmd.append('-fPIC')
-        r = subprocess.run(
-            cmd,
-            capture_output=True, text=True
-        )
-        if r.returncode == 0:
-            objs.append(runtime_obj)
+        linker.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=3, pic=pic, eh=True)
+        objs.append(runtime_obj)
 
     out_name = output.rsplit('.', 1)[0] if '.' in output else output
-    link_cmd = ['clang', '-O3', '-o', out_name] + objs + ['-lm']
-    for fw in (frameworks or []):
-        link_cmd.extend(['-framework', fw])
-    if lto:
-        link_cmd.insert(1, '-flto')
-    r = subprocess.run(
-        link_cmd,
-        capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        print_err(f'error linking: {format_cc_diag(r.stderr)}')
-        raise SystemExit(1)
+    linker.link(objs, out_name, opt_level=3, pic=pic, frameworks=frameworks)
 
 
 if getattr(sys, 'frozen', False):

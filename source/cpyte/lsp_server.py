@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import pathlib
 import time
 import traceback
 from urllib.parse import unquote, urlparse
@@ -47,15 +48,17 @@ def _fmt_params(params, const_params=None):
     )
 
 _KEYWORDS = [
-    "def", "return", "if", "elif", "else", "while", "for", "break", "continue",
+    "def", "return", "if", "elif", "else", "while", "for", "in", "break", "continue",
     "public", "private", "static",
-    "import", "struct", "new", "sizeof",
+    "import", "struct", "class", "enum", "new", "sizeof", "type",
     "true", "false", "null",
     "switch", "case", "default",
-    "print", "input", "input_str", "input_big",
+    "try", "except", "raise", "assert",
+    "let", "virtual", "override", "ccode", "llvm", "asm", "unsafe",
+    "print", "input", "input_str", "input_big", "free",
 ]
 
-_TYPES = ["int", "int64", "uint64", "float", "str", "void", "bool"]
+_TYPES = ["int", "int64", "uint64", "float", "double", "str", "char", "void", "bool", "big", "size_t", "dynamic"]
 
 _KEYWORD_DESC = {
     "def": "Define a function",
@@ -65,6 +68,7 @@ _KEYWORD_DESC = {
     "else": "Fallback when all conditions are false",
     "while": "Repeat block while condition is true",
     "for": "Iterate over a range or collection",
+    "in": "Used in for-loops to iterate over a collection",
     "break": "Exit the innermost loop immediately",
     "continue": "Skip to the next iteration of the loop",
     "public": "Make a symbol accessible outside the module",
@@ -72,18 +76,33 @@ _KEYWORD_DESC = {
     "static": "Declare a class-level member",
     "import": "Bring a module's symbols into scope",
     "struct": "Define a composite data type with named fields",
+    "class": "Define a class with fields and methods",
+    "enum": "Define an enumeration of named integer constants",
     "new": "Allocate a new struct instance on the heap",
     "sizeof": "Return the byte size of a type",
+    "type": "Define a type alias",
     "true": "Boolean literal representing truth",
     "false": "Boolean literal representing falsehood",
     "null": "Null pointer literal",
     "switch": "Select one branch to execute based on a value",
     "case": "A labelled branch inside a switch statement",
     "default": "The fallback branch when no case matches",
+    "try": "Begin an exception handling block",
+    "except": "Catch an exception thrown inside a try block",
+    "raise": "Throw an exception with a message",
+    "assert": "Verify a condition is true, trap with message if not",
+    "let": "Declare a variable (expression-statement form)",
+    "virtual": "Declare an overridable method",
+    "override": "Override a parent class method",
+    "ccode": "Embed raw C code block",
+    "llvm": "Embed raw LLVM IR block",
+    "asm": "Inline assembly block",
+    "unsafe": "Mark code as unsafe (no bounds checking)",
     "print": "Write a string representation to stdout",
     "input": "Read a line of text from stdin",
     "input_str": "Read a line of text from stdin and return it as a string",
     "input_big": "Read a line of text from stdin and return it as an arbitrary-precision big integer",
+    "free": "Deallocate heap memory",
 }
 
 _TYPE_DESC = {
@@ -91,9 +110,48 @@ _TYPE_DESC = {
     "int64": "Signed 64-bit integer",
     "uint64": "Unsigned 64-bit integer",
     "float": "64-bit floating-point number (IEEE 754)",
-    "str": "Heap-allocated UTF-8 string",
+    "double": "64-bit floating-point number (alias for float)",
+    "str": "Heap-allocated UTF-8 string (native char*)",
+    "char": "Single byte character (8-bit)",
     "void": "Absence of a value (used as return type)",
     "bool": "Boolean (true or false)",
+    "big": "Arbitrary-precision integer (unlimited size)",
+    "size_t": "Unsigned platform-dependent size type",
+    "dynamic": "Dynamically-typed value (resolved at runtime)",
+}
+
+_BUILTIN_FUNCS = {
+    "print": "print(value: any) -> void",
+    "input": "input() -> int",
+    "input_str": "input_str() -> str",
+    "input_big": "input_big() -> big",
+    "str": "str(value: any) -> str",
+    "int": "int(value: any) -> int",
+    "float": "float(value: any) -> float",
+    "double": "double(value: any) -> float",
+    "range": "range(stop: int) -> int64[]",
+    "str_split": "str_split(s: str, sep: str) -> dynamic[]",
+    "sizeof": "sizeof(type: T) -> int",
+    "new": "new T(...) -> T*",
+    "free": "free(ptr: any*) -> void",
+    "code": "code() -> dynamic",
+}
+
+_BUILTIN_FUNC_PARAMS = {
+    "print": {"value": "any"},
+    "input": {},
+    "input_str": {},
+    "input_big": {},
+    "str": {"value": "any"},
+    "int": {"value": "any"},
+    "float": {"value": "any"},
+    "double": {"value": "any"},
+    "range": {"stop": "int"},
+    "str_split": {"s": "str", "sep": "str"},
+    "sizeof": {"type": "T"},
+    "new": {},
+    "free": {"ptr": "any*"},
+    "code": {},
 }
 
 _SNIPPETS = {
@@ -104,6 +162,10 @@ _SNIPPETS = {
     "while": "while ${1:condition}:\n    ${0:body}",
     "for": "for ${1:var} in ${2:iter}:\n    ${0:body}",
     "struct": "struct ${1:Name}:\n    ${0:int field}",
+    "class": "class ${1:Name}:\n    ${0:field}",
+    "enum": "enum ${1:Name}:\n    ${0:MEMBER}",
+    "try": "try:\n    ${0:body}\nexcept:\n    pass",
+    "switch": "switch ${1:value}:\n    case ${2:pattern}:\n        ${0:body}",
     "public def": "public def ${1:name}(${2:params}) -> ${3:type}:\n    ${0:body}",
 }
 
@@ -571,9 +633,20 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
                 items.append(lsp.CompletionItem(
                     label=t,
                     kind=lsp.CompletionItemKind.TypeParameter,
+                    detail=_TYPE_DESC.get(t, ""),
                     insert_text=t,
                 ))
                 seen.add(t)
+
+        for name, sig in _BUILTIN_FUNCS.items():
+            if name.startswith(prefix) and name not in seen:
+                items.append(lsp.CompletionItem(
+                    label=name,
+                    kind=lsp.CompletionItemKind.Function,
+                    detail=sig,
+                    insert_text=f"{name}(",
+                ))
+                seen.add(name)
 
         for node in parsed:
             if isinstance(node, FuncDef) and node.name.startswith(prefix) and node.name not in seen:
@@ -684,30 +757,62 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
             content = f"**`{word}`** — {_TYPE_DESC[word]}"
         elif word in _KEYWORD_DESC:
             content = f"**`{word}`** — {_KEYWORD_DESC[word]}"
+        elif word in _BUILTIN_FUNCS:
+            content = f"**`{_BUILTIN_FUNCS[word]}`**  \n*built-in function*"
         else:
-            for node in parsed:
-                if isinstance(node, FuncDef) and node.name == word:
-                    sig = _fmt_params(node.params, getattr(node, 'const_params', None))
-                    ret = node.rettype or "void"
-                    content = f"**`{node.name}({sig}) → {ret}`**"
-                    if node.visibility:
-                        content += f"  \n*visibility: `{node.visibility}`*"
-                    break
-                elif isinstance(node, StructDef) and node.name == word:
-                    fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
-                    content = f"**`struct {node.name}`**  \n`{{ {fields} }}`"
-                    break
-                elif isinstance(node, ClassDef) and node.name == word:
-                    fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
-                    methods = ", ".join(f"`{m.name}()`" for m in node.methods)
-                    content = f"**`class {node.name}`**  \n`{{ {fields} }}`"
-                    if node.methods:
-                        content += f"  \nmethods: {methods}"
-                    break
-                elif isinstance(node, EnumDef) and node.name == word:
-                    members = ", ".join(f"`{m['name']}` = `{m.get('_const_value')}`" for m in node.members)
-                    content = f"**`enum {node.name}`**  \n{{ {members} }}"
-                    break
+            base = _dot_context(tokens, line, col)
+            if base is not None and analyzer:
+                name = f'{base}.{word}'
+                sym = analyzer.globals.lookup(name)
+                if sym:
+                    if sym.kind == 'field':
+                        content = f"**`{word}`**: `{sym.type}`  \n*field of {base}*"
+                    elif sym.kind == 'function':
+                        content = f"**`{word}`**: `{sym.type}`  \n*method*"
+                if not content:
+                    base_sym = analyzer.globals.lookup(base)
+                    if base_sym and hasattr(base_sym, 'node') and base_sym.node is not None:
+                        node = base_sym.node
+                        for f in getattr(node, 'fields', None) or []:
+                            if f.name == word:
+                                content = f"**`{word}`**: `{f.type_expr}`  \n*field of {base}*"
+                                break
+                        if not content:
+                            for m in getattr(node, 'methods', None) or []:
+                                if m.name == word:
+                                    sig = _fmt_params(m.params, getattr(m, 'const_params', None))
+                                    content = f"**`{m.name}({sig}) → {m.rettype or 'void'}`**  \n*method of {base}*"
+                                    break
+
+            if not content:
+                for node in parsed:
+                    if isinstance(node, FuncDef) and node.name == word:
+                        sig = _fmt_params(node.params, getattr(node, 'const_params', None))
+                        ret = node.rettype or "void"
+                        content = f"**`{node.name}({sig}) → {ret}`**"
+                        if node.decorators:
+                            decs = ", ".join(f"@{d}" if isinstance(d, str) else f"@{d}" for d in node.decorators)
+                            content += f"  \n*decorators: {decs}*"
+                        if node.visibility:
+                            content += f"  \n*visibility: `{node.visibility}`*"
+                        break
+                    elif isinstance(node, StructDef) and node.name == word:
+                        fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
+                        content = f"**`struct {node.name}`**  \n`{{ {fields} }}`"
+                        break
+                    elif isinstance(node, ClassDef) and node.name == word:
+                        fields = ", ".join(f"`{f.name}`: `{f.type_expr}`" for f in node.fields)
+                        methods = ", ".join(f"`{m.name}()`" for m in node.methods)
+                        content = f"**`class {node.name}`**  \n`{{ {fields} }}`"
+                        if node.base:
+                            content += f"  \nextends `{node.base}`"
+                        if node.methods:
+                            content += f"  \nmethods: {methods}"
+                        break
+                    elif isinstance(node, EnumDef) and node.name == word:
+                        members = ", ".join(f"`{m['name']}` = `{m.get('_const_value')}`" for m in node.members)
+                        content = f"**`enum {node.name}`**  \n{{ {members} }}"
+                        break
             if not content:
                 sym = analyzer.globals.lookup(word) if analyzer else None
                 if sym:
@@ -719,6 +824,8 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
                         content = f"**`enum {word}`**"
                     elif sym.kind == "enum_member":
                         content = f"**`{word}`**: `{sym.type}` = `{_const_value_text(sym)}`  \n*enum member*"
+                    elif sym.kind == "package":
+                        content = f"**`{word}`**  \n*imported package*"
                     else:
                         content = f"**`{word}`**: `{sym.type or sym.kind}`"
                 else:
@@ -740,6 +847,93 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
         return None
     except Exception:
         logger.error(f"hover error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_SIGNATURE_HELP,
+                lsp.SignatureHelpOptions(trigger_characters=["(", ","]))
+@server.thread()
+def signature_help(ls: CpyLanguageServer, params: lsp.SignatureHelpParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        source, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+
+        paren_depth = 0
+        active_param = 0
+        func_name = None
+        for tok in reversed(tokens):
+            if tok is None:
+                continue
+            t_line = tok.line - 1
+            t_end = tok.column - 1 + len(tok.value or "")
+            if t_line > line or (t_line == line and t_end > col):
+                continue
+            if t_line < line or (t_line == line and t_end <= col):
+                if tok.type == TokenType.RPAREN:
+                    paren_depth += 1
+                elif tok.type == TokenType.LPAREN:
+                    if paren_depth == 0:
+                        if tok.column >= 2:
+                            prev = None
+                            for t2 in tokens:
+                                if t2 is None:
+                                    continue
+                                if t2.line == tok.line and t2.column == tok.column - 1:
+                                    prev = t2
+                                    break
+                            if prev and prev.type == TokenType.IDENTIFIER:
+                                func_name = prev.value
+                            elif prev and prev.type == TokenType.KEYWORD and prev.value in _BUILTIN_FUNC_PARAMS:
+                                func_name = prev.value
+                        break
+                    paren_depth -= 1
+                elif tok.type == TokenType.COMMA and paren_depth == 0:
+                    active_param += 1
+
+        if func_name is None:
+            return None
+
+        params_map = None
+        sig_label = None
+
+        if func_name in _BUILTIN_FUNC_PARAMS:
+            params_map = _BUILTIN_FUNC_PARAMS[func_name]
+            sig_label = _BUILTIN_FUNCS.get(func_name, f"{func_name}(...)")
+        elif analyzer:
+            sym = analyzer.globals.lookup(func_name)
+            if sym and sym.kind == 'function' and hasattr(sym, 'node') and sym.node is not None:
+                node = sym.node
+                if hasattr(node, 'params'):
+                    params_map = node.params
+                    const_params = getattr(node, 'const_params', None) or set()
+                    parts = []
+                    for pname, ptype in params_map.items():
+                        parts.append(f"({pname}): {ptype}" if pname in const_params else f"{pname}: {ptype}")
+                    sig_label = f"{func_name}({', '.join(parts)}) -> {node.rettype or 'void'}"
+
+        if params_map is None:
+            return None
+
+        sig_params = []
+        for pname, ptype in params_map.items():
+            sig_params.append(lsp.ParameterInformation(
+                label=pname,
+                documentation=f"{pname}: {ptype}",
+            ))
+
+        sig = lsp.SignatureInformation(
+            label=sig_label,
+            parameters=sig_params,
+        )
+        return lsp.SignatureHelp(
+            signatures=[sig],
+            active_signature=0,
+            active_parameter=active_param,
+        )
+    except Exception:
+        logger.error(f"signature_help error:\n{traceback.format_exc()}")
         return None
 
 
@@ -899,6 +1093,7 @@ def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
             return None
         word = tok.value
         target = None
+        target_uri = uri
         if analyzer is not None:
             name = word
             base = _dot_context(tokens, line, col)
@@ -907,6 +1102,21 @@ def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
             sym = analyzer.globals.lookup(name)
             if sym is not None and getattr(sym, 'node', None) is not None:
                 target = sym.node
+                node_file = getattr(target, '_source_file', None)
+                if node_file and node_file != _uri_to_path(uri):
+                    target_uri = pathlib.Path(node_file).as_uri()
+                else:
+                    import_node = getattr(sym, '_import_node', None)
+                    if import_node is None and analyzer:
+                        for imp in getattr(analyzer, '_imports', []):
+                            sub_ast = getattr(imp, 'sub_ast', None)
+                            if sub_ast and hasattr(target, 'name'):
+                                for n in sub_ast:
+                                    if getattr(n, 'name', None) == target.name:
+                                        src = getattr(imp, 'src_file', None)
+                                        if src:
+                                            target_uri = pathlib.Path(src).as_uri()
+                                        break
         if target is None:
             func = _find_containing_function(parsed, line + 1)
             if func is not None:
@@ -919,10 +1129,45 @@ def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
         start = lsp.Position(line=t.line - 1, character=t.column - 1)
         end = lsp.Position(line=t.line - 1,
                            character=t.column - 1 + len(t.value or ""))
-        return lsp.Location(uri=uri, range=lsp.Range(start=start, end=end))
+        return lsp.Location(uri=target_uri, range=lsp.Range(start=start, end=end))
     except Exception:
         logger.error(f"definition error:\n{traceback.format_exc()}")
         return None
+
+
+def _walk_all_tokens(tokens, word, current_line, current_col):
+    """Find all occurrences of `word` in tokens, yielding (line, col, length)."""
+    if not word:
+        return
+    for tok in tokens:
+        if tok is None or tok.value != word:
+            continue
+        yield (tok.line - 1, tok.column - 1, len(tok.value or ""))
+
+
+@server.feature(lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
+@server.thread()
+def document_highlight(ls: CpyLanguageServer, params: lsp.DocumentHighlightParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value:
+            return []
+        word = tok.value
+        results = []
+        for t_line, t_col, t_len in _walk_all_tokens(tokens, word, line, col):
+            rng = lsp.Range(
+                start=lsp.Position(line=t_line, character=t_col),
+                end=lsp.Position(line=t_line, character=t_col + t_len),
+            )
+            results.append(lsp.DocumentHighlight(range=rng, kind=lsp.DocumentHighlightKind.Read))
+        return results
+    except Exception:
+        logger.error(f"document_highlight error:\n{traceback.format_exc()}")
+        return []
 
 
 if __name__ == "__main__":

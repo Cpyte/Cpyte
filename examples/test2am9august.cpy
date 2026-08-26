@@ -1,0 +1,2 @@
+int i
+print(i)

@@ -294,8 +294,8 @@ void* bigint_div(void* a, void* b) {
     int norm_shift = __builtin_clzll(y->limbs[y->used - 1]);
     BigNum* u = _bn_alloc(); // normalized dividend
     BigNum* v = _bn_alloc(); // normalized divisor
-    _bn_reserve(u, x->used + 1);
-    _bn_reserve(v, y->used);
+    _bn_reserve(u, x->used + 2);
+    _bn_reserve(v, y->used + 1);
 
     if (norm_shift > 0) {
         uint64_t carry = 0;
@@ -304,24 +304,29 @@ void* bigint_div(void* a, void* b) {
             v->limbs[i] = val;
             carry = y->limbs[i] >> (64 - norm_shift);
         }
-        v->used = y->used;
+        v->limbs[y->used] = carry;
+        v->used = y->used + (carry ? 1 : 0);
         
         carry = 0;
+        u->limbs[0] = 0; // leading zero for Knuth-D
         for (size_t i = 0; i < x->used; i++) {
             uint64_t val = (carry) | (x->limbs[i] << norm_shift);
-            u->limbs[i] = val;
+            u->limbs[i + 1] = val;
             carry = x->limbs[i] >> (64 - norm_shift);
         }
-        u->limbs[x->used] = carry;
-        u->used = x->used + (carry ? 1 : 0);
+        u->limbs[x->used + 1] = carry;
+        u->used = x->used + 1 + (carry ? 1 : 0);
     } else {
+        v->limbs[y->used] = 0;
         memcpy(v->limbs, y->limbs, y->used * sizeof(uint64_t));
         v->used = y->used;
-        memcpy(u->limbs, x->limbs, x->used * sizeof(uint64_t));
-        u->used = x->used;
+        u->limbs[0] = 0; // leading zero for Knuth-D
+        memcpy(u->limbs + 1, x->limbs, x->used * sizeof(uint64_t));
+        u->limbs[x->used + 1] = 0;
+        u->used = x->used + 1;
     }
 
-    size_t q_len = u->used - v->used + 1;
+    size_t q_len = u->used - v->used;
     _bn_reserve(r, q_len);
     memset(r->limbs, 0, q_len * sizeof(uint64_t));
     r->used = q_len;
@@ -332,24 +337,14 @@ void* bigint_div(void* a, void* b) {
         size_t idx = j - 1;
         size_t u_idx = idx + v->used;
 
-        // Estimate quotient digit
-        __uint128_t u_hi;
-        if (u_idx >= u->used) {
-            if (u->used > 0) {
-                u_hi = ((__uint128_t)u->limbs[u->used - 1] << 64) |
-                       (u->used > 1 ? u->limbs[u->used - 2] : 0);
-            } else {
-                u_hi = 0;
-            }
-        } else {
-            u_hi = ((__uint128_t)u->limbs[u_idx] << 64) |
-                    (u_idx > 0 ? u->limbs[u_idx - 1] : 0);
-        }
+        // Estimate quotient digit from top 2 limbs of u window
+        __uint128_t u_hi = ((__uint128_t)u->limbs[u_idx] << 64) |
+                            (u_idx > 0 ? u->limbs[u_idx - 1] : 0);
         __uint128_t q_est = u_hi / v_top;
         if (q_est > 0xFFFFFFFFFFFFFFFFULL)
             q_est = 0xFFFFFFFFFFFFFFFFULL;
 
-        // Subtract q_est * v from u
+        // Subtract q_est * v from u[idx..idx+v->used]
         uint64_t borrow = 0;
         for (size_t i = 0; i < v->used; i++) {
             __uint128_t prod = q_est * v->limbs[i];
@@ -357,19 +352,20 @@ void* bigint_div(void* a, void* b) {
             u->limbs[idx + i] = (uint64_t)sub;
             borrow = (uint64_t)(prod >> 64) - (uint64_t)(sub >> 64);
         }
-        __uint128_t final_sub = (__uint128_t)u->limbs[u_idx] - borrow;
-        u->limbs[u_idx] = (uint64_t)final_sub;
-
-        if ((uint64_t)(final_sub >> 64) != 0) {
-            // Quotient was too large, add back
-            q_est--;
-            uint64_t carry = 0;
-            for (size_t i = 0; i < v->used; i++) {
-                __uint128_t sum = (__uint128_t)u->limbs[idx + i] + v->limbs[i] + carry;
-                u->limbs[idx + i] = (uint64_t)sum;
-                carry = (uint64_t)(sum >> 64);
+        // Handle the borrow past the window
+        if (u_idx < u->used) {
+            __uint128_t final_sub = (__uint128_t)u->limbs[u_idx] - borrow;
+            u->limbs[u_idx] = (uint64_t)final_sub;
+            if ((uint64_t)(final_sub >> 64) != 0) {
+                q_est--;
+                uint64_t carry = 0;
+                for (size_t i = 0; i < v->used; i++) {
+                    __uint128_t sum = (__uint128_t)u->limbs[idx + i] + v->limbs[i] + carry;
+                    u->limbs[idx + i] = (uint64_t)sum;
+                    carry = (uint64_t)(sum >> 64);
+                }
+                u->limbs[u_idx] += carry;
             }
-            u->limbs[u_idx] += carry;
         }
 
         r->limbs[idx] = (uint64_t)q_est;
@@ -418,6 +414,91 @@ void* bigint_mod(void* a, void* b) {
     bigint_free(q);
     bigint_free(prod);
     return r;
+}
+
+void* bigint_floor_div(void* a, void* b) {
+    if (!a || !b) return bigint_from_int(0);
+    BigNum* x = (BigNum*)a;
+    BigNum* y = (BigNum*)b;
+    if (y->used == 1 && y->limbs[0] == 0)
+        return bigint_from_int(0);
+    void* q = bigint_div(a, b);
+    void* r = bigint_mod(a, b);
+    BigNum* rq = (BigNum*)q;
+    BigNum* rr = (BigNum*)r;
+    // If remainder is nonzero and signs differ, floor = trunc_div - 1
+    int r_nonzero = !(rr->used == 1 && rr->limbs[0] == 0);
+    if (r_nonzero && x->negative != y->negative) {
+        void* one = bigint_from_int(1);
+        void* result = bigint_sub(q, one);
+        bigint_free(one);
+        bigint_free(q);
+        bigint_free(r);
+        return result;
+    }
+    bigint_free(r);
+    return q;
+}
+
+void* bigint_pow(void* a, void* b) {
+    if (!a) return bigint_from_int(0);
+    BigNum* base = (BigNum*)a;
+    BigNum* exp = (BigNum*)b;
+    if (exp->negative) {
+        return bigint_from_int(0);
+    }
+    if (exp->used == 1 && exp->limbs[0] == 0)
+        return bigint_from_int(1);
+    if (exp->used == 1 && exp->limbs[0] == 1) {
+        BigNum* r = _bn_alloc();
+        _bn_reserve(r, base->used);
+        memcpy(r->limbs, base->limbs, base->used * sizeof(uint64_t));
+        r->used = base->used;
+        r->negative = base->negative;
+        return r;
+    }
+
+    int exp_is_odd = exp->limbs[0] & 1;
+
+    void* result = bigint_from_int(1);
+    BigNum* cb = _bn_alloc();
+    _bn_reserve(cb, base->used);
+    memcpy(cb->limbs, base->limbs, base->used * sizeof(uint64_t));
+    cb->used = base->used;
+    cb->negative = base->negative;
+
+    BigNum exp_copy;
+    _bn_reserve(&exp_copy, exp->used);
+    memcpy(exp_copy.limbs, exp->limbs, exp->used * sizeof(uint64_t));
+    exp_copy.used = exp->used;
+    exp_copy.len = exp->used;
+    exp_copy.negative = 0;
+
+    while (!(exp_copy.used == 1 && exp_copy.limbs[0] == 0)) {
+        if (exp_copy.limbs[0] & 1) {
+            void* new_result = bigint_mul(result, cb);
+            bigint_free(result);
+            result = new_result;
+        }
+        uint64_t carry = 0;
+        for (size_t i = exp_copy.used; i > 0; i--) {
+            uint64_t val = (carry << 63) | (exp_copy.limbs[i - 1] >> 1);
+            carry = exp_copy.limbs[i - 1] & 1;
+            exp_copy.limbs[i - 1] = val;
+        }
+        _bn_trim(&exp_copy);
+        void* new_base = bigint_mul(cb, cb);
+        bigint_free(cb);
+        cb = new_base;
+    }
+
+    bigint_free(cb);
+    free(exp_copy.limbs);
+
+    BigNum* res = (BigNum*)result;
+    if (!exp_is_odd) res->negative = 0;
+    if (res->used == 1 && res->limbs[0] == 0) res->negative = 0;
+    return result;
 }
 
 int bigint_cmp(void* a, void* b) {

@@ -99,6 +99,7 @@ from .astparse import (
     BinOp,
     Break,
     Call,
+    CastExpr,
     CCode,
     ClassDef,
     Continue,
@@ -757,7 +758,6 @@ class SemanticAnalyzer:
                 "PIPE",
                 "CARET",
                 "PERCENT",
-                "SLASH_SLASH",
             ):
                 if node.op.name in ("SHL", "SHR", "AMPERSAND", "PIPE", "CARET"):
                     # Bitwise operations not supported for big
@@ -781,7 +781,7 @@ class SemanticAnalyzer:
                         return "int64"
                     node.inferred_type = "int"
                     return "int"
-                # PERCENT, SLASH_SLASH
+                # PERCENT
                 valid_int_types = ("int", "int64", "uint64", "big")
                 if (left_t is not None and left_t not in valid_int_types) or (
                     right_t is not None and right_t not in valid_int_types
@@ -807,7 +807,7 @@ class SemanticAnalyzer:
                 node.inferred_type = "int"
                 return "int"
 
-            if node.op.name in ("PLUS", "MINUS", "STAR", "SLASH", "POW"):
+            if node.op.name in ("PLUS", "MINUS", "STAR", "SLASH", "SLASH_SLASH", "POW"):
                 if left_t == "str" and right_t == "str" and node.op.name == "PLUS":
                     node.inferred_type = "str"
                     return "str"
@@ -1058,6 +1058,11 @@ class SemanticAnalyzer:
         if isinstance(node, SizeOf):
             return "int"
 
+        if isinstance(node, CastExpr):
+            self._infer_type(node.expr)
+            node.inferred_type = node.type_expr
+            return node.type_expr
+
         if isinstance(node, InlineAsm):
             for _, arg_expr in node.inputs:
                 self._infer_type(arg_expr)
@@ -1091,6 +1096,8 @@ class SemanticAnalyzer:
         if isinstance(node, InlineAsm):
             return [arg_expr for _, arg_expr in node.inputs]
         if isinstance(node, ExprStmt):
+            return [node.expr]
+        if isinstance(node, CastExpr):
             return [node.expr]
         return []
 
@@ -1939,10 +1946,16 @@ class SemanticAnalyzer:
                 valid_conversions = [
                     ("int", "int64"),
                     ("int", "uint64"),
+                    ("int", "size_t"),
                     ("int64", "int"),
                     ("uint64", "int"),
                     ("int64", "uint64"),
                     ("uint64", "int64"),
+                    ("int64", "size_t"),
+                    ("uint64", "size_t"),
+                    ("size_t", "int"),
+                    ("size_t", "int64"),
+                    ("size_t", "uint64"),
                     ("float", "double"),
                     ("double", "float"),
                     ("str", "char"),
@@ -1950,6 +1963,7 @@ class SemanticAnalyzer:
                     ("int", "big"),
                     ("int64", "big"),
                     ("uint64", "big"),
+                    ("size_t", "big"),
                     ("big", "big"),
                 ]
                 ok = (val_type, existing.type) in valid_conversions
@@ -2039,8 +2053,14 @@ class SemanticAnalyzer:
                             ok = ok or (val_type, field.type_expr) in (
                                 ("int", "int64"),
                                 ("int", "uint64"),
+                                ("int", "size_t"),
                                 ("int64", "uint64"),
+                                ("int64", "size_t"),
                                 ("uint64", "int64"),
+                                ("uint64", "size_t"),
+                                ("size_t", "int"),
+                                ("size_t", "int64"),
+                                ("size_t", "uint64"),
                                 ("float", "double"),
                                 ("double", "float"),
                                 ("str", "char"),
@@ -2099,10 +2119,16 @@ class SemanticAnalyzer:
                 valid_conversions = [
                     ("int", "int64"),
                     ("int", "uint64"),
+                    ("int", "size_t"),
                     ("int64", "int"),
                     ("uint64", "int"),
                     ("int64", "uint64"),
                     ("uint64", "int64"),
+                    ("int64", "size_t"),
+                    ("uint64", "size_t"),
+                    ("size_t", "int"),
+                    ("size_t", "int64"),
+                    ("size_t", "uint64"),
                     ("float", "double"),
                     ("double", "float"),
                     ("str", "char"),
@@ -2111,6 +2137,7 @@ class SemanticAnalyzer:
                     ("int", "big"),
                     ("int64", "big"),
                     ("uint64", "big"),
+                    ("size_t", "big"),
                     ("big", "big"),
                 ]
                 ok = (init_type, val_type) in valid_conversions

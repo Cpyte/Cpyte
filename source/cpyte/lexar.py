@@ -76,6 +76,7 @@ _BASE_KEYWORDS = {
     'ccode',
     'llvm',
     'enum', 'type',
+    'unsafe',
 }
 
 # Additional keywords registered by packages

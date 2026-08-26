@@ -294,6 +294,35 @@ def _parse_unary(tokens: list[Token], pos: int):
     return _wrap_unary_prefixes(prefixes, node), pos
 
 
+def _try_parse_cast_type(tokens, pos):
+    """Try to parse a type name for a C-style cast like (int), (size_t*), (float[]).
+
+    Returns (type_string, new_pos) on success, or (None, original_pos) if not a cast.
+    """
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        return None, pos
+    name = tokens[pos].value
+    if name not in _TYPE_NAMES:
+        return None, pos
+    pos += 1
+    while pos < len(tokens):
+        t = tokens[pos].type
+        if t == TokenType.STAR:
+            pos += 1
+        elif t == TokenType.POW:
+            pos += 1
+        elif t == TokenType.LBRACKET:
+            if pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.RBRACKET:
+                pos += 2
+            else:
+                break
+        elif t == TokenType.AMPERSAND:
+            pos += 1
+        else:
+            break
+    return name, pos
+
+
 def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
 
@@ -396,7 +425,18 @@ def _parse_atom(tokens: list[Token], pos: int):
         return SizeOf(type_str, token=tok), pos
 
     if tok.type == TokenType.LPAREN:
-        pos += 1
+        save = pos + 1
+        tp, tp_end = _try_parse_cast_type(tokens, save)
+        if tp is not None:
+            if tp_end < len(tokens) and tokens[tp_end].type == TokenType.RPAREN:
+                after = tp_end + 1
+                if after < len(tokens) and tokens[after].type not in (
+                    TokenType.NEWLINE, TokenType.RPAREN, TokenType.RBRACKET,
+                    TokenType.COMMA, TokenType.COLON, TokenType.EOF,
+                ):
+                    expr, expr_pos = parse_expression(tokens, after)
+                    return CastExpr(tp, expr, token=tok), expr_pos
+        pos = save
         node, pos = parse_expression(tokens, pos)
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
             raise ParseError('Expected closing parenthesis', tok)
@@ -1377,6 +1417,17 @@ class SizeOf(Node):
         self._token = token
     def __repr__(self):
         return f'SizeOf({self.type_expr})'
+
+
+class CastExpr(Node):
+    __slots__ = ('_token', 'inferred_type', 'type_expr', 'expr')
+    def __init__(self, type_expr: str, expr, token=None):
+        self.type_expr = type_expr
+        self.expr = expr
+        self._token = token
+        self.inferred_type = None
+    def __repr__(self):
+        return f'CastExpr({self.type_expr}, {self.expr})'
 
 
 class StructDef(Node):

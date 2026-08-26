@@ -162,6 +162,9 @@ def pretty_ast(node, indent=0):
     if name == 'SizeOf':
         return f'{pad}sizeof({node.type_expr})'
 
+    if name == 'CastExpr':
+        return f'{pad}({node.type_expr}){pretty_ast(node.expr, 0)}'
+
     if name == 'StructDef':
         gp = f'<{", ".join(node.generic_params)}>' if node.generic_params else ''
         result = f'{pad}struct {node.name}{gp}:'

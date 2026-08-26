@@ -226,6 +226,8 @@ class _Formatter:
             return '&' + self._expr(node.operand)
         if isinstance(node, astparse.SizeOf):
             return f'sizeof({node.type_expr})'
+        if isinstance(node, astparse.CastExpr):
+            return f'({node.type_expr}){self._expr(node.expr)}'
         if isinstance(node, astparse.NewExpr):
             text = f'new {node.type_expr}'
             if node.size is not None:

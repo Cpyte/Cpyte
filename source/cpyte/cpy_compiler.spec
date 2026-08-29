@@ -1,9 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 _runtime_c = os.path.join(os.path.dirname(SPEC), 'runtime.c')
+_gc_runtime_c = os.path.join(os.path.dirname(SPEC), 'gc_runtime.c')
+_ugc_h = os.path.join(os.path.dirname(SPEC), 'ugc.h')
 _datas = []
-if os.path.exists(_runtime_c):
-    _datas.append((_runtime_c, '.'))
+for _p in (_runtime_c, _gc_runtime_c, _ugc_h):
+    if os.path.exists(_p):
+        _datas.append((_p, '.'))
 
 a = Analysis(
     ['mainpie.py'],

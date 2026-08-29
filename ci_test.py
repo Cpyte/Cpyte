@@ -1,33 +1,150 @@
+"""Cross-platform CI test harness for Cpyte.
+
+Builds every program in the curated corpus as a native executable (AOT), then
+runs it, to exercise the full compile pipeline — lexer, parser, semantic
+analysis, LLVM codegen, the C runtime, the GC runtime and the system linker —
+on every CI OS (macOS / Linux / Windows).
+
+The corpus is explicit rather than a wildcard directory glob so that programs
+which cannot be exercised generically in CI are never picked up:
+- programs that block on stdin (e.g. ``input_big``) would hang the job;
+- ``examples/test.cpy`` installs a global macOS event tap and drops key
+  events, which can affect the host / CI runner;
+- programs with intentional semantic errors (e.g. ``test_uninitialized``) are
+  negative tests and belong in their own harness, not here.
+"""
+
+from __future__ import annotations
+
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 CPYTE = ROOT / "source" / "cpyte" / "__main__.py"
 
-for directory in ("examples", "crash"):
-    path = ROOT / directory
+# Curated programs that compile (AOT) and run cleanly on all CI platforms.
+# Each entry is a repo-relative path from ROOT.
+CORPUS: tuple[str, ...] = (
+    "examples/c_import_example.cpy",
+    "examples/test2am9august.cpy",
+    "test/test_big.cpy",
+    "test/test_big2.cpy",
+    "test/test_big_hex.cpy",
+    "test/test_big_mixed.cpy",
+    "test/test_decorator.cpy",
+    "test/most_complex.cpy",
+)
 
-    if not path.is_dir():
-        continue
 
-    for file in sorted(path.rglob("*.cpy")):
-        relative = file.relative_to(ROOT)
+def _snapshot_artifacts() -> set[Path]:
+    """Return the compiler's intermediate ".o" artifacts currently in the repo.
 
-        print(f"\n{'=' * 60}")
-        print(f"Testing: {relative}")
-        print(f"{'=' * 60}")
+    Covers ``foo.o``, ``foo.gc.o`` and ``foo.runtime.o`` (all end in ".o").
+    """
+    artifacts: set[Path] = set()
+    for d in (ROOT / "examples", ROOT / "test"):
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix == ".o":
+                artifacts.add(p)
+    return artifacts
 
-        result = subprocess.run(
-            [sys.executable, str(CPYTE), str(file)],
-            cwd=ROOT,
-            check=False
-        )
 
-        if result.returncode != 0:
-            print(f"✗ FAILED: {relative}")
-            sys.exit(result.returncode)
+def main() -> int:
+    python = sys.executable
 
-        print(f"✓ PASSED: {relative}")
+    failures: list[str] = []
+    built = 0
 
-print("\nAll tests passed.")
+    with tempfile.TemporaryDirectory(prefix="cpyte_ci_") as tmp:
+        tmpdir = Path(tmp)
+
+        for rel in CORPUS:
+            src = ROOT / rel
+
+            if not src.is_file():
+                failures.append(f"{rel}: source file not found")
+                continue
+
+            built += 1
+            exe = tmpdir / ("prog.exe" if os.name == "nt" else "prog")
+
+            print(f"\n{'=' * 60}")
+            print(f"Build + run: {rel}")
+            print(f"{'=' * 60}")
+
+            # Snapshot existing compiler artifacts so we can remove any the
+            # build creates, leaving the repository untouched.
+            pre_existing = _snapshot_artifacts()
+
+            # Build a native executable (AOT). This exercises the compiler on
+            # the current OS, including the C/GC runtimes and system linker.
+            # Source-relative C imports (e.g. `import "examples/foo.c"`)
+            # resolve from the repo, so we build in place from the original
+            # file.
+            build = subprocess.run(
+                [python, str(CPYTE), "build", "-o", str(exe), str(src)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            # The `build` command writes intermediate objects next to the
+            # source and any C files it imports; remove the ones this run
+            # created so CI leaves the repository untouched.
+            def _cleanup() -> None:
+                for p in _snapshot_artifacts() - pre_existing:
+                    p.unlink(missing_ok=True)
+
+            if build.returncode != 0:
+                print(build.stdout)
+                print(f"✗ BUILD FAILED: {rel}")
+                failures.append(f"{rel}: build failed")
+                _cleanup()
+                continue
+
+            if not exe.exists():
+                print(f"✗ BUILD FAILED (no output): {rel}")
+                failures.append(f"{rel}: build produced no executable")
+                _cleanup()
+                continue
+
+            run = subprocess.run(
+                [str(exe)],
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            _cleanup()
+            if run.returncode != 0:
+                print(run.stdout)
+                print(f"✗ RUN FAILED: {rel}")
+                failures.append(f"{rel}: run failed (exit {run.returncode})")
+                continue
+
+            print(
+                f"✓ PASSED: {rel} -> {run.stdout.splitlines()[0] if run.stdout.strip() else '<no output>'}"
+            )
+
+    print(f"\n{'=' * 60}")
+    print(f"Built {built}/{len(CORPUS)} programs. Failures: {len(failures)}")
+    print(f"{'=' * 60}")
+
+    if failures:
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+
+    print("All tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

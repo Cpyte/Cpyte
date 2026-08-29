@@ -7,19 +7,24 @@ import sys
 import warnings
 
 from ._bignum_bc import load_bignum_bc
-from ._gc_bc import load_gc_bc
 from .generate_bc import _remove_probe_stack_ir
-from .linker import format_cc_diag, find_linker, LinkerNotFoundError, Linker
+from .linker import format_cc_diag, LinkerNotFoundError, Linker
 from .ui import print_err, print_ok
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
-warnings.filterwarnings("ignore", category=RuntimeWarning,
-                        message="memory leak in callback function")
+warnings.filterwarnings(
+    "ignore", category=RuntimeWarning, message="memory leak in callback function"
+)
 
-if getattr(sys, 'frozen', False):
-    _RUNTIME_C = os.path.join(getattr(sys, '_MEIPASS', ''), 'runtime.c')
+if getattr(sys, "frozen", False):
+    _RUNTIME_C = os.path.join(getattr(sys, "_MEIPASS", ""), "runtime.c")
 else:
-    _RUNTIME_C = os.path.join(os.path.dirname(__file__), 'runtime.c')
+    _RUNTIME_C = os.path.join(os.path.dirname(__file__), "runtime.c")
+
+if getattr(sys, "frozen", False):
+    _GC_RUNTIME_C = os.path.join(getattr(sys, "_MEIPASS", ""), "gc_runtime.c")
+else:
+    _GC_RUNTIME_C = os.path.join(os.path.dirname(__file__), "gc_runtime.c")
 
 _llvm_cc_cache = None
 
@@ -34,25 +39,29 @@ def _find_llvm_cc():
     if _llvm_cc_cache is not None:
         return _llvm_cc_cache
     import shutil
-    for name in ('clang', 'cc', 'gcc'):
+
+    for name in ("clang", "cc", "gcc"):
         exe = shutil.which(name)
         if exe:
             try:
                 r = subprocess.run(
-                    [exe, '-S', '-emit-llvm', '-O0', '-o', '/dev/null', '-xc', '-'],
-                    input='int __x = 0;',
-                    capture_output=True, text=True, timeout=10)
+                    [exe, "-S", "-emit-llvm", "-O0", "-o", "/dev/null", "-xc", "-"],
+                    input="int __x = 0;",
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
                 if r.returncode == 0:
                     _llvm_cc_cache = exe
                     return exe
             except (OSError, subprocess.TimeoutExpired):
                 continue
     print_err(
-        'error: no C compiler found that supports -emit-llvm (needed for JIT).\n'
-        '  Install clang, or use --aot mode which works with gcc.\n'
-        '  On macOS: xcode-select --install\n'
-        '  On Ubuntu/Debian: sudo apt install clang\n'
-        '  On Fedora/RHEL: sudo dnf install clang'
+        "error: no C compiler found that supports -emit-llvm (needed for JIT).\n"
+        "  Install clang, or use --aot mode which works with gcc.\n"
+        "  On macOS: xcode-select --install\n"
+        "  On Ubuntu/Debian: sudo apt install clang\n"
+        "  On Fedora/RHEL: sudo dnf install clang"
     )
     raise SystemExit(1)
 
@@ -69,16 +78,16 @@ def _load_libc():
     to resolve to the real libSystem symbols so JIT'd malloc/free/realloc/
     calloc stay self-consistent.
     """
-    if sys.platform == 'darwin':
+    if sys.platform == "darwin":
         RTLD_FIRST = 0x100
         try:
             return ctypes.CDLL(
-                '/usr/lib/libSystem.B.dylib',
+                "/usr/lib/libSystem.B.dylib",
                 mode=os.RTLD_NOW | RTLD_FIRST,
             )
         except OSError:
             pass
-    return ctypes.CDLL(ctypes.util.find_library('c'))
+    return ctypes.CDLL(ctypes.util.find_library("c"))
 
 
 _libc = _load_libc()
@@ -120,16 +129,16 @@ def _runtime_print_str(s: bytes):
         print("(null)")
     else:
         try:
-            print(s.decode('utf-8'))
+            print(s.decode("utf-8"))
         except UnicodeDecodeError:
             print(repr(s))
 
 
 def _runtime_cstr(s: str) -> int:
     """Copy a Python string into a libc heap buffer, returning its address."""
-    raw = s.encode('utf-8')
+    raw = s.encode("utf-8")
     size = len(raw) + 1
-    buf = ctypes.create_string_buffer(raw + b'\0')
+    buf = ctypes.create_string_buffer(raw + b"\0")
     ptr = _libc.malloc(size)
     if not ptr:
         return 0
@@ -162,7 +171,7 @@ def _runtime_input() -> int:
 
 
 def _runtime_input_str() -> bytes:
-    return input().encode('utf-8')
+    return input().encode("utf-8")
 
 
 # Array length registry (mirrors runtime.c side table).
@@ -182,22 +191,39 @@ def _runtime_array_unregister(ptr: int):
 
 
 # Dynamic variable runtime (name-keyed tagged values).
-_DYN_NONE, _DYN_INT, _DYN_INT64, _DYN_UINT64, _DYN_CHAR, _DYN_BOOL, \
-    _DYN_DOUBLE, _DYN_STR, _DYN_BIG, _DYN_PTR = range(10)
+(
+    _DYN_NONE,
+    _DYN_INT,
+    _DYN_INT64,
+    _DYN_UINT64,
+    _DYN_CHAR,
+    _DYN_BOOL,
+    _DYN_DOUBLE,
+    _DYN_STR,
+    _DYN_BIG,
+    _DYN_PTR,
+) = range(10)
 
 _dyn_table: dict[bytes, tuple[int, int]] = {}
 
 
 def _dyn_is_numeric(kind: int) -> bool:
-    return kind in (_DYN_INT, _DYN_INT64, _DYN_UINT64, _DYN_CHAR, _DYN_BOOL, _DYN_DOUBLE)
+    return kind in (
+        _DYN_INT,
+        _DYN_INT64,
+        _DYN_UINT64,
+        _DYN_CHAR,
+        _DYN_BOOL,
+        _DYN_DOUBLE,
+    )
 
 
 def _dyn_bits_to_double(bits: int) -> float:
-    return struct.unpack('<d', struct.pack('<Q', bits))[0]
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
 
 
 def _dyn_double_to_bits(v: float) -> int:
-    return struct.unpack('<Q', struct.pack('<d', v))[0]
+    return struct.unpack("<Q", struct.pack("<d", v))[0]
 
 
 def _runtime_assign(name: bytes, kind: int, data: int):
@@ -225,7 +251,9 @@ def _runtime_dyn_as(name: bytes, want_kind: int) -> int:
         return _dyn_double_to_bits(v)
     if (k in (_DYN_STR, _DYN_PTR)) and (want_kind in (_DYN_STR, _DYN_PTR)):
         return data
-    print(f"dynamic variable '{name}' type mismatch ({k} -> {want_kind})", file=sys.stderr)
+    print(
+        f"dynamic variable '{name}' type mismatch ({k} -> {want_kind})", file=sys.stderr
+    )
     os.abort()
 
 
@@ -257,7 +285,7 @@ def _runtime_dyn_print(name: bytes):
     elif k == _DYN_UINT64:
         print(data)
     elif k == _DYN_CHAR:
-        print(ctypes.c_int8(data & 0xff).value)
+        print(ctypes.c_int8(data & 0xFF).value)
     elif k == _DYN_BOOL:
         print(1 if data else 0)
     elif k == _DYN_DOUBLE:
@@ -267,7 +295,7 @@ def _runtime_dyn_print(name: bytes):
             print("(null)")
         else:
             try:
-                print(ctypes.string_at(data).decode('utf-8'))
+                print(ctypes.string_at(data).decode("utf-8"))
             except UnicodeDecodeError:
                 print(repr(ctypes.string_at(data)))
     elif k == _DYN_BIG:
@@ -294,7 +322,7 @@ def _runtime_dyn_str(name: bytes) -> int:
     if k == _DYN_UINT64:
         return _runtime_cstr(str(data))
     if k == _DYN_CHAR:
-        return _runtime_cstr(str(ctypes.c_int8(data & 0xff).value))
+        return _runtime_cstr(str(ctypes.c_int8(data & 0xFF).value))
     if k == _DYN_BOOL:
         return _runtime_cstr("1" if data else "0")
     if k == _DYN_DOUBLE:
@@ -302,7 +330,7 @@ def _runtime_dyn_str(name: bytes) -> int:
     if k == _DYN_STR:
         if data == 0:
             return _runtime_cstr("")
-        return _runtime_cstr(ctypes.string_at(data).decode('utf-8', 'replace'))
+        return _runtime_cstr(ctypes.string_at(data).decode("utf-8", "replace"))
     if k == _DYN_BIG:
         cb = _dyn_bigint_to_str[0]
         if cb is not None:
@@ -320,12 +348,13 @@ def _runtime_input_big():
     try:
         line = input()
     except EOFError:
-        line = ''
-    return _bigint_from_str_cb(line.strip().encode('utf-8'))
+        line = ""
+    return _bigint_from_str_cb(line.strip().encode("utf-8"))
 
 
 def optimize(mod, opt_level=3, opt_size=False):
     from llvmlite import binding
+
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
     if opt_level <= 0 and not opt_size:
@@ -347,8 +376,7 @@ def optimize(mod, opt_level=3, opt_size=False):
         pto.loop_interleaving = False
     else:
         effective = opt_level
-        pto = binding.create_pipeline_tuning_options(
-            speed_level=min(opt_level, 3))
+        pto = binding.create_pipeline_tuning_options(speed_level=min(opt_level, 3))
 
     heavy = effective >= 3
     extra_heavy = effective >= 4
@@ -378,9 +406,9 @@ def optimize(mod, opt_level=3, opt_size=False):
         fpm.add_sroa_pass()
         fpm.add_instruction_combine_pass()
         if heavy:
-            fpm.add_new_gvn_pass()              # global value numbering
+            fpm.add_new_gvn_pass()  # global value numbering
             fpm.add_instruction_combine_pass()
-            fpm.add_sccp_pass()                 # sparse conditional constant propagation
+            fpm.add_sccp_pass()  # sparse conditional constant propagation
             fpm.add_reassociate_pass()
             fpm.add_jump_threading_pass()
             fpm.add_loop_rotate_pass()
@@ -441,6 +469,7 @@ def optimize(mod, opt_level=3, opt_size=False):
     # Let extension hooks add their own passes
     try:
         from .extension_hooks import get_global_hook_registry
+
         registry = get_global_hook_registry()
         for hook in registry.get_codegen_hooks():
             if hook.should_add_module_passes():
@@ -451,23 +480,30 @@ def optimize(mod, opt_level=3, opt_size=False):
     npm.run(mod, pb)
 
 
-# Bruh, dead code.
-
-
 def _maybe_compile(module, use_native_eh=False):
     if isinstance(module, list):
         from .bytecoding import LLVM
+
         c = LLVM(use_native_eh=use_native_eh)
         prog, src_files = c.emit_program(module)
         return prog, src_files
     return module, None
 
-def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, use_native_eh=False):
+
+def run_jit(
+    module,
+    opt_level=3,
+    src_files=None,
+    no_userspace=False,
+    pic=False,
+    use_native_eh=False,
+):
     module, src_files_auto = _maybe_compile(module, use_native_eh=use_native_eh)
     if src_files_auto is not None:
         src_files = src_files_auto
     global _print_fn, _input_fn
     from llvmlite import binding
+
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
 
@@ -477,17 +513,29 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     if src_files:
         target = binding.Target.from_default_triple()
         for src in src_files:
-            if src.endswith('.ll'):
+            if src.endswith(".ll"):
                 with open(src) as f:
                     src_ir = f.read()
             else:
                 r = subprocess.run(
-                    [llvm_cc, '-S', '-emit-llvm', '-O0', '-target', target.triple,
-                     '-fno-stack-protector', '-o', '-', src],
-                    capture_output=True, text=True)
+                    [
+                        llvm_cc,
+                        "-S",
+                        "-emit-llvm",
+                        "-O0",
+                        "-target",
+                        target.triple,
+                        "-fno-stack-protector",
+                        "-o",
+                        "-",
+                        src,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
 
                 if r.returncode != 0:
-                    print_err(f'error compiling {src}: {format_cc_diag(r.stderr)}')
+                    print_err(f"error compiling {src}: {format_cc_diag(r.stderr)}")
                     raise SystemExit(1)
                 src_ir = r.stdout
             src_ir = _remove_probe_stack_ir(src_ir)
@@ -498,11 +546,23 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     # JIT can resolve native helpers that have no Python callback mirror.
     target = binding.Target.from_default_triple()
     r = subprocess.run(
-        [llvm_cc, '-S', '-emit-llvm', '-O0', '-target', target.triple,
-         '-fno-stack-protector', '-o', '-', _RUNTIME_C],
-        capture_output=True, text=True)
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-target",
+            target.triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            _RUNTIME_C,
+        ],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
-        print_err(f'error compiling {_RUNTIME_C}: {format_cc_diag(r.stderr)}')
+        print_err(f"error compiling {_RUNTIME_C}: {format_cc_diag(r.stderr)}")
         raise SystemExit(1)
     runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, runtime_mod)
@@ -510,7 +570,28 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
 
-    gc_mod = load_gc_bc()
+    # Compile the GC runtime from source at JIT time so it matches the host
+    # platform (macOS/Linux/Windows) instead of relying on pre-built bitcode.
+    r = subprocess.run(
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-target",
+            target.triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            _GC_RUNTIME_C,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print_err(f"error compiling {_GC_RUNTIME_C}: {format_cc_diag(r.stderr)}")
+        raise SystemExit(1)
+    gc_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, gc_mod)
 
     mod.verify()
@@ -625,7 +706,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
-        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_ulonglong)(_runtime_str_of_uint64)
+        cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_ulonglong)(
+            _runtime_str_of_uint64
+        )
         _callbacks.append(cb)
         try:
             engine.add_global_mapping(
@@ -655,7 +738,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
-        cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64)(_runtime_assign)
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64)(
+            _runtime_assign
+        )
         _callbacks.append(cb)
         try:
             engine.add_global_mapping(
@@ -665,7 +750,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
-        cb = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int)(_runtime_dyn_as)
+        cb = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int)(
+            _runtime_dyn_as
+        )
         _callbacks.append(cb)
         try:
             engine.add_global_mapping(
@@ -705,7 +792,9 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
-        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_longlong)(_runtime_array_register)
+        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_longlong)(
+            _runtime_array_register
+        )
         _callbacks.append(cb)
         try:
             engine.add_global_mapping(
@@ -735,27 +824,41 @@ def run_jit(module, opt_level=3, src_files=None, no_userspace=False, pic=False, 
         except NameError:
             pass
 
-    _map_libc_fn(engine, mod, 'malloc', ctypes.c_size_t, ctypes.c_void_p)
-    _map_libc_fn(engine, mod, 'free', None, None, argtypes=[ctypes.c_void_p])
-    _map_libc_fn(engine, mod, 'realloc', ctypes.c_void_p, ctypes.c_void_p,
-                 argtypes=[ctypes.c_void_p, ctypes.c_size_t])
-    _map_libc_fn(engine, mod, 'calloc', ctypes.c_size_t, ctypes.c_void_p,
-                 argtypes=[ctypes.c_size_t, ctypes.c_size_t])
-    _map_libc_fn(engine, mod, 'strlen', ctypes.c_char_p, ctypes.c_int)
-    _map_libc_fn(engine, mod, 'memcpy', None, ctypes.c_void_p,
-                 argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int])
-    _map_libc_fn(engine, mod, 'atoi', ctypes.c_char_p, ctypes.c_int)
-    _map_libc_fn(engine, mod, 'atof', ctypes.c_char_p, ctypes.c_double)
+    _map_libc_fn(engine, mod, "malloc", ctypes.c_size_t, ctypes.c_void_p)
+    _map_libc_fn(engine, mod, "free", None, None, argtypes=[ctypes.c_void_p])
+    _map_libc_fn(
+        engine,
+        mod,
+        "realloc",
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        argtypes=[ctypes.c_void_p, ctypes.c_size_t],
+    )
+    _map_libc_fn(
+        engine,
+        mod,
+        "calloc",
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        argtypes=[ctypes.c_size_t, ctypes.c_size_t],
+    )
+    _map_libc_fn(engine, mod, "strlen", ctypes.c_char_p, ctypes.c_int)
+    _map_libc_fn(
+        engine,
+        mod,
+        "memcpy",
+        None,
+        ctypes.c_void_p,
+        argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int],
+    )
+    _map_libc_fn(engine, mod, "atoi", ctypes.c_char_p, ctypes.c_int)
+    _map_libc_fn(engine, mod, "atof", ctypes.c_char_p, ctypes.c_double)
 
     try:
-        fn = mod.get_function('strcmp')
-        engine.add_global_mapping(fn, _libc_addr('strcmp'))
+        fn = mod.get_function("strcmp")
+        engine.add_global_mapping(fn, _libc_addr("strcmp"))
     except NameError:
         pass
-
-    # Bruh, dead code.
-
-    # GC functions come from the linked gc_runtime bitcode
 
     engine.finalize_object()
     engine.run_static_constructors()
@@ -812,24 +915,32 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
     engine.add_global_mapping(fn, _libc_addr(name))
 
 
-def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspace=False, pic=False, lto=False, frameworks=None):
+def run_aot(
+    module,
+    output="program.o",
+    opt_level=3,
+    src_files=None,
+    no_userspace=False,
+    pic=False,
+    lto=False,
+    frameworks=None,
+):
     llvm_ir = str(module)
     from llvmlite import binding
+
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(llvm_ir)
     bignum_mod = load_bignum_bc()
     binding.link_modules(mod, bignum_mod)
-    gc_mod = load_gc_bc()
-    binding.link_modules(mod, gc_mod)
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()
 
     target = binding.Target.from_default_triple()
     if pic:
-        target_machine = target.create_target_machine(reloc='pic')
+        target_machine = target.create_target_machine(reloc="pic")
     else:
         target_machine = target.create_target_machine()
 
@@ -842,43 +953,52 @@ def run_aot(module, output="program.o", opt_level=3, src_files=None, no_userspac
     try:
         linker = Linker(lto=lto)
     except LinkerNotFoundError as e:
-        print_err(f'error: {e}')
+        print_err(f"error: {e}")
         raise SystemExit(1)
 
-    for src in (src_files or []):
-        src_obj = src.rsplit('.', 1)[0] + '.o'
+    for src in src_files or []:
+        src_obj = src.rsplit(".", 1)[0] + ".o"
         linker.compile_c(src, output=src_obj, opt_level=3, pic=pic)
         objs.append(src_obj)
 
     if not no_userspace:
-        runtime_obj = output + '.runtime.o'
+        runtime_obj = output + ".runtime.o"
         linker.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=3, pic=pic, eh=True)
         objs.append(runtime_obj)
 
-    out_name = output.rsplit('.', 1)[0] if '.' in output else output
+    # Compile the GC runtime from source for the host platform (instead of
+    # pre-built bitcode) — cross-platform on macOS/Linux/Windows.
+    gc_obj = output + ".gc.o"
+    linker.compile_c(_GC_RUNTIME_C, output=gc_obj, opt_level=3, pic=pic)
+    objs.append(gc_obj)
+
+    out_name = output.rsplit(".", 1)[0] if "." in output else output
     linker.link(objs, out_name, opt_level=3, pic=pic, frameworks=frameworks)
 
 
-if getattr(sys, 'frozen', False):
-    _RUNTIME_SCORPION_C = os.path.join(getattr(sys, '_MEIPASS', ''), 'runtime_scorpion.c')
+if getattr(sys, "frozen", False):
+    _RUNTIME_SCORPION_C = os.path.join(
+        getattr(sys, "_MEIPASS", ""), "runtime_scorpion.c"
+    )
 else:
-    _RUNTIME_SCORPION_C = os.path.join(os.path.dirname(__file__), 'runtime_scorpion.c')
+    _RUNTIME_SCORPION_C = os.path.join(os.path.dirname(__file__), "runtime_scorpion.c")
 
-_SCORPION_CC = 'riscv32-unknown-elf-gcc'
-_SCORPION_AS = 'riscv64-elf-as'
-_SCORPION_LD = 'riscv64-elf-ld'
-_SCORPION_OBJCOPY = 'riscv64-elf-objcopy'
-_SCORPION_ARCH = '-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb'
-_SCORPION_ABI = '-mabi=ilp32'
+_SCORPION_CC = "riscv32-unknown-elf-gcc"
+_SCORPION_AS = "riscv64-elf-as"
+_SCORPION_LD = "riscv64-elf-ld"
+_SCORPION_OBJCOPY = "riscv64-elf-objcopy"
+_SCORPION_ARCH = "-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb"
+_SCORPION_ABI = "-mabi=ilp32"
 
 
 def _find_scorpion_tool(name, fallback):
     """Find a scorpion cross-compilation tool."""
     import shutil
+
     candidates = [
-        f'riscv32-unknown-elf-{name}',
-        f'riscv64-unknown-elf-{name}',
-        f'riscv64-elf-{name}',
+        f"riscv32-unknown-elf-{name}",
+        f"riscv64-unknown-elf-{name}",
+        f"riscv64-elf-{name}",
     ]
     for c in candidates:
         if shutil.which(c):
@@ -886,8 +1006,9 @@ def _find_scorpion_tool(name, fallback):
     return fallback
 
 
-def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=False,
-                 exports=None):
+def run_scorpion(
+    module, output="program.sef", opt_level=3, src_files=None, pic=False, exports=None
+):
     """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file.
     Please use it good! :):)
 
@@ -897,6 +1018,7 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
     exported for dynamic linking (libraries).
     """
     from llvmlite import binding
+
     binding.initialize_all_targets()
     binding.initialize_all_asmprinters()
 
@@ -907,76 +1029,112 @@ def run_scorpion(module, output='program.sef', opt_level=3, src_files=None, pic=
     optimize(mod, opt_level)
     mod.verify()
 
-    target = binding.Target.from_triple('riscv32-unknown-elf')
+    target = binding.Target.from_triple("riscv32-unknown-elf")
     if pic:
-        target_machine = target.create_target_machine(reloc='pic')
+        target_machine = target.create_target_machine(reloc="pic")
     else:
         target_machine = target.create_target_machine()
 
     # Emit RV32 object file
     obj = target_machine.emit_object(mod)
-    obj_file = output.rsplit('.', 1)[0] + '.o'
-    with open(obj_file, 'wb') as f:
+    obj_file = output.rsplit(".", 1)[0] + ".o"
+    with open(obj_file, "wb") as f:
         f.write(obj)
 
     objs = [obj_file]
 
     # Compile Scorpion runtime
-    runtime_obj = output.rsplit('.', 1)[0] + '.runtime.o'
-    cc = _find_scorpion_tool('gcc', _SCORPION_CC)
-    cmd = [cc, '-c', '-O3', _SCORPION_ARCH, _SCORPION_ABI,
-           '-nostdlib', '-ffreestanding',
-           '-o', runtime_obj, _RUNTIME_SCORPION_C]
+    runtime_obj = output.rsplit(".", 1)[0] + ".runtime.o"
+    cc = _find_scorpion_tool("gcc", _SCORPION_CC)
+    cmd = [
+        cc,
+        "-c",
+        "-O3",
+        _SCORPION_ARCH,
+        _SCORPION_ABI,
+        "-nostdlib",
+        "-ffreestanding",
+        "-o",
+        runtime_obj,
+        _RUNTIME_SCORPION_C,
+    ]
     if pic:
-        cmd.append('-fPIC') # This must be done to be ran on microcontrollers.
+        cmd.append("-fPIC")  # This must be done to be ran on microcontrollers.
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print_err(f'error compiling runtime_scorpion.c: {format_cc_diag(r.stderr)}')
+        print_err(f"error compiling runtime_scorpion.c: {format_cc_diag(r.stderr)}")
         raise SystemExit(1)
     objs.append(runtime_obj)
 
     # Link into ELF using the GCC driver so libgcc (e.g. __fixdfsi) is resolved
-    elf_base = output.rsplit('.', 1)[0]
-    elf_file = elf_base + '.elf'
-    cc = _find_scorpion_tool('gcc', _SCORPION_CC)
-    cmd = [cc, _SCORPION_ARCH, _SCORPION_ABI,
-           '-nostdlib', '-nostartfiles',
-           '-Wl,-e,main', '-Wl,--no-relax', '-Wl,-Ttext=0',
-           '-o', elf_file] + objs + ['-lgcc']
+    elf_base = output.rsplit(".", 1)[0]
+    elf_file = elf_base + ".elf"
+    cc = _find_scorpion_tool("gcc", _SCORPION_CC)
+    cmd = (
+        [
+            cc,
+            _SCORPION_ARCH,
+            _SCORPION_ABI,
+            "-nostdlib",
+            "-nostartfiles",
+            "-Wl,-e,main",
+            "-Wl,--no-relax",
+            "-Wl,-Ttext=0",
+            "-o",
+            elf_file,
+        ]
+        + objs
+        + ["-lgcc"]
+    )
     if pic:
-        cmd += ['-Wl,-q', '-Wl,--unresolved-symbols=ignore-all']
+        cmd += ["-Wl,-q", "-Wl,--unresolved-symbols=ignore-all"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print_err(f'error linking: {format_cc_diag(r.stderr)}')
+        print_err(f"error linking: {format_cc_diag(r.stderr)}")
         raise SystemExit(1)
 
     if pic:
         # Dynamic SEF v2: relocation + import/export records
-        elf2sef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
-                               '..', '..', 'WEW-scorpion', 'tools', 'elf2sef.py')
+        elf2sef = os.path.join(
+            os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
+            "..",
+            "..",
+            "WEW-scorpion",
+            "tools",
+            "elf2sef.py",
+        )
         cmd = [sys.executable, elf2sef, elf_file, output]
         if exports:
             for name in exports:
-                cmd += ['--export', name]
+                cmd += ["--export", name]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            print_err(f'error converting to SEF: {format_cc_diag(r.stderr)}')
+            print_err(f"error converting to SEF: {format_cc_diag(r.stderr)}")
             raise SystemExit(1)
     else:
         # Static SEF v1 via mksef.py
-        mksef = os.path.join(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
-                             '..', '..', 'WEW-scorpion', 'user', 'mksef.py')
+        mksef = os.path.join(
+            os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
+            "..",
+            "..",
+            "WEW-scorpion",
+            "user",
+            "mksef.py",
+        )
         if not os.path.isfile(mksef):
             # Fallback: inline SEF generation using objdump/objcopy
             _elf_to_sef(elf_file, output, 0)
         else:
-            r = subprocess.run([sys.executable, mksef, elf_file, output],
-                               capture_output=True, text=True)
+            r = subprocess.run(
+                [sys.executable, mksef, elf_file, output],
+                capture_output=True,
+                text=True,
+            )
             if r.returncode != 0:
-                print_err(f'error converting to SEF: {format_cc_diag(r.stderr)}')
+                print_err(f"error converting to SEF: {format_cc_diag(r.stderr)}")
                 raise SystemExit(1)
 
-    print_ok(f'Wrote {os.path.getsize(output)} bytes to {output}')
+    print_ok(f"Wrote {os.path.getsize(output)} bytes to {output}")
     return elf_file
 
 
@@ -986,59 +1144,66 @@ def _elf_to_sef(elf_path, sef_output, flags=0):
 
     sections = {}
     result = subprocess.run(
-        [_find_scorpion_tool('objdump', _SCORPION_LD.replace('ld', 'objdump')),
-         '-h', elf_path],
-        capture_output=True, text=True
+        [
+            _find_scorpion_tool("objdump", _SCORPION_LD.replace("ld", "objdump")),
+            "-h",
+            elf_path,
+        ],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         print(f"error: objdump failed on {elf_path}", file=sys.stderr)
         raise SystemExit(1)
 
-    for line in result.stdout.split('\n'):
+    for line in result.stdout.split("\n"):
         parts = line.split()
         if len(parts) >= 4 and parts[0].isdigit():
             name = parts[1]
-            if name in ('.text', '.rodata', '.data', '.bss'):
+            if name in (".text", ".rodata", ".data", ".bss"):
                 sections[name] = int(parts[2], 16)
 
     result = subprocess.run(
-        [_find_scorpion_tool('readelf', _SCORPION_LD.replace('ld', 'readelf')),
-         '-h', elf_path],
-        capture_output=True, text=True
+        [
+            _find_scorpion_tool("readelf", _SCORPION_LD.replace("ld", "readelf")),
+            "-h",
+            elf_path,
+        ],
+        capture_output=True,
+        text=True,
     )
     entry = 0
-    for line in result.stdout.split('\n'):
-        if 'Entry point address' in line:
-            entry = int(line.split(':')[1].strip(), 16)
+    for line in result.stdout.split("\n"):
+        if "Entry point address" in line:
+            entry = int(line.split(":")[1].strip(), 16)
 
-    bin_path = elf_path + '.bin'
-    objcopy = _find_scorpion_tool('objcopy', _SCORPION_OBJCOPY)
-    subprocess.run([objcopy, '-O', 'binary', elf_path, bin_path],
-                   capture_output=True)
+    bin_path = elf_path + ".bin"
+    objcopy = _find_scorpion_tool("objcopy", _SCORPION_OBJCOPY)
+    subprocess.run([objcopy, "-O", "binary", elf_path, bin_path], capture_output=True)
 
-    with open(bin_path, 'rb') as f:
+    with open(bin_path, "rb") as f:
         flat = f.read()
     os.unlink(bin_path)
 
     segments = []
     off = 0
-    for sec in ('.text', '.rodata', '.data'):
+    for sec in (".text", ".rodata", ".data"):
         if sec in sections:
-            segments.append((0 if sec == '.text' else 1, off, sections[sec]))
+            segments.append((0 if sec == ".text" else 1, off, sections[sec]))
             off += sections[sec]
-    if '.bss' in sections:
-        segments.append((2, off, sections['.bss']))
+    if ".bss" in sections:
+        segments.append((2, off, sections[".bss"]))
 
     num = len(segments)
     hdr = 12 + num * 16
 
     out = bytearray()
-    out += struct.pack('<IIHH', 0x00464553, entry, num, flags)
+    out += struct.pack("<IIHH", 0x00464553, entry, num, flags)
     dc = hdr
     for st, sv, ss in segments:
-        out += struct.pack('<IIII', st, sv, ss, dc)
+        out += struct.pack("<IIII", st, sv, ss, dc)
         dc += ss
     out += flat
 
-    with open(sef_output, 'wb') as f:
+    with open(sef_output, "wb") as f:
         f.write(out)

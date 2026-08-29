@@ -44,8 +44,9 @@ try:
 except ImportError:
     print_ok = print
 
+
 def _remove_probe_stack_ir(llvm_ir: str) -> str:
-    return re.sub(r'\s+"probe-stack"="[^"]*"', '', llvm_ir)
+    return re.sub(r'\s+"probe-stack"="[^"]*"', "", llvm_ir)
 
 
 def _repo_root() -> Path:
@@ -67,25 +68,25 @@ def _find_gmp_include(explicit: str | None = None) -> str | None:
         candidates.append(explicit)
     root = _repo_root()
     if root.is_dir():
-        for d in sorted(root.glob('gmp-*')):
+        for d in sorted(root.glob("gmp-*")):
             candidates.append(str(d))
-    brew = shutil.which('brew')
+    brew = shutil.which("brew")
     if brew:
         try:
             prefix = subprocess.run(
-                [brew, '--prefix', 'gmp'], capture_output=True, text=True, timeout=10
+                [brew, "--prefix", "gmp"], capture_output=True, text=True, timeout=10
             ).stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
-            prefix = ''
+            prefix = ""
         if prefix:
-            candidates.append(os.path.join(prefix, 'include'))
-    candidates.extend(['/opt/homebrew/include', '/usr/local/include'])
+            candidates.append(os.path.join(prefix, "include"))
+    candidates.extend(["/opt/homebrew/include", "/usr/local/include"])
     seen = set()
     for cand in candidates:
         if cand in seen:
             continue
         seen.add(cand)
-        if os.path.isfile(os.path.join(cand, 'gmp.h')):
+        if os.path.isfile(os.path.join(cand, "gmp.h")):
             return cand
     return None
 
@@ -94,8 +95,8 @@ def _needs_gmp_headers(c_path: str, gmp_include: str | None) -> bool:
     if gmp_include:
         return True
     try:
-        with open(c_path, encoding='utf-8', errors='replace') as f:
-            return '#include <gmp.h>' in f.read()
+        with open(c_path, encoding="utf-8", errors="replace") as f:
+            return "#include <gmp.h>" in f.read()
     except OSError:
         return False
 
@@ -120,37 +121,45 @@ def _canonicalize_module(mod) -> None:
     pm.run(mod, pb)
 
 
-def compile_to_bitcode(c_path: str, target_triple: str | None = None,
-                       cpu: str | None = None, opt_level: int = 3,
-                       opt_size: bool = False,
-                       gmp_include: str | None = None,
-                       canonicalize: bool = False) -> bytes:
+def compile_to_bitcode(
+    c_path: str,
+    target_triple: str | None = None,
+    cpu: str | None = None,
+    opt_level: int = 3,
+    opt_size: bool = False,
+    gmp_include: str | None = None,
+    canonicalize: bool = False,
+) -> bytes:
     c_path = str(Path(c_path).resolve())
     clang_opt = max(0, min(int(opt_level), 3))
     with tempfile.TemporaryDirectory() as tmp:
-        ll_path = Path(tmp) / 'out.ll'
+        ll_path = Path(tmp) / "out.ll"
         cmd = [
-            'clang', '-S', '-emit-llvm',
-            '-o', str(ll_path),
-            '-fno-stack-protector',
+            "clang",
+            "-S",
+            "-emit-llvm",
+            "-o",
+            str(ll_path),
+            "-fno-stack-protector",
         ]
         if opt_size:
-            cmd.append('-Oz')
+            cmd.append("-Oz")
         else:
-            cmd.append(f'-O{clang_opt}')
+            cmd.append(f"-O{clang_opt}")
         if _needs_gmp_headers(str(c_path), gmp_include):
             inc = _find_gmp_include(gmp_include)
             if inc:
-                cmd.extend(['-I', inc])
+                cmd.extend(["-I", inc])
         if target_triple:
-            cmd.extend(['-target', target_triple])
+            cmd.extend(["-target", target_triple])
         if cpu:
-            cmd.append(f'-mcpu={cpu}')
+            cmd.append(f"-mcpu={cpu}")
         cmd.append(str(c_path))
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             from .linker import format_cc_diag
-            print(f'clang error: {format_cc_diag(r.stderr)}', file=sys.stderr)
+
+            print(f"clang error: {format_cc_diag(r.stderr)}", file=sys.stderr)
             raise SystemExit(r.returncode)
         text = ll_path.read_text()
         stripped = _remove_probe_stack_ir(text)
@@ -162,15 +171,15 @@ def compile_to_bitcode(c_path: str, target_triple: str | None = None,
 
 
 def make_module(source_c: str, out_py: str, module_name: str, **opts) -> None:
-    target_triple = opts.pop('target_triple', None)
+    target_triple = opts.pop("target_triple", None)
     if not target_triple:
         target_triple = binding.Target.from_default_triple().triple
     raw = compile_to_bitcode(source_c, target_triple, **opts)
     compressed = zlib.compress(raw)
     b64 = base64.b64encode(compressed).decode()
-    lines = [b64[i:i+80] for i in range(0, len(b64), 80)]
-    body = '\n'.join(f'    {l!r}' for l in lines)
-    py_code = f'''import base64, zlib
+    lines = [b64[i : i + 80] for i in range(0, len(b64), 80)]
+    body = "\n".join(f"    {line!r}" for line in lines)
+    py_code = f"""import base64, zlib
 from llvmlite import binding
 
 
@@ -181,48 +190,67 @@ _B64 = (
 def load_{module_name}_bc():
     data = zlib.decompress(base64.b64decode(_B64))
     return binding.parse_bitcode(data)
-'''
+"""
     Path(out_py).write_text(py_code)
-    print_ok(f'Wrote {out_py}')
+    print_ok(f"Wrote {out_py}")
 
 
 def _default_module_name(out_py: str) -> str:
     stem = Path(out_py).stem
-    for suffix, name in (('_bignum_bc', 'bignum'),
-                         ('_runtime_bc', 'runtime'),
-                         ('_gc_bc', 'gc')):
+    for suffix, name in (("_bignum_bc", "bignum"), ("_runtime_bc", "runtime")):
         if stem.endswith(suffix):
             return name
-    return stem.replace('_', '')
+    return stem.replace("_", "")
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description='Compile a C file to optimized, embedded LLVM bitcode.')
-    parser.add_argument('source', help='input .c file')
-    parser.add_argument('output', help='output .py module')
-    parser.add_argument('module', nargs='?', help='module name (default: derived)')
-    parser.add_argument('-O', '--opt', type=int, default=int(os.environ.get('CPYTE_BC_OPT_LEVEL', 3)),
-                        help='clang optimization level 0-3 (default: 3, env CPYTE_BC_OPT_LEVEL)')
-    parser.add_argument('--osize', action='store_true',
-                        help='optimize the embedded module for size (-Oz), ignoring speed')
-    parser.add_argument('--target', default=None, help='target triple (default: host)')
-    parser.add_argument('--cpu', default=None, help='-mcpu value (e.g. apple-m1)')
-    parser.add_argument('--gmp-include', default=os.environ.get('CPYTE_GMP_INCLUDE'),
-                        help='explicit GMP include dir (default: auto-detect)')
-    parser.add_argument('--canonicalize', action='store_true',
-                        help='run safe LLVM module passes to shrink the embedded module')
+        description="Compile a C file to optimized, embedded LLVM bitcode."
+    )
+    parser.add_argument("source", help="input .c file")
+    parser.add_argument("output", help="output .py module")
+    parser.add_argument("module", nargs="?", help="module name (default: derived)")
+    parser.add_argument(
+        "-O",
+        "--opt",
+        type=int,
+        default=int(os.environ.get("CPYTE_BC_OPT_LEVEL", 3)),
+        help="clang optimization level 0-3 (default: 3, env CPYTE_BC_OPT_LEVEL)",
+    )
+    parser.add_argument(
+        "--osize",
+        action="store_true",
+        help="optimize the embedded module for size (-Oz), ignoring speed",
+    )
+    parser.add_argument("--target", default=None, help="target triple (default: host)")
+    parser.add_argument("--cpu", default=None, help="-mcpu value (e.g. apple-m1)")
+    parser.add_argument(
+        "--gmp-include",
+        default=os.environ.get("CPYTE_GMP_INCLUDE"),
+        help="explicit GMP include dir (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--canonicalize",
+        action="store_true",
+        help="run safe LLVM module passes to shrink the embedded module",
+    )
     args = parser.parse_args(argv)
 
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
     module_name = args.module or _default_module_name(args.output)
     make_module(
-        args.source, args.output, module_name,
-        target_triple=args.target, cpu=args.cpu, opt_level=args.opt, opt_size=args.osize,
-        gmp_include=args.gmp_include, canonicalize=args.canonicalize,
+        args.source,
+        args.output,
+        module_name,
+        target_triple=args.target,
+        cpu=args.cpu,
+        opt_level=args.opt,
+        opt_size=args.osize,
+        gmp_include=args.gmp_include,
+        canonicalize=args.canonicalize,
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

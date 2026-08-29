@@ -5,7 +5,7 @@ Check out the official documentation [here](https://gitea.5gnew.io.vn/Cpyte-Proj
 Cpyte supports a package extension system that allows packages to extend the compiler with custom keywords, operators, and compiler hooks. Packages can provide:
 
 - **Custom Keywords**: Add new language keywords via `package.json`
-- **Custom Operators**: Define new operators for syntax extensions  
+- **Custom Operators**: Define new operators for syntax extensions
 - **Compiler Hooks**: Extend lexing, parsing, semantic analysis, and code generation
 - **Runtime Extensions**: Add runtime code and libraries
 
@@ -72,3 +72,17 @@ Cpyte is experimental software. The compiler is continuously tested with fuzzing
 Cpyte uses a **concurrent tri-color garbage collector** for automatic memory management. Heap-allocated objects (via `new`) are managed automatically — no manual `free` needed.
 
 **Note:** The collector adds a small runtime overhead (~5-10%) compared to manual `malloc/free`. For performance-critical ecosystem projects or embedded use cases, this trade-off may be significant. The GC is required for safety but will slow down programs that do heavy heap allocation.
+
+## Cross-Platform Runtime
+
+The compiler is fully cross-platform. On every target OS (macOS, Linux, Windows) the C runtime (`runtime.c`), the GC runtime (`gc_runtime.c`), and any embedded `ccode:` blocks are **compiled from source** at JIT/AOT time for the host platform, rather than linking pre-built, OS-specific bitcode. This keeps native helpers and the garbage collector correct on each system:
+
+- Portable threading: `pthread` on POSIX; native Windows threads + `CRITICAL_SECTION` on Windows.
+- Portable stack scanning for the GC that works on macOS, Linux, and Windows.
+- A portable sleep/yield helper replaces the POSIX-only `nanosleep`.
+
+The compiler auto-discovers a C compiler (`clang` → `cc` → `gcc`) and system linker on the current platform, so `cpy`, `cpy build`, and `cpy --aot` all work without per-OS configuration.
+
+## Continuous Integration
+
+GitHub Actions (see `.github/workflows/code_quality.yml`) builds and runs a curated, cross-platform regression corpus on Ubuntu (x86_64 + arm64), macOS (x86_64 + arm64), and Windows. `ci_test.py` AOT-compiles each program with the system linker and executes the result to exercise the full pipeline — lexer, parser, semantic analysis, LLVM codegen, the C and GC runtimes, and linking.

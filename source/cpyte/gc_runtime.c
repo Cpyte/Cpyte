@@ -2,10 +2,14 @@
  * gc_runtime.c - Cpyte concurrent tri-color mark GC
  *
  * Wraps ugc (https://github.com/bullno1/ugc) with:
- *   - Background pthread marker
+ *   - Background collector thread (pthread / Windows thread)
  *   - Conservative stack scanning
  *   - Object tracking for pointer validation
  *   - Write barrier for tri-color invariant
+ *
+ * Cross-platform: pthread on POSIX (macOS/Linux/BSD), native Windows
+ * threads + CRITICAL_SECTION on _WIN32. A portable sleep helper replaces
+ * the POSIX-only nanosleep.
  *
  * License: BSD-2-Clause (ugc) + project license
  */
@@ -14,11 +18,36 @@
 #define UGC_USE_TAGGED_POINTER 0
 #include "ugc.h"
 
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
+
+/* --- Platform threading / mutex abstraction (mirrors runtime.c) --- */
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <process.h>
+typedef CRITICAL_SECTION cpy_mutex_t;
+#  define CPY_MUTEX_INIT(ctx) do { InitializeCriticalSection(&(ctx)); } while(0)
+#  define CPY_MUTEX_LOCK(ctx)   EnterCriticalSection(ctx)
+#  define CPY_MUTEX_UNLOCK(ctx) LeaveCriticalSection(ctx)
+typedef unsigned long cpy_thread_t;
+#  define CPY_THREAD_START(tid, fn, arg) ((*tid) = (uintptr_t)_beginthreadex(NULL, 0, fn, arg, 0, NULL), (*tid) != 0)
+#  define CPY_THREAD_JOIN(tid)  WaitForSingleObject((HANDLE)(tid), INFINITE), CloseHandle((HANDLE)(tid))
+#  define CPY_SLEEP_MS(ms)      Sleep(ms)
+#else
+#  include <unistd.h>
+#  include <pthread.h>
+#  include <time.h>
+typedef pthread_mutex_t cpy_mutex_t;
+#  define CPY_MUTEX_INIT(ctx) do { (ctx) = (cpy_mutex_t)PTHREAD_MUTEX_INITIALIZER; } while(0)
+#  define CPY_MUTEX_LOCK(ctx)   pthread_mutex_lock(ctx)
+#  define CPY_MUTEX_UNLOCK(ctx) pthread_mutex_unlock(ctx)
+typedef pthread_t cpy_thread_t;
+#  define CPY_THREAD_START(tid, fn, arg) (pthread_create((tid), NULL, fn, arg) == 0)
+#  define CPY_THREAD_JOIN(tid)  pthread_join((tid), NULL)
+#  define CPY_SLEEP_MS(ms)      do { struct timespec __ts = { (ms) / 1000, ((ms) % 1000) * 1000000L }; nanosleep(&__ts, NULL); } while(0)
+#endif
 
 /* ── Extended header ────────────────────────────────────────────── */
 
@@ -35,10 +64,16 @@ typedef struct {
 /* ── Global GC state ────────────────────────────────────────────── */
 
 static ugc_t         gc;
-static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t     gc_thread;
+static cpy_mutex_t   gc_lock_;
+static volatile int  gc_lock_init_once = 0;
+static cpy_thread_t  gc_thread;
 static volatile int  gc_running   = 0;
-static volatile int  gc_paused    = 0;  /* safepoint: mutator paused */
+
+static void gc_lock_init(void) {
+    if (gc_lock_init_once) return;
+    CPY_MUTEX_INIT(gc_lock_);
+    gc_lock_init_once = 1;
+}
 
 /* allocation pressure for triggering collection */
 static volatile size_t gc_alloc_bytes = 0;
@@ -98,6 +133,7 @@ static int obj_is_tracked(const void* hdr) {
 
 static void scan_stack_range(void* lo, void* hi) {
     /* scan word-aligned addresses from lo to hi */
+    if (lo > hi) { void* t = lo; lo = hi; hi = t; }
     for (void** p = (void**)lo; p < (void**)hi; p++) {
         void* candidate = *p;
         if (!candidate) continue;
@@ -114,7 +150,12 @@ static void scan_stack_range(void* lo, void* hi) {
 }
 
 static void scan_stack(void) {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    /* Windows: use GetCurrentThreadStackLimits (Win 8+) */
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    scan_stack_range((void*)lo, (void*)hi);
+#elif defined(__APPLE__)
     /* macOS: use pthread APIs */
     pthread_t self = pthread_self();
     void* stack_addr  = pthread_get_stackaddr_np(self);
@@ -124,20 +165,14 @@ static void scan_stack(void) {
     void* hi = stack_addr;
     scan_stack_range(lo, hi);
 #elif defined(__linux__)
-    /* Linux: read /proc/self/maps or use pthread_getattr_np */
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "[stack]")) {
-                unsigned long start, end;
-                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                    scan_stack_range((void*)start, (void*)end);
-                }
-                break;
-            }
-        }
-        fclose(f);
+    /* Linux: read pthread_getattr_np for the current thread (no /proc parsing) */
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void* stack_addr = NULL;
+        size_t stack_size = 0;
+        pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+        pthread_attr_destroy(&attr);
+        scan_stack_range(stack_addr, (char*)stack_addr + stack_size);
     }
 #else
     /* Fallback: scan a conservative range around the frame pointer.
@@ -148,6 +183,10 @@ static void scan_stack(void) {
 }
 
 /* ── ugc callbacks ──────────────────────────────────────────────── */
+
+/* Array length registry (defined in runtime.c): unregister arrays when their
+ * object is collected so stale length entries can never be reused. */
+extern void cpyte_array_unregister(void* arr);
 
 static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
     if (hdr == NULL) {
@@ -185,11 +224,8 @@ static void gc_release_cb(ugc_t* g, ugc_header_t* hdr) {
 
 /* ── Public API (called from generated code) ────────────────────── */
 
-/* Array length registry (defined in runtime.c): unregister arrays when their
- * object is collected so stale length entries can never be reused. */
-extern void cpyte_array_unregister(void* arr);
-
 void gc_init(void) {
+    gc_lock_init();
     memset(obj_table, 0, sizeof(obj_table));
     ugc_init(&gc, gc_scan_cb, gc_release_cb);
     gc_alloc_bytes = 0;
@@ -197,7 +233,8 @@ void gc_init(void) {
 }
 
 void* gc_malloc(size_t size) {
-    pthread_mutex_lock(&gc_lock);
+    gc_lock_init();
+    CPY_MUTEX_LOCK(&gc_lock_);
 
     cpyte_obj_t* obj = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + size);
     if (!obj) {
@@ -205,7 +242,7 @@ void* gc_malloc(size_t size) {
         ugc_collect(&gc);
         obj = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + size);
         if (!obj) {
-            pthread_mutex_unlock(&gc_lock);
+            CPY_MUTEX_UNLOCK(&gc_lock_);
             fprintf(stderr, "gc_malloc: out of memory (requested %zu bytes)\n", size);
             abort();
         }
@@ -217,13 +254,7 @@ void* gc_malloc(size_t size) {
 
     gc_alloc_bytes += size;
 
-    /* Trigger collection if pressure exceeds threshold */
-    if (gc_alloc_bytes >= gc_threshold) {
-        gc_alloc_bytes = 0;
-        /* Non-blocking: kick the background thread */
-    }
-
-    pthread_mutex_unlock(&gc_lock);
+    CPY_MUTEX_UNLOCK(&gc_lock_);
     return TO_USER(obj);
 }
 
@@ -238,28 +269,33 @@ void gc_write_barrier(void* parent_ptr, void* child_ptr) {
     /* quick validity check */
     if (!obj_is_tracked(parent) || !obj_is_tracked(child)) return;
 
-    pthread_mutex_lock(&gc_lock);
+    gc_lock_init();
+    CPY_MUTEX_LOCK(&gc_lock_);
     ugc_write_barrier(&gc, UGC_BARRIER_FORWARD, &parent->base, &child->base);
-    pthread_mutex_unlock(&gc_lock);
+    CPY_MUTEX_UNLOCK(&gc_lock_);
 }
 
 void gc_collect(void) {
-    pthread_mutex_lock(&gc_lock);
+    gc_lock_init();
+    CPY_MUTEX_LOCK(&gc_lock_);
     ugc_collect(&gc);
     gc_alloc_bytes = 0;
-    pthread_mutex_unlock(&gc_lock);
+    CPY_MUTEX_UNLOCK(&gc_lock_);
 }
-
-// Bruh, dead code.
 
 /* ── Background GC thread ───────────────────────────────────────── */
 
+#ifdef _WIN32
+static unsigned int __stdcall gc_thread_fn(void* arg) {
+    (void)arg;
+#else
 static void* gc_thread_fn(void* arg) {
     (void)arg;
+#endif
 
     while (gc_running) {
         /* Step the GC if it has work to do */
-        pthread_mutex_lock(&gc_lock);
+        CPY_MUTEX_LOCK(&gc_lock_);
         if (gc.state != UGC_IDLE) {
             ugc_step(&gc);
         } else if (gc_alloc_bytes >= gc_threshold) {
@@ -267,34 +303,38 @@ static void* gc_thread_fn(void* arg) {
             ugc_step(&gc);  /* IDLE -> MARK, scans roots */
             gc_alloc_bytes = 0;
         }
-        pthread_mutex_unlock(&gc_lock);
+        CPY_MUTEX_UNLOCK(&gc_lock_);
 
         /* Yield: sleep 1ms between steps */
-        struct timespec ts = { 0, 1000000 };  /* 1 ms */
-        nanosleep(&ts, NULL);
+        CPY_SLEEP_MS(1);
     }
 
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 void gc_start_thread(void) {
+    gc_lock_init();
     if (gc_thread) return;  /* already started */
-    pthread_create(&gc_thread, NULL, gc_thread_fn, NULL);
+    CPY_THREAD_START(&gc_thread, gc_thread_fn, NULL);
 }
 
 void gc_stop_thread(void) {
     gc_running = 0;
     if (gc_thread) {
-        pthread_join(gc_thread, NULL);
-        gc_thread = (pthread_t)0;
+        CPY_THREAD_JOIN(gc_thread);
+        gc_thread = (cpy_thread_t)0;
     }
 }
 
 void gc_shutdown(void) {
     gc_stop_thread();
-    pthread_mutex_lock(&gc_lock);
+    CPY_MUTEX_LOCK(&gc_lock_);
     ugc_release_all(&gc);
-    pthread_mutex_unlock(&gc_lock);
+    CPY_MUTEX_UNLOCK(&gc_lock_);
 
     /* free remaining hash table entries */
     for (int i = 0; i < OBJ_TABLE_SIZE; i++) {
@@ -307,8 +347,3 @@ void gc_shutdown(void) {
         obj_table[i] = NULL;
     }
 }
-
-/* ── GC state queries ───────────────────────────────────────────── */
-
-// Bruh, dead code.
-

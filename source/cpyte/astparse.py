@@ -4,6 +4,31 @@ from .lexar import Lexer, Token, TokenType, _unescape_run
 
 _parser_hooks: list[Any] = []
 
+# User-declared type names (structs, type aliases, classes) collected in a
+# pre-scan so bare-name casts like `(MyInt)x` are recognized as casts at parse
+# time. Reset per parse_file().
+_user_type_names: set[str] = set()
+
+
+def _pre_scan_user_types(tokens):
+    """Collect identifiers declared as struct/type/class so the parser can
+    recognize casts to user-defined types even without a pointer suffix."""
+    global _user_type_names
+    names = set()
+    i = 0
+    n = len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t.type == TokenType.KEYWORD and t.value in ("struct", "type", "class"):
+            j = i + 1
+            if j < n and tokens[j].type == TokenType.IDENTIFIER:
+                names.add(tokens[j].value)
+                i = j + 1
+                continue
+        i += 1
+    _user_type_names = names
+    return names
+
 
 def register_parser_hook(hook: Any) -> None:
     _parser_hooks.append(hook)
@@ -21,10 +46,10 @@ def _get_all_parser_hooks(enable_extensions: bool) -> list[Any]:
         return []
     hooks = list(_parser_hooks)
     try:
-        from .extension_hooks import get_global_hook_registry
+        from .extension_hooks import HookStage, ParserHook, get_global_hook_registry
         registry = get_global_hook_registry()
-        for hook in registry.get_parser_hooks():
-            if hook not in hooks:
+        for hook in registry.get(HookStage.PARSER):
+            if isinstance(hook, ParserHook) and hook not in hooks:
                 hooks.append(hook)
     except ImportError:
         pass
@@ -296,35 +321,74 @@ def _parse_unary(tokens: list[Token], pos: int):
 
 def _try_parse_cast_type(tokens, pos):
     """Try to parse a type name for a C-style cast like (int), (size_t*), (float[]).
+    Also accepts user-defined types (structs / type aliases / classes) as cast
+    targets, e.g. ``(Point*)p`` or ``(MyInt)x``.
 
     Returns (type_string, new_pos) on success, or (None, original_pos) if not a cast.
+    The returned type string retains pointer/array/ref suffixes, so ``(int*)x``
+    decodes to a pointer cast rather than silently degrading to ``int``.
     """
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         return None, pos
     name = tokens[pos].value
-    if name not in _TYPE_NAMES:
-        return None, pos
+    base = name
     pos += 1
+    has_suffix = False
     while pos < len(tokens):
         t = tokens[pos].type
         if t == TokenType.STAR:
+            base = _type_to_str(base) + "*"
+            has_suffix = True
             pos += 1
         elif t == TokenType.POW:
+            base = _type_to_str(base) + "**"
+            has_suffix = True
             pos += 1
         elif t == TokenType.LBRACKET:
             if pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.RBRACKET:
+                base = _type_to_str(base) + "[]"
+                has_suffix = True
                 pos += 2
             else:
                 break
         elif t == TokenType.AMPERSAND:
+            base = _type_to_str(base) + "&"
+            has_suffix = True
             pos += 1
         else:
             break
-    return name, pos
+    # A bare (no-suffix) name is accepted as a cast target only when it is a
+    # known builtin type or a user-declared type. Otherwise leave it to the
+    # normal parenthesized-expression/call path to avoid ambiguity.
+    if not has_suffix and name not in _TYPE_NAMES and name not in _user_type_names:
+        return None, pos
+    return base, pos
 
 
 def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'borrow':
+        pos += 1
+        mutable = False
+        if (
+            pos < len(tokens)
+            and tokens[pos].type == TokenType.KEYWORD
+            and tokens[pos].value == 'mut'
+        ):
+            mutable = True
+            pos += 1
+        if pos >= len(tokens):
+            raise ParseError('Expected expression after `borrow`', tok)
+        operand, pos = parse_expression(tokens, pos)
+        return BorrowExpr(operand, mutable=mutable, token=tok), pos
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'move':
+        pos += 1
+        if pos >= len(tokens):
+            raise ParseError('Expected expression after `move`', tok)
+        operand, pos = parse_expression(tokens, pos)
+        return MoveExpr(operand, token=tok), pos
 
     if tok.type == TokenType.NUMBER and tok.value == '67':
         pos += 1
@@ -815,6 +879,7 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
 
 
 def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True):
+    _pre_scan_user_types(tokens)
     nodes = []
     while pos < len(tokens) and tokens[pos].type not in (TokenType.EOF, TokenType.DEDENT):
         while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
@@ -827,11 +892,12 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
 
         all_hooks = _get_all_parser_hooks(enable_extensions)
         if all_hooks:
+            ctx = _make_parser_ctx(tokens, pos)
             handled = False
             for hook in all_hooks:
                 try:
                     if hasattr(hook, 'should_handle_statement') and hook.should_handle_statement(tokens, pos):
-                        node, pos = hook.parse_statement(tokens, pos, {'tokens': tokens, 'pos': pos})
+                        node, pos = hook.parse_statement(tokens, pos, ctx)
                         nodes.append(node)
                         handled = True
                         break
@@ -845,6 +911,25 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
             nodes.append(node)
 
     return nodes, pos
+
+
+_parser_ctx = None
+
+
+def _make_parser_ctx(tokens, pos):
+    """Build a lazily-cached CompilerContext for parser hooks."""
+    global _parser_ctx
+    if _parser_ctx is None:
+        from .extension_hooks import CompilerContext
+        _parser_ctx = CompilerContext(data={"astparse": _get_module_ref()})
+    _parser_ctx.data["tokens"] = tokens
+    _parser_ctx.data["pos"] = pos
+    return _parser_ctx
+
+
+def _get_module_ref():
+    import sys
+    return sys.modules.get(__name__)
 
 
 def _parse_standard_statement(tokens: list[Token], pos: int):
@@ -1430,6 +1515,53 @@ class CastExpr(Node):
         return f'CastExpr({self.type_expr}, {self.expr})'
 
 
+class BorrowExpr(Node):
+    """`borrow x` or `borrow mut x` — create a reference to x.
+
+    `borrow x` is an immutable borrow (x must not be mutated while borrowed);
+    `borrow mut x` is a mutable borrow. Both lower to taking x's address, but
+    the semantic/ownership pass enforces borrow rules.
+    """
+    __slots__ = ('_token', 'operand', 'mutable', 'inferred_type')
+    def __init__(self, operand, mutable: bool = False, token=None):
+        self.operand = operand
+        self.mutable = mutable
+        self._token = token
+        self.inferred_type = None
+    def __repr__(self):
+        return f'BorrowExpr(mut={self.mutable}, {self.operand})'
+
+
+class MoveExpr(Node):
+    """`move x` — transfer ownership of x (heap/owned value) to the mover.
+
+    After a move, x is no longer valid to use; the ownership pass errors if x is
+    used afterward unless it is reassigned.
+    """
+    __slots__ = ('_token', 'operand', 'inferred_type')
+    def __init__(self, operand, token=None):
+        self.operand = operand
+        self._token = token
+        self.inferred_type = None
+    def __repr__(self):
+        return f'MoveExpr({self.operand})'
+
+
+class DeferStmt(Node):
+    """`defer <stmt>` — run <stmt> when the enclosing function returns (LIFO).
+
+    Deferred statements are collected per function and emitted (in reverse
+    order) just before every function exit point: return statements and the
+    implicit end-of-function return.
+    """
+    __slots__ = ('_token', 'body')
+    def __init__(self, body, token=None):
+        self.body = body
+        self._token = token
+    def __repr__(self):
+        return f'DeferStmt({self.body!r})'
+
+
 class StructDef(Node):
     __slots__ = ('_token', 'fields', 'generic_params', 'name')
     def __init__(self, name: str, fields: list, generic_params: list | None = None, token=None):
@@ -1780,6 +1912,17 @@ def parse_var_decl(tokens: list[Token], pos: int):
     return VarDecl(name, var_type_str, init, is_const=is_const, token=tok), pos
 
 
+def parse_defer(tokens: list[Token], pos: int):
+    tok = tokens[pos]  # 'defer'
+    pos += 1
+    if pos >= len(tokens):
+        raise ParseError('Expected a statement after `defer`', tok)
+    stmt, pos = parse_statement(tokens, pos)
+    if stmt is None:
+        stmt = parse_expr_stmt(tokens, pos)
+    return DeferStmt(stmt, token=tok), pos
+
+
 def parse_statement(tokens: list[Token], pos: int):
     if pos >= len(tokens):
         return None, pos
@@ -1834,6 +1977,9 @@ def parse_statement(tokens: list[Token], pos: int):
 
     if tok.type == TokenType.KEYWORD and tok.value == 'unsafe':
         return parse_llvm(tokens, pos, unsafe=True)
+
+    if tok.type == TokenType.KEYWORD and tok.value == 'defer':
+        return parse_defer(tokens, pos)
 
     if tok.type == TokenType.IDENTIFIER:
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):

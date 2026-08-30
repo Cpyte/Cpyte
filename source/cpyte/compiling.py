@@ -468,12 +468,25 @@ def optimize(mod, opt_level=3, opt_size=False):
 
     # Let extension hooks add their own passes
     try:
-        from .extension_hooks import get_global_hook_registry
+        from .extension_hooks import (
+            CompilerContext,
+            HookStage,
+            OptimizeHook,
+            get_global_hook_registry,
+        )
 
         registry = get_global_hook_registry()
-        for hook in registry.get_codegen_hooks():
-            if hook.should_add_module_passes():
-                hook.add_module_passes(npm, {})
+        ctx = CompilerContext(optimization_level=opt_level, llvm_module=mod)
+        for hook in registry.get(HookStage.OPTIMIZE):
+            if not isinstance(hook, OptimizeHook):
+                continue
+            try:
+                if hook.should_add_passes(ctx):
+                    hook.add_module_passes(npm, ctx)
+            except Exception as e:
+                print_err(
+                    f"optimize hook {hook.__class__.__name__} failed: {e}"
+                )
     except Exception:
         pass
 

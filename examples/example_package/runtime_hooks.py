@@ -12,14 +12,13 @@ from cpyte.extension_hooks import RuntimeHook
 
 class AsyncRuntimeHook(RuntimeHook):
     """Runtime hook for async runtime support."""
-    
-    def __init__(self, package_name: str, hook_path: str = None):
-        super().__init__(package_name, hook_path)
-    
-    def get_runtime_code(self):
+
+    def get_runtime_code(self, context):
         """Return additional runtime code for async support."""
         return """
 // Async runtime support for example_package
+#include <stdlib.h>
+
 typedef struct Promise {
     void* value;
     int is_resolved;
@@ -42,11 +41,11 @@ void resolve_promise(Promise* p, void* value) {
     }
 }
 """
-    
-    def get_runtime_libraries(self):
+
+    def get_runtime_libraries(self, context):
         """Return additional runtime libraries to link."""
         return []  # No additional libraries needed for this example
-    
+
     def initialize(self, context):
         """Initialize the runtime hook."""
 

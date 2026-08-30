@@ -1,4 +1,5 @@
 import ast
+import ctypes
 import os
 import re
 import subprocess
@@ -6,108 +7,140 @@ import sys
 import tempfile
 
 # Function descriptor: (return_type, [(param_name, type), ...], vararg=bool)
-# vararg defaults to False
+# vararg defaults to False. In C_LIBRARIES the types are C source-level types
+# (e.g. 'char*', 'size_t', 'double'); they are converted to cpyte types through
+# the same strict, platform-aware mapper used for parsed headers, so a hand
+# written entry can never disagree with what libclang would have produced.
 
-# ── libclang setup ──────────────────────────────────────────────
+# ── libclang setup (cross-platform) ─────────────────────────────
 _LIBCLANG_PATHS = [
+    # macOS: Xcode Command Line Tools / Xcode toolchains
     '/Library/Developer/CommandLineTools/usr/lib/libclang.dylib',
     '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib',
+    # Linux: distro LLVM installs (Debian/Ubuntu/Fedora/Arch, x86-64 + arm64)
     '/usr/lib/llvm-*/lib/libclang.so',
+    '/usr/lib/llvm-*/lib/libclang.so.*',
+    '/usr/lib/x86_64-linux-gnu/libclang-*.so.*',
+    '/usr/lib/aarch64-linux-gnu/libclang-*.so.*',
     '/usr/lib/libclang.so',
+    '/usr/lib64/libclang.so',
+    '/usr/local/lib/libclang.so',
+    # Windows / generic (also tried by name on PATH, then clang.cindex defaults)
+    'libclang.dll',
+    'libclang.so',
+    'libclang.dylib',
 ]
 _libclang_loaded = False
+
+
+def _find_libclang():
+    """Locate a libclang shared library on any platform, or None."""
+    try:
+        import ctypes.util as _cutil
+        found = _cutil.find_library('clang')
+        if found:
+            return found
+    except Exception:
+        pass
+    import shutil
+    for p in _LIBCLANG_PATHS:
+        expanded = os.path.expanduser(p)
+        if os.path.isabs(expanded) and '*' in expanded:
+            from glob import glob
+            matches = sorted(glob(expanded))
+            if not matches:
+                continue
+            expanded = matches[0]
+        if os.path.exists(expanded):
+            return expanded
+        if not os.path.isabs(expanded) and shutil.which(expanded):
+            return expanded
+    return None
+
 
 def _init_libclang():
     global _libclang_loaded
     if _libclang_loaded:
         return True
-    for p in _LIBCLANG_PATHS:
-        expanded = os.path.expanduser(p)
-        if '*' in expanded:
-            from glob import glob
-            candidates = glob(expanded)
-            if candidates:
-                expanded = candidates[0]
-        if os.path.exists(expanded):
-            try:
-                import clang.cindex  # type: ignore[reportMissingImports]
-                clang.cindex.Config.set_library_file(expanded)
-                _libclang_loaded = True
-                return True
-            except Exception:
-                continue
+    library_file = _find_libclang()
     try:
         import clang.cindex  # type: ignore[reportMissingImports]
+        if library_file:
+            clang.cindex.Config.set_library_file(library_file)
         _libclang_loaded = True
         return True
     except Exception:
         return False
 
+# Hand-written fallback libraries. Types here are C source-level types (e.g.
+# 'char*', 'size_t', 'double') — they are converted to cpyte types through the
+# strict C→cpyte mapper (see `_hardcoded_symbols`), so a curated entry can
+# never disagree with what parsing the real header with libclang would produce.
 C_LIBRARIES = {
     'stdio': {
-        'printf':   ('int', [('fmt', 'str')], True),
+        'printf':   ('int', [('fmt', 'char*')], True),
         'putchar':  ('int', [('c', 'int')]),
         'getchar':  ('int', []),
-        'puts':     ('int', [('s', 'str')]),
-        'sprintf':  ('int', [('buf', 'str'), ('fmt', 'str')], True),
-        'snprintf': ('int', [('buf', 'str'), ('n', 'int'), ('fmt', 'str')], True),
-        'fprintf':  ('int', [('stream', 'void*'), ('fmt', 'str')], True),
-        'scanf':    ('int', [('fmt', 'str')], True),
-        'sscanf':   ('int', [('s', 'str'), ('fmt', 'str')], True),
+        'puts':     ('int', [('s', 'char*')]),
+        'sprintf':  ('int', [('buf', 'char*'), ('fmt', 'char*')], True),
+        'snprintf': ('int', [('buf', 'char*'), ('n', 'size_t'), ('fmt', 'char*')], True),
+        'fprintf':  ('int', [('stream', 'FILE*'), ('fmt', 'char*')], True),
+        'scanf':    ('int', [('fmt', 'char*')], True),
+        'sscanf':   ('int', [('s', 'char*'), ('fmt', 'char*')], True),
     },
     'stdlib': {
         'abs':     ('int', [('x', 'int')]),
-        'labs':    ('int', [('x', 'int')]),
+        'labs':    ('long', [('x', 'long')]),
         'rand':    ('int', []),
-        'srand':   ('void', [('seed', 'int')]),
-        'malloc':  ('void*', [('size', 'int64')]),
-        'calloc':  ('void*', [('nmemb', 'int64'), ('size', 'int64')]),
-        'realloc': ('void*', [('ptr', 'void*'), ('size', 'int64')]),
+        'srand':   ('void', [('seed', 'unsigned')]),
+        'malloc':  ('void*', [('size', 'size_t')]),
+        'calloc':  ('void*', [('nmemb', 'size_t'), ('size', 'size_t')]),
+        'realloc': ('void*', [('ptr', 'void*'), ('size', 'size_t')]),
         'free':    ('void', [('ptr', 'void*')]),
-        'atoi':    ('int', [('s', 'str')]),
-        'atol':    ('int', [('s', 'str')]),
-        'atof':    ('float', [('s', 'str')]),
+        'atoi':    ('int', [('s', 'char*')]),
+        'atol':    ('long', [('s', 'char*')]),
+        'atof':    ('double', [('s', 'char*')]),
         'exit':    ('void', [('status', 'int')]),
-        'system':  ('int', [('cmd', 'str')]),
+        'system':  ('int', [('cmd', 'char*')]),
     },
     'math': {
-        'sqrt':   ('float', [('x', 'float')]),
-        'sin':    ('float', [('x', 'float')]),
-        'cos':    ('float', [('x', 'float')]),
-        'tan':    ('float', [('x', 'float')]),
-        'asin':   ('float', [('x', 'float')]),
-        'acos':   ('float', [('x', 'float')]),
-        'atan':   ('float', [('x', 'float')]),
-        'atan2':  ('float', [('y', 'float'), ('x', 'float')]),
-        'pow':    ('float', [('x', 'float'), ('y', 'float')]),
-        'exp':    ('float', [('x', 'float')]),
-        'log':    ('float', [('x', 'float')]),
-        'log10':  ('float', [('x', 'float')]),
-        'floor':  ('float', [('x', 'float')]),
-        'ceil':   ('float', [('x', 'float')]),
-        'fabs':   ('float', [('x', 'float')]),
-        'fmod':   ('float', [('x', 'float'), ('y', 'float')]),
+        'sqrt':   ('double', [('x', 'double')]),
+        'sin':    ('double', [('x', 'double')]),
+        'cos':    ('double', [('x', 'double')]),
+        'tan':    ('double', [('x', 'double')]),
+        'asin':   ('double', [('x', 'double')]),
+        'acos':   ('double', [('x', 'double')]),
+        'atan':   ('double', [('x', 'double')]),
+        'atan2':  ('double', [('y', 'double'), ('x', 'double')]),
+        'pow':    ('double', [('x', 'double'), ('y', 'double')]),
+        'exp':    ('double', [('x', 'double')]),
+        'log':    ('double', [('x', 'double')]),
+        'log10':  ('double', [('x', 'double')]),
+        'floor':  ('double', [('x', 'double')]),
+        'ceil':   ('double', [('x', 'double')]),
+        'fabs':   ('double', [('x', 'double')]),
+        'fmod':   ('double', [('x', 'double'), ('y', 'double')]),
     },
     'string': {
-        'strlen':   ('int', [('s', 'str')]),
-        'strcmp':   ('int', [('s1', 'str'), ('s2', 'str')]),
-        'strncmp':  ('int', [('s1', 'str'), ('s2', 'str'), ('n', 'int')]),
-        'strcpy':   ('str', [('dst', 'str'), ('src', 'str')]),
-        'strncpy':  ('str', [('dst', 'str'), ('src', 'str'), ('n', 'int')]),
-        'strcat':   ('str', [('dst', 'str'), ('src', 'str')]),
-        'strncat':  ('str', [('dst', 'str'), ('src', 'str'), ('n', 'int')]),
-        'strchr':   ('str', [('s', 'str'), ('c', 'int')]),
-        'strstr':   ('str', [('haystack', 'str'), ('needle', 'str')]),
-        'strdup':   ('str', [('s', 'str')]),
-        'memset':   ('void*', [('s', 'void*'), ('c', 'int'), ('n', 'int')]),
-        'memcpy':   ('void*', [('dst', 'void*'), ('src', 'void*'), ('n', 'int')]),
-        'memcmp':   ('int', [('s1', 'void*'), ('s2', 'void*'), ('n', 'int')]),
+        'strlen':   ('size_t', [('s', 'char*')]),
+        'strcmp':   ('int', [('s1', 'char*'), ('s2', 'char*')]),
+        'strncmp':  ('int', [('s1', 'char*'), ('s2', 'char*'), ('n', 'size_t')]),
+        'strcpy':   ('char*', [('dst', 'char*'), ('src', 'char*')]),
+        'strncpy':  ('char*', [('dst', 'char*'), ('src', 'char*'), ('n', 'size_t')]),
+        'strcat':   ('char*', [('dst', 'char*'), ('src', 'char*')]),
+        'strncat':  ('char*', [('dst', 'char*'), ('src', 'char*'), ('n', 'size_t')]),
+        'strchr':   ('char*', [('s', 'char*'), ('c', 'int')]),
+        'strstr':   ('char*', [('haystack', 'char*'), ('needle', 'char*')]),
+        'strdup':   ('char*', [('s', 'char*')]),
+        'memset':   ('void*', [('s', 'void*'), ('c', 'int'), ('n', 'size_t')]),
+        'memcpy':   ('void*', [('dst', 'void*'), ('src', 'void*'), ('n', 'size_t')]),
+        'memcmp':   ('int', [('s1', 'void*'), ('s2', 'void*'), ('n', 'size_t')]),
     },
     'time': {
-        'time':      ('int', [('t', 'void*')]),
-        'clock':     ('int', []),
-        'difftime':  ('float', [('t1', 'int'), ('t2', 'int')]),
-        'ctime':     ('str', [('t', 'void*')]),
+        'time':      ('time_t', [('t', 'time_t*')]),
+        'clock':     ('time_t', []),
+        'difftime':  ('double', [('t1', 'time_t'), ('t2', 'time_t')]),
+        'ctime':     ('char*', [('t', 'time_t*')]),
     },
 }
 
@@ -156,39 +189,126 @@ _BUILTIN_LIB_HEADERS = {
 # Cache for parsed system headers (header_name -> symbols dict)
 _parsed_system_header_cache = {}
 
-# Minimal SDK path discovery (avoids circular import with semantic_analasis)
+# SDK / include path caches (avoid circular import with semantic_analasis)
 _sdk_paths_cache = None
+_include_dirs_cache = None
+
+
+def _sdk_roots():
+    """SDK roots with a `usr/include` layout (macOS SDKs), cached.
+
+    Returns [] on platforms without an SDK-layout tree; callers must treat an
+    empty list as "no exclusive SDK", not as an error. On macOS this is the
+    xcrun SDK plus any Xcode/CLT SDKs on disk. Never touches a compiler.
+    """
+    if sys.platform != "darwin":
+        return []
+    roots = []
+    try:
+        r = subprocess.run(
+            ["xcrun", "--show-sdk-path"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            roots.append(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for base in (
+        "/Library/Developer/CommandLineTools/SDKs",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
+    ):
+        if os.path.isdir(base):
+            for entry in sorted(os.listdir(base), reverse=True):
+                full = os.path.join(base, entry)
+                if (
+                    os.path.isdir(full)
+                    and entry.startswith("MacOSX")
+                    and full not in roots
+                ):
+                    roots.append(full)
+    return roots
+
+
+def _probe_cc_include_dirs():
+    """Ask the system C compiler for its default include directories.
+
+    Cross-platform (clang/gcc/mingw): parses the search-list block emitted by
+    `cc -E -x c -v -`. This is the source of truth for where `<stdio.h>` etc.
+    actually live on the host, so discovery never depends on a macOS SDK.
+    """
+    dirs = []
+    for cc in ("cc", "gcc", "clang"):
+        try:
+            r = subprocess.run(
+                [cc, "-E", "-x", "c", "-v", "-"],
+                input="",
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        output = r.stderr
+        if not output:
+            output = r.stdout
+        m = re.search(
+            r'#include <\.\.\.> search starts here:(.*?)\nEnd of search list\.',
+            output, re.DOTALL,
+        )
+        if not m:
+            continue
+        for line in m.group(1).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r'\s*\((framework|library) directory\)$', '', line)
+            if not line.startswith('/') or not os.path.isdir(line):
+                continue
+            if line not in dirs:
+                dirs.append(line)
+        if dirs:
+            break
+    return dirs
+
+
+def _find_include_dirs():
+    """Deduped absolute directories suitable for `-I` / `-isystem`. Cached."""
+    global _include_dirs_cache
+    if _include_dirs_cache is not None:
+        return _include_dirs_cache
+
+    dirs = []
+    for root in _sdk_roots():
+        cand = os.path.join(root, "usr/include")
+        if os.path.isdir(cand) and cand not in dirs:
+            dirs.append(cand)
+    for d in _probe_cc_include_dirs():
+        if d not in dirs:
+            dirs.append(d)
+    for p in ("/usr/local/include", "/usr/include"):
+        if os.path.isdir(p) and p not in dirs:
+            dirs.append(p)
+
+    _include_dirs_cache = dirs
+    return dirs
+
 
 def _find_sdk_paths():
-    """Find system include paths. Cached after first call."""
+    """System roots used for header/framework resolution. Cached.
+
+    Broadest view: macOS SDK roots followed by the compiler's include dirs and
+    the standard include directories, deduplicated. Callers that only need
+    `-I` dirs should use `_find_include_dirs()` instead.
+    """
     global _sdk_paths_cache
     if _sdk_paths_cache is not None:
         return _sdk_paths_cache
 
-    paths = []
-    if sys.platform == "darwin":
-        try:
-            r = subprocess.run(
-                ["xcrun", "--show-sdk-path"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                paths.append(r.stdout.strip())
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        for base in (
-            "/Library/Developer/CommandLineTools/SDKs",
-            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
-        ):
-            if os.path.isdir(base):
-                for entry in sorted(os.listdir(base), reverse=True):
-                    full = os.path.join(base, entry)
-                    if os.path.isdir(full) and entry.startswith("MacOSX") and full not in paths:
-                        paths.append(full)
-    else:
-        for p in ("/usr/local/include", "/usr/include"):
-            if os.path.isdir(p) and p not in paths:
-                paths.append(p)
+    paths = list(_sdk_roots())
+    for d in _find_include_dirs():
+        if d not in paths:
+            paths.append(d)
+    for p in ("/usr/local/include", "/usr/include"):
+        if os.path.isdir(p) and p not in paths:
+            paths.append(p)
 
     _sdk_paths_cache = paths
     return paths
@@ -209,10 +329,15 @@ def _parse_system_header(header_name):
 
     import clang.cindex as ci  # type: ignore[reportMissingImports]
 
-    search_paths = _find_sdk_paths()
     include_args = []
-    for p in search_paths:
-        include_args.extend(["-I", os.path.join(p, "usr/include")])
+    for d in _find_include_dirs():
+        include_args.extend(["-isystem", d])
+    # Framework search roots (macOS SDKs) so Apple frameworks resolve too.
+    for root in _sdk_roots():
+        for fw_root in ("System/Library/Frameworks", "Library/Frameworks"):
+            fw_dir = os.path.join(root, fw_root)
+            if os.path.isdir(fw_dir):
+                include_args.extend(["-F", fw_dir])
 
     fd, tmp_path = tempfile.mkstemp(suffix=".c", prefix="cpyte_sysheader_")
     try:
@@ -236,7 +361,7 @@ def _parse_system_header(header_name):
             if c.spelling in _C_KEYWORDS:
                 continue
 
-            ret_type = _c_type_to_lang(c.result_type.spelling)
+            ret_type = _c_type_to_lang(_canonical_spelling(c.result_type))
             if ret_type is None:
                 continue
 
@@ -248,17 +373,16 @@ def _parse_system_header(header_name):
 
             params = []
             for p in c.get_arguments():
-                raw = p.type.spelling
-                # Skip function pointer params (e.g. qsort comparator) —
-                # map them to void* since cpyte doesn't have function pointer types.
-                if '(' in raw and ')' in raw:
-                    ptype = 'void*'
-                else:
-                    ptype = _c_type_to_lang(raw)
+                ptype = _c_type_to_lang(_canonical_spelling(p.type))
+                # A single unmappable parameter means the whole signature would
+                # be wrong; drop the symbol rather than emit a broken extern.
                 if ptype is None:
-                    continue
+                    params = None
+                    break
                 pname = p.spelling or f'p{len(params)}'
                 params.append((pname, ptype))
+            if params is None:
+                continue
 
             symbols[c.spelling] = (ret_type, params, vararg)
 
@@ -287,7 +411,7 @@ _HEADER_PATTERN = re.compile(
 _HEADER_PATTERN_CF = re.compile(
     r'(?:CF_EXPORT)\s+'
     r'([\w\s\*]+)\s+'          # return type
-    r'(\w+)\s*'                # function name  
+    r'(\w+)\s*'                # function name
     r'\(([^)]*)\)'             # parameters
     r'\s*;',
     re.DOTALL
@@ -313,38 +437,31 @@ def _add_symbol(symbols, m):
     raw_ret = m.group(1).strip()
     fname = m.group(2).strip()
     raw_params = m.group(3).strip()
-    ret_type = _c_type_to_lang(raw_ret)
+    if fname in _C_KEYWORDS:
+        return
+
+    _, ret_type = _parse_decl(raw_ret)
+    if ret_type is None:
+        return
+
     if not raw_params or raw_params.strip() == 'void':
         params = []
         vararg = False
     else:
-        parts = _split_params(raw_params)
         params = []
         vararg = False
-        for p in parts:
-            p = p.strip()
-            if p == '...':
+        for part in _split_params(raw_params):
+            part = part.strip()
+            if part == '...':
                 vararg = True
                 continue
-            tokens = p.split()
-            if len(tokens) == 1:
-                ptype = _c_type_to_lang(tokens[0])
-                pname = ''
-            else:
-                # Handle * attached to param name (e.g., "void *ptr" -> tokens=['void', '*ptr'])
-                type_tokens = tokens[:-1]
-                pname = tokens[-1]
-                while pname.startswith('*'):
-                    type_tokens.append('*')
-                    pname = pname[1:]
-                ptype = _c_type_to_lang(' '.join(type_tokens))
-                if not pname:
-                    pname = f'p{len(params)}'
+            pname, ptype = _parse_decl(part)
+            # A single unmappable parameter means the whole signature would be
+            # wrong; drop the symbol rather than emit a broken extern.
             if ptype is None:
-                continue
-            params.append((pname, ptype))
-    if ret_type is not None:
-        symbols[fname] = (ret_type, params, vararg)
+                return
+            params.append((pname or f'p{len(params)}', ptype))
+    symbols[fname] = (ret_type, params, vararg)
 
 
 # Pattern for CF_EXPORT const variable declarations (e.g., kCFRunLoopCommonModes)
@@ -354,41 +471,72 @@ _CONST_VAR_PATTERN = re.compile(
 )
 
 
+def _hardcoded_symbols(name):
+    """Convert C-level C_LIBRARIES entries to cpyte signatures.
+
+    Entries are pushed through the same strict, platform-width-aware mapper
+    used for parsed headers, so a curated signature can never silently disagree
+    with what libclang would have produced. Returned dict is in the standard
+    `{fname: (ret_type, [(pname, ptype), ...], vararg)}` shape, or None when
+    the library contributes no fully-representable symbols.
+    """
+    treated = C_LIBRARIES.get(name)
+    if not treated:
+        return None
+    symbols = {}
+    for fname, desc in treated.items():
+        ret = _c_type_to_lang(desc[0])
+        if ret is None:
+            continue
+        params = []
+        ok = True
+        for pname, ptype_c in desc[1]:
+            pt = _c_type_to_lang(ptype_c)
+            if pt is None:
+                ok = False
+                break
+            params.append((pname, pt))
+        if not ok:
+            continue
+        vararg = len(desc) > 2 and desc[2]
+        symbols[fname] = (ret, params, vararg)
+    return symbols or None
+
+
+# Cache for validated hardcoded signatures (name -> symbols dict or None)
+_hardcoded_symbols_cache = {}
+
+
 def resolve_library(name):
     """Resolve a bare import name (e.g. 'stdlib') to (symbols_dict, 'c').
 
     Tries parsing the actual system header via libclang for full C compatibility.
     Falls back to the hardcoded C_LIBRARIES when libclang is unavailable or the
-    header can't be found.
+    header can't be found. All signatures — parsed or hand-written — go through
+    the same strict, platform-width-aware C→cpyte conversion.
     """
+    if name in _hardcoded_symbols_cache:
+        hard = _hardcoded_symbols_cache[name]
+    else:
+        hard = _hardcoded_symbols(name)
+        _hardcoded_symbols_cache[name] = hard
+
     header_name = _BUILTIN_LIB_HEADERS.get(name)
     if header_name is not None:
         # Try parsing the real system header for complete symbol coverage
         parsed = _parse_system_header(header_name)
         if parsed is not None:
-            # Merge with hardcoded C_LIBRARIES as fallback for any symbols
-            # the parser missed (function pointers, macros, etc.)
-            hardcoded = C_LIBRARIES.get(name, {})
-            for fname, desc in hardcoded.items():
+            # Fill any symbols the parser missed (function pointers, macros,
+            # static-inline wrappers, ...) from the curated fallback table.
+            for fname, desc in (hard or {}).items():
                 if fname not in parsed:
-                    ret_type = desc[0]
-                    params = desc[1]
-                    vararg = len(desc) > 2 and desc[2]
-                    parsed[fname] = (ret_type, params, vararg)
+                    parsed[fname] = desc
             if parsed:
                 return parsed, 'c'
-        # If libclang unavailable or parsing failed, fall through to hardcoded
 
-    resolved = C_LIBRARIES.get(name)
-    if resolved is None:
-        return None
-    symbols = {}
-    for fname, desc in resolved.items():
-        ret_type = desc[0]
-        params = desc[1]
-        vararg = len(desc) > 2 and desc[2]
-        symbols[fname] = (ret_type, params, vararg)
-    return symbols, 'c'
+    if hard is not None:
+        return hard, 'c'
+    return None
 
 
 _INCLUDE_PATTERN = re.compile(r'#\s*include\s+[<"](\S+)[>"]')
@@ -403,19 +551,23 @@ def _resolve_include(include_path, current_file, search_paths):
         if os.path.exists(candidate):
             return candidate
 
-    # Try framework paths (e.g., <CoreGraphics/CGEventTypes.h>)
+    # Try framework paths (e.g., <CoreGraphics/CGEventTypes.h>). Framework
+    # roots are searched generically (System/Library/Frameworks, Frameworks,
+    # or the SDK root itself) so any SDK layout works.
     parts = include_path.split('/')
     if len(parts) >= 2:
         framework_name = parts[0]
         header_rel = '/'.join(parts[1:])
         for sdk in search_paths:
-            for fw_subdir in (
-                f'{framework_name}.framework/Headers',
-                f'{framework_name}.framework/Versions/A/Headers',
-            ):
-                candidate = os.path.join(sdk, 'System/Library/Frameworks', fw_subdir, header_rel)
-                if os.path.exists(candidate):
-                    return candidate
+            for fw_root in ('System/Library/Frameworks', 'Frameworks', ''):
+                for fw_subdir in (
+                    f'{framework_name}.framework/Headers',
+                    f'{framework_name}.framework/Versions/Current/Headers',
+                    f'{framework_name}.framework/Versions/A/Headers',
+                ):
+                    candidate = os.path.join(sdk, fw_root, fw_subdir, header_rel)
+                    if os.path.exists(candidate):
+                        return candidate
 
     # Search standard SDK include paths
     for sdk in search_paths:
@@ -429,10 +581,12 @@ def _resolve_include(include_path, current_file, search_paths):
         framework_name = parts[0]
         header_rel = '/'.join(parts[1:])
         for sdk in search_paths:
-            candidate = os.path.join(sdk, 'System/Library/Frameworks',
-                                     f'{framework_name}.framework/PrivateHeaders', header_rel)
-            if os.path.exists(candidate):
-                return candidate
+            for fw_root in ('System/Library/Frameworks', 'Frameworks', ''):
+                candidate = os.path.join(
+                    sdk, fw_root, f'{framework_name}.framework/PrivateHeaders', header_rel
+                )
+                if os.path.exists(candidate):
+                    return candidate
 
     return None
 
@@ -465,7 +619,7 @@ def _normalize_header_content(content):
                     depth -= 1
                 i += 1
             content = content[:start] + content[i:]
-    # Remove __attribute__((...)) 
+    # Remove __attribute__((...))
     content = re.sub(r'__attribute__\s*\(\([^)]*\)\)', '', content)
     # Remove single keywords
     for kw in ['nullable', 'nonnull', '__nullable', '__nonnull', '__null_unspecified',
@@ -714,159 +868,303 @@ def _framework_names_from_path(filepath):
     return names
 
 
-_C_TYPE_MAP = {
-    'void': 'void',
-    'char': 'char',
-    'int': 'int',
-    'short': 'int',
-    'long': 'int',
-    'unsigned': 'int',
-    'float': 'float',
-    'double': 'float',
-    'size_t': 'int',
-    'FILE': 'void*',
+# ── Strict, structured C → cpyte type conversion ────────────────
+#
+# cpyte has a small fixed type vocabulary: void, bool, char, int, int64,
+# uint64, float, double, str (char*), and the pointer forms int*, int64*,
+# uint64*, float*, double*, plus generic void*. This mapper converts a C type
+# *exactly* into that vocabulary — never silently widening, narrowing, or
+# fabricating a type. Anything unrepresentable yields None, and callers skip
+# the whole symbol instead of emitting a wrong signature.
+#
+# Integer widths come from ctypes, so they are correct for whatever host is
+# running (LP64: mac/linux, LLP64: windows) rather than guessed.
+
+# qualifiers with no ABI effect
+_C_QUALIFIERS = frozenset({
+    'const', 'volatile', 'restrict', '__restrict', '__restrict__',
+    '_Nonnull', '_Nullable', '_Null_unspecified', '__nonnull', '__nullable',
+    'inline', '__inline', '__inline__', 'static', 'extern', 'register',
+    'auto', 'typedef', '_Noreturn', '_Atomic', '_Alignas', '_Thread_local',
+    '__thread', '__signed__', '__extension__', '__asm__', 'asm',
+})
+
+# base-type keywords that start a C type
+_C_BASE_KEYWORDS = frozenset({
+    'void', 'char', 'short', 'int', 'long', 'float', 'double',
+    'signed', 'unsigned', '_Bool', 'bool',
+    'struct', 'union', 'enum',
+})
+
+# Platform integer widths, derived from the running interpreter (ctypes).
+_LONG_WIDTH = ctypes.sizeof(ctypes.c_long)   # 8 on mac/linux, 4 on windows (LLP64)
+_SSIZE_T_SIZE = ctypes.sizeof(ctypes.c_ssize_t)
+_SIZE_T_SIZE = ctypes.sizeof(ctypes.c_size_t)
+
+# Standard typedefs whose width genuinely varies by platform (or that cpyte
+# needs to name explicitly). Mapping them through ctypes keeps these correct
+# on both LP64 and LLP64 hosts.
+_STD_INT_TYPES = {
+    'size_t':     (_SIZE_T_SIZE, True),
+    'ssize_t':    (_SSIZE_T_SIZE, False),
+    'ptrdiff_t':  (_SSIZE_T_SIZE, False),
+    'intptr_t':   (_SSIZE_T_SIZE, False),
+    'uintptr_t':  (_SIZE_T_SIZE, True),
+    'time_t':     (8, False),      # 8 everywhere cpyte targets
+    # <stdint.h> fixed-width types
+    'int8_t':   (1, False),
+    'uint8_t':  (1, True),
+    'int16_t':  (2, False),
+    'uint16_t': (2, True),
+    'int32_t':  (4, False),
+    'uint32_t': (4, True),
+    'int64_t':  (8, False),
+    'uint64_t': (8, True),
+    'intmax_t':  (8, False),
+    'uintmax_t': (8, True),
+    # Apple / POSIX aliases (64-bit dev targets: macOS, Linux)
+    'CFIndex':    (_LONG_WIDTH, False),
+    'NSInteger':  (_LONG_WIDTH, False),
+    'NSUInteger': (_LONG_WIDTH, True),
+    'pid_t':      (4, False),      # int on mac/linux
+    # Apple _types.h short names
+    'int32':    (4, False),
+    'uint32':   (4, True),
+    'int64':    (8, False),
+    'uint64':   (8, True),
 }
 
-_C_PTR_TYPE_MAP = {
-    'void': 'void*',
-    'char': 'str',
-    'int': 'int*',
-    'float': 'float*',
-    'double': 'double*',
-    'CGColorRef': 'void*',
-    'CGColorSpaceRef': 'void*',
-    'CGEventTapCallBack': 'void*',
-    'CGContextRef': 'void*',
-    'CGDataProviderRef': 'void*',
-    'CGDisplayStreamRef': 'void*',
-    'CGEventRef': 'void*',
-    'CGEventSourceRef': 'void*',
-    'CGImageRef': 'void*',
-    'CGPathRef': 'void*',
-    'CGPatternRef': 'void*',
-    'CGPDFDocumentRef': 'void*',
-    'CGPDFPageRef': 'void*',
-    'CGFontRef': 'void*',
-    'CGLayerRef': 'void*',
-    'CGPSConverterRef': 'void*',
-    'CFAllocatorRef': 'void*',
-    'CFArrayRef': 'void*',
-    'CFAttributedStringRef': 'void*',
-    'CFBooleanRef': 'void*',
-    'CFCalendarRef': 'void*',
-    'CFCharacterSetRef': 'void*',
-    'CFDataRef': 'void*',
-    'CFDateRef': 'void*',
-    'CFDictionaryRef': 'void*',
-    'CFErrorRef': 'void*',
-    'CFLocaleRef': 'void*',
-    'CFMachPortRef': 'void*',
-    'CFMutableArrayRef': 'void*',
-    'CFMutableDataRef': 'void*',
-    'CFMutableDictionaryRef': 'void*',
-    'CFMutableSetRef': 'void*',
-    'CFMutableStringRef': 'void*',
-    'CFNotificationCenterRef': 'void*',
-    'CFNullRef': 'void*',
-    'CFNumberRef': 'void*',
-    'CFPropertyListRef': 'void*',
-    'CFReadStreamRef': 'void*',
-    'CFRunLoopRef': 'void*',
-    'CFRunLoopSourceRef': 'void*',
-    'CFRunLoopTimerRef': 'void*',
-    'CFRunLoopObserverRef': 'void*',
-    'CFSetRef': 'void*',
-    'CFStringRef': 'void*',
-    'CFTimeZoneRef': 'void*',
-    'CFTypeRef': 'void*',
-    'CFURLRef': 'void*',
-    'CFUUIDRef': 'void*',
-    'CFWriteStreamRef': 'void*',
-    'SecIdentityRef': 'void*',
-    'SecCertificateRef': 'void*',
-    'SecKeyRef': 'void*',
-    'SecTrustRef': 'void*',
-    'SecPolicyRef': 'void*',
-    'IOSurfaceRef': 'void*',
-    'CVPixelBufferRef': 'void*',
-    'CVBufferRef': 'void*',
-    'CVImageBufferRef': 'void*',
-    'CVOpenGLBufferRef': 'void*',
-    'CVOpenGLTextureRef': 'void*',
-    'CVDisplayLinkRef': 'void*',
-    'MIDIEndpointRef': 'void*',
-    'MIDIClientRef': 'void*',
-    'MIDIPortRef': 'void*',
-    'AudioQueueRef': 'void*',
-    'AudioUnit': 'void*',
-    'AudioComponentInstance': 'void*',
-    'SecAccessRef': 'void*',
-    'SecKeychainRef': 'void*',
-    'SecKeychainItemRef': 'void*',
-    'SecTrustedApplicationRef': 'void*',
-    'SecAccessControlRef': 'void*',
-}
+# Opaque pointer typedefs (libc + Apple frameworks). These deliberately
+# degrade to cpyte `void*`: pointer-typed, ABI-safe, and the only way to use
+# framework APIs from cpyte. Used by the regex fallback path; with libclang the
+# canonical spelling already resolves them to plain pointers.
+_OPAQUE_POINTER_TYPES = frozenset({
+    'FILE',
+    'CGColorRef', 'CGColorSpaceRef', 'CGEventTapCallBack', 'CGContextRef',
+    'CGDataProviderRef', 'CGDisplayStreamRef', 'CGEventRef', 'CGEventSourceRef',
+    'CGImageRef', 'CGPathRef', 'CGPatternRef', 'CGPDFDocumentRef', 'CGPDFPageRef',
+    'CGFontRef', 'CGLayerRef', 'CGPSConverterRef', 'CGWindowRef',
+    'CFAllocatorRef', 'CFArrayRef', 'CFAttributedStringRef', 'CFBooleanRef',
+    'CFCalendarRef', 'CFCharacterSetRef', 'CFDataRef', 'CFDateRef',
+    'CFDictionaryRef', 'CFErrorRef', 'CFLocaleRef', 'CFMachPortRef',
+    'CFMutableArrayRef', 'CFMutableDataRef', 'CFMutableDictionaryRef',
+    'CFMutableSetRef', 'CFMutableStringRef', 'CFNotificationCenterRef',
+    'CFNullRef', 'CFNumberRef', 'CFPropertyListRef', 'CFReadStreamRef',
+    'CFRunLoopRef', 'CFRunLoopSourceRef', 'CFRunLoopTimerRef',
+    'CFRunLoopObserverRef', 'CFSetRef', 'CFStringRef', 'CFTimeZoneRef',
+    'CFTypeRef', 'CFURLRef', 'CFUUIDRef', 'CFWriteStreamRef',
+    'SecIdentityRef', 'SecCertificateRef', 'SecKeyRef', 'SecTrustRef',
+    'SecPolicyRef', 'SecAccessRef', 'SecKeychainRef', 'SecKeychainItemRef',
+    'SecTrustedApplicationRef', 'SecAccessControlRef', 'SecItemRef',
+    'IOSurfaceRef', 'CVPixelBufferRef', 'CVBufferRef', 'CVImageBufferRef',
+    'CVOpenGLBufferRef', 'CVOpenGLTextureRef', 'CVDisplayLinkRef',
+    'MIDIEndpointRef', 'MIDIClientRef', 'MIDIPortRef',
+    'AudioQueueRef', 'AudioUnit', 'AudioComponentInstance',
+})
 
-_C_UNSIGNED_TYPES = {
-    'unsigned char': 'int',
-    'unsigned short': 'int',
-    'unsigned int': 'int',
-    'unsigned long': 'int',
-    'unsigned long long': 'int',
-}
+# 8-bit scalars (macOS), ABI-safe as cpyte `char` (i8). Not pointers.
+_8BIT_SCALAR_TYPES = frozenset({
+    'BOOL', 'Boolean', 'DarwinBoolean', 'SInt8', 'UInt8',
+})
 
-_C_QUALIFIERS = {'const', 'restrict', 'volatile', '__restrict', '__restrict__', '_Nonnull', '_Nullable'}
+_C_TOKEN_RE = re.compile(r'\w+|\*+|\[+|\]+|\(|\)|\.\.\.|,')
+
+
+def _tokenize_type(raw):
+    return [t for t in _C_TOKEN_RE.findall(raw) if t]
+
+
+def _consume_int_spec(words, i):
+    """Consume a C integer spec from words[i:] tolerating the free ordering
+    clang emits in canonical spellings (e.g. 'long unsigned int').
+
+    Returns ((kind, unsigned_flag), consumed) where kind is one of
+    'char'/'short'/'int'/'long'/'longlong', or (None, i) when words[i:] does
+    not begin with an integer-type word.
+    """
+    if i >= len(words) or words[i] not in ('signed', 'unsigned', 'char', 'short', 'int', 'long'):
+        return None, i
+    unsigned = False
+    has_long = 0
+    kind = None
+    j = i
+    while j < len(words) and words[j] in ('signed', 'unsigned', 'char', 'short', 'int', 'long'):
+        w = words[j]
+        if w == 'unsigned':
+            unsigned = True
+        elif w == 'long':
+            has_long += 1
+        elif w == 'char':
+            kind = 'char'
+        elif w == 'short':
+            kind = 'short'
+        elif w == 'int':
+            if kind is None:
+                kind = 'int'
+        j += 1
+    if kind is None:
+        kind = 'int'
+    if has_long:
+        kind = 'longlong' if has_long >= 2 else 'long'
+    else:
+        # 'char *' -> the char op on 'const char *' is handled by caller
+        pass
+    return (kind, unsigned), j
+
+
+def _int_width_lang(width, unsigned):
+    """Exact-width integer → cpyte scalar type, or None when cpyte has no type
+    of that width (16-bit)."""
+    if width == 1:
+        return 'char'
+    if width == 2:
+        return None
+    if width == 4:
+        return 'int'
+    if width == 8:
+        return 'uint64' if unsigned else 'int64'
+    return None
+
+
+def _int_width_ptr(width, unsigned):
+    """Exact-width integer → cpyte pointer type, or None."""
+    if width == 1:
+        # char* is the cpyte string contract; byte-happy `unsigned char*` stays
+        # generic so it is not mistaken for a NUL-terminated string.
+        return 'str' if not unsigned else None
+    if width == 2:
+        return None
+    if width == 4:
+        return 'int*'
+    if width == 8:
+        return 'uint64*' if unsigned else 'int64*'
+    return None
+
+
+def _int_spec_lang(kind, unsigned):
+    widths = {'char': 1, 'short': 2, 'int': 4, 'long': _LONG_WIDTH, 'longlong': 8}
+    return _int_width_lang(widths[kind], unsigned)
+
+
+def _int_spec_ptr(kind, unsigned):
+    widths = {'char': 1, 'short': 2, 'int': 4, 'long': _LONG_WIDTH, 'longlong': 8}
+    return _int_width_ptr(widths[kind], unsigned)
+
+
+def _canonical_spelling(ctype):
+    """Best-effort canonical spelling from a libclang Type object."""
+    try:
+        return ctype.get_canonical().spelling
+    except Exception:
+        try:
+            return ctype.spelling
+        except Exception:
+            return ''
+
+
+def _parse_decl(raw):
+    """Parse a C type or `type name` declarator into (name, cpy_type).
+
+    `raw` accepts both pure type spellings (from libclang) and full declarators
+    such as `const char *name` or `unsigned char buf[16]` (from the regex
+    fallback). Returns (None, None) when the type cannot be represented
+    exactly in cpyte, so callers skip the symbol entirely.
+    """
+    raw = (raw or '').strip()
+    if not raw:
+        return None, None
+
+    # Function pointers have no cpyte type, but as a parameter or return value
+    # they are plain pointers under every relevant calling convention, so they
+    # degrade ABI-safely to void*.
+    if '(' in raw:
+        m = re.search(r'\(\s*\*\s*(\w+)\s*\)', raw)
+        name = m.group(1) if m else ''
+        return name, 'void*'
+
+    words = []
+    stars = 0
+    array = False
+    for t in _tokenize_type(raw):
+        if t in _C_QUALIFIERS:
+            continue
+        if t.startswith('*'):
+            stars += t.count('*')
+        elif t in ('[', ']'):
+            array = True
+        elif t.isdigit():
+            continue
+        else:
+            words.append(t)
+
+    if not words:
+        return None, None
+
+    first = words[0]
+    base_lang = None          # scalar cpyte type
+    base_ptr_lang = None      # single-pointer cpyte type
+    consumed = 1
+
+    if first in ('void', 'float', 'double', '_Bool', 'bool', 'struct', 'union', 'enum'):
+        if first in ('_Bool', 'bool'):
+            base_lang, base_ptr_lang = 'bool', None
+        elif first == 'void':
+            base_lang, base_ptr_lang = 'void', 'void*'
+        elif first == 'float':
+            base_lang, base_ptr_lang = 'float', 'float*'
+        elif first == 'double':
+            base_lang, base_ptr_lang = 'double', 'double*'
+        else:  # struct/union/enum: representable only by pointer
+            base_lang, base_ptr_lang = None, 'void*'
+            if len(words) > 1 and words[1] not in _C_BASE_KEYWORDS:
+                consumed = 2
+    else:
+        spec, c = _consume_int_spec(words, 0)
+        if spec is not None:
+            kind, unsigned = spec
+            consumed = c
+            base_lang = _int_spec_lang(kind, unsigned)
+            base_ptr_lang = _int_spec_ptr(kind, unsigned)
+        elif first in _OPAQUE_POINTER_TYPES:
+            base_lang, base_ptr_lang = 'void*', 'void*'
+        elif first in _STD_INT_TYPES:
+            width, unsigned = _STD_INT_TYPES[first]
+            base_lang = _int_width_lang(width, unsigned)
+            base_ptr_lang = _int_width_ptr(width, unsigned)
+            if base_lang is None and base_ptr_lang is None:
+                return None, None
+        elif first in _8BIT_SCALAR_TYPES:
+            base_lang = 'char'
+        else:
+            # Unknown typedef: cannot know width or pointerness. A bare
+            # unrepresentable scalar must be skipped, not guessed.
+            return None, None
+
+    rest = words[consumed:]
+    for w in rest:
+        if w in _C_BASE_KEYWORDS:
+            # A trailing keyword means the base spec was under-consumed
+            # (e.g. 'long double'); treat as unrepresentable.
+            return None, None
+    if len(rest) > 1:
+        return None, None
+    name = rest[0] if rest else ''
+
+    if stars or array:
+        if base_ptr_lang is None:
+            return name, 'void*'
+        if stars + (1 if array else 0) == 1:
+            return name, base_ptr_lang
+        return name, 'void*'
+    if base_lang is None:
+        return None, None
+    return name, base_lang
 
 
 def _c_type_to_lang(raw):
-    tokens = raw.replace('*', ' * ').split()
-    cleaned = []
-    for t in tokens:
-        if t not in _C_QUALIFIERS:
-            cleaned.append(t)
-    if not cleaned:
-        return None
-
-    ptr_count = 0
-    while cleaned and cleaned[-1] == '*':
-        cleaned.pop()
-        ptr_count += 1
-
-    base = ' '.join(cleaned)
-    if ptr_count > 0:
-        if base in _C_UNSIGNED_TYPES:
-            return 'int*'
-        mapped = _C_PTR_TYPE_MAP.get(base)
-        if mapped:
-            return mapped
-        # For unknown opaque pointer types, map to void*
-        if base.endswith('Ref') or base == 'OpaqueRef' or base.startswith('Opaque'):
-            return 'void*'
-        return 'void*'
-    if base in _C_UNSIGNED_TYPES:
-        return _C_UNSIGNED_TYPES[base]
-    mapped = _C_TYPE_MAP.get(base)
-    if mapped:
-        return mapped
-    # For known base names, try with fallback
-    # Mac types that end in Ref → void* (opaque pointer type)
-    if base.endswith('Ref') or base == 'Boolean':
-        return 'void*'
-    # Try bool-like types  
-    if base in ('bool', 'BOOL', 'Boolean', '_Bool'):
-        return 'int'
-    if base in ('uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
-                 'int8_t', 'int16_t', 'int32_t', 'int64_t',
-                 'CFIndex', 'pid_t', 'size_t', 'NSInteger', 'NSUInteger'):
-        return 'int'
-    if base in ('float', 'CGFloat'):
-        return 'float'
-    if base in ('double',):
-        return 'float'
-    # Unknown types → void* (safe for pointers, works for ints on 64-bit)
-    if base:
-        return 'void*'
-    return None
+    """Strict C type string → cpyte type string, or None if unrepresentable."""
+    _, lang = _parse_decl(raw)
+    return lang
 
 
 def _split_params(s):
@@ -913,7 +1211,7 @@ def parse_c_source(filepath):
         if c.spelling in _C_KEYWORDS:
             continue
 
-        ret_type = _c_type_to_lang(c.result_type.spelling)
+        ret_type = _c_type_to_lang(_canonical_spelling(c.result_type))
         if ret_type is None:
             continue
 
@@ -925,10 +1223,15 @@ def parse_c_source(filepath):
 
         params = []
         for p in c.get_arguments():
-            ptype = _c_type_to_lang(p.type.spelling)
+            ptype = _c_type_to_lang(_canonical_spelling(p.type))
+            # A single unmappable parameter means the whole signature would be
+            # wrong; drop the symbol rather than emit a broken extern.
             if ptype is None:
-                continue
+                params = None
+                break
             params.append((p.spelling or f'p{len(params)}', ptype))
+        if params is None:
+            continue
 
         symbols[c.spelling] = (ret_type, params, vararg)
 
@@ -947,7 +1250,7 @@ def _parse_c_source_regex(filepath):
         if fname in _C_KEYWORDS or fname == 'main':
             continue
 
-        ret_type = _c_type_to_lang(raw_ret)
+        _, ret_type = _parse_decl(raw_ret)
         if ret_type is None:
             continue
 
@@ -963,16 +1266,14 @@ def _parse_c_source_regex(filepath):
                 if p == '...':
                     vararg = True
                     continue
-                tokens = p.split()
-                if len(tokens) == 1:
-                    ptype = _c_type_to_lang(tokens[0])
-                    pname = ''
-                else:
-                    ptype = _c_type_to_lang(' '.join(tokens[:-1]))
-                    pname = tokens[-1]
+                pname, ptype = _parse_decl(p)
+                # Never emit a signature with a hole in it.
                 if ptype is None:
-                    continue
+                    params = None
+                    break
                 params.append((pname or f'p{len(params)}', ptype))
+            if params is None:
+                continue
         symbols[fname] = (ret_type, params, vararg)
     return symbols, 'c'
 
@@ -1074,6 +1375,13 @@ def _ir_param_type_to_lang(param):
 
 
 def _ir_type_to_lang(t):
+    """Exact LLVM IR type → cpyte type, or None when unrepresentable.
+
+    `double` and `float` are distinct 64/32-bit cpyte types, so IR `double`
+    maps to `double` and IR `float` maps to `float`; anything else that is not
+    in the cpyte vocabulary (i16, i128, aggregates, vectors, multi-indirection)
+    yields None and the enclosing function is skipped.
+    """
     t = t.strip()
     if t == 'void':
         return 'void'
@@ -1085,16 +1393,24 @@ def _ir_type_to_lang(t):
         return 'int'
     if t == 'i64':
         return 'int64'
-    if t == 'double':
+    if t == 'float':
         return 'float'
+    if t == 'double':
+        return 'double'
     if t == 'i8*':
         return 'str'
-    if t == 'ptr':
-        return 'void*'
-    if t == 'i64*':
-        return 'int64*'
     if t == 'i32*':
         return 'int*'
-    if t == 'float':
-        return None
+    if t == 'i64*':
+        return 'int64*'
+    if t == 'float*':
+        return 'float*'
+    if t == 'double*':
+        return 'double*'
+    if t == 'ptr':
+        return 'void*'
+    if t == 'i1*':
+        return 'void*'
+    if t.endswith('*'):
+        return 'void*'
     return None

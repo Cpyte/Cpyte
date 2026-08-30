@@ -98,11 +98,13 @@ from .astparse import (
     Attr,
     BinOp,
     Break,
+    BorrowExpr,
     Call,
     CastExpr,
     CCode,
     ClassDef,
     Continue,
+    DeferStmt,
     Deref,
     EnumDef,
     ExprStmt,
@@ -111,6 +113,7 @@ from .astparse import (
     If,
     Import,
     Index,
+    MoveExpr,
     InlineAsm,
     Input,
     InputBig,
@@ -143,21 +146,98 @@ from .clib import (
     parse_llvm_ir_text,
     resolve_library,
 )
-from .extension_hooks import HookLoader, get_global_hook_registry
+from .extension_hooks import (
+    CompilerContext,
+    DiagnosticSeverity,
+    HookLoader,
+    HookStage,
+    SemanticHook,
+    SourceLocation,
+    get_global_hook_registry,
+)
 from .lexar import Lexer, LexerError, register_keywords
 from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
 
 
+def _c(text, *styles):
+    """Colorize `text` with ANSI codes when stdout is a terminal (and color is
+    not disabled). Falls back to plain text for piped/non-tty output."""
+    import os
+    import sys
+
+    if os.environ.get("NO_COLOR"):
+        return text
+    if os.environ.get("CLICOLOR") == "0" and not (
+        os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE")
+    ):
+        return text
+    forced = bool(os.environ.get("FORCE_COLOR")) or bool(
+        os.environ.get("CLICOLOR_FORCE")
+    )
+    stream = sys.stderr if sys.stderr else sys.stdout
+    if not forced and not getattr(stream, "isatty", lambda: False)():
+        return text
+    codes = {
+        "bold": 1,
+        "dim": 2,
+        "italic": 3,
+        "underline": 4,
+        "black": 30,
+        "red": 31,
+        "green": 32,
+        "yellow": 33,
+        "blue": 34,
+        "magenta": 35,
+        "cyan": 36,
+        "white": 37,
+        "bright_red": 91,
+        "bright_green": 92,
+        "bright_yellow": 93,
+        "bright_blue": 94,
+        "bright_magenta": 95,
+        "bright_cyan": 96,
+        "bright_white": 97,
+        "bright_black": 90,
+    }
+    parts = [str(codes[s]) for s in styles if s in codes]
+    if not parts:
+        return text
+    return "\x1b[%sm%s\x1b[0m" % (";".join(parts), text)
+
+
 class Diagnostic:
-    __slots__ = ("level", "message", "note", "token")
+    __slots__ = ("level", "message", "note", "span", "token", "code")
 
     def __init__(
-        self, message: str, token=None, note: str | None = None, level: str = "error"
+        self,
+        message: str,
+        token=None,
+        note: str | None = None,
+        level: str = "error",
+        span: int = 0,
+        code: str | None = None,
     ):
         self.message = message
         self.token = token
         self.note = note
         self.level = level
+        # Length of the underlined region in characters (0 => single caret).
+        self.span = span
+        self.code = code
+
+
+_LEVEL_COLORS = {
+    "error": "bright_red",
+    "strict-error": "magenta",
+    "warning": "bright_yellow",
+    "strict-warning": "yellow",
+}
+_LEVEL_LABEL = {
+    "error": "error",
+    "strict-error": "error",
+    "warning": "warning",
+    "strict-warning": "warning",
+}
 
 
 class Reporter:
@@ -165,16 +245,78 @@ class Reporter:
         self.source = source
         self.lines = source.split("\n")
         self.diagnostics: list[Diagnostic] = []
+        self._error_count = 0
+        self._warning_count = 0
 
-    def error(self, message: str, token=None, note: str | None = None):
-        self.diagnostics.append(Diagnostic(message, token, note, level="error"))
+    def _code(self, prefix: str, explicit: str | None) -> str:
+        """Return an error/warning code. Explicit codes are used verbatim;
+        otherwise a unique `E####` / `W####` is generated."""
+        if explicit:
+            return explicit
+        if prefix == "E":
+            self._error_count += 1
+            return f"E{self._error_count:04d}"
+        self._warning_count += 1
+        return f"W{self._warning_count:04d}"
 
-    def strict_error(self, message: str, token=None, note: str | None = None):
-        self.diagnostics.append(Diagnostic(message, token, note, level="strict-error"))
-
-    def strict_warning(self, message: str, token=None, note: str | None = None):
+    def error(
+        self,
+        message: str,
+        token=None,
+        note: str | None = None,
+        span: int = 0,
+        code: str | None = None,
+    ):
         self.diagnostics.append(
-            Diagnostic(message, token, note, level="strict-warning")
+            Diagnostic(
+                message,
+                token,
+                note,
+                level="error",
+                span=span,
+                code=self._code("E", code),
+            )
+        )
+
+    def strict_error(self, message: str, token=None, note: str | None = None, code: str | None = None):
+        self.diagnostics.append(
+            Diagnostic(
+                message,
+                token,
+                note,
+                level="strict-error",
+                code=self._code("E", code),
+            )
+        )
+
+    def strict_warning(self, message: str, token=None, note: str | None = None, code: str | None = None):
+        self.diagnostics.append(
+            Diagnostic(
+                message,
+                token,
+                note,
+                level="strict-warning",
+                code=self._code("W", code),
+            )
+        )
+
+    def warning(
+        self,
+        message: str,
+        token=None,
+        note: str | None = None,
+        span: int = 0,
+        code: str | None = None,
+    ):
+        self.diagnostics.append(
+            Diagnostic(
+                message,
+                token,
+                note,
+                level="warning",
+                span=span,
+                code=self._code("W", code),
+            )
         )
 
     def has_errors(self) -> bool:
@@ -184,49 +326,100 @@ class Reporter:
         if not self.diagnostics:
             return ""
 
+        diags = self._sorted_deduped(self.diagnostics)
+
+        # Recolor the message with its level and render each diagnostic.
         parts = []
-        for diag in self.diagnostics:
+        for diag in diags:
             parts.append(self._format(diag))
 
         err_count = sum(
-            1 for d in self.diagnostics if d.level in ("error", "strict-error")
+            1 for d in diags if d.level in ("error", "strict-error")
         )
-        warn_count = sum(1 for d in self.diagnostics if d.level == "strict-warning")
-        summary_parts = []
-        if err_count:
-            plural = "s" if err_count > 1 else ""
-            summary_parts.append(f"{err_count} semantic error{plural}")
-        if warn_count:
-            plural = "s" if warn_count > 1 else ""
-            summary_parts.append(f"{warn_count} strict warning{plural}")
-        if summary_parts:
-            parts.append("found: " + ", ".join(summary_parts) + ".")
+        warn_count = sum(
+            1 for d in diags if d.level in ("strict-warning", "warning")
+        )
+        if err_count or warn_count:
+            bits = []
+            if err_count:
+                plural = "s" if err_count > 1 else ""
+                bits.append(f"{err_count} semantic error{plural}")
+            if warn_count:
+                plural = "s" if warn_count > 1 else ""
+                bits.append(f"{warn_count} warning{plural}")
+            summary = "found: " + ", ".join(bits) + "."
+            parts.append(_c(summary, "bold"))
         return "\n".join(parts)
+
+    @staticmethod
+    def _sorted_deduped(diags):
+        """Return diagnostics ordered by (line, column) with exact duplicates
+        removed, keeping only the first occurrence of a repeated diagnostic."""
+        key = lambda d: (
+            d.token.line if d.token is not None else -1,
+            d.token.column if d.token is not None else -1,
+            d.level,
+            d.message,
+        )
+        seen = set()
+        out = []
+        for d in sorted(diags, key=key):
+            sig = (d.level, d.message, d.note, key(d))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(d)
+        return out
 
     def _format(self, diag: Diagnostic) -> str:
-        token = diag.token
-        if token is None:
-            return f"{diag.level}: {diag.message}"
+        color = _LEVEL_COLORS.get(diag.level, "bright_red")
+        label = _LEVEL_LABEL.get(diag.level, diag.level)
+        bare = diag.token is None
+        code = diag.code if diag.code else ""
+        if bare:
+            head = f"{label}: {diag.message}"
+            if code:
+                head = f"{label} {code}: {diag.message}"
+            head = _c(head, color)
+            lines = [head]
+            if diag.note:
+                lines.append(_c(f"  help: {diag.note}", "bright_black"))
+            return "\n".join(lines)
 
-        line = token.line
-        col = token.column
+        line = diag.token.line
+        col = diag.token.column
+        src = self.lines[line - 1] if 0 < line <= len(self.lines) else ""
 
-        source_line = self.lines[line - 1] if 0 < line <= len(self.lines) else ""
+        span = diag.span
+        if span <= 0:
+            # Default span: the length of the token value when available.
+            val = getattr(diag.token, "value", None)
+            span = len(val) if isinstance(val, str) and val else 1
+        # Clamp the span to the source line so we don't underline past the end.
+        span = max(1, min(span, max(1, len(src) - col + 1)))
 
-        line_str = str(line)
-        pad = " " * (len(line_str) + 1)
+        width = len(str(line))
+        gutter = " " * width
+        line_no = _c(str(line).rjust(width), "bright_cyan")
 
-        parts = [
-            f"{diag.level}[{line}:{col}]: {diag.message}",
-            f"{pad}|",
-            f" {line_str} | {source_line}",
-            f'{pad}| {" " * (col - 1)}^',
+        loc = f"[{line}:{col}]"
+        if code:
+            loc = f"[{line}:{col}] {code}"
+        head = _c(f"{label}{loc} {diag.message}", color)
+        lines = [
+            head,
+            f"{gutter} |",
+            f"{line_no} | {src}",
         ]
 
+        underline = "^" * span
+        marker_col = max(0, col - 1)
+        lines.append(f"{gutter} | {_c(' ' * marker_col + underline, color)}")
         if diag.note:
-            parts.append(f"{pad}| {diag.note}")
+            lines.append(_c(f"{gutter} |", "bright_black"))
+            lines.append(_c(f"{gutter} = help: {diag.note}", "bright_black"))
 
-        return "\n".join(parts)
+        return "\n".join(lines)
 
 
 class Symbol:
@@ -327,13 +520,13 @@ class SemanticAnalyzer:
         self.strict = strict
         self.enable_extensions = enable_extensions
         self.no_gc = no_gc
-        if no_gc:
-            self.globals.define(
-                "free", Symbol("builtin_func", "void", None, initialized=True)
-            )
+        self.globals.define(
+            "free", Symbol("builtin_func", "void", None, initialized=True)
+        )
         self._loaded_packages: set[str] = set()
         self._manifest_registry = get_global_registry()
         self._hook_registry = get_global_hook_registry()
+        self._hook_ctx: CompilerContext | None = None
         self._analyze_depth = 0
         self._infer_memo: dict[int, str] = {}
         self._in_iterative = False
@@ -341,6 +534,21 @@ class SemanticAnalyzer:
         self._lazy_header_cache: dict[tuple, tuple] = {}
         self._lazy_load_error: str | None = None
         self._promoted_vars: set[str] = set()
+
+    def _hook_context(self) -> CompilerContext:
+        """Build a cached CompilerContext exposing this analyzer to hooks."""
+        if self._hook_ctx is None:
+            from .extension_hooks import SourceLocation
+
+            self._hook_ctx = CompilerContext(
+                source_file=self.filepath,
+                semantic_model=self,
+                data={
+                    "analyzer": self,
+                    "workspace_root": self._workspace_root,
+                },
+            )
+        return self._hook_ctx
 
     def _load_package_manifest(self, package_dir: str, package_name: str) -> bool:
         """
@@ -375,12 +583,9 @@ class SemanticAnalyzer:
 
             # Load hooks if present
             if self._workspace_root:
-                context = {
-                    "workspace_root": self._workspace_root,
-                    "package_dir": package_dir,
-                    "package_name": package_name,
-                    "analyzer": self,
-                }
+                context = self._hook_context()
+                context.data["package_dir"] = package_dir
+                context.data["package_name"] = package_name
 
                 all_hook_files = (
                     manifest.extensions.parser_hooks
@@ -434,8 +639,82 @@ class SemanticAnalyzer:
             return node.get("_token")
         return getattr(node, "_token", None)
 
-    def error(self, message: str, node=None, note: str | None = None):
-        self.reporter.error(message, self._tok(node), note)
+    @staticmethod
+    def _levenshtein(a: str, b: str) -> int:
+        """Edit distance between two strings (Levenshtein)."""
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(
+                    min(
+                        prev[j] + 1,
+                        cur[j - 1] + 1,
+                        prev[j - 1] + (ca != cb),
+                    )
+                )
+            prev = cur
+        return prev[-1]
+
+    def _suggest(self, name: str, candidates: list[str]) -> str | None:
+        """Return the best-matching candidate for `name`, or None if none is
+        close enough. Used for 'did you mean ...?' hints."""
+        best = None
+        best_dist = None
+        for cand in candidates:
+            if cand == name:
+                continue
+            if cand.startswith("_") and not name.startswith("_"):
+                continue
+            d = self._levenshtein(name, cand)
+            if d <= 1 or (len(name) >= 4 and d <= 2):
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+                    best = cand
+        return best
+
+    def _scope_names(self) -> list[str]:
+        """All visible identifier names in the current scope chain + globals."""
+        names: set[str] = set()
+        for scope in self._scope_chain():
+            names.update(scope.symbols.keys())
+        return sorted(names)
+
+    def _scope_chain(self):
+        chain = []
+        s = getattr(self, "current_scope", None) or getattr(self, "globals", None)
+        while s is not None:
+            chain.append(s)
+            s = getattr(s, "parent", None)
+        if not chain and getattr(self, "globals", None) is not None:
+            chain.append(self.globals)
+        return chain
+
+    def error(
+        self,
+        message: str,
+        node=None,
+        note: str | None = None,
+        span: int = 0,
+        code: str | None = None,
+    ):
+        self.reporter.error(message, self._tok(node), note, span=span, code=code)
+
+    def warning(
+        self,
+        message: str,
+        node=None,
+        note: str | None = None,
+        span: int = 0,
+        code: str | None = None,
+    ):
+        self.reporter.warning(message, self._tok(node), note, span=span, code=code)
 
     def _strict_error(self, message: str, node=None, note: str | None = None):
         if self.strict:
@@ -445,8 +724,8 @@ class SemanticAnalyzer:
         if self.strict:
             self.reporter.strict_warning(message, self._tok(node), note)
 
-    _NUMERIC_TYPES = ("int", "int64", "uint64", "float", "double", "big", "char")
-    _INT_TYPES = ("int", "int64", "uint64", "char")
+    _NUMERIC_TYPES = ("int", "int64", "uint64", "float", "double", "big", "char", "size_t")
+    _INT_TYPES = ("int", "int64", "uint64", "char", "size_t")
     _FLOAT_TYPES = ("float", "double")
     _WIDE_INT_TYPES = ("int64", "uint64")
     _CONV_BUILTINS = {"str": "str", "int": "int", "float": "float", "double": "float"}
@@ -479,6 +758,8 @@ class SemanticAnalyzer:
         if t1 in self._INT_TYPES and t2 in self._INT_TYPES:
             if t1 in self._WIDE_INT_TYPES or t2 in self._WIDE_INT_TYPES:
                 return "int64"
+            if t1 == "size_t" or t2 == "size_t":
+                return "size_t"
             return "int"
         return None
 
@@ -641,10 +922,16 @@ class SemanticAnalyzer:
             if sym is None:
                 if self._report_lazy_load_error(node):
                     return None
+                note = "no definition found in this scope"
+                suggestion = self._suggest(node.name, self._scope_names())
+                if suggestion:
+                    note = f"did you mean `{suggestion}`?"
                 self.error(
                     f"use of undeclared identifier `{node.name}`",
                     node,
-                    note="no definition found in this scope",
+                    span=len(node.name),
+                    code="E1001",
+                    note=note,
                 )
                 return None
             if sym.const_value is not None:
@@ -761,7 +1048,7 @@ class SemanticAnalyzer:
             ):
                 if node.op.name in ("SHL", "SHR", "AMPERSAND", "PIPE", "CARET"):
                     # Bitwise operations not supported for big
-                    valid_int_types = ("int", "int64", "uint64")
+                    valid_int_types = ("int", "int64", "uint64", "size_t")
                     if left_t == "big" or right_t == "big":
                         self.error(
                             f"bitwise operator `{node.op.name}` not supported for `big` operands",
@@ -779,10 +1066,13 @@ class SemanticAnalyzer:
                     if left_t in ("int64", "uint64") or right_t in ("int64", "uint64"):
                         node.inferred_type = "int64"
                         return "int64"
+                    if left_t == "size_t" or right_t == "size_t":
+                        node.inferred_type = "size_t"
+                        return "size_t"
                     node.inferred_type = "int"
                     return "int"
                 # PERCENT
-                valid_int_types = ("int", "int64", "uint64", "big")
+                valid_int_types = ("int", "int64", "uint64", "big", "size_t")
                 if (left_t is not None and left_t not in valid_int_types) or (
                     right_t is not None and right_t not in valid_int_types
                 ):
@@ -804,6 +1094,9 @@ class SemanticAnalyzer:
                 if left_t in ("int64", "uint64") or right_t in ("int64", "uint64"):
                     node.inferred_type = "int64"
                     return "int64"  # Simplified: promote to int64 for mixed operations
+                if left_t == "size_t" or right_t == "size_t":
+                    node.inferred_type = "size_t"
+                    return "size_t"
                 node.inferred_type = "int"
                 return "int"
 
@@ -855,6 +1148,9 @@ class SemanticAnalyzer:
                 if left_t in ("int64", "uint64") or right_t in ("int64", "uint64"):
                     node.inferred_type = "int64"
                     return "int64"
+                if left_t == "size_t" or right_t == "size_t":
+                    node.inferred_type = "size_t"
+                    return "size_t"
                 node.inferred_type = "int"
                 return "int"
 
@@ -870,7 +1166,7 @@ class SemanticAnalyzer:
                 node.inferred_type = "int"
                 return "int"
             if node.op.name == "MINUS":
-                valid_types = ("int", "float", "double", "int64", "uint64", "big")
+                valid_types = ("int", "float", "double", "int64", "uint64", "big", "size_t")
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f"cannot apply unary minus to `{operand_t}`",
@@ -878,7 +1174,7 @@ class SemanticAnalyzer:
                         note="unary minus expects numeric type",
                     )
             if node.op.name == "TILDE":
-                valid_types = ("int", "int64", "uint64")
+                valid_types = ("int", "int64", "uint64", "size_t")
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f"bitwise NOT (`~`) not supported for `{operand_t}`",
@@ -1049,6 +1345,17 @@ class SemanticAnalyzer:
                 return operand_t + "*"
             return None
 
+        if isinstance(node, BorrowExpr):
+            operand_t = self._infer_type(node.operand)
+            resolved = self._resolve_type_alias(operand_t or "void")
+            node.inferred_type = resolved + "*"
+            return node.inferred_type
+
+        if isinstance(node, MoveExpr):
+            operand_t = self._infer_type(node.operand)
+            node.inferred_type = operand_t
+            return operand_t
+
         if isinstance(node, NewExpr):
             if node.size is not None:
                 self._infer_type(node.size)
@@ -1060,8 +1367,10 @@ class SemanticAnalyzer:
 
         if isinstance(node, CastExpr):
             self._infer_type(node.expr)
-            node.inferred_type = node.type_expr
-            return node.type_expr
+            resolved = self._resolve_type_alias(node.type_expr)
+            node.type_expr = resolved
+            node.inferred_type = resolved
+            return resolved
 
         if isinstance(node, InlineAsm):
             for _, arg_expr in node.inputs:
@@ -1099,6 +1408,12 @@ class SemanticAnalyzer:
             return [node.expr]
         if isinstance(node, CastExpr):
             return [node.expr]
+        if isinstance(node, BorrowExpr):
+            return [node.operand]
+        if isinstance(node, MoveExpr):
+            return [node.operand]
+        if isinstance(node, DeferStmt):
+            return [node.body]
         return []
 
     def _infer_combine(self, node):
@@ -1186,13 +1501,18 @@ class SemanticAnalyzer:
             )
 
     def _visit(self, node, scope: Scope | None = None):
-        for hook in self._hook_registry.get_semantic_hooks():
+        for hook in self._hook_registry.get(HookStage.SEMANTIC):
+            if not isinstance(hook, SemanticHook):
+                continue
             try:
                 if hook.should_visit_node(node):
-                    hook.visit_node(node, {"analyzer": self, "scope": scope})
+                    ctx = self._hook_context()
+                    ctx.data["scope"] = scope
+                    ctx.data["node"] = node
+                    for diag in hook.visit_node(node, ctx) or []:
+                        self._report_hook_diag(diag)
             except Exception:
                 pass
-
         if isinstance(node, FuncDef):
             self._visit_funcdef(node, scope)
         elif isinstance(node, If):
@@ -1217,6 +1537,8 @@ class SemanticAnalyzer:
             self._visit_switch(node, scope)
         elif isinstance(node, ExprStmt):
             self._infer_type(node.expr)
+        elif isinstance(node, DeferStmt):
+            self._visit(node.body, scope)
         elif isinstance(node, Import):
             self._visit_import(node)
         elif isinstance(node, StructDef):
@@ -1265,6 +1587,36 @@ class SemanticAnalyzer:
         elif isinstance(node, (list, tuple)):
             for n in node:
                 self._visit(n, scope)
+
+    def _report_hook_diag(self, diag):
+        """Surface a hook-returned Diagnostic through the local reporter."""
+        if getattr(diag, "severity", None) is None:
+            return
+        sev = diag.severity
+        note = None
+        span = 0
+        loc = getattr(diag, "location", None)
+        tok = None
+        if loc is not None and loc.line is not None:
+            # Build a lightweight token so the reporter can point at the line.
+            class _Tok:
+                pass
+            t = _Tok()
+            t.line = loc.line
+            t.column = loc.column or 1
+            t.value = ""
+            tok = t
+        notes = getattr(diag, "notes", None) or []
+        if notes:
+            note = "; ".join(notes)
+        code = getattr(diag, "code", None)
+        if sev in (DiagnosticSeverity.ERROR, DiagnosticSeverity.FATAL):
+            self.reporter.error(diag.message, tok, note, span=span, code=code)
+        elif sev == DiagnosticSeverity.WARNING:
+            self.reporter.warning(diag.message, tok, note, span=span, code=code)
+        elif sev == DiagnosticSeverity.NOTE:
+            self.reporter.warning(diag.message, tok, note, span=span, code=code)
+
 
     def _resolve_module_path(
         self, module: str, sdk_path: str | None = None
@@ -1808,8 +2160,463 @@ class SemanticAnalyzer:
         for stmt in node.body:
             self._visit(stmt, self.locals)
 
+        self._check_ownership(node.body, node)
+        self._check_lints(node.body, node)
+
         self.current_func = old_func
         self.locals = old_locals
+
+    def _check_lints(self, body, fn):
+        """Hygiene lints: unused-local warnings, unreachable-code warnings, and
+        a missing-return error for non-void functions that can fall off the end.
+
+        All diagnostics here are advisory (best-effort over simple control flow)
+        and are gated so they never break a valid compile: unused/unreachable are
+        warnings; a definitely-missing return is an error only when the function
+        has no `return` statement anywhere in its body.
+        """
+        reads: set = set()
+        declared: list = []  # (name, VarDecl-node)
+        written: set = set()
+        terminates: set = set()  # names of `return`-terminated statements
+        has_return = [False]
+
+        def walk(stmt, terminated):
+            """Return True if the rest of the enclosing block is unreachable."""
+            if isinstance(stmt, Return):
+                has_return[0] = True
+                names = set()
+                _collect(stmt.value, names)
+                reads.update(names)
+                return True
+            if isinstance(stmt, (Break, Continue, Raise)):
+                return True
+            if isinstance(stmt, VarDecl):
+                if stmt.name and not stmt.name.startswith("_"):
+                    declared.append((stmt.name, stmt, terminated))
+                # reads capture the RHS
+                names = set()
+                _collect(stmt.init, names)
+                reads.update(names)
+                return False
+            if isinstance(stmt, Assign):
+                if isinstance(stmt.target, Variable):
+                    written.add(stmt.target.name)
+                else:
+                    # e.g. `*p = v` or `arr[i] = v` — the base of the target is a
+                    # read of the underlying variable.
+                    names = set()
+                    _collect(stmt.target, names)
+                    reads.update(names)
+                names = set()
+                _collect(stmt.value, names)
+                reads.update(names)
+                return False
+            if isinstance(stmt, Print):
+                for arg in stmt.value:
+                    names = set()
+                    _collect(arg, names)
+                    reads.update(names)
+                return False
+            if isinstance(stmt, ExprStmt):
+                names = set()
+                _collect(stmt.expr, names)
+                reads.update(names)
+                return False
+            if isinstance(stmt, DeferStmt):
+                names = set()
+                _collect(stmt.body, names)
+                reads.update(names)
+                return False
+            if isinstance(stmt, If):
+                names = set()
+                _collect(stmt.cond, names)
+                reads.update(names)
+                then_ret = False
+                els_ret = False
+                for s in stmt.body:
+                    then_ret = walk(s, then_ret) or then_ret
+                for s in getattr(stmt, "orelse", None) or []:
+                    els_ret = walk(s, els_ret) or els_ret
+                # If the condition is a constant true/false, the other branch is
+                # unreachable; otherwise fall through only if both branches return.
+                return then_ret and els_ret
+            if isinstance(stmt, While):
+                names = set()
+                _collect(stmt.cond, names)
+                reads.update(names)
+                for s in stmt.body:
+                    walk(s, False)
+                # a `while True:` without a break is non-terminating; treat as
+                # terminating only if the loop body is unreachable-agnostic.
+                return False
+            if isinstance(stmt, Switch):
+                for branch in getattr(stmt, "cases", []):
+                    names = set()
+                    _collect(branch[0], names)
+                    reads.update(names)
+                    for s in branch[1]:
+                        walk(s, False)
+                return False
+            # default container
+            for child in getattr(stmt, "body", None) or []:
+                walk(child, False)
+            return False
+
+        def _collect(node, acc):
+            if node is None:
+                return
+            if isinstance(node, Variable):
+                acc.add(node.name)
+                return
+            for child in self._infer_children(node):
+                _collect(child, acc)
+            # Some expression nodes aren't covered by _infer_children (e.g.
+            # print args, move/borrow operands).
+            for attr in ("operand", "expr"):
+                child = getattr(node, attr, None)
+                if child is not None and not isinstance(child, Variable):
+                    _collect(child, acc)
+
+        for stmt in body:
+            terminated = walk(stmt, False)
+            # If a statement sets terminated True, subsequent statements in the
+            # same block are unreachable — handled via the walker's signal.
+            if terminated:
+                continue
+        # Unreachable-code warning: statements in a block after a terminator.
+        self._warn_unreachable(body)
+
+        # Unused-local warnings (only for locals, skipping params/_ -prefixed).
+        param_names = set(fn.params.keys())
+        for name, node, _term in declared:
+            if name in param_names or name.startswith("_"):
+                continue
+            if name in reads:
+                continue
+            self.warning(
+                f"local `{name}` is assigned but never used",
+                node,
+                span=len(name),
+                code="W1001",
+                note="remove it, or prefix with `_` to silence this warning",
+            )
+
+        # Missing-return lint: a non-void function that has no `return` at all.
+        # cpyte implicitly returns 0, so this is advisory rather than a fatal
+        # error — it flags a likely-intended `return <value>` omission.
+        rettype = fn.rettype
+        if (
+            rettype
+            and rettype not in ("void", "auto", "dynamic", "decorated")
+            and not has_return[0]
+        ):
+            self.warning(
+                f"missing `return` in function `{fn.name}` returning `{rettype}`; "
+                f"it will implicitly return 0",
+                fn,
+                span=0,
+                code="W1002",
+                note="add a `return <value>` before the end of the function body",
+            )
+
+    def _warn_unreachable(self, body):
+        for stmt in body:
+            if isinstance(stmt, (Return, Break, Continue, Raise)):
+                idx = body.index(stmt) + 1
+                for after in body[idx:]:
+                    self.warning(
+                        "unreachable code",
+                        after,
+                        span=1,
+                        code="W1003",
+                        note="this statement follows a return/break/continue and "
+                        "will never run",
+                    )
+                break
+            if isinstance(stmt, If):
+                self._warn_unreachable(stmt.body)
+                self._warn_unreachable(getattr(stmt, "orelse", None) or [])
+            elif isinstance(stmt, While):
+                self._warn_unreachable(stmt.body)
+            elif isinstance(stmt, Switch):
+                for branch in getattr(stmt, "cases", []):
+                    self._warn_unreachable(branch[1])
+            elif hasattr(stmt, "body") and isinstance(stmt.body, list):
+                self._warn_unreachable(stmt.body)
+
+    def _check_ownership(self, body, fn):
+        """Intra-procedural ownership + memory analysis (supportive, not a
+        full sound borrow checker).
+
+        Tracks, per named variable, whether it holds a `new` allocation and
+        whether it has been freed/moved. Emits:
+          * warning when a `new`-allocated variable is never freed (unmanaged
+            memory / leak),
+          * warning when a `new`-allocated variable is overwritten without
+            freeing it first,
+          * error when a variable is used after `move`,
+          * warning when a value is mutated while it has an outstanding
+            immutable borrow.
+        Because cpyte has no runtime ownership metadata, this is best-effort
+        static analysis over the function's statement list, walking into
+        branch/loop bodies sequentially.
+        """
+        # state: name -> 'owned' | 'freed' | 'moved' | 'plain'
+        # borrowed: name -> set of "ro"/"mut" outstanding borrows
+        state: dict = {}
+        borrowed: dict = {}
+        visited: set = set()
+
+        def is_new_expr(v):
+            if isinstance(v, NewExpr):
+                return True
+            if isinstance(v, CastExpr):
+                return is_new_expr(v.expr)
+            if isinstance(v, BorrowExpr) or isinstance(v, MoveExpr):
+                return False
+            return False
+
+        def free_target(v):
+            """If expression is a free()/deferring-free call over a variable,
+            return the variable name, else None."""
+            val = v
+            if isinstance(val, DeferStmt):
+                val = val.body
+            if isinstance(val, ExprStmt):
+                val = val.expr
+            if (
+                isinstance(val, Call)
+                and isinstance(val.callee, Variable)
+                and val.callee.name == "free"
+                and len(val.args) == 1
+                and isinstance(val.args[0], Variable)
+            ):
+                return val.args[0].name
+            return None
+
+        def used_names(v, acc):
+            if isinstance(v, Variable):
+                acc.add(v.name)
+            for child in self._infer_children(v):
+                used_names(child, acc)
+
+        def mark_owned(name, node):
+            if state.get(name) == "owned":
+                self.warning(
+                    f"unmanaged memory: `{name}` already holds a `new` allocation "
+                    f"that is never freed before being overwritten",
+                    node,
+                    note=f"use `free({name})` (or `defer free({name})`) before reassigning",
+                )
+            state[name] = "owned"
+
+        def walk_stmt(stmt, frame):
+            if id(stmt) in visited:
+                return
+            if isinstance(stmt, VarDecl):
+                if is_new_expr(stmt.init):
+                    mark_owned(stmt.name, stmt)
+                elif isinstance(stmt.init, MoveExpr) and isinstance(
+                    stmt.init.operand, Variable
+                ):
+                    src = stmt.init.operand.name
+                    if state.get(src) == "moved":
+                        self.error(
+                            f"`{src}` is already moved",
+                            stmt,
+                            note="cannot move a value that has already been moved",
+                        )
+                    if state.get(stmt.name) == "owned":
+                        self.warning(
+                            f"assigning `move {src}` to `{stmt.name}` drops its previous "
+                            f"`new` allocation without freeing it",
+                            stmt,
+                        )
+                    state[stmt.name] = state.get(src) or "plain"
+                    state[src] = "moved"
+                elif isinstance(stmt.init, BorrowExpr) and isinstance(
+                    stmt.init.operand, Variable
+                ):
+                    borrowed.setdefault(stmt.init.operand.name, set()).add(
+                        "mut" if stmt.init.mutable else "ro"
+                    )
+                return
+            if isinstance(stmt, Assign):
+                if isinstance(stmt.target, Variable):
+                    name = stmt.target.name
+                    if "ro" in borrowed.get(name, set()):
+                        self.warning(
+                            f"mutating `{name}` while it is immutably borrowed",
+                            stmt,
+                            note=f"`borrow {name}` forbids mutation until the borrow ends",
+                        )
+                    if state.get(name) == "moved":
+                        self.error(
+                            f"cannot reinitialize `{name}`; it was already moved",
+                            stmt,
+                        )
+                    if is_new_expr(stmt.value):
+                        mark_owned(name, stmt)
+                    elif isinstance(stmt.value, MoveExpr) and isinstance(
+                        stmt.value.operand, Variable
+                    ):
+                        src = stmt.value.operand.name
+                        if state.get(src) == "moved":
+                            self.error(
+                                f"`{src}` is already moved",
+                                stmt,
+                                note="cannot move a value that has already been moved",
+                            )
+                        if state.get(name) == "owned":
+                            self.warning(
+                                f"moving `{src}` into `{name}` drops its previous "
+                                f"`new` allocation without freeing it",
+                                stmt,
+                            )
+                        st = state.get(src) or "plain"
+                        state[name] = st
+                        state[src] = "moved"
+                    else:
+                        if state.get(name) == "owned":
+                            # reassigning to a non-freed owned var leaks the old
+                            # allocation unless it is an internal pointer update.
+                            self.warning(
+                                f"unmanaged memory: reassigning `{name}` discards its "
+                                f"previous `new` allocation without freeing it",
+                                stmt,
+                                note=f"call `free({name})` first (e.g. `defer free({name})`)",
+                            )
+                    if isinstance(stmt.value, BorrowExpr) and isinstance(
+                        stmt.value.operand, Variable
+                    ):
+                        borrowed.setdefault(stmt.value.operand.name, set()).add(
+                            "mut" if stmt.value.mutable else "ro"
+                        )
+                return
+            if isinstance(stmt, Return):
+                return
+            if isinstance(stmt, Print):
+                names = set()
+                for arg in stmt.value:
+                    if isinstance(arg, (list, tuple)):
+                        for item in arg:
+                            used_names(item, names)
+                    else:
+                        used_names(arg, names)
+                for n in names:
+                    if state.get(n) == "moved":
+                        self.error(
+                            f"use of `{n}` after it was moved",
+                            stmt,
+                            note="`move` transfers ownership; the value is no longer valid",
+                        )
+                return
+            if isinstance(stmt, (If, While)):
+                for s in stmt.body:
+                    walk_stmt(s, frame)
+                for s in getattr(stmt, "orelse", None) or []:
+                    walk_stmt(s, frame)
+                return
+            if isinstance(stmt, DeferStmt):
+                ft = free_target(stmt)
+                if ft is not None:
+                    if not self.no_gc:
+                        self.warning(
+                            f"manual `free({ft})` while the GC is enabled",
+                            stmt,
+                            note="GC-managed `new` allocations are reclaimed by the GC; "
+                            "manually freeing them risks a double-free. Mark this "
+                            "module `#nogc` to manage memory manually.",
+                        )
+                    if state.get(ft) == "freed":
+                        self.warning(
+                            f"`{ft}` is already freed", stmt,
+                            note="double-free of a `new` allocation",
+                        )
+                    state[ft] = "freed"
+                else:
+                    walk_stmt(stmt.body, frame)
+                return
+            if isinstance(stmt, ExprStmt):
+                e = stmt.expr
+                ft = free_target(stmt)
+                if ft is not None:
+                    if not self.no_gc:
+                        self.warning(
+                            f"manual `free({ft})` while the GC is enabled",
+                            stmt,
+                            note="GC-managed `new` allocations are reclaimed by the GC; "
+                            "manually freeing them risks a double-free. Mark this "
+                            "module `#nogc` to manage memory manually.",
+                        )
+                    if state.get(ft) == "freed":
+                        self.warning(
+                            f"`{ft}` is freed more than once", stmt,
+                            note="double-free of a `new` allocation",
+                        )
+                    elif state.get(ft) not in ("owned", None):
+                        self.warning(
+                            f"`free({ft})` called on a value that was not allocated "
+                            f"with `new` in this function", stmt,
+                        )
+                    state[ft] = "freed"
+                    return
+                # Generic expression walking: detect moves, borrows, use-after-move.
+                if isinstance(e, MoveExpr) and isinstance(e.operand, Variable):
+                    name = e.operand.name
+                    state[name] = "moved"
+                    return
+                if isinstance(e, BorrowExpr) and isinstance(e.operand, Variable):
+                    b = borrowed.setdefault(e.operand.name, set())
+                    b.add("mut" if e.mutable else "ro")
+                    return
+                # plain expression statement — detect use-after-move + mutation of
+                # immutably-borrowed vars.
+                names = set()
+                used_names(e, names)
+                for n in names:
+                    if state.get(n) == "moved":
+                        self.error(
+                            f"use of `{n}` after it was moved",
+                            stmt,
+                            note="`move` transfers ownership; the value is no longer valid",
+                        )
+                # detect writes to immutably-borrowed variables (best effort)
+                tgt = None
+                if isinstance(e, Assign):
+                    if isinstance(e.target, Variable):
+                        tgt = e.target.name
+                elif isinstance(e, Call) and isinstance(e.callee, Variable):
+                    pass
+                if tgt is not None and "ro" in borrowed.get(tgt, set()):
+                    self.warning(
+                        f"mutating `{tgt}` while it is immutably borrowed",
+                        stmt,
+                        note="`borrow {tgt}` forbids mutation until the borrow ends",
+                    )
+                return
+            # fallback: recurse into known container bodies
+            for child in getattr(stmt, "body", None) or []:
+                if isinstance(child, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)):
+                    walk_stmt(child, frame)
+
+        for stmt in body:
+            if not isinstance(stmt, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)):
+                continue
+            walk_stmt(stmt, fn)
+
+        # Final leak warning for allocations still owned at function end.
+        # Only meaningful without the GC: with the GC enabled, `new` memory is
+        # reclaimed automatically, so a manual "leak" is not an actual leak.
+        if self.no_gc:
+            for name, st in state.items():
+                if st == "owned":
+                    self.warning(
+                        f"unmanaged memory: `new` allocation held by `{name}` is never freed",
+                        fn,
+                        note=f"add `defer free({name})` to release it on scope exit",
+                    )
 
     def _visit_if(self, node: If, scope: Scope | None = None):
         self._infer_type(node.cond)
@@ -2523,8 +3330,6 @@ class SemanticAnalyzer:
         if sym and sym.kind == "type_alias":
             return self._resolve_type_alias(sym.type)
         return type_name
-
-
 def analyze(
     source: str,
     nodes: list,
@@ -2544,5 +3349,14 @@ def analyze(
     if enable_extensions:
         analyzer._load_cpm_package_manifests()
     if not analyzer.analyze(nodes):
-        return analyzer.reporter.display(), None
-    return None, analyzer._generic_instantiations
+        return analyzer.reporter.display(), None, analyzer._generic_instantiations
+    # No errors, but there may be warnings to surface.
+    warnings_txt = ""
+    warn_texts = [
+        d
+        for d in analyzer.reporter.diagnostics
+        if d.level in ("warning", "strict-warning")
+    ]
+    if warn_texts:
+        warnings_txt = analyzer.reporter.display()
+    return None, warnings_txt or None, analyzer._generic_instantiations

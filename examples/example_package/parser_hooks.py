@@ -12,10 +12,7 @@ from cpyte.extension_hooks import ParserHook
 
 class AsyncParserHook(ParserHook):
     """Parser hook for async/await syntax."""
-    
-    def __init__(self, package_name: str, hook_path: str = None):
-        super().__init__(package_name, hook_path)
-    
+
     def should_handle_statement(self, tokens, pos):
         """Check if this is an async function definition."""
         if pos < len(tokens) and tokens[pos].value == 'async':
@@ -23,20 +20,20 @@ class AsyncParserHook(ParserHook):
             if pos + 1 < len(tokens) and tokens[pos + 1].value == 'def':
                 return True
         return False
-    
+
     def parse_statement(self, tokens, pos, context):
         """Parse async def statement."""
         # Skip 'async' keyword
         pos += 1
-        
+
         # Parse as regular function but mark as async
         from cpyte.astparse import parse_def
-        
+
         node, new_pos = parse_def(tokens, pos)
         node.is_async = True  # Add custom attribute
-        
+
         return node, new_pos
-    
+
     def initialize(self, context):
         """Initialize the parser hook."""
 

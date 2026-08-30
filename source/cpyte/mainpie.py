@@ -14,7 +14,7 @@ if __package__:
         run_jit,
         run_scorpion,
     )
-    from .extension_hooks import HookLoader, get_global_hook_registry
+    from .extension_hooks import HookLoader, HookStage, get_global_hook_registry
     from .lexar import Lexer, LexerError, register_keywords
     from .linker import Linker
     from .package_manifest import (
@@ -39,7 +39,7 @@ else:
         run_jit,
         run_scorpion,
     )
-    from cpyte.extension_hooks import HookLoader, get_global_hook_registry
+    from cpyte.extension_hooks import HookLoader, HookStage, get_global_hook_registry
     from cpyte.lexar import Lexer, LexerError, register_keywords
     from cpyte.linker import Linker
     from cpyte.package_manifest import (
@@ -266,7 +266,6 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
         return
 
     manifest_registry = get_global_registry()
-    hook_registry = get_global_hook_registry()
 
     # Load all available packages in the workspace
     for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
@@ -288,27 +287,43 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
             # Register manifest
             manifest_registry.register(manifest)
 
-            # Load hooks if present
-            all_hook_files = (
-                manifest.extensions.parser_hooks
-                + manifest.extensions.semantic_hooks
-                + manifest.extensions.codegen_hooks
-                + manifest.extensions.runtime_hooks
-            )
-
-            if all_hook_files:
-                context = {
-                    "workspace_root": workspace_root,
-                    "package_dir": version_dir,
-                    "package_name": package_name,
-                }
-
-                HookLoader.load_hooks_from_package(
-                    package_name, version_dir, all_hook_files, hook_registry, context
-                )
+            # Note: hooks are NOT loaded here. Per the "hooks only when
+            # imported" rule, a package's extension hooks are introduced by the
+            # semantic analyzer when the package is actually imported. This
+            # function only registers the manifest (for import resolution) and
+            # any lexer keywords so imports of that package resolve correctly.
 
         except Exception as e:
             ui.print_warn(f"Failed to load package manifest for '{package_name}': {e}")
+
+
+_DEEP_INTEGRATION_STAGES = {
+    HookStage.LEXER,
+    HookStage.PARSER,
+    HookStage.SEMANTIC,
+    HookStage.TRANSFORM,
+    HookStage.CODEGEN,
+    HookStage.OPTIMIZE,
+    HookStage.LINK,
+    HookStage.RUNTIME,
+}
+
+
+def _notify_deep_hook_usage() -> None:
+    """Emit a small notice when packages integrate into compiler internals."""
+    registry = get_global_hook_registry()
+    deep = [
+        hook
+        for hook in registry.all()
+        if hook.stage in _DEEP_INTEGRATION_STAGES
+    ]
+    if not deep:
+        return
+    names = sorted({hook.package_name for hook in deep})
+    ui.print_status(
+        "deep extension integration active: "
+        + ", ".join(names)
+    )
 
 
 def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=False):
@@ -323,7 +338,7 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=Fal
     except (LexerError, ParseError) as e:
         ui.print_err(f"parse error: {e}")
         sys.exit(1)
-    result, generic_instantiations = analyze(
+    result, warnings_txt, generic_instantiations = analyze(
         source,
         parsed,
         strict=strict,
@@ -332,8 +347,12 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=Fal
         no_gc=no_gc,
     )
     if result:
-        ui.print_err(result)
+        sys.stderr.write(result + ("\n" if result else ""))
         sys.exit(1)
+    if warnings_txt:
+        sys.stderr.write(warnings_txt.strip() + "\n")
+    if enable_extensions:
+        _notify_deep_hook_usage()
     return parsed, generic_instantiations
 
 

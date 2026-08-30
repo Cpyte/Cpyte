@@ -1,465 +1,1115 @@
 """
-Extension hooks framework for Cpyte package extensions.
+Cpyte Compiler Extension Framework.
 
-This module provides the hook system that allows packages to extend the compiler
-at various stages: lexing, parsing, semantic analysis, and code generation.
+Provides a stable extension API for packages that need to participate in
+compilation without modifying the Cpyte compiler itself.
+
+Extension stages:
+
+    lifecycle
+        ↓
+    lexer
+        ↓
+    parser
+        ↓
+    semantic
+        ↓
+    AST transformation
+        ↓
+    codegen
+        ↓
+    optimization
+        ↓
+    linking
+        ↓
+    runtime
+
+Extensions are ordinary Python packages loaded by HookLoader.
 """
+
+from __future__ import annotations
 
 import importlib.util
 import os
-import sys
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, IntEnum
 from typing import Any, Generic, TypeVar
 
-# =============================================================================
-# Hook Base Classes
-# =============================================================================
+# ============================================================================
+# Diagnostics
+# ============================================================================
 
-class CompilerHook(ABC):
-    """Base class for all compiler hooks."""
-    
-    def __init__(self, package_name: str, hook_path: str | None = None):
-        self.package_name = package_name
-        self.hook_path = hook_path
-        self.enabled = True
-    
-    @abstractmethod
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the hook with compiler context."""
-    
-    def disable(self) -> None:
-        """Disable this hook."""
-        self.enabled = False
-    
-    def enable(self) -> None:
-        """Enable this hook."""
-        self.enabled = True
+class DiagnosticSeverity(IntEnum):
+    NOTE = 0
+    WARNING = 1
+    ERROR = 2
+    FATAL = 3
 
 
-class LexerHook(CompilerHook):
-    """Hook for extending the lexer with custom tokens and keywords."""
-    
-    def get_additional_keywords(self) -> set[str]:
-        """Return set of additional keywords this hook provides."""
-        return set()
-    
-    def get_additional_operators(self) -> set[str]:
-        """Return set of additional operators this hook provides."""
-        return set()
-    
-    def should_customize_token(self, token_type: str, token_value: str) -> bool:
-        """Return True if this hook wants to customize a given token."""
-        return False
-    
-    def customize_token(self, token_type: str, token_value: str, line: int, column: int) -> dict[str, Any] | None:
-        """Customize a token, returning modified token data or None to keep original."""
-        return None
-    
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the lexer hook with compiler context."""
+@dataclass(slots=True)
+class SourceLocation:
+    file: str | None = None
+    line: int | None = None
+    column: int | None = None
+    end_line: int | None = None
+    end_column: int | None = None
 
 
-class ParserHook(CompilerHook):
-    """Hook for extending the parser with custom syntax."""
-    
-    def should_handle_expression(self, tokens: list[Any], pos: int) -> bool:
-        """Return True if this hook wants to handle expression parsing at current position."""
-        return False
-    
-    def parse_expression(self, tokens: list[Any], pos: int, context: dict[str, Any]) -> tuple:
-        """
-        Parse a custom expression.
-        
-        Returns:
-            Tuple of (parsed_node, new_position)
-        """
-        raise NotImplementedError("Parser hook must implement parse_expression")
-    
-    def should_handle_statement(self, tokens: list[Any], pos: int) -> bool:
-        """Return True if this hook wants to handle statement parsing at current position."""
-        return False
-    
-    def parse_statement(self, tokens: list[Any], pos: int, context: dict[str, Any]) -> tuple:
-        """
-        Parse a custom statement.
-        
-        Returns:
-            Tuple of (parsed_node, new_position)
-        """
-        raise NotImplementedError("Parser hook must implement parse_statement")
-    
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the parser hook with compiler context."""
+@dataclass(slots=True)
+class Diagnostic:
+    severity: DiagnosticSeverity
+    message: str
+    location: SourceLocation | None = None
+    code: str | None = None
+    package: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+    @classmethod
+    def error(
+        cls,
+        message: str,
+        *,
+        code: str | None = None,
+        location: SourceLocation | None = None,
+        package: str | None = None,
+    ) -> Diagnostic:
+        return cls(
+            DiagnosticSeverity.ERROR,
+            message,
+            location,
+            code,
+            package,
+        )
+
+    @classmethod
+    def warning(
+        cls,
+        message: str,
+        *,
+        code: str | None = None,
+        location: SourceLocation | None = None,
+        package: str | None = None,
+    ) -> Diagnostic:
+        return cls(
+            DiagnosticSeverity.WARNING,
+            message,
+            location,
+            code,
+            package,
+        )
 
 
-class SemanticHook(CompilerHook):
-    """Hook for extending semantic analysis with custom type checking and rules."""
-    
-    def should_visit_node(self, node: Any) -> bool:
-        """Return True if this hook wants to analyze a specific node type."""
-        return False
-    
-    def visit_node(self, node: Any, context: dict[str, Any]) -> list[str] | None:
-        """
-        Analyze a node and return list of error messages, or None if no errors.
-        
-        Returns:
-            List of error messages, or None/empty list if no errors
-        """
-        return None
-    
-    def get_custom_type_rules(self) -> dict[str, Callable]:
-        """Return custom type checking rules."""
-        return {}
-    
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the semantic hook with compiler context."""
-
-
-class CodegenHook(CompilerHook):
-    """Hook for extending code generation with custom IR emission."""
-    
-    def should_emit_node(self, node: Any) -> bool:
-        """Return True if this hook wants to handle code generation for a node."""
-        return False
-    
-    def emit_node(self, node: Any, builder: Any, context: dict[str, Any]) -> Any:
-        """
-        Generate custom IR for a node.
-        
-        Returns:
-            The generated IR value or None
-        """
-        raise NotImplementedError("Codegen hook must implement emit_node")
-    
-    def should_add_module_passes(self) -> bool:
-        """Return True if this hook wants to add custom optimization passes."""
-        return False
-    
-    def add_module_passes(self, pass_manager: Any, context: dict[str, Any]) -> None:
-        """Add custom optimization passes to the pass manager."""
-    
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the codegen hook with compiler context."""
-
-
-class RuntimeHook(CompilerHook):
-    """Hook for extending runtime behavior."""
-    
-    def get_runtime_code(self) -> str | None:
-        """Return additional runtime code as string, or None."""
-        return None
-    
-    def get_runtime_libraries(self) -> list[str]:
-        """Return list of additional runtime libraries to link."""
-        return []
-    
-    def initialize(self, context: dict[str, Any]) -> None:
-        """Initialize the runtime hook with compiler context."""
-
-
-# =============================================================================
-# Hook Registry
-# =============================================================================
-
-H = TypeVar('H', bound=CompilerHook)
-
+# ============================================================================
+# Compiler Context
+# ============================================================================
 
 @dataclass
-class HookRegistration(Generic[H]):
-    """Represents a registered hook with its metadata."""
-    hook: H
-    priority: int  # Higher priority hooks run first
-    package_name: str
-    hook_path: str | None = None
+class CompilerContext:
+    """
+    Shared compiler state exposed to extensions.
 
+    Extensions should prefer using the explicit fields below instead of
+    relying on arbitrary dictionary keys. `data` exists for extension-
+    specific state.
+    """
+
+    source_file: str | None = None
+    target: str | None = None
+    platform: str | None = None
+    architecture: str | None = None
+    optimization_level: int = 0
+    debug: bool = False
+
+    ast: Any = None
+    semantic_model: Any = None
+    llvm_module: Any = None
+
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+
+    include_paths: list[str] = field(default_factory=list)
+    library_paths: list[str] = field(default_factory=list)
+    libraries: list[str] = field(default_factory=list)
+
+    compiler_flags: list[str] = field(default_factory=list)
+    linker_flags: list[str] = field(default_factory=list)
+    defines: dict[str, str | None] = field(default_factory=dict)
+
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def emit(
+        self,
+        severity: DiagnosticSeverity,
+        message: str,
+        *,
+        code: str | None = None,
+        location: SourceLocation | None = None,
+        package: str | None = None,
+    ) -> Diagnostic:
+        diagnostic = Diagnostic(
+            severity=severity,
+            message=message,
+            location=location,
+            code=code,
+            package=package,
+        )
+        self.diagnostics.append(diagnostic)
+        return diagnostic
+
+    def error(self, message: str, **kwargs: Any) -> Diagnostic:
+        return self.emit(DiagnosticSeverity.ERROR, message, **kwargs)
+
+    def warning(self, message: str, **kwargs: Any) -> Diagnostic:
+        return self.emit(DiagnosticSeverity.WARNING, message, **kwargs)
+
+    def note(self, message: str, **kwargs: Any) -> Diagnostic:
+        return self.emit(DiagnosticSeverity.NOTE, message, **kwargs)
+
+
+# ============================================================================
+# Hook Metadata
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class HookMetadata:
+    """
+    Metadata used by the registry to order and validate extensions.
+    """
+
+    name: str
+    version: str = "0.0.0"
+    priority: int = 0
+
+    requires: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+
+    description: str = ""
+
+
+# ============================================================================
+# Compiler Stages
+# ============================================================================
+
+class HookStage(Enum):
+    LIFECYCLE = "lifecycle"
+    LEXER = "lexer"
+    PARSER = "parser"
+    SEMANTIC = "semantic"
+    TRANSFORM = "transform"
+    CODEGEN = "codegen"
+    OPTIMIZE = "optimize"
+    LINK = "link"
+    RUNTIME = "runtime"
+
+
+# ============================================================================
+# Base Hook
+# ============================================================================
+
+class CompilerHook(ABC):
+
+    stage: HookStage | None = None
+
+    def __init__(
+        self,
+        package_name: str,
+        *,
+        metadata: HookMetadata | None = None,
+    ):
+        self.package_name = package_name
+        self.metadata = metadata or HookMetadata(name=package_name)
+
+        self.hook_path: str | None = None
+        self.enabled = True
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    @property
+    def priority(self) -> int:
+        return self.metadata.priority
+
+    def initialize(self, context: CompilerContext) -> None:
+        pass
+
+    def shutdown(self, context: CompilerContext) -> None:
+        pass
+
+    def enable(self) -> None:
+        self.enabled = True
+
+    def disable(self) -> None:
+        self.enabled = False
+
+
+# ============================================================================
+# Lexer
+# ============================================================================
+
+class LexerHook(CompilerHook):
+
+    stage = HookStage.LEXER
+
+    def get_additional_keywords(self) -> set[str]:
+        return set()
+
+    def get_additional_operators(self) -> set[str]:
+        return set()
+
+    def should_customize_token(
+        self,
+        token_type: str,
+        token_value: str,
+    ) -> bool:
+        return False
+
+    def customize_token(
+        self,
+        token_type: str,
+        token_value: str,
+        line: int,
+        column: int,
+    ) -> dict[str, Any] | None:
+        return None
+
+
+# ============================================================================
+# Parser
+# ============================================================================
+
+class ParserHook(CompilerHook):
+
+    stage = HookStage.PARSER
+
+    def should_handle_expression(
+        self,
+        tokens: list[Any],
+        position: int,
+    ) -> bool:
+        return False
+
+    def parse_expression(
+        self,
+        tokens: list[Any],
+        position: int,
+        context: CompilerContext,
+    ) -> tuple[Any, int]:
+        raise NotImplementedError
+
+    def should_handle_statement(
+        self,
+        tokens: list[Any],
+        position: int,
+    ) -> bool:
+        return False
+
+    def parse_statement(
+        self,
+        tokens: list[Any],
+        position: int,
+        context: CompilerContext,
+    ) -> tuple[Any, int]:
+        raise NotImplementedError
+
+
+# ============================================================================
+# Semantic Analysis
+# ============================================================================
+
+class SemanticHook(CompilerHook):
+
+    stage = HookStage.SEMANTIC
+
+    def should_visit_node(self, node: Any) -> bool:
+        return False
+
+    def visit_node(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> list[Diagnostic]:
+        return []
+
+    def get_custom_type_rules(self) -> dict[str, Callable[..., Any]]:
+        return {}
+
+    def can_convert(
+        self,
+        source_type: Any,
+        target_type: Any,
+        context: CompilerContext,
+    ) -> bool | None:
+        """
+        Return:
+
+            True  -> conversion is supported
+            False -> conversion is explicitly rejected
+            None  -> hook does not know
+        """
+        return None
+
+    def infer_type(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> Any | None:
+        return None
+
+
+# ============================================================================
+# AST Transformation
+# ============================================================================
+
+class TransformHook(CompilerHook):
+
+    stage = HookStage.TRANSFORM
+
+    def should_transform(self, node: Any) -> bool:
+        return False
+
+    def transform_node(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> Any:
+        return node
+
+    def transform_module(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> Any:
+        return module
+
+
+# ============================================================================
+# Symbol / Import Resolution
+# ============================================================================
+
+class SymbolResolverHook(CompilerHook):
+
+    """
+    Allows packages to provide external symbols, imports, SDKs, headers,
+    generated declarations, etc.
+    """
+
+    stage = HookStage.SEMANTIC
+
+    def can_resolve_import(self, name: str) -> bool:
+        return False
+
+    def resolve_import(
+        self,
+        name: str,
+        context: CompilerContext,
+    ) -> Any | None:
+        return None
+
+    def can_resolve_symbol(self, name: str) -> bool:
+        return False
+
+    def resolve_symbol(
+        self,
+        name: str,
+        context: CompilerContext,
+    ) -> Any | None:
+        return None
+
+
+# ============================================================================
+# Code Generation
+# ============================================================================
+
+class CodegenHook(CompilerHook):
+
+    stage = HookStage.CODEGEN
+
+    def should_emit_node(self, node: Any) -> bool:
+        return False
+
+    def emit_node(
+        self,
+        node: Any,
+        builder: Any,
+        context: CompilerContext,
+    ) -> Any:
+        raise NotImplementedError
+
+    def before_codegen(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> None:
+        pass
+
+    def after_codegen(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> None:
+        pass
+
+
+# ============================================================================
+# Optimization
+# ============================================================================
+
+class OptimizeHook(CompilerHook):
+
+    stage = HookStage.OPTIMIZE
+
+    def should_add_passes(self, context: CompilerContext) -> bool:
+        return False
+
+    def add_module_passes(
+        self,
+        pass_manager: Any,
+        context: CompilerContext,
+    ) -> None:
+        pass
+
+    def optimize_module(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> Any:
+        return module
+
+
+# ============================================================================
+# Build / Linking
+# ============================================================================
+
+class BuildHook(CompilerHook):
+
+    stage = HookStage.LINK
+
+    def get_include_paths(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+    def get_library_paths(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+    def get_libraries(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+    def get_defines(
+        self,
+        context: CompilerContext,
+    ) -> dict[str, str | None]:
+        return {}
+
+    def get_compiler_flags(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+    def get_linker_flags(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+
+# ============================================================================
+# Runtime
+# ============================================================================
+
+class RuntimeHook(CompilerHook):
+
+    stage = HookStage.RUNTIME
+
+    def get_runtime_code(
+        self,
+        context: CompilerContext,
+    ) -> str | None:
+        return None
+
+    def get_runtime_files(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+    def get_runtime_libraries(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        return []
+
+
+# ============================================================================
+# Lifecycle
+# ============================================================================
+
+class LifecycleHook(CompilerHook):
+
+    stage = HookStage.LIFECYCLE
+
+    def before_compile(self, context: CompilerContext) -> None:
+        pass
+
+    def after_compile(self, context: CompilerContext) -> None:
+        pass
+
+    def on_compile_error(self, context: CompilerContext) -> None:
+        pass
+
+
+# ============================================================================
+# Registration
+# ============================================================================
+
+H = TypeVar("H", bound=CompilerHook)
+
+
+@dataclass(slots=True)
+class HookRegistration(Generic[H]):
+
+    hook: H
+    package_name: str
+    priority: int
+
+    @property
+    def name(self) -> str:
+        return self.hook.name
+
+
+# ============================================================================
+# Registry
+# ============================================================================
 
 class HookRegistry:
-    """
-    Central registry for all compiler hooks.
-    
-    Manages registration, prioritization, and execution of hooks across
-    all compilation stages.
-    """
-    
-    def __init__(self):
-        self._lexer_hooks: list[HookRegistration[LexerHook]] = []
-        self._parser_hooks: list[HookRegistration[ParserHook]] = []
-        self._semantic_hooks: list[HookRegistration[SemanticHook]] = []
-        self._codegen_hooks: list[HookRegistration[CodegenHook]] = []
-        self._runtime_hooks: list[HookRegistration[RuntimeHook]] = []
-        
-        self._context: dict[str, Any] = {}
-    
-    def set_context(self, context: dict[str, Any]) -> None:
-        """Set the compiler context for hooks."""
-        self._context = context.copy()
-    
-    def update_context(self, key: str, value: Any) -> None:
-        """Update a specific context value."""
-        self._context[key] = value
-    
-    def get_context(self) -> dict[str, Any]:
-        """Get the current compiler context."""
-        return self._context.copy()
-    
-    def _is_duplicate(self, existing_list, package_name, hook_path) -> bool:
-        return any(r.package_name == package_name and r.hook_path == hook_path for r in existing_list)
 
-    def register_lexer_hook(self, hook: LexerHook, priority: int = 0) -> None:
-        """Register a lexer hook."""
-        if self._is_duplicate(self._lexer_hooks, hook.package_name, hook.hook_path):
-            return
-        registration = HookRegistration(
-            hook=hook,
-            priority=priority,
-            package_name=hook.package_name,
-            hook_path=hook.hook_path
-        )
-        self._lexer_hooks.append(registration)
-        self._lexer_hooks.sort(key=lambda r: r.priority, reverse=True)
+    def __init__(self) -> None:
+        self._hooks: dict[HookStage, list[HookRegistration]] = {
+            stage: []
+            for stage in HookStage
+        }
 
-    def register_parser_hook(self, hook: ParserHook, priority: int = 0) -> None:
-        """Register a parser hook."""
-        if self._is_duplicate(self._parser_hooks, hook.package_name, hook.hook_path):
-            return
-        registration = HookRegistration(
-            hook=hook,
-            priority=priority,
-            package_name=hook.package_name,
-            hook_path=hook.hook_path
-        )
-        self._parser_hooks.append(registration)
-        self._parser_hooks.sort(key=lambda r: r.priority, reverse=True)
+        self._by_name: dict[str, CompilerHook] = {}
+        self._context: CompilerContext | None = None
 
-    def register_semantic_hook(self, hook: SemanticHook, priority: int = 0) -> None:
-        """Register a semantic analysis hook."""
-        if self._is_duplicate(self._semantic_hooks, hook.package_name, hook.hook_path):
-            return
-        registration = HookRegistration(
-            hook=hook,
-            priority=priority,
-            package_name=hook.package_name,
-            hook_path=hook.hook_path
-        )
-        self._semantic_hooks.append(registration)
-        self._semantic_hooks.sort(key=lambda r: r.priority, reverse=True)
-    
-    def register_codegen_hook(self, hook: CodegenHook, priority: int = 0) -> None:
-        """Register a code generation hook."""
-        if self._is_duplicate(self._codegen_hooks, hook.package_name, hook.hook_path):
-            return
-        registration = HookRegistration(
-            hook=hook,
-            priority=priority,
-            package_name=hook.package_name,
-            hook_path=hook.hook_path
-        )
-        self._codegen_hooks.append(registration)
-        self._codegen_hooks.sort(key=lambda r: r.priority, reverse=True)
+    # ------------------------------------------------------------------
+    # Context
+    # ------------------------------------------------------------------
 
-    def register_runtime_hook(self, hook: RuntimeHook, priority: int = 0) -> None:
-        """Register a runtime hook."""
-        if self._is_duplicate(self._runtime_hooks, hook.package_name, hook.hook_path):
-            return
+    def set_context(self, context: CompilerContext) -> None:
+        self._context = context
+
+    def get_context(self) -> CompilerContext | None:
+        return self._context
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
+    def register(
+        self,
+        hook: CompilerHook,
+        *,
+        priority: int | None = None,
+    ) -> None:
+
+        if hook.stage is None:
+            raise ValueError(
+                f"Hook {hook.name!r} does not define a compiler stage"
+            )
+
+        if hook.name in self._by_name:
+            raise ValueError(
+                f"Hook {hook.name!r} is already registered"
+            )
+
+        priority = (
+            hook.priority
+            if priority is None
+            else priority
+        )
+
+        for conflict in hook.metadata.conflicts:
+            if conflict in self._by_name:
+                raise ValueError(
+                    f"Hook {hook.name!r} conflicts with {conflict!r}"
+                )
+
         registration = HookRegistration(
             hook=hook,
-            priority=priority,
             package_name=hook.package_name,
-            hook_path=hook.hook_path
+            priority=priority,
         )
-        self._runtime_hooks.append(registration)
-        self._runtime_hooks.sort(key=lambda r: r.priority, reverse=True)
-    
-    def get_lexer_hooks(self) -> list[LexerHook]:
-        """Get all registered lexer hooks in priority order."""
-        return [reg.hook for reg in self._lexer_hooks if reg.hook.enabled]
-    
-    def get_parser_hooks(self) -> list[ParserHook]:
-        """Get all registered parser hooks in priority order."""
-        return [reg.hook for reg in self._parser_hooks if reg.hook.enabled]
-    
-    def get_semantic_hooks(self) -> list[SemanticHook]:
-        """Get all registered semantic hooks in priority order."""
-        return [reg.hook for reg in self._semantic_hooks if reg.hook.enabled]
-    
-    def get_codegen_hooks(self) -> list[CodegenHook]:
-        """Get all registered codegen hooks in priority order."""
-        return [reg.hook for reg in self._codegen_hooks if reg.hook.enabled]
-    
-    def get_runtime_hooks(self) -> list[RuntimeHook]:
-        """Get all registered runtime hooks in priority order."""
-        return [reg.hook for reg in self._runtime_hooks if reg.hook.enabled]
-    
-    def unregister_package_hooks(self, package_name: str) -> None:
-        """Unregister all hooks from a specific package."""
-        self._lexer_hooks = [r for r in self._lexer_hooks if r.package_name != package_name]
-        self._parser_hooks = [r for r in self._parser_hooks if r.package_name != package_name]
-        self._semantic_hooks = [r for r in self._semantic_hooks if r.package_name != package_name]
-        self._codegen_hooks = [r for r in self._codegen_hooks if r.package_name != package_name]
-        self._runtime_hooks = [r for r in self._runtime_hooks if r.package_name != package_name]
-    
+
+        self._hooks[hook.stage].append(registration)
+
+        self._hooks[hook.stage].sort(
+            key=lambda r: (-r.priority, r.package_name, r.name)
+        )
+
+        self._by_name[hook.name] = hook
+
+    def unregister(self, name: str) -> bool:
+        hook = self._by_name.pop(name, None)
+
+        if hook is None:
+            return False
+
+        if hook.stage is not None:
+            self._hooks[hook.stage] = [
+                registration
+                for registration in self._hooks[hook.stage]
+                if registration.hook is not hook
+            ]
+
+        return True
+
+    def unregister_package(self, package_name: str) -> None:
+        names = [
+            name
+            for name, hook in self._by_name.items()
+            if hook.package_name == package_name
+        ]
+
+        for name in names:
+            self.unregister(name)
+
+    # ------------------------------------------------------------------
+    # Retrieval
+    # ------------------------------------------------------------------
+
+    def get(
+        self,
+        stage: HookStage,
+    ) -> list[CompilerHook]:
+
+        return [
+            registration.hook
+            for registration in self._hooks[stage]
+            if registration.hook.enabled
+        ]
+
+    # ------------------------------------------------------------------
+    # Compatibility accessors (legacy callers used get_*_hooks methods)
+    # ------------------------------------------------------------------
+
+    def get_parser_hooks(self) -> list[CompilerHook]:
+        return self.get(HookStage.PARSER)
+
+    def get_semantic_hooks(self) -> list[CompilerHook]:
+        return self.get(HookStage.SEMANTIC)
+
+    def get_codegen_hooks(self) -> list[CompilerHook]:
+        return self.get(HookStage.CODEGEN)
+
+    def get_lexer_hooks(self) -> list[CompilerHook]:
+        return self.get(HookStage.LEXER)
+
+    def get_runtime_hooks(self) -> list[CompilerHook]:
+        return self.get(HookStage.RUNTIME)
+
+    def get_typed(
+        self,
+        hook_type: type[H],
+    ) -> list[H]:
+
+        return [
+            registration.hook
+            for registrations in self._hooks.values()
+            for registration in registrations
+            if (
+                registration.hook.enabled
+                and isinstance(registration.hook, hook_type)
+            )
+        ]
+
+    def find(self, name: str) -> CompilerHook | None:
+        return self._by_name.get(name)
+
+    def all(self) -> list[CompilerHook]:
+        return [
+            registration.hook
+            for registrations in self._hooks.values()
+            for registration in registrations
+            if registration.hook.enabled
+        ]
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def initialize_all(
+        self,
+        context: CompilerContext,
+    ) -> None:
+
+        self._context = context
+
+        for hook in self.all():
+            hook.initialize(context)
+
+    def shutdown_all(
+        self,
+        context: CompilerContext,
+    ) -> None:
+
+        for hook in reversed(self.all()):
+            hook.shutdown(context)
+
     def clear(self) -> None:
-        """Clear all registered hooks."""
-        self._lexer_hooks.clear()
-        self._parser_hooks.clear()
-        self._semantic_hooks.clear()
-        self._codegen_hooks.clear()
-        self._runtime_hooks.clear()
-        self._context.clear()
+        self._hooks = {
+            stage: []
+            for stage in HookStage
+        }
+        self._by_name.clear()
+        self._context = None
 
 
-# =============================================================================
-# Hook Loader
-# =============================================================================
+# ============================================================================
+# Hook Loading
+# ============================================================================
 
 class HookLoadError(Exception):
-    """Raised when hook loading fails."""
+    pass
 
 
 class HookLoader:
-    """Loads and initializes hooks from package hook files."""
-    
+
     @staticmethod
     def load_hooks_from_package(
         package_name: str,
         package_dir: str,
         hook_files: list[str],
         registry: HookRegistry,
-        context: dict[str, Any]
+        context: CompilerContext,
     ) -> int:
-        """
-        Load hooks from a package's hook files.
-        
-        Args:
-            package_name: Name of the package
-            package_dir: Directory containing the package
-            hook_files: List of hook file paths (relative to package_dir)
-            registry: Hook registry to register loaded hooks
-            context: Compiler context to pass to hooks
-            
-        Returns:
-            Number of hooks successfully loaded
-            
-        Raises:
-            HookLoadError: If hook loading fails
-        """
-        loaded_count = 0
-        
-        for hook_file in hook_files:
-            hook_path = os.path.join(package_dir, hook_file)
-            
-            if not os.path.exists(hook_path):
-                print(f"Warning: Hook file not found: {hook_path}", file=sys.stderr)
-                continue
-            
+
+        loaded = 0
+
+        for relative_path in hook_files:
+
+            hook_path = os.path.abspath(
+                os.path.join(package_dir, relative_path)
+            )
+
+            if not os.path.isfile(hook_path):
+                raise HookLoadError(
+                    f"Hook file does not exist: {hook_path}"
+                )
+
             try:
-                hooks = HookLoader._load_hook_file(hook_path, package_name)
+                hooks = HookLoader._load_hook_file(
+                    hook_path,
+                    package_name,
+                )
+
                 for hook in hooks:
                     hook.initialize(context)
-                    
-                    # Register based on hook type
-                    if isinstance(hook, LexerHook):
-                        registry.register_lexer_hook(hook)
-                    elif isinstance(hook, ParserHook):
-                        registry.register_parser_hook(hook)
-                    elif isinstance(hook, SemanticHook):
-                        registry.register_semantic_hook(hook)
-                    elif isinstance(hook, CodegenHook):
-                        registry.register_codegen_hook(hook)
-                    elif isinstance(hook, RuntimeHook):
-                        registry.register_runtime_hook(hook)
-                    
-                    loaded_count += 1
-                    
-            except Exception as e:
+                    registry.register(hook)
+                    loaded += 1
+
+            except HookLoadError:
+                raise
+
+            except Exception as exc:
                 raise HookLoadError(
-                    f"Failed to load hooks from {hook_path}: {e}"
-                )
-        
-        return loaded_count
-    
+                    f"Failed loading hooks from "
+                    f"{hook_path}: {exc}"
+                ) from exc
+
+        return loaded
+
     @staticmethod
-    def _load_hook_file(hook_path: str, package_name: str) -> list[CompilerHook]:
-        """
-        Load hooks from a single hook file.
-        
-        Hook files should define a function `get_hooks()` that returns
-        a list of hook instances.
-        
-        Args:
-            hook_path: Path to the hook file
-            package_name: Name of the package owning the hooks
-            
-        Returns:
-            List of loaded hook instances
-            
-        Raises:
-            HookLoadError: If loading fails
-        """
-        # Load the module
-        spec = importlib.util.spec_from_file_location(
-            f"{package_name}_hooks",
-            hook_path
+    def _load_hook_file(
+        hook_path: str,
+        package_name: str,
+    ) -> list[CompilerHook]:
+
+        module_name = (
+            f"_cpyte_extension_"
+            f"{abs(hash((package_name, hook_path)))}"
         )
+
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            hook_path,
+        )
+
         if spec is None or spec.loader is None:
-            raise HookLoadError(f"Cannot load hook file: {hook_path}")
-        
+            raise HookLoadError(
+                f"Cannot create module loader for {hook_path}"
+            )
+
         module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        
+
         try:
             spec.loader.exec_module(module)
-        except Exception as e:
-            raise HookLoadError(f"Failed to execute hook file {hook_path}: {e}")
-        
-        # Get hooks from the module
-        if not hasattr(module, 'get_hooks'):
+        except Exception as exc:
             raise HookLoadError(
-                f"Hook file {hook_path} must define a get_hooks() function"
-            )
-        
-        get_hooks_func = module.get_hooks
-        if not callable(get_hooks_func):
+                f"Failed to execute {hook_path}: {exc}"
+            ) from exc
+
+        get_hooks = getattr(module, "get_hooks", None)
+
+        if get_hooks is None:
             raise HookLoadError(
-                f"get_hooks in {hook_path} must be a callable"
+                f"{hook_path} must define get_hooks()"
             )
-        
+
+        if not callable(get_hooks):
+            raise HookLoadError(
+                f"get_hooks in {hook_path} is not callable"
+            )
+
         try:
-            hooks = get_hooks_func()
-        except Exception as e:
+            hooks = get_hooks()
+        except Exception as exc:
             raise HookLoadError(
-                f"get_hooks() failed in {hook_path}: {e}"
-            )
-        
-        if not isinstance(hooks, list):
+                f"get_hooks() failed in {hook_path}: {exc}"
+            ) from exc
+
+        if not isinstance(hooks, (list, tuple)):
             raise HookLoadError(
-                f"get_hooks() in {hook_path} must return a list"
+                f"get_hooks() in {hook_path} must return "
+                f"a list or tuple"
             )
-        
-        # Validate hooks
+
+        result: list[CompilerHook] = []
+
         for hook in hooks:
+
             if not isinstance(hook, CompilerHook):
                 raise HookLoadError(
-                    f"Invalid hook in {hook_path}: must be instance of CompilerHook"
+                    f"Invalid hook returned by {hook_path}: "
+                    f"{hook!r}"
                 )
+
             hook.package_name = package_name
             hook.hook_path = hook_path
-        
-        return hooks
+
+            # Hooks constructed with only a package name fall back to the
+            # default HookMetadata(name=package_name). The registry keys hooks
+            # by metadata name and rejects duplicates, so give such hooks a
+            # unique name derived from the package, defining file and class.
+            if hook.name == package_name:
+                module_name = os.path.splitext(
+                    os.path.basename(hook_path)
+                )[0]
+                hook.metadata = HookMetadata(
+                    name=(
+                        f"{package_name}:{module_name}:"
+                        f"{type(hook).__name__}"
+                    ),
+                    version=hook.metadata.version,
+                    priority=hook.metadata.priority,
+                    requires=hook.metadata.requires,
+                    conflicts=hook.metadata.conflicts,
+                    description=hook.metadata.description,
+                )
+
+            result.append(hook)
+
+        return result
 
 
-# =============================================================================
-# Global hook registry instance
-# =============================================================================
+# ============================================================================
+# Hook Dispatcher
+# ============================================================================
 
-_global_hook_registry = HookRegistry()
+class HookDispatcher:
+
+    """
+    High-level interface used by the compiler itself.
+
+    The compiler should generally interact with this class rather than
+    manually iterating over every hook list.
+    """
+
+    def __init__(self, registry: HookRegistry):
+        self.registry = registry
+
+    # ------------------------------------------------------------------
+    # Lexer
+    # ------------------------------------------------------------------
+
+    def additional_keywords(self) -> set[str]:
+        result: set[str] = set()
+
+        for hook in self.registry.get(HookStage.LEXER):
+            if isinstance(hook, LexerHook):
+                result.update(
+                    hook.get_additional_keywords()
+                )
+
+        return result
+
+    def additional_operators(self) -> set[str]:
+        result: set[str] = set()
+
+        for hook in self.registry.get(HookStage.LEXER):
+            if isinstance(hook, LexerHook):
+                result.update(
+                    hook.get_additional_operators()
+                )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # AST
+    # ------------------------------------------------------------------
+
+    def transform_node(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> Any:
+
+        for hook in self.registry.get(HookStage.TRANSFORM):
+
+            if not isinstance(hook, TransformHook):
+                continue
+
+            if hook.should_transform(node):
+                node = hook.transform_node(
+                    node,
+                    context,
+                )
+
+        return node
+
+    # ------------------------------------------------------------------
+    # Semantic
+    # ------------------------------------------------------------------
+
+    def analyze_node(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> list[Diagnostic]:
+
+        diagnostics: list[Diagnostic] = []
+
+        for hook in self.registry.get(HookStage.SEMANTIC):
+
+            if isinstance(hook, SemanticHook):
+                if hook.should_visit_node(node):
+                    diagnostics.extend(
+                        hook.visit_node(
+                            node,
+                            context,
+                        )
+                    )
+
+        return diagnostics
+
+    # ------------------------------------------------------------------
+    # Codegen
+    # ------------------------------------------------------------------
+
+    def emit_node(
+        self,
+        node: Any,
+        builder: Any,
+        context: CompilerContext,
+    ) -> Any | None:
+
+        for hook in self.registry.get(HookStage.CODEGEN):
+
+            if not isinstance(hook, CodegenHook):
+                continue
+
+            if hook.should_emit_node(node):
+                return hook.emit_node(
+                    node,
+                    builder,
+                    context,
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
+    def collect_build_configuration(
+        self,
+        context: CompilerContext,
+    ) -> None:
+
+        for hook in self.registry.get(HookStage.LINK):
+
+            if not isinstance(hook, BuildHook):
+                continue
+
+            context.include_paths.extend(
+                hook.get_include_paths(context)
+            )
+
+            context.library_paths.extend(
+                hook.get_library_paths(context)
+            )
+
+            context.libraries.extend(
+                hook.get_libraries(context)
+            )
+
+            context.defines.update(
+                hook.get_defines(context)
+            )
+
+            context.compiler_flags.extend(
+                hook.get_compiler_flags(context)
+            )
+
+            context.linker_flags.extend(
+                hook.get_linker_flags(context)
+            )
+
+    # ------------------------------------------------------------------
+    # Runtime
+    # ------------------------------------------------------------------
+
+    def runtime_code(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+
+        result: list[str] = []
+
+        for hook in self.registry.get(HookStage.RUNTIME):
+
+            if not isinstance(hook, RuntimeHook):
+                continue
+
+            code = hook.get_runtime_code(context)
+
+            if code:
+                result.append(code)
+
+        return result
+
+
+# ============================================================================
+# Global Registry
+# ============================================================================
+
+_global_registry = HookRegistry()
+_global_dispatcher = HookDispatcher(_global_registry)
 
 
 def get_global_hook_registry() -> HookRegistry:
-    """Get the global hook registry instance."""
-    return _global_hook_registry
+    return _global_registry
 
-# Bruh, dead code.
+
+def get_global_hook_dispatcher() -> HookDispatcher:
+    return _global_dispatcher

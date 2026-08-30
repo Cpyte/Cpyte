@@ -7,7 +7,14 @@ from llvmlite import binding, ir
 from llvmlite.ir import instructions
 
 from .astparse import *
-from .extension_hooks import HookLoadError, get_global_hook_registry
+from .extension_hooks import (
+    CodegenHook,
+    CompilerContext,
+    HookLoadError,
+    HookStage,
+    RuntimeHook,
+    get_global_hook_registry,
+)
 from .lexar import TokenType
 from .ui import *
 
@@ -321,6 +328,17 @@ class LLVM:
         q = abs(a) // abs(b)
         return -q if (a < 0) != (b < 0) else q
 
+    def _hook_context(self, data: dict | None = None) -> CompilerContext:
+        """Build a CompilerContext exposing this codegen instance to hooks."""
+        ctx = CompilerContext(llvm_module=self.module)
+        ctx.data["llvm"] = self
+        ctx.data["module"] = self.module
+        if getattr(self, "builder", None) is not None:
+            ctx.data["builder"] = self.builder
+        if data:
+            ctx.data.update(data)
+        return ctx
+
     def _emit_int_divmod(self, left, right, is_rem):
         """Signed int division/remainder that stays well-defined in LLVM IR.
 
@@ -469,6 +487,7 @@ class LLVM:
         self.ssa_values = {}
         self.ssa_types = {}  # Track types of SSA values
         self.scope_stack = []
+        self._deferred: list = []  # statements collected by `defer`, run LIFO on function exit
         self.structs = {}
         self.struct_fields = {}
         self.import_src_files = []
@@ -1007,9 +1026,17 @@ class LLVM:
             import os
             import tempfile
 
-            for hook in self._hook_registry.get_runtime_hooks():
+            context = self._hook_context()
+            for hook in self._hook_registry.get(HookStage.RUNTIME):
+                if not isinstance(hook, RuntimeHook):
+                    continue
                 try:
-                    runtime_code = hook.get_runtime_code()
+                    for rel_file in hook.get_runtime_files(context):
+                        base = os.path.dirname(hook.hook_path) if hook.hook_path else ""
+                        abs_path = os.path.join(base, rel_file)
+                        if os.path.isfile(abs_path):
+                            self.import_src_files.append(abs_path)
+                    runtime_code = hook.get_runtime_code(context)
                     if runtime_code:
                         fd, tmp_path = tempfile.mkstemp(
                             suffix=".c", prefix="hook_runtime_"
@@ -1157,7 +1184,9 @@ class LLVM:
         left_len = self.builder.call(strlen_fn, [left])
         right_len = self.builder.call(strlen_fn, [right])
         total_len = self.builder.add(left_len, right_len)
-        plus_one = self.builder.add(total_len, ir.Constant(_i32, 1))
+        plus_one = self.builder.add(
+            total_len, ir.Constant(total_len.type, 1)
+        )
         new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
         self.builder.call(memcpy_fn, [new_str, left, left_len])
         dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
@@ -1169,6 +1198,13 @@ class LLVM:
     @register_emitter(ExprStmt)
     def emit_exprstmt(self, node):
         return self.emit(node.expr)
+
+    @register_emitter(DeferStmt)
+    def emit_deferstmt(self, node: DeferStmt):
+        # Collect the deferred statement; it is emitted (in reverse order) at
+        # the function's exit points, both explicit `return` and implicit end.
+        self._deferred.append(node.body)
+        return None
 
     def emit(self, node: Node | dict) -> _IRValue:
         key = id(node)
@@ -1425,17 +1461,15 @@ class LLVM:
     def _emit_recursive(self, node: Node | dict) -> _IRValue:
         # Try codegen hooks if extensions are enabled
         if self.enable_extensions:
-            for hook in self._hook_registry.get_codegen_hooks():
+            for hook in self._hook_registry.get(HookStage.CODEGEN):
+                if not isinstance(hook, CodegenHook):
+                    continue
                 try:
                     if hook.should_emit_node(node):
                         return hook.emit_node(
                             node,
                             self.builder,
-                            {
-                                "llvm": self,
-                                "module": self.module,
-                                "builder": self.builder,
-                            },
+                            self._hook_context(data={"node": node}),
                         )
                 except Exception as e:
                     raise HookLoadError(
@@ -1798,6 +1832,18 @@ class LLVM:
             raise Exception(f"Undefined variable '{name}'")
         raise Exception("Address-of requires a variable")
 
+    @register_emitter(BorrowExpr)
+    def emit_borrow(self, node: BorrowExpr):
+        # `borrow x` / `borrow mut x` lowers to taking x's address, exactly like
+        # `&x`. Mutable vs immutable is enforced at the semantic stage.
+        return self.emit_addrof(AddrOf(node.operand))
+
+    @register_emitter(MoveExpr)
+    def emit_move(self, node: MoveExpr):
+        # `move x` is a compile-time ownership transfer; at runtime it just
+        # yields the value of x (no copy is made).
+        return self.emit(node.operand)
+
     @register_emitter(SizeOf)
     def emit_sizeof(self, node: SizeOf):
         ty = self.llvm_type(node.type_expr)
@@ -2086,11 +2132,13 @@ class LLVM:
         old_ssa = self.ssa_values
         old_ssa_types = self.ssa_types
         old_scope_stack = self.scope_stack
+        old_deferred = self._deferred
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
         self.ssa_types = {}
         self.scope_stack = [{}]
+        self._deferred = []
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
             if isinstance(llvm_arg.type, ir.VoidType):
                 self._codegen_error(
@@ -2108,6 +2156,7 @@ class LLVM:
                 self.emit(stmt)
 
         if not self._block_terminated():
+            self._run_deferred()
             # Shutdown GC before main returns
             if node.name == "main" and not self.no_gc:
                 gc_shutdown_fn = self.functions.get("gc_shutdown")
@@ -2133,6 +2182,7 @@ class LLVM:
         self.ssa_values = old_ssa
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
+        self._deferred = old_deferred
 
     def _emit_decorated_funcdef(self, node: FuncDef):
         """Emit a decorated function: original as __name, trampoline, and wrapper."""
@@ -2247,6 +2297,7 @@ class LLVM:
     def emit_return(self, node: Return):
         if self._block_terminated():
             return
+        self._run_deferred()
         # Shutdown GC before main returns
         fn_name = self.builder.function.name
         if fn_name == "main" and not self.no_gc:
@@ -2503,7 +2554,7 @@ class LLVM:
             return _DYN_STR
         if ty == "big":
             return _DYN_BIG
-        if ty.endswith("*") or ty.endswith("&"):
+        if ty.endswith(("*", "&")):
             return _DYN_PTR
         return _DYN_INT
 
@@ -2554,7 +2605,7 @@ class LLVM:
             return self.builder.bitcast(bits, _double)
         if ty in ("str", "big", "void*"):
             return self.builder.inttoptr(bits, _i8ptr)
-        if ty.endswith("*") or ty.endswith("&"):
+        if ty.endswith(("*", "&")):
             ptr_ty = self.llvm_type(ty)
             if isinstance(ptr_ty, ir.PointerType):
                 return self.builder.inttoptr(bits, ptr_ty)
@@ -2567,9 +2618,7 @@ class LLVM:
         """True when a node carries a runtime-typed (dynamic) value."""
         if getattr(node, "inferred_type", None) == "dynamic":
             return True
-        if isinstance(node, Variable) and getattr(node, "dynamic", False):
-            return True
-        return False
+        return bool(isinstance(node, Variable) and getattr(node, "dynamic", False))
 
     def _dyn_local_ptr(self, name):
         """Return (creating if needed) the {i32,i64} slot that backs a dynamic local."""
@@ -2665,6 +2714,25 @@ class LLVM:
             return True
         return block.is_terminated
 
+    def _run_deferred(self):
+        """Emit all accumulated deferred statements in LIFO order.
+
+        Called at every function exit point (explicit `return` statements and the
+        implicit end-of-function return). It does NOT clear the accumulated list,
+        so every static exit site of the function emits the full set of defers;
+        at runtime only the exit that is actually reached executes them. The list
+        is reset when the function's own emission completes (emit_funcdef restores
+        the outer value).
+        """
+        if not self._deferred:
+            return
+        for stmt in reversed(self._deferred):
+            if self._block_terminated():
+                break
+            self.emit(stmt)
+            if self._block_terminated():
+                break
+
     @register_emitter(BinOp)
     def emit_binop(self, node):
         if node.op == TokenType.PLUS and self._is_string_concat(node):
@@ -2673,27 +2741,26 @@ class LLVM:
         # Runtime dispatch when either operand is dynamically typed.
         if not self.no_userspace and (
             self._is_dynamic_expr(node.left) or self._is_dynamic_expr(node.right)
+        ) and node.op in (
+            TokenType.PLUS,
+            TokenType.MINUS,
+            TokenType.STAR,
+            TokenType.SLASH,
+            TokenType.SLASH_SLASH,
+            TokenType.PERCENT,
+            TokenType.EQ_EQ,
+            TokenType.NOT_EQ,
+            TokenType.LESS,
+            TokenType.GREATER,
+            TokenType.LESS_EQ,
+            TokenType.GREATER_EQ,
+            TokenType.AMPERSAND,
+            TokenType.PIPE,
+            TokenType.CARET,
+            TokenType.SHL,
+            TokenType.SHR,
         ):
-            if node.op in (
-                TokenType.PLUS,
-                TokenType.MINUS,
-                TokenType.STAR,
-                TokenType.SLASH,
-                TokenType.SLASH_SLASH,
-                TokenType.PERCENT,
-                TokenType.EQ_EQ,
-                TokenType.NOT_EQ,
-                TokenType.LESS,
-                TokenType.GREATER,
-                TokenType.LESS_EQ,
-                TokenType.GREATER_EQ,
-                TokenType.AMPERSAND,
-                TokenType.PIPE,
-                TokenType.CARET,
-                TokenType.SHL,
-                TokenType.SHR,
-            ):
-                return self._emit_dyn_binop(node)
+            return self._emit_dyn_binop(node)
 
         match node.op:
             case TokenType.AND:
@@ -2939,12 +3006,7 @@ class LLVM:
             and self.local_types.get(node.left.name) == "str"
         ):
             return True
-        if (
-            isinstance(node.right, Variable)
-            and self.local_types.get(node.right.name) == "str"
-        ):
-            return True
-        return False
+        return bool(isinstance(node.right, Variable) and self.local_types.get(node.right.name) == "str")
 
     def _emit_dyn_binop(self, node):
         dynop_map = {
@@ -2987,7 +3049,8 @@ class LLVM:
             if f.name == "strlen":
                 self._strlen_fn = f
                 return f
-        fnty = ir.FunctionType(_i32, [_i8ptr])
+        # strlen returns size_t (i64 on every cpyte target), not int.
+        fnty = ir.FunctionType(_i64, [_i8ptr])
         fn = ir.Function(self.module, fnty, "strlen")
         self._strlen_fn = fn
         return fn
@@ -3000,7 +3063,8 @@ class LLVM:
             if f.name == "memcpy":
                 self._memcpy_fn = f
                 return f
-        fnty = ir.FunctionType(_i8ptr, [_i8ptr, _i8ptr, _i32])
+        # n is size_t (i64 on every cpyte target).
+        fnty = ir.FunctionType(_i8ptr, [_i8ptr, _i8ptr, _i64])
         fn = ir.Function(self.module, fnty, "memcpy")
         self._memcpy_fn = fn
         return fn
@@ -3927,6 +3991,8 @@ class LLVM:
 
         len_fn = self._get_strlen_fn()
         length = self.builder.call(len_fn, [iter_ptr])
+        if length.type.width != 32:
+            length = self.builder.trunc(length, _i32)
 
         idx_ptr = self._alloca(_i32, name=f"{var_name}.idx")
         self.builder.store(ir.Constant(_i32, 0), idx_ptr)

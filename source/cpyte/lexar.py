@@ -77,6 +77,8 @@ _BASE_KEYWORDS = {
     'llvm',
     'enum', 'type',
     'unsafe',
+    'defer',
+    'borrow', 'move', 'mut',
 }
 
 # Additional keywords registered by packages

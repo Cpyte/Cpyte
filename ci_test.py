@@ -55,6 +55,13 @@ def _snapshot_artifacts() -> set[Path]:
 
 
 def main() -> int:
+    # Windows CI consoles default to cp1252, which cannot encode the ✓ / ✗
+    # markers used by this harness. Force UTF-8 (with replacement) on our own
+    # streams so the report can never crash the job with UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     python = sys.executable
 
     failures: list[str] = []
@@ -86,11 +93,26 @@ def main() -> int:
             # Source-relative C imports (e.g. `import "examples/foo.c"`)
             # resolve from the repo, so we build in place from the original
             # file.
+            #
+            # The package lives under source/ and is not guaranteed to be
+            # installed on the runner, so put source/ on PYTHONPATH for the
+            # compiler subprocess. This also ensures we exercise THIS checkout
+            # rather than whatever may be installed in the environment.
+            env = dict(os.environ)
+            src_on_path = str(ROOT / "source")
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                src_on_path + os.pathsep + existing if existing else src_on_path
+            )
+
             build = subprocess.run(
                 [python, str(CPYTE), "build", "-o", str(exe), str(src)],
                 cwd=ROOT,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
                 text=True,
             )
 
@@ -120,6 +142,8 @@ def main() -> int:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
                 text=True,
             )
             _cleanup()

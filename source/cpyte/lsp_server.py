@@ -51,10 +51,12 @@ _KEYWORDS = [
     "def", "return", "if", "elif", "else", "while", "for", "in", "break", "continue",
     "public", "private", "static",
     "import", "struct", "class", "enum", "new", "sizeof", "type",
-    "true", "false", "null",
+    "true", "false", "null", "True", "False",
+    "and", "or", "not",
     "switch", "case", "default",
     "try", "except", "raise", "assert",
     "let", "virtual", "override", "ccode", "llvm", "asm", "unsafe",
+    "ref", "defer", "borrow", "move", "mut",
     "print", "input", "input_str", "input_big", "free",
 ]
 
@@ -103,6 +105,16 @@ _KEYWORD_DESC = {
     "input_str": "Read a line of text from stdin and return it as a string",
     "input_big": "Read a line of text from stdin and return it as an arbitrary-precision big integer",
     "free": "Deallocate heap memory",
+    "True": "Boolean literal representing truth",
+    "False": "Boolean literal representing falsehood",
+    "and": "Logical AND (both sides must be true)",
+    "or": "Logical OR (at least one side must be true)",
+    "not": "Logical NOT (inverts a boolean)",
+    "ref": "Take a reference to a value",
+    "defer": "Schedule an action to run when the enclosing scope exits",
+    "borrow": "Borrow a value (non-owning access)",
+    "move": "Move ownership of a value",
+    "mut": "Mark a binding as mutable",
 }
 
 _TYPE_DESC = {
@@ -170,6 +182,20 @@ _SNIPPETS = {
 }
 
 
+def _load_manifest_keywords(workspace_root):
+    """Register package manifest keywords so the lexer recognises extension
+    keywords/operators before lexing — mirrors the compiler CLI path in
+    mainpie. Safe to call repeatedly (global registry de-dupes by package)."""
+    if not workspace_root:
+        return
+    try:
+        from .mainpie import _load_package_manifests_from_source
+
+        _load_package_manifests_from_source(workspace_root)
+    except Exception:
+        pass
+
+
 def _analyze(source, filepath=None, workspace_root=None):
     try:
         tokens = []
@@ -177,6 +203,7 @@ def _analyze(source, filepath=None, workspace_root=None):
         analyzer = None
         error = None
         try:
+            _load_manifest_keywords(workspace_root)
             tokens = Lexer(source).get_tokens()
         except LexerError as e:
             error = ("lexer", str(e), getattr(e, "token", None))
@@ -411,6 +438,99 @@ def _find_containing_function(parsed, line):
     return None
 
 
+_TOPLEVEL_KEYWORDS = {"def", "class", "struct", "enum", "import"}
+_LOOP_ONLY_KEYWORDS = {"break", "continue"}
+_BLOCK_KEYWORDS = {"def", "class", "struct", "enum", "if", "elif", "else",
+                   "for", "while", "switch", "try", "except"}
+
+
+def _scope_at(parsed, line):
+    """Best statement-kind at the cursor: whether we're at module top level or
+    inside a function/class/struct body."""
+    for node in parsed:
+        if isinstance(node, FuncDef):
+            start = getattr(getattr(node, '_token', None), 'line', None)
+            end = max(
+                [start or 0]
+                + [getattr(getattr(s, '_token', None), 'line', 0) or 0
+                   for s in getattr(node, 'body', None) or []]
+            )
+            if start is not None and start <= line <= end:
+                return 'function'
+        elif isinstance(node, ClassDef) or isinstance(node, StructDef):
+            start = getattr(getattr(node, '_token', None), 'line', None)
+            if start is not None and start <= line:
+                return 'type'
+            if isinstance(node, ClassDef):
+                for m in node.methods:
+                    ms = getattr(getattr(m, '_token', None), 'line', None)
+                    me = max(
+                        [ms or 0]
+                        + [getattr(getattr(s, '_token', None), 'line', 0) or 0
+                           for s in getattr(m, 'body', None) or []]
+                    )
+                    if ms is not None and ms <= line <= me:
+                        return 'function'
+    return 'top'
+
+
+def _inside_loop(parsed, line):
+    """True if the cursor line sits inside a for/while loop body."""
+    for node in parsed:
+        if _stmt_contains_loop(node, line):
+            return True
+    return False
+
+
+def _stmt_line(stmt):
+    """Resolve the source line of a statement node or dict-like statement."""
+    if stmt is None:
+        return None
+    tok = getattr(stmt, '_token', None)
+    if tok is None and isinstance(stmt, dict):
+        tok = stmt.get('_token') or stmt.get('token')
+    tok = getattr(tok, 'line', None) or getattr(tok, 'lineno', None)
+    return tok
+
+
+def _stmt_children(stmt):
+    """Yield direct child statements from a node or dict-like statement."""
+    if isinstance(stmt, dict):
+        for key in ('body', 'orelse'):
+            for c in stmt.get(key) or []:
+                yield c
+        return
+    for attr in ('body', 'orelse'):
+        for c in getattr(stmt, attr, None) or []:
+            yield c
+
+
+def _is_loop_stmt(stmt):
+    if isinstance(stmt, While):
+        return True
+    return isinstance(stmt, dict) and stmt.get('type') == 'for'
+
+
+def _stmt_contains_loop(stmt, line):
+    if _is_loop_stmt(stmt):
+        start = _stmt_line(stmt) or 0
+        end = start
+        for b in _stmt_children(stmt):
+            l = _stmt_line(b)
+            if l:
+                end = max(end, l)
+        if start <= line <= end:
+            return True
+        for b in _stmt_children(stmt):
+            if _stmt_contains_loop(b, line):
+                return True
+        return False
+    for child in _stmt_children(stmt):
+        if _stmt_contains_loop(child, line):
+            return True
+    return False
+
+
 def _walk_stmt(stmt, cursor_line, out):
     if isinstance(stmt, VarDecl):
         tok = stmt._token
@@ -467,10 +587,47 @@ def _const_value_text(sym):
     return '?'
 
 
+def _type_node_for(analyzer, type_name):
+    """Resolve a type name (with optional `*` / `[]` decorations) to its
+    struct/class/enum AST declaration node, or None."""
+    if not type_name:
+        return None
+    t = type_name
+    while t.endswith('*') or t.endswith('[]'):
+        t = t[:-2] if t.endswith('[]') else t[:-1]
+    t = t.strip('@')
+    if t in ('int', 'int64', 'uint64', 'float', 'double', 'str', 'char', 'void',
+             'bool', 'big', 'size_t', 'dynamic'):
+        return None
+    type_sym = analyzer.globals.lookup(t)
+    if type_sym is not None and type_sym.node is not None:
+        return type_sym.node
+    return None
+
+
+def _collect_imported_symbols(parsed):
+    """Collect public symbols (functions/structs/classes/enums/constants) re-exported
+    through `import` statements so completion can offer them even though they live in
+    another file/package."""
+    out = {}
+    for node in parsed:
+        if isinstance(node, Import) and getattr(node, 'symbols', None):
+            for fname, _sig in node.symbols:
+                out.setdefault(fname, ('function', ''))
+        for sub in getattr(node, 'sub_ast', None) or []:
+            if isinstance(sub, Import) and getattr(sub, 'symbols', None):
+                for fname, _sig in sub.symbols:
+                    out.setdefault(fname, ('function', ''))
+    return out
+
+
 def _member_completions(analyzer, parsed, base, prefix, cursor_line):
     items = []
     if not base or analyzer is None:
         return items
+
+    # 1) Resolve the base to a symbol: global, let-binding (import), function
+    #    parameter, or a local variable in the enclosing function.
     sym = analyzer.globals.lookup(base)
     if sym is None:
         func = _find_containing_function(parsed, cursor_line)
@@ -484,8 +641,21 @@ def _member_completions(analyzer, parsed, base, prefix, cursor_line):
                 sym = SimpleNamespace(kind='variable', type=locs[base], node=None)
     if sym is None:
         return items
+
     seen = set()
-    if sym.kind == 'enum':
+    type_name = sym.type
+
+    # 2) Enum member completion — both for an enum-typed value and when the base
+    #    is the enum type name itself.
+    is_enum = sym.kind == 'enum'
+    if type_name and not is_enum:
+        t0 = type_name
+        while t0.endswith('*') or t0.endswith('[]'):
+            t0 = t0[:-2] if t0.endswith('[]') else t0[:-1]
+        tsym = analyzer.globals.lookup(t0.strip('@'))
+        if tsym is not None and tsym.kind == 'enum':
+            is_enum = True
+    if is_enum:
         pfx = f'{base}.'
         for name, m in analyzer.globals.symbols.items():
             if name.startswith(pfx):
@@ -498,19 +668,22 @@ def _member_completions(analyzer, parsed, base, prefix, cursor_line):
                         insert_text=label,
                     ))
                     seen.add(label)
-        return items
-    type_name = sym.type
-    if type_name and type_name.endswith('*'):
-        type_name = type_name[:-1]
+        if items:
+            return items
+
     node = None
-    if type_name:
-        type_sym = analyzer.globals.lookup(type_name)
-        if type_sym is not None:
-            node = type_sym.node
+    # 3) If the base is itself a struct/class/enum type name (e.g. `Vec.` or
+    #    `MyStruct.`), offer its members directly.
+    if sym.kind in ('struct', 'class', 'enum', 'type_alias'):
+        node = sym.node or _type_node_for(analyzer, base)
+    # 4) Otherwise resolve the base value's declared type to its node.
+    if node is None:
+        node = _type_node_for(analyzer, type_name)
     if node is None:
         node = getattr(sym, 'node', None)
     if node is None:
         return items
+
     for f in getattr(node, 'fields', None) or []:
         if f.name.startswith(prefix) and f.name not in seen:
             items.append(lsp.CompletionItem(
@@ -531,6 +704,38 @@ def _member_completions(analyzer, parsed, base, prefix, cursor_line):
             ))
             seen.add(m.name)
     return items
+
+
+# Block-starting keywords that expand to a snippet. If the user is already
+# typing one of these on the current line (e.g. mid-`for` loop), re-offering the
+# same snippet is noise — suppress it.
+_SNIPPET_KEYWORDS = set(_SNIPPETS) | {"public def"}
+
+
+def _keyword_on_line(tokens, line, col, keyword):
+    """True if `keyword` appears earlier on the cursor's line (before col).
+
+    Used to avoid re-suggesting a block-keyword snippet (for/if/while/...)
+    when the user has already started typing that construct."""
+    for t in tokens:
+        if t is None or t.value != keyword:
+            continue
+        if (t.line - 1) == line and (t.column - 1) < col:
+            return True
+    return False
+
+
+def _is_new_context(tokens, line, col):
+    """True if the cursor is completing a `new T` expression (the token before
+    the prefix on the same line is the `new` keyword)."""
+    for t in tokens:
+        if t is None or (t.line - 1) != line:
+            continue
+        if t.column - 1 >= col:
+            continue
+        if t.value == 'new':
+            return True
+    return False
 
 
 class CpyLanguageServer(LanguageServer):
@@ -606,6 +811,12 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
         tok = _find_token_at(tokens, line, col)
         prefix = (tok.value or "") if tok else ""
 
+        scope = _scope_at(parsed, line + 1)
+        in_loop = _inside_loop(parsed, line + 1)
+
+        # Contextual: are we completing the argument of a `new T` / `new Foo`?
+        new_context = _is_new_context(tokens, line, col)
+
         items = []
         seen = set()
 
@@ -619,6 +830,12 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
 
         for kw in _KEYWORDS:
             if kw.startswith(prefix):
+                if _SNIPPETS.get(kw) and _keyword_on_line(tokens, line, col, kw):
+                    continue
+                if kw in _TOPLEVEL_KEYWORDS and scope != 'top':
+                    continue
+                if kw in _LOOP_ONLY_KEYWORDS and not in_loop:
+                    continue
                 snippet = _SNIPPETS.get(kw)
                 items.append(lsp.CompletionItem(
                     label=kw,
@@ -650,14 +867,15 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
 
         for node in parsed:
             if isinstance(node, FuncDef) and node.name.startswith(prefix) and node.name not in seen:
-                sig = _fmt_params(node.params, getattr(node, 'const_params', None))
-                items.append(lsp.CompletionItem(
-                    label=node.name,
-                    kind=lsp.CompletionItemKind.Function,
-                    detail=f"({sig}) -> {node.rettype or 'void'}",
-                    insert_text=f"{node.name}(",
-                ))
-                seen.add(node.name)
+                if not new_context:
+                    sig = _fmt_params(node.params, getattr(node, 'const_params', None))
+                    items.append(lsp.CompletionItem(
+                        label=node.name,
+                        kind=lsp.CompletionItemKind.Function,
+                        detail=f"({sig}) -> {node.rettype or 'void'}",
+                        insert_text=f"{node.name}(",
+                    ))
+                    seen.add(node.name)
             elif isinstance(node, StructDef) and node.name.startswith(prefix) and node.name not in seen:
                 items.append(lsp.CompletionItem(
                     label=node.name,
@@ -685,18 +903,21 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
                 if '.' in name:
                     continue
                 if name.startswith(prefix) and name not in seen:
+                    if sym.kind in ('struct', 'class', 'enum'):
+                        kind = {'struct': lsp.CompletionItemKind.Class,
+                                'class': lsp.CompletionItemKind.Class,
+                                'enum': lsp.CompletionItemKind.Enum}[sym.kind]
+                        items.append(lsp.CompletionItem(label=name, kind=kind, detail=sym.kind))
+                        seen.add(name)
+                        continue
+                    if new_context:
+                        continue
                     if sym.kind == 'const':
                         kind = lsp.CompletionItemKind.Constant
                         detail = f"const {sym.type} = {_const_value_text(sym)}"
                     elif sym.kind == 'function':
                         kind = lsp.CompletionItemKind.Function
                         detail = f"-> {sym.type or ''}"
-                    elif sym.kind == 'enum':
-                        kind = lsp.CompletionItemKind.Enum
-                        detail = 'enum'
-                    elif sym.kind in ('struct', 'class'):
-                        kind = lsp.CompletionItemKind.Class
-                        detail = sym.kind
                     else:
                         kind = lsp.CompletionItemKind.Variable
                         detail = sym.type or sym.kind
@@ -706,6 +927,18 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
                         detail=detail,
                     ))
                     seen.add(name)
+
+        # Symbols re-exported by imports (functions/types from imported files
+        # and installed CPM packages).
+        for name, (kind, _detail) in _collect_imported_symbols(parsed).items():
+            if name.startswith(prefix) and name not in seen:
+                items.append(lsp.CompletionItem(
+                    label=name,
+                    kind=lsp.CompletionItemKind.Function if kind == 'function'
+                    else lsp.CompletionItemKind.Class,
+                    detail='imported',
+                ))
+                seen.add(name)
 
         func = _find_containing_function(parsed, line + 1)
         if func is not None:

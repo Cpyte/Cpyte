@@ -564,6 +564,16 @@ class SemanticAnalyzer:
         if package_name in self._loaded_packages:
             return True  # Already loaded
 
+        # In a long-lived process (the LSP server re-analyses the same file many
+        # times) the global manifest/hook registries persist across analyses.
+        # If this package's manifest is already registered globally, its hooks
+        # were already registered by an earlier analysis — re-loading them here
+        # would raise "Hook ... is already registered" and make the LSP emit
+        # spurious "not installed" diagnostics on correct installed libraries.
+        if self._manifest_registry.is_loaded(package_name):
+            self._loaded_packages.add(package_name)
+            return True
+
         manifest_path = os.path.join(package_dir, "package.json")
         if not os.path.exists(manifest_path):
             return False  # No manifest file

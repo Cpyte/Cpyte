@@ -45,6 +45,82 @@ def _host_default_pic():
     return platform.machine().lower() in ("arm64", "aarch64")
 
 
+# Optional global CPU / target-features override, set via ``--cpu``/``--mattr``
+# or programmatically. When both are None the host's native CPU and SIMD
+# features are detected and used.
+_GLOBAL_CPU = None
+_GLOBAL_FEATURES = None
+
+
+def set_target_cpu(cpu=None, features=None):
+    """Override the target CPU / LLVM target-features for all JIT/AOT builds."""
+    global _GLOBAL_CPU, _GLOBAL_FEATURES
+    _GLOBAL_CPU = cpu
+    _GLOBAL_FEATURES = features
+
+
+def host_cpu_features():
+    """Return a ``(cpu, features)`` tuple describing the native host.
+
+    ``cpu`` is ``llvmlite.binding.get_host_cpu_name()`` (e.g. ``apple-m1``,
+    ``skylake``); ``features`` is the comma-joined ``+feat,-feat`` string that
+    enables the widest SIMD the host supports (SSE/AVX/AVX2/AVX-512 on x86,
+    NEON/SVE on AArch64), or ``""`` when undetectable.
+    """
+    from llvmlite import binding
+
+    cpu = ""
+    features = ""
+    if hasattr(binding, "get_host_cpu_name"):
+        try:
+            cpu = binding.get_host_cpu_name() or ""
+        except Exception:
+            cpu = ""
+    if hasattr(binding, "get_host_cpu_features"):
+        try:
+            fm = binding.get_host_cpu_features()
+            features = fm.flatten() if fm else ""
+        except Exception:
+            features = ""
+    return cpu, features
+
+
+def make_target_machine(pic=False, cpu=None, features=None):
+    """Build a :class:`llvmlite.binding.TargetMachine` for the host (or an
+    explicit cpu/features override) with SIMD enabled.
+
+    Passing the host's native CPU and feature set lets LLVM's auto-vectorizer
+    (loop/SLP vectorization, run by :func:`optimize` at ``-O2``/``-O3``) emit the
+    widest available SIMD — SSE/AVX/AVX2 on x86-64, NEON/SVE on AArch64 — instead
+    of the conservative baseline the ``from_default_triple()`` target machine
+    produces. ``pic`` selects the relocation model (PIE is required on modern
+    AArch64 linkers).
+    """
+    from llvmlite import binding
+
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
+
+    if cpu is None:
+        cpu = _GLOBAL_CPU
+    if features is None:
+        features = _GLOBAL_FEATURES
+    if cpu is None and features is None:
+        host_cpu, host_feats = host_cpu_features()
+        cpu = host_cpu
+        features = host_feats
+
+    target = binding.Target.from_default_triple()
+    kwargs = {}
+    if pic:
+        kwargs["reloc"] = "pic"
+    if cpu:
+        kwargs["cpu"] = cpu
+    if features:
+        kwargs["features"] = features
+    return target.create_target_machine(**kwargs)
+
+
 def _find_llvm_cc():
     """Find a C compiler that supports -emit-llvm for JIT compilation.
 
@@ -85,14 +161,24 @@ def _find_llvm_cc():
 _callbacks: list = []
 
 
+# Symbols the JIT/runtime resolves from libc. On POSIX they come from libc.so
+# / libSystem; on Windows from the C runtime (UCRT/msvcrt). Verified on load so
+# a half-loaded CRT (e.g. ucrtbase.dll lacking malloc) is skipped.
+_LIBC_REQUIRED = ("malloc", "calloc", "realloc", "free", "strlen", "memcpy")
+
+
 def _load_libc():
-    """Open libc bypassing symbol interposition where possible.
+    """Open the platform C runtime for JIT symbol resolution.
 
     On macOS, tools like MallocStackLogging may interpose malloc/free with a
     private arena allocator whose pointers the interposed free() rejects
     ("pointer being freed was not allocated"). Using RTLD_FIRST forces dlsym
     to resolve to the real libSystem symbols so JIT'd malloc/free/realloc/
     calloc stay self-consistent.
+
+    On Windows, ``ctypes.util.find_library("c")`` returns ``None`` (there is
+    no ELF-style SONAME to discover), so the CRT must be opened explicitly
+    instead of passing ``None`` to CDLL (which raises TypeError on LoadLibrary).
     """
     if sys.platform == "darwin":
         RTLD_FIRST = 0x100
@@ -103,7 +189,27 @@ def _load_libc():
             )
         except OSError:
             pass
-    return ctypes.CDLL(ctypes.util.find_library("c"))
+    if os.name == "nt":
+        for name in ("msvcrt", "ucrtbase", "api-ms-win-crt-runtime-l1-1-0"):
+            try:
+                lib = ctypes.CDLL(name)
+                for sym in _LIBC_REQUIRED:
+                    getattr(lib, sym)
+                return lib
+            except (OSError, AttributeError):
+                continue
+        raise OSError("cpyte: unable to load a Windows C runtime")
+    name = ctypes.util.find_library("c")
+    if not name:
+        # find_library may return None on some libc/distros; fall back to the
+        # conventional SONAMEs rather than passing None to CDLL.
+        for cand in ("libc.so.6", "libc.so"):
+            try:
+                return ctypes.CDLL(cand)
+            except OSError:
+                continue
+        raise OSError("cpyte: unable to locate the C standard library")
+    return ctypes.CDLL(name)
 
 
 _libc = _load_libc()
@@ -375,8 +481,7 @@ def optimize(mod, opt_level=3, opt_size=False):
     binding.initialize_native_asmprinter()
     if opt_level <= 0 and not opt_size:
         return
-    target = binding.Target.from_default_triple()
-    target_machine = target.create_target_machine()
+    target_machine = make_target_machine()
 
     if opt_size:
         # -OSize: optimize purely for code size, completely ignoring speed.
@@ -649,8 +754,7 @@ def run_jit(
     optimize(mod, opt_level)
     mod.verify()
 
-    target = binding.Target.from_default_triple()
-    target_machine = target.create_target_machine()
+    target_machine = make_target_machine()
 
     backing_mod = binding.parse_assembly("")
     engine = binding.create_mcjit_compiler(backing_mod, target_machine)
@@ -1013,11 +1117,7 @@ def run_aot(
     optimize(mod, opt_level)
     mod.verify()
 
-    target = binding.Target.from_default_triple()
-    if pic:
-        target_machine = target.create_target_machine(reloc="pic")
-    else:
-        target_machine = target.create_target_machine()
+    target_machine = make_target_machine(pic=pic)
 
     obj = target_machine.emit_object(mod)
 

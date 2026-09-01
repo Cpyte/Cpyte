@@ -582,7 +582,13 @@ def _parse_atom(tokens: list[Token], pos: int):
                     TokenType.COLON,
                     TokenType.EOF,
                 ):
-                    expr, expr_pos = parse_expression(tokens, after)
+                    # Parse only the immediate cast operand (unary/postfix), NOT
+                    # a greedy full expression. `(size_t)1 > cap` must mean
+                    # `((size_t)1) > cap`; greedy parsing here made it
+                    # `(size_t)(1 > cap)`, silently re-associating binary ops
+                    # that follow the cast and corrupting comparisons like
+                    # `b.bits + (size_t)1 > b.cap` (the bitvector grow bug).
+                    expr, expr_pos = _parse_unary(tokens, after)
                     return CastExpr(tp, expr, token=tok), expr_pos
         pos = save
         node, pos = parse_expression(tokens, pos)

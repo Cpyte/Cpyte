@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <unistd.h>
 
 // --- Minimal bignum implementation ---
 // Each bignum is a 64-bit limb array (little-endian), dynamically allocated.
@@ -15,8 +14,8 @@ typedef struct {
 } BigNum;
 
 static void _bn_fail(const char* msg) {
-    write(2, msg, strlen(msg));
-    write(2, "\n", 1);
+    fputs(msg, stderr);
+    fputc('\n', stderr);
     exit(1);
 }
 

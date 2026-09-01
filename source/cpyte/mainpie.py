@@ -1,14 +1,18 @@
 import os
+import subprocess
 import sys
 
 if __package__:
     from . import __version__, ui
-    from ._bignum_bc import load_bignum_bc
     from .astparse import Import, ParseError, parse_file
     from .bytecoding import LLVM
     from .compiling import (
+        _BIGNUM_C,
         _GC_RUNTIME_C,
         _RUNTIME_C,
+        _find_llvm_cc,
+        _host_default_pic,
+        _remove_probe_stack_ir,
         optimize,
         run_aot,
         run_jit,
@@ -16,7 +20,7 @@ if __package__:
     )
     from .extension_hooks import HookStage, get_global_hook_registry
     from .lexar import Lexer, LexerError, register_keywords
-    from .linker import Linker
+    from .linker import Linker, format_cc_diag
     from .package_manifest import (
         ManifestParser,
         get_global_registry,
@@ -28,12 +32,15 @@ if __package__:
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from cpyte import __version__, ui
-    from cpyte._bignum_bc import load_bignum_bc
     from cpyte.astparse import Import, ParseError, parse_file
     from cpyte.bytecoding import LLVM
     from cpyte.compiling import (
+        _BIGNUM_C,
         _GC_RUNTIME_C,
         _RUNTIME_C,
+        _find_llvm_cc,
+        _host_default_pic,
+        _remove_probe_stack_ir,
         optimize,
         run_aot,
         run_jit,
@@ -41,7 +48,7 @@ else:
     )
     from cpyte.extension_hooks import HookStage, get_global_hook_registry
     from cpyte.lexar import Lexer, LexerError, register_keywords
-    from cpyte.linker import Linker
+    from cpyte.linker import Linker, format_cc_diag
     from cpyte.package_manifest import (
         ManifestParser,
         get_global_registry,
@@ -433,7 +440,7 @@ def cmd_build(
     tab_size=4,
     strict=False,
     no_userspace=False,
-    pic=False,
+    pic=None,
     lto=False,
     no_gc=False,
 ):
@@ -492,6 +499,9 @@ def cmd_build(
         )
         sys.exit(1)
 
+    if pic is None:
+        pic = _host_default_pic()
+
     if opt_size:
         # -OSize ignores speed entirely; cap at O2 so the O3/O4 pipelines never run.
         if opt > 2:
@@ -533,7 +543,29 @@ def cmd_build(
     binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(str(prog))
-    bignum_mod = load_bignum_bc()
+    # Compile the bignum runtime from source for the host platform (instead
+    # of pre-built bitcode) so its libc symbol names match the target OS.
+    llvm_cc = _find_llvm_cc()
+    r = subprocess.run(
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-target",
+            binding.Target.from_default_triple().triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            _BIGNUM_C,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        ui.print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+        sys.exit(1)
+    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, bignum_mod)
     mod.verify()
 
@@ -772,7 +804,7 @@ def _main():
 
     strict = False
     no_userspace = False
-    pic = False
+    pic = None
     lto = False
     no_gc = False
     exports = []

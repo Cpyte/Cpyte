@@ -6,7 +6,6 @@ import subprocess
 import sys
 import warnings
 
-from ._bignum_bc import load_bignum_bc
 from .generate_bc import _remove_probe_stack_ir
 from .linker import format_cc_diag, LinkerNotFoundError, Linker
 from .ui import print_err, print_ok
@@ -26,7 +25,24 @@ if getattr(sys, "frozen", False):
 else:
     _GC_RUNTIME_C = os.path.join(os.path.dirname(__file__), "gc_runtime.c")
 
+if getattr(sys, "frozen", False):
+    _BIGNUM_C = os.path.join(getattr(sys, "_MEIPASS", ""), "bignum.c")
+else:
+    _BIGNUM_C = os.path.join(os.path.dirname(__file__), "bignum.c")
+
 _llvm_cc_cache = None
+
+
+def _host_default_pic():
+    """Return True when the host linker requires PIC (PIE) by default.
+
+    Both macOS and Linux on AArch64 link position-independent executables by
+    default, so non-PIC objects (with UABS relocations) are rejected at link
+    time. x86-64 keeps the historical non-PIC default.
+    """
+    import platform
+
+    return platform.machine().lower() in ("arm64", "aarch64")
 
 
 def _find_llvm_cc():
@@ -580,7 +596,29 @@ def run_jit(
     runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, runtime_mod)
 
-    bignum_mod = load_bignum_bc()
+    # Compile the bignum runtime from source at JIT time so it matches the
+    # host platform (macOS/Linux/Windows) instead of relying on pre-built
+    # bitcode that bakes in a single platform's libc symbol names.
+    r = subprocess.run(
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-target",
+            target.triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            _BIGNUM_C,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+        raise SystemExit(1)
+    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, bignum_mod)
 
     # Compile the GC runtime from source at JIT time so it matches the host
@@ -934,10 +972,12 @@ def run_aot(
     opt_level=3,
     src_files=None,
     no_userspace=False,
-    pic=False,
+    pic=None,
     lto=False,
     frameworks=None,
 ):
+    if pic is None:
+        pic = _host_default_pic()
     llvm_ir = str(module)
     from llvmlite import binding
 
@@ -945,7 +985,29 @@ def run_aot(
     binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(llvm_ir)
-    bignum_mod = load_bignum_bc()
+    # Compile the bignum runtime from source for the host platform (instead
+    # of pre-built bitcode) so its libc symbol names match the target OS.
+    llvm_cc = _find_llvm_cc()
+    r = subprocess.run(
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            "-O0",
+            "-target",
+            binding.Target.from_default_triple().triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            _BIGNUM_C,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+        raise SystemExit(1)
+    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, bignum_mod)
     mod.verify()
     optimize(mod, opt_level)

@@ -152,7 +152,6 @@ from .extension_hooks import (
     HookLoader,
     HookStage,
     SemanticHook,
-    SourceLocation,
     get_global_hook_registry,
 )
 from .lexar import Lexer, LexerError, register_keywords
@@ -278,7 +277,9 @@ class Reporter:
             )
         )
 
-    def strict_error(self, message: str, token=None, note: str | None = None, code: str | None = None):
+    def strict_error(
+        self, message: str, token=None, note: str | None = None, code: str | None = None
+    ):
         self.diagnostics.append(
             Diagnostic(
                 message,
@@ -289,7 +290,9 @@ class Reporter:
             )
         )
 
-    def strict_warning(self, message: str, token=None, note: str | None = None, code: str | None = None):
+    def strict_warning(
+        self, message: str, token=None, note: str | None = None, code: str | None = None
+    ):
         self.diagnostics.append(
             Diagnostic(
                 message,
@@ -333,12 +336,8 @@ class Reporter:
         for diag in diags:
             parts.append(self._format(diag))
 
-        err_count = sum(
-            1 for d in diags if d.level in ("error", "strict-error")
-        )
-        warn_count = sum(
-            1 for d in diags if d.level in ("strict-warning", "warning")
-        )
+        err_count = sum(1 for d in diags if d.level in ("error", "strict-error"))
+        warn_count = sum(1 for d in diags if d.level in ("strict-warning", "warning"))
         if err_count or warn_count:
             bits = []
             if err_count:
@@ -538,8 +537,6 @@ class SemanticAnalyzer:
     def _hook_context(self) -> CompilerContext:
         """Build a cached CompilerContext exposing this analyzer to hooks."""
         if self._hook_ctx is None:
-            from .extension_hooks import SourceLocation
-
             self._hook_ctx = CompilerContext(
                 source_file=self.filepath,
                 semantic_model=self,
@@ -724,7 +721,16 @@ class SemanticAnalyzer:
         if self.strict:
             self.reporter.strict_warning(message, self._tok(node), note)
 
-    _NUMERIC_TYPES = ("int", "int64", "uint64", "float", "double", "big", "char", "size_t")
+    _NUMERIC_TYPES = (
+        "int",
+        "int64",
+        "uint64",
+        "float",
+        "double",
+        "big",
+        "char",
+        "size_t",
+    )
     _INT_TYPES = ("int", "int64", "uint64", "char", "size_t")
     _FLOAT_TYPES = ("float", "double")
     _WIDE_INT_TYPES = ("int64", "uint64")
@@ -1125,6 +1131,18 @@ class SemanticAnalyzer:
                             node,
                             note="cannot divide integer by zero",
                         )
+                if left_t is not None and right_t is not None:
+                    left_ptr = left_t.endswith("*")
+                    right_ptr = right_t.endswith("*")
+                    if node.op.name in ("PLUS", "MINUS") and (
+                        (left_ptr and right_t == "int")
+                        or (right_ptr and left_t == "int")
+                    ):
+                        node.inferred_type = left_t if left_ptr else right_t
+                        return node.inferred_type
+                    if node.op.name == "MINUS" and left_ptr and right_ptr:
+                        node.inferred_type = "int"
+                        return "int"
                 if left_t is not None and right_t is not None and left_t != right_t:
                     # Usual arithmetic conversions: promote to the widest type
                     promoted = self._numeric_promote(left_t, right_t)
@@ -1166,7 +1184,15 @@ class SemanticAnalyzer:
                 node.inferred_type = "int"
                 return "int"
             if node.op.name == "MINUS":
-                valid_types = ("int", "float", "double", "int64", "uint64", "big", "size_t")
+                valid_types = (
+                    "int",
+                    "float",
+                    "double",
+                    "int64",
+                    "uint64",
+                    "big",
+                    "size_t",
+                )
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f"cannot apply unary minus to `{operand_t}`",
@@ -1601,6 +1627,7 @@ class SemanticAnalyzer:
             # Build a lightweight token so the reporter can point at the line.
             class _Tok:
                 pass
+
             t = _Tok()
             t.line = loc.line
             t.column = loc.column or 1
@@ -1616,7 +1643,6 @@ class SemanticAnalyzer:
             self.reporter.warning(diag.message, tok, note, span=span, code=code)
         elif sev == DiagnosticSeverity.NOTE:
             self.reporter.warning(diag.message, tok, note, span=span, code=code)
-
 
     def _resolve_module_path(
         self, module: str, sdk_path: str | None = None
@@ -1996,21 +2022,35 @@ class SemanticAnalyzer:
         return None
 
     def _try_cpm_import(self, node: Import, module: str) -> bool:
-        # Check if package was already loaded via manifest
-        # Handle both @package.name and package.name formats
-        pkg_name = module.lstrip("@").rsplit("/", 1)[-1]
-        if pkg_name in self._loaded_packages:
-            # Package was loaded via manifest, register empty symbols and succeed
-            self._register_import_symbols({}, node)
-            return True
+        # Support both @scope.name and @scope/name import forms.
+        import_name = module[1:] if module.startswith("@") else module
+        pkg_name = import_name.replace("/", ".").split(".")[-1]
 
         cpm_root = None
         if self._workspace_root:
             cpm_root = os.path.join(self._workspace_root, ".cpm", "modules")
         elif self._filedir:
             cpm_root = os.path.join(self._filedir, "..", ".cpm", "modules")
+
+        # A package already loaded purely via its manifest (extension hooks only)
+        # has no real symbols; short-circuit only when no CPM directory exists to
+        # resolve a real entry from. A package that ships an entry file must still
+        # re-export its actual symbols below.
+        if pkg_name in self._loaded_packages and not (
+            cpm_root and os.path.isdir(cpm_root)
+        ):
+            self._register_import_symbols({}, node)
+            return True
+
         if cpm_root and os.path.isdir(cpm_root):
-            pkg_dir = os.path.join(cpm_root, module.lstrip("@"))
+            if module.startswith("@"):
+                scoped = module[1:].replace("/", ".").replace(".", os.sep)
+                pkg_dir = os.path.join(
+                    cpm_root, f"@{scoped.split(os.sep)[0]}", *scoped.split(os.sep)[1:]
+                )
+            else:
+                pkg_dir = os.path.join(cpm_root, *module.replace("/", ".").split("."))
+
             if os.path.isdir(pkg_dir):
                 versions = sorted(
                     [
@@ -2021,10 +2061,8 @@ class SemanticAnalyzer:
                     reverse=True,
                 )
                 if versions:
-                    pkg_name = module.lstrip("@").rsplit("/", 1)[-1]
                     version_dir = os.path.join(pkg_dir, versions[0])
 
-                    # Load package manifest if extensions are enabled
                     manifest_loaded = False
                     if self.enable_extensions:
                         manifest_loaded = self._load_package_manifest(
@@ -2041,12 +2079,12 @@ class SemanticAnalyzer:
                     if result:
                         return True
 
-                    # If no .cpy or prebuilt files but manifest was loaded, allow the import
-                    # This supports extension-only packages
                     if manifest_loaded:
-                        # Register empty symbols for extension-only packages
                         self._register_import_symbols({}, node)
                         return True
+        if self.enable_extensions and pkg_name in self._loaded_packages:
+            self._register_import_symbols({}, node)
+            return True
         return False
 
     def _import_cpy(self, module: str, node: Import | None = None):
@@ -2096,6 +2134,12 @@ class SemanticAnalyzer:
                 for fname, (ret_type, params, vararg) in ast_node.symbols:
                     if fname not in symbols:
                         symbols[fname] = (ret_type, params, vararg)
+
+                # Preserve the sub-AST chain for re-exported imports so codegen
+                # can still reach the aggregated module's function definitions
+                # (emit_program recurses through Import sub_ast).
+                if getattr(ast_node, "sub_ast", None):
+                    sub_ast.append(ast_node)
 
         if node is not None:
             node.sub_ast = sub_ast
@@ -2531,7 +2575,8 @@ class SemanticAnalyzer:
                         )
                     if state.get(ft) == "freed":
                         self.warning(
-                            f"`{ft}` is already freed", stmt,
+                            f"`{ft}` is already freed",
+                            stmt,
                             note="double-free of a `new` allocation",
                         )
                     state[ft] = "freed"
@@ -2552,13 +2597,15 @@ class SemanticAnalyzer:
                         )
                     if state.get(ft) == "freed":
                         self.warning(
-                            f"`{ft}` is freed more than once", stmt,
+                            f"`{ft}` is freed more than once",
+                            stmt,
                             note="double-free of a `new` allocation",
                         )
                     elif state.get(ft) not in ("owned", None):
                         self.warning(
                             f"`free({ft})` called on a value that was not allocated "
-                            f"with `new` in this function", stmt,
+                            f"with `new` in this function",
+                            stmt,
                         )
                     state[ft] = "freed"
                     return
@@ -2598,11 +2645,16 @@ class SemanticAnalyzer:
                 return
             # fallback: recurse into known container bodies
             for child in getattr(stmt, "body", None) or []:
-                if isinstance(child, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)):
+                if isinstance(
+                    child,
+                    (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print),
+                ):
                     walk_stmt(child, frame)
 
         for stmt in body:
-            if not isinstance(stmt, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)):
+            if not isinstance(
+                stmt, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)
+            ):
                 continue
             walk_stmt(stmt, fn)
 
@@ -3330,16 +3382,20 @@ class SemanticAnalyzer:
         if sym and sym.kind == "type_alias":
             return self._resolve_type_alias(sym.type)
         return type_name
+
+
 def analyze(
     source: str,
     nodes: list,
     strict: bool = False,
     workspace_root: str | None = None,
+    filepath: str | None = None,
     enable_extensions: bool = True,
     no_gc: bool = False,
 ):
     analyzer = SemanticAnalyzer(
         source,
+        filepath=filepath,
         strict=strict,
         workspace_root=workspace_root,
         enable_extensions=enable_extensions,

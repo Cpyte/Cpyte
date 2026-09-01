@@ -47,6 +47,7 @@ def _get_all_parser_hooks(enable_extensions: bool) -> list[Any]:
     hooks = list(_parser_hooks)
     try:
         from .extension_hooks import HookStage, ParserHook, get_global_hook_registry
+
         registry = get_global_hook_registry()
         for hook in registry.get(HookStage.PARSER):
             if isinstance(hook, ParserHook) and hook not in hooks:
@@ -57,10 +58,10 @@ def _get_all_parser_hooks(enable_extensions: bool) -> list[Any]:
 
 
 def _loc(node):
-    token = getattr(node, '_token', None)
+    token = getattr(node, "_token", None)
     if token:
-        return f'L{token.line}:{token.column}'
-    return '<unknown>'
+        return f"L{token.line}:{token.column}"
+    return "<unknown>"
 
 
 class Node:
@@ -71,134 +72,168 @@ class Node:
 
 class Number(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', 'value')
+    __slots__ = ("_token", "inferred_type", "value")
+
     def __init__(self, value: str, token=None):
         self.value = value
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'Number({self.value})'
+        return f"Number({self.value})"
+
 
 class String(Node):
-    __slots__ = ('_token', 'inferred_type', 'value')
+    __slots__ = ("_token", "inferred_type", "value")
+
     def __init__(self, value: str, token=None):
         self.value = value
         self._token = token
+
     def __repr__(self):
-        return f'String({self.value})'
+        return f"String({self.value})"
+
 
 class FString(Node):
-    __slots__ = ('_token', 'inferred_type', 'parts')
+    __slots__ = ("_token", "inferred_type", "parts")
+
     def __init__(self, parts: list, token=None):
         self.parts = parts
         self._token = token
+
     def __repr__(self):
-        return f'FString({self.parts})'
+        return f"FString({self.parts})"
+
 
 class Variable(Node):
-    __slots__ = ('_token', 'const_value', 'dynamic', 'inferred_type', 'name')
+    __slots__ = ("_token", "const_value", "dynamic", "inferred_type", "name")
+
     def __init__(self, name: str, token=None):
         self.name = name
         self._token = token
         self.const_value = None
+
     def __repr__(self):
-        return f'Variable({self.name})'
+        return f"Variable({self.name})"
 
     @property
     def token(self):
         return self._token
 
+
 class ListLit(Node):
-    __slots__ = ('_token', 'inferred_type', 'items')
+    __slots__ = ("_token", "inferred_type", "items")
+
     def __init__(self, items: list, token=None):
         self.items = items
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'ListLit({self.items})'
+        return f"ListLit({self.items})"
 
 
 class Call(Node):
-    __slots__ = ('_token', 'args', 'callee', 'inferred_type')
+    __slots__ = ("_token", "args", "callee", "inferred_type")
+
     def __init__(self, callee, args: list, token=None):
         self.callee = callee
         self.args = args
         self._token = token
+
     def __repr__(self):
-        return f'Call({self.callee}, {self.args})'
+        return f"Call({self.callee}, {self.args})"
+
 
 class Index(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'index', 'inferred_type', 'obj')
+    __slots__ = ("_token", "index", "inferred_type", "obj")
+
     def __init__(self, obj, index, token=None):
         self.obj = obj
         self.index = index
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'Index({self.obj}, {self.index})'
+        return f"Index({self.obj}, {self.index})"
+
 
 class Attr(Node):
-    __slots__ = ('_enum_member_value', '_token', 'name', 'obj')
+    __slots__ = ("_enum_member_value", "_token", "name", "obj")
+
     def __init__(self, obj, name: str, token=None):
         self.obj = obj
         self.name = name
         self._token = token
         self._enum_member_value = None
+
     def __repr__(self):
-        return f'Attr({self.obj}, {self.name})'
+        return f"Attr({self.obj}, {self.name})"
+
 
 class UnaryOp(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', 'op', 'operand')
+    __slots__ = ("_token", "inferred_type", "op", "operand")
+
     def __init__(self, op: TokenType, operand, token=None):
         self.op = op
         self.operand = operand
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'UnaryOp({self.op.name}, {self.operand})'
+        return f"UnaryOp({self.op.name}, {self.operand})"
+
 
 class BinOp(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', 'left', 'op', 'right')
+    __slots__ = ("_token", "inferred_type", "left", "op", "right")
+
     def __init__(self, left, op: TokenType, right, token=None):
         self.left = left
         self.op = op
         self.right = right
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'BinOp({self.left}, {self.op.name}, {self.right})'
+        return f"BinOp({self.left}, {self.op.name}, {self.right})"
+
 
 class CCode(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', 'symbols', 'value', 'var_names')
-    def __init__(self, value : str, token=None):
+    __slots__ = ("_token", "inferred_type", "symbols", "value", "var_names")
+
+    def __init__(self, value: str, token=None):
         self.value = value
         self._token = token
         self.inferred_type = None
         self.symbols = None
         self.var_names = None
+
     def __repr__(self):
-        return f'CCode({self.value!r})'
+        return f"CCode({self.value!r})"
+
 
 class LLVMblock(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', "is_unsafe", 'value')
+    __slots__ = ("_token", "inferred_type", "is_unsafe", "value")
 
-    def __init__(self, value: str, is_unsafe : bool, token=None):
+    def __init__(self, value: str, is_unsafe: bool, token=None):
         self.value = value
         self._token = token
         self.is_unsafe = is_unsafe
         self.inferred_type = None
 
     def __repr__(self):
-        return f'LLVM({self.value!r})'
+        return f"LLVM({self.value!r})"
+
 
 class Llvm(Node):
     inferred_type: str | None
-    __slots__ = ('_token', 'inferred_type', 'symbols', 'unsafe', 'value', 'var_names')
+    __slots__ = ("_token", "inferred_type", "symbols", "unsafe", "value", "var_names")
+
     def __init__(self, value: str, unsafe: bool = False, token=None):
         self.value = value
         self.unsafe = unsafe
@@ -206,17 +241,27 @@ class Llvm(Node):
         self.inferred_type = None
         self.symbols = None
         self.var_names = None
+
     def __repr__(self):
-        return f'Llvm({self.value!r}, unsafe={self.unsafe})'
+        return f"Llvm({self.value!r}, unsafe={self.unsafe})"
+
 
 _PREC = {
     TokenType.POW: 80,
-    TokenType.STAR: 70, TokenType.SLASH: 70, TokenType.SLASH_SLASH: 70, TokenType.PERCENT: 70,
-    TokenType.PLUS: 60, TokenType.MINUS: 60,
-    TokenType.SHL: 50, TokenType.SHR: 50,
-    TokenType.GREATER: 40, TokenType.LESS: 40,
-    TokenType.GREATER_EQ: 40, TokenType.LESS_EQ: 40,
-    TokenType.EQ_EQ: 40, TokenType.NOT_EQ: 40,
+    TokenType.STAR: 70,
+    TokenType.SLASH: 70,
+    TokenType.SLASH_SLASH: 70,
+    TokenType.PERCENT: 70,
+    TokenType.PLUS: 60,
+    TokenType.MINUS: 60,
+    TokenType.SHL: 50,
+    TokenType.SHR: 50,
+    TokenType.GREATER: 40,
+    TokenType.LESS: 40,
+    TokenType.GREATER_EQ: 40,
+    TokenType.LESS_EQ: 40,
+    TokenType.EQ_EQ: 40,
+    TokenType.NOT_EQ: 40,
     TokenType.AMPERSAND: 30,
     TokenType.CARET: 20,
     TokenType.PIPE: 10,
@@ -236,13 +281,23 @@ _EXPR_DEPTH_LIMIT = 120
 _expr_depth = 0
 
 _UNARY_PREFIX_TYPES = {
-    TokenType.MINUS, TokenType.PLUS, TokenType.NOT, TokenType.TILDE,
-    TokenType.POW, TokenType.STAR, TokenType.AMPERSAND, TokenType.MINUS_MINUS,
+    TokenType.MINUS,
+    TokenType.PLUS,
+    TokenType.NOT,
+    TokenType.TILDE,
+    TokenType.POW,
+    TokenType.STAR,
+    TokenType.AMPERSAND,
+    TokenType.MINUS_MINUS,
 }
 
 
 def _skip_expr_newlines(tokens: list[Token], pos: int) -> int:
-    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+    while pos < len(tokens) and tokens[pos].type in (
+        TokenType.NEWLINE,
+        TokenType.INDENT,
+        TokenType.DEDENT,
+    ):
         pos += 1
     return pos
 
@@ -269,8 +324,8 @@ def _wrap_unary_prefixes(prefixes, node):
 class ParseError(Exception):
     def __init__(self, msg: str, token: Token | None = None):
         self.token = token
-        loc = f' at L{token.line}:{token.column}' if token else ''
-        super().__init__(f'{msg}{loc}')
+        loc = f" at L{token.line}:{token.column}" if token else ""
+        super().__init__(f"{msg}{loc}")
 
 
 def _prec(tok: Token) -> int:
@@ -290,10 +345,18 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
 
         left, pos = _parse_unary(tokens, pos)
 
-        while pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= min_prec:
+        while (
+            pos < len(tokens)
+            and tokens[pos].type in _BINARY_OPS
+            and _prec(tokens[pos]) >= min_prec
+        ):
             op = tokens[pos]
             pos += 1
-            while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            while pos < len(tokens) and tokens[pos].type in (
+                TokenType.NEWLINE,
+                TokenType.INDENT,
+                TokenType.DEDENT,
+            ):
                 pos += 1
             next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
             right, pos = _parse_binary(tokens, pos, next_prec)
@@ -307,7 +370,7 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
 def _parse_unary(tokens: list[Token], pos: int):
     pos = _skip_expr_newlines(tokens, pos)
     if pos >= len(tokens):
-        raise ParseError('Unexpected end of expression')
+        raise ParseError("Unexpected end of expression")
 
     prefixes = []
     while pos < len(tokens) and tokens[pos].type in _UNARY_PREFIX_TYPES:
@@ -368,29 +431,29 @@ def _try_parse_cast_type(tokens, pos):
 def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'borrow':
+    if tok.type == TokenType.KEYWORD and tok.value == "borrow":
         pos += 1
         mutable = False
         if (
             pos < len(tokens)
             and tokens[pos].type == TokenType.KEYWORD
-            and tokens[pos].value == 'mut'
+            and tokens[pos].value == "mut"
         ):
             mutable = True
             pos += 1
         if pos >= len(tokens):
-            raise ParseError('Expected expression after `borrow`', tok)
+            raise ParseError("Expected expression after `borrow`", tok)
         operand, pos = parse_expression(tokens, pos)
         return BorrowExpr(operand, mutable=mutable, token=tok), pos
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'move':
+    if tok.type == TokenType.KEYWORD and tok.value == "move":
         pos += 1
         if pos >= len(tokens):
-            raise ParseError('Expected expression after `move`', tok)
+            raise ParseError("Expected expression after `move`", tok)
         operand, pos = parse_expression(tokens, pos)
         return MoveExpr(operand, token=tok), pos
 
-    if tok.type == TokenType.NUMBER and tok.value == '67':
+    if tok.type == TokenType.NUMBER and tok.value == "67":
         pos += 1
         if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
             pos += 1
@@ -398,7 +461,7 @@ def _parse_atom(tokens: list[Token], pos: int):
                 raise ParseError('Expected ")" after 67()', tok)
             return Signed67(token=tok), pos + 1
         pos -= 1
-        return Number('67', token=tok), pos + 1
+        return Number("67", token=tok), pos + 1
 
     if tok.type == TokenType.NUMBER:
         assert tok.value is not None
@@ -412,28 +475,41 @@ def _parse_atom(tokens: list[Token], pos: int):
         assert tok.value is not None
         parts = []
         for kind, payload in _split_fstring(tok.value):
-            if kind == 'lit':
-                parts.append(('lit', payload if getattr(tok, 'raw', False) else _unescape_run(payload)))
+            if kind == "lit":
+                parts.append(
+                    (
+                        "lit",
+                        payload
+                        if getattr(tok, "raw", False)
+                        else _unescape_run(payload),
+                    )
+                )
             else:
-                expr_tokens = Lexer(payload + '\n').get_tokens()
+                expr_tokens = Lexer(payload + "\n").get_tokens()
                 expr_node, _ = parse_expression(expr_tokens, 0)
-                parts.append(('expr', expr_node))
+                parts.append(("expr", expr_node))
         return FString(parts, token=tok), pos + 1
 
     if tok.type == TokenType.IDENTIFIER:
         assert tok.value is not None
         return Variable(tok.value, token=tok), pos + 1
 
-    if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'True', 'False', 'null'):
-        if tok.value in ('true', 'True'):
-            val = '1'
-        elif tok.value in ('false', 'False'):
-            val = '0'
+    if tok.type == TokenType.KEYWORD and tok.value in (
+        "true",
+        "false",
+        "True",
+        "False",
+        "null",
+    ):
+        if tok.value in ("true", "True"):
+            val = "1"
+        elif tok.value in ("false", "False"):
+            val = "0"
         else:
-            val = '0'
+            val = "0"
         return Number(val, token=tok), pos + 1
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'input':
+    if tok.type == TokenType.KEYWORD and tok.value == "input":
         pos += 1
         if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
             pos += 1
@@ -442,7 +518,7 @@ def _parse_atom(tokens: list[Token], pos: int):
             return Input(token=tok), pos + 1
         raise ParseError('Expected "(" after input', tok)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'input_str':
+    if tok.type == TokenType.KEYWORD and tok.value == "input_str":
         pos += 1
         if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
             pos += 1
@@ -451,7 +527,7 @@ def _parse_atom(tokens: list[Token], pos: int):
             return InputStr(token=tok), pos + 1
         raise ParseError('Expected "(" after input_str', tok)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'input_big':
+    if tok.type == TokenType.KEYWORD and tok.value == "input_big":
         pos += 1
         if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
             pos += 1
@@ -460,10 +536,12 @@ def _parse_atom(tokens: list[Token], pos: int):
             return InputBig(token=tok), pos + 1
         raise ParseError('Expected "(" after input_big', tok)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'new':
+    if tok.type == TokenType.KEYWORD and tok.value == "new":
         pos += 1
         base_type, pos = parse_type(tokens, pos)
-        type_str = _type_to_str(base_type) if isinstance(base_type, tuple) else base_type
+        type_str = (
+            _type_to_str(base_type) if isinstance(base_type, tuple) else base_type
+        )
         size = None
         if pos < len(tokens) and tokens[pos].type == TokenType.LBRACKET:
             pos += 1
@@ -473,10 +551,10 @@ def _parse_atom(tokens: list[Token], pos: int):
             pos += 1
         return NewExpr(type_str, size, token=tok), pos
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+    if tok.type == TokenType.KEYWORD and tok.value == "asm":
         return parse_inline_asm(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'sizeof':
+    if tok.type == TokenType.KEYWORD and tok.value == "sizeof":
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
             raise ParseError('Expected "("', tok)
@@ -485,7 +563,9 @@ def _parse_atom(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
             raise ParseError('Expected ")"', tok)
         pos += 1
-        type_str = _type_to_str(type_expr) if isinstance(type_expr, tuple) else type_expr
+        type_str = (
+            _type_to_str(type_expr) if isinstance(type_expr, tuple) else type_expr
+        )
         return SizeOf(type_str, token=tok), pos
 
     if tok.type == TokenType.LPAREN:
@@ -495,21 +575,27 @@ def _parse_atom(tokens: list[Token], pos: int):
             if tp_end < len(tokens) and tokens[tp_end].type == TokenType.RPAREN:
                 after = tp_end + 1
                 if after < len(tokens) and tokens[after].type not in (
-                    TokenType.NEWLINE, TokenType.RPAREN, TokenType.RBRACKET,
-                    TokenType.COMMA, TokenType.COLON, TokenType.EOF,
+                    TokenType.NEWLINE,
+                    TokenType.RPAREN,
+                    TokenType.RBRACKET,
+                    TokenType.COMMA,
+                    TokenType.COLON,
+                    TokenType.EOF,
                 ):
                     expr, expr_pos = parse_expression(tokens, after)
                     return CastExpr(tp, expr, token=tok), expr_pos
         pos = save
         node, pos = parse_expression(tokens, pos)
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-            raise ParseError('Expected closing parenthesis', tok)
+            raise ParseError("Expected closing parenthesis", tok)
         return node, pos + 1
 
     if tok.type == TokenType.LBRACKET:
         return _parse_list_literal(tokens, pos, tok)
 
-    raise ParseError(f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok)
+    raise ParseError(
+        f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok
+    )
 
 
 def _parse_list_literal(tokens, pos, tok):
@@ -521,7 +607,7 @@ def _parse_list_literal(tokens, pos, tok):
             item, pos = parse_expression(tokens, pos)
             items.append(item)
             if pos >= len(tokens):
-                raise ParseError('Unterminated list literal', tok)
+                raise ParseError("Unterminated list literal", tok)
             if tokens[pos].type == TokenType.COMMA:
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.RBRACKET:
@@ -550,14 +636,14 @@ def _split_fstring(content: str) -> list:
 
     def flush_literal():
         if literal:
-            parts.append(('lit', ''.join(literal)))
+            parts.append(("lit", "".join(literal)))
             literal.clear()
 
     while i < n:
         ch = content[i]
-        if ch == '{':
-            if i + 1 < n and content[i + 1] == '{':
-                literal.append('{')
+        if ch == "{":
+            if i + 1 < n and content[i + 1] == "{":
+                literal.append("{")
                 i += 2
                 continue
             flush_literal()
@@ -569,7 +655,7 @@ def _split_fstring(content: str) -> list:
                 c = content[i]
                 if expr_quote is not None:
                     expr_chars.append(c)
-                    if c == '\\' and i + 1 < n:
+                    if c == "\\" and i + 1 < n:
                         expr_chars.append(content[i + 1])
                         i += 2
                         continue
@@ -582,12 +668,12 @@ def _split_fstring(content: str) -> list:
                     expr_chars.append(c)
                     i += 1
                     continue
-                if c == '{':
+                if c == "{":
                     depth += 1
                     expr_chars.append(c)
                     i += 1
                     continue
-                if c == '}':
+                if c == "}":
                     depth -= 1
                     if depth == 0:
                         i += 1
@@ -597,12 +683,12 @@ def _split_fstring(content: str) -> list:
                     continue
                 expr_chars.append(c)
                 i += 1
-            expr = ''.join(expr_chars).strip()
-            parts.append(('expr', expr))
+            expr = "".join(expr_chars).strip()
+            parts.append(("expr", expr))
             continue
-        if ch == '}':
-            if i + 1 < n and content[i + 1] == '}':
-                literal.append('}')
+        if ch == "}":
+            if i + 1 < n and content[i + 1] == "}":
+                literal.append("}")
                 i += 2
                 continue
             literal.append(ch)
@@ -625,12 +711,18 @@ def _parse_call_args(tokens: list[Token], pos: int, callee):
         if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-        raise ParseError('Expected ")" after arguments', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected ")" after arguments', tokens[pos] if pos < len(tokens) else None
+        )
     return Call(callee, args, token=tok), pos + 1
 
 
 def _parse_postfix(tokens: list[Token], pos: int, node):
-    while pos < len(tokens) and tokens[pos].type in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.DOT):
+    while pos < len(tokens) and tokens[pos].type in (
+        TokenType.LPAREN,
+        TokenType.LBRACKET,
+        TokenType.DOT,
+    ):
         tok = tokens[pos]
         if tok.type == TokenType.LPAREN:
             node, pos = _parse_call_args(tokens, pos, node)
@@ -638,13 +730,18 @@ def _parse_postfix(tokens: list[Token], pos: int, node):
             pos += 1
             index, pos = parse_expression(tokens, pos)
             if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
-                raise ParseError('Expected "]"', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    'Expected "]"', tokens[pos] if pos < len(tokens) else None
+                )
             pos += 1
             node = Index(node, index, token=tok)
         elif tok.type == TokenType.DOT:
             pos += 1
             if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-                raise ParseError('Expected attribute name', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    "Expected attribute name",
+                    tokens[pos] if pos < len(tokens) else None,
+                )
             name = tokens[pos].value
             assert name is not None
             pos += 1
@@ -662,31 +759,31 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
     explicit continuation stack, so arbitrarily deep expressions are safe.
     """
     vals: list = []
-    frames: list = [('binary', min_prec)]
+    frames: list = [("binary", min_prec)]
 
     while frames:
         frame = frames.pop()
         kind = frame[0]
 
-        if kind == 'binary':
+        if kind == "binary":
             _, mp = frame
-            frames.append(('binary_loop', mp))
-            frames.append(('unary', []))
+            frames.append(("binary_loop", mp))
+            frames.append(("unary", []))
 
-        elif kind == 'unary':
+        elif kind == "unary":
             prefixes = frame[1]
             pos = _skip_expr_newlines(tokens, pos)
             if pos >= len(tokens):
-                raise ParseError('Unexpected end of expression')
+                raise ParseError("Unexpected end of expression")
             while pos < len(tokens) and tokens[pos].type in _UNARY_PREFIX_TYPES:
                 prefixes.append(tokens[pos])
                 pos += 1
-            frames.append(('postfix', prefixes))
-            frames.append(('atom',))
+            frames.append(("postfix", prefixes))
+            frames.append(("atom",))
 
-        elif kind == 'atom':
+        elif kind == "atom":
             tok = tokens[pos]
-            if tok.type == TokenType.NUMBER and tok.value == '67':
+            if tok.type == TokenType.NUMBER and tok.value == "67":
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
                     pos += 1
@@ -695,7 +792,7 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     pos += 1
                     vals.append(Signed67(token=tok))
                     continue
-                vals.append(Number('67', token=tok))
+                vals.append(Number("67", token=tok))
                 continue
             if tok.type == TokenType.NUMBER:
                 assert tok.value is not None
@@ -712,12 +809,18 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                 pos += 1
                 vals.append(Variable(tok.value, token=tok))
                 continue
-            if tok.type == TokenType.KEYWORD and tok.value in ('true', 'false', 'True', 'False', 'null'):
-                val = '1' if tok.value in ('true', 'True') else '0'
+            if tok.type == TokenType.KEYWORD and tok.value in (
+                "true",
+                "false",
+                "True",
+                "False",
+                "null",
+            ):
+                val = "1" if tok.value in ("true", "True") else "0"
                 pos += 1
                 vals.append(Number(val, token=tok))
                 continue
-            if tok.type == TokenType.KEYWORD and tok.value == 'input':
+            if tok.type == TokenType.KEYWORD and tok.value == "input":
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
                     pos += 1
@@ -727,7 +830,7 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     vals.append(Input(token=tok))
                     continue
                 raise ParseError('Expected "(" after input', tok)
-            if tok.type == TokenType.KEYWORD and tok.value == 'input_str':
+            if tok.type == TokenType.KEYWORD and tok.value == "input_str":
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
                     pos += 1
@@ -737,7 +840,7 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     vals.append(InputStr(token=tok))
                     continue
                 raise ParseError('Expected "(" after input_str', tok)
-            if tok.type == TokenType.KEYWORD and tok.value == 'input_big':
+            if tok.type == TokenType.KEYWORD and tok.value == "input_big":
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
                     pos += 1
@@ -747,22 +850,26 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     vals.append(InputBig(token=tok))
                     continue
                 raise ParseError('Expected "(" after input_big', tok)
-            if tok.type == TokenType.KEYWORD and tok.value == 'new':
+            if tok.type == TokenType.KEYWORD and tok.value == "new":
                 pos += 1
                 base_type, pos = parse_type(tokens, pos)
-                type_str = _type_to_str(base_type) if isinstance(base_type, tuple) else base_type
+                type_str = (
+                    _type_to_str(base_type)
+                    if isinstance(base_type, tuple)
+                    else base_type
+                )
                 if pos < len(tokens) and tokens[pos].type == TokenType.LBRACKET:
                     pos += 1
-                    frames.append(('new_size_done', tok, type_str))
-                    frames.append(('binary', 0))
+                    frames.append(("new_size_done", tok, type_str))
+                    frames.append(("binary", 0))
                     continue
                 vals.append(NewExpr(type_str, None, token=tok))
                 continue
-            if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+            if tok.type == TokenType.KEYWORD and tok.value == "asm":
                 node, pos = parse_inline_asm(tokens, pos)
                 vals.append(node)
                 continue
-            if tok.type == TokenType.KEYWORD and tok.value == 'sizeof':
+            if tok.type == TokenType.KEYWORD and tok.value == "sizeof":
                 pos += 1
                 if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
                     raise ParseError('Expected "("', tok)
@@ -771,7 +878,11 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                 if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
                     raise ParseError('Expected ")"', tok)
                 pos += 1
-                type_str = _type_to_str(type_expr) if isinstance(type_expr, tuple) else type_expr
+                type_str = (
+                    _type_to_str(type_expr)
+                    if isinstance(type_expr, tuple)
+                    else type_expr
+                )
                 vals.append(SizeOf(type_str, token=tok))
                 continue
             if tok.type == TokenType.LBRACKET:
@@ -781,18 +892,20 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
 
             if tok.type == TokenType.LPAREN:
                 pos += 1
-                frames.append(('paren_rparen', tok))
-                frames.append(('binary', 0))
+                frames.append(("paren_rparen", tok))
+                frames.append(("binary", 0))
                 continue
-            raise ParseError(f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok)
+            raise ParseError(
+                f'Unexpected token in expression: {tok.type.name} "{tok.value}"', tok
+            )
 
-        elif kind == 'paren_rparen':
+        elif kind == "paren_rparen":
             tok = frame[1]
             if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-                raise ParseError('Expected closing parenthesis', tok)
+                raise ParseError("Expected closing parenthesis", tok)
             pos += 1
 
-        elif kind == 'new_size_done':
+        elif kind == "new_size_done":
             tok, type_str = frame[1], frame[2]
             size = vals.pop()
             if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
@@ -800,25 +913,32 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
             pos += 1
             vals.append(NewExpr(type_str, size, token=tok))
 
-        elif kind == 'postfix':
+        elif kind == "postfix":
             prefixes = frame[1]
             node = vals.pop()
-            while pos < len(tokens) and tokens[pos].type in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.DOT):
+            while pos < len(tokens) and tokens[pos].type in (
+                TokenType.LPAREN,
+                TokenType.LBRACKET,
+                TokenType.DOT,
+            ):
                 ptok = tokens[pos]
                 if ptok.type == TokenType.LPAREN:
                     pos += 1
-                    frames.append(('call_done', prefixes))
-                    frames.append(('callargs', node, [], ptok))
+                    frames.append(("call_done", prefixes))
+                    frames.append(("callargs", node, [], ptok))
                     break
                 elif ptok.type == TokenType.LBRACKET:
                     pos += 1
-                    frames.append(('index_done', prefixes, node, ptok))
-                    frames.append(('binary', 0))
+                    frames.append(("index_done", prefixes, node, ptok))
+                    frames.append(("binary", 0))
                     break
                 else:
                     pos += 1
                     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-                        raise ParseError('Expected attribute name', tokens[pos] if pos < len(tokens) else None)
+                        raise ParseError(
+                            "Expected attribute name",
+                            tokens[pos] if pos < len(tokens) else None,
+                        )
                     name = tokens[pos].value
                     assert name is not None
                     pos += 1
@@ -826,11 +946,11 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
             else:
                 vals.append(_wrap_unary_prefixes(prefixes, node))
 
-        elif kind == 'call_done':
+        elif kind == "call_done":
             prefixes = frame[1]
-            frames.append(('postfix', prefixes))
+            frames.append(("postfix", prefixes))
 
-        elif kind == 'callargs':
+        elif kind == "callargs":
             callee, args, call_tok = frame[1], frame[2], frame[3]
             if pos >= len(tokens):
                 raise ParseError('Expected ")" after arguments', None)
@@ -838,41 +958,47 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                 pos += 1
                 vals.append(Call(callee, args, token=call_tok))
                 continue
-            frames.append(('callarg_done', callee, args, call_tok))
-            frames.append(('binary', 0))
+            frames.append(("callarg_done", callee, args, call_tok))
+            frames.append(("binary", 0))
 
-        elif kind == 'callarg_done':
+        elif kind == "callarg_done":
             callee, args, call_tok = frame[1], frame[2], frame[3]
             args.append(vals.pop())
             if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
                 pos += 1
-            frames.append(('callargs', callee, args, call_tok))
+            frames.append(("callargs", callee, args, call_tok))
 
-        elif kind == 'index_done':
+        elif kind == "index_done":
             prefixes, base, tok = frame[1], frame[2], frame[3]
             index = vals.pop()
             if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
-                raise ParseError('Expected "]"', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    'Expected "]"', tokens[pos] if pos < len(tokens) else None
+                )
             pos += 1
             vals.append(Index(base, index, token=tok))
-            frames.append(('postfix', prefixes))
+            frames.append(("postfix", prefixes))
 
-        elif kind == 'binary_loop':
+        elif kind == "binary_loop":
             mp = frame[1]
-            if pos < len(tokens) and tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= mp:
+            if (
+                pos < len(tokens)
+                and tokens[pos].type in _BINARY_OPS
+                and _prec(tokens[pos]) >= mp
+            ):
                 op = tokens[pos]
                 pos += 1
                 pos = _skip_expr_newlines(tokens, pos)
                 next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
-                frames.append(('binary_combine', mp, op))
-                frames.append(('binary', next_prec))
+                frames.append(("binary_combine", mp, op))
+                frames.append(("binary", next_prec))
 
-        elif kind == 'binary_combine':
+        elif kind == "binary_combine":
             mp, op = frame[1], frame[2]
             right = vals.pop()
             left = vals.pop()
             vals.append(BinOp(left, op.type, right, token=op))
-            frames.append(('binary_loop', mp))
+            frames.append(("binary_loop", mp))
 
     node = vals.pop()
     return node, pos
@@ -881,7 +1007,10 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
 def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True):
     _pre_scan_user_types(tokens)
     nodes = []
-    while pos < len(tokens) and tokens[pos].type not in (TokenType.EOF, TokenType.DEDENT):
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.EOF,
+        TokenType.DEDENT,
+    ):
         while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
             pos += 1
 
@@ -896,7 +1025,9 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
             handled = False
             for hook in all_hooks:
                 try:
-                    if hasattr(hook, 'should_handle_statement') and hook.should_handle_statement(tokens, pos):
+                    if hasattr(
+                        hook, "should_handle_statement"
+                    ) and hook.should_handle_statement(tokens, pos):
                         node, pos = hook.parse_statement(tokens, pos, ctx)
                         nodes.append(node)
                         handled = True
@@ -921,6 +1052,7 @@ def _make_parser_ctx(tokens, pos):
     global _parser_ctx
     if _parser_ctx is None:
         from .extension_hooks import CompilerContext
+
         _parser_ctx = CompilerContext(data={"astparse": _get_module_ref()})
     _parser_ctx.data["tokens"] = tokens
     _parser_ctx.data["pos"] = pos
@@ -929,6 +1061,7 @@ def _make_parser_ctx(tokens, pos):
 
 def _get_module_ref():
     import sys
+
     return sys.modules.get(__name__)
 
 
@@ -937,49 +1070,55 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
     tok = tokens[pos]
     if tok.type == TokenType.AT_SIGN:
         node, pos = parse_at_def(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'def':
+    elif tok.type == TokenType.KEYWORD and tok.value == "def":
         node, pos = parse_def(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value in ('public', 'private', 'static', 'virtual', 'override'):
+    elif tok.type == TokenType.KEYWORD and tok.value in (
+        "public",
+        "private",
+        "static",
+        "virtual",
+        "override",
+    ):
         node, pos = parse_decorated_def(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'class':
+    elif tok.type == TokenType.KEYWORD and tok.value == "class":
         node, pos = parse_class(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'struct':
+    elif tok.type == TokenType.KEYWORD and tok.value == "struct":
         node, pos = parse_struct_def(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'if':
+    elif tok.type == TokenType.KEYWORD and tok.value == "if":
         node, pos = parse_if(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'return':
+    elif tok.type == TokenType.KEYWORD and tok.value == "return":
         node, pos = parse_return(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'while':
+    elif tok.type == TokenType.KEYWORD and tok.value == "while":
         node, pos = parse_while(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'for':
+    elif tok.type == TokenType.KEYWORD and tok.value == "for":
         node, pos = parse_for(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'import':
+    elif tok.type == TokenType.KEYWORD and tok.value == "import":
         node, pos = parse_import(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'print':
+    elif tok.type == TokenType.KEYWORD and tok.value == "print":
         node, pos = parse_print(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'break':
+    elif tok.type == TokenType.KEYWORD and tok.value == "break":
         node, pos = parse_break(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'continue':
+    elif tok.type == TokenType.KEYWORD and tok.value == "continue":
         node, pos = parse_continue(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'assert':
+    elif tok.type == TokenType.KEYWORD and tok.value == "assert":
         node, pos = parse_assert(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'asm':
+    elif tok.type == TokenType.KEYWORD and tok.value == "asm":
         node, pos = parse_inline_asm(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'ccode':
+    elif tok.type == TokenType.KEYWORD and tok.value == "ccode":
         node, pos = parse_ccode(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'llvm':
+    elif tok.type == TokenType.KEYWORD and tok.value == "llvm":
         node, pos = parse_llvm(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'unsafe':
+    elif tok.type == TokenType.KEYWORD and tok.value == "unsafe":
         node, pos = parse_llvm(tokens, pos, unsafe=True)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'switch':
+    elif tok.type == TokenType.KEYWORD and tok.value == "switch":
         node, pos = parse_switch(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'try':
+    elif tok.type == TokenType.KEYWORD and tok.value == "try":
         node, pos = parse_try(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'raise':
+    elif tok.type == TokenType.KEYWORD and tok.value == "raise":
         node, pos = parse_raise(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'enum':
+    elif tok.type == TokenType.KEYWORD and tok.value == "enum":
         node, pos = parse_enum(tokens, pos)
-    elif tok.type == TokenType.KEYWORD and tok.value == 'type':
+    elif tok.type == TokenType.KEYWORD and tok.value == "type":
         node, pos = parse_type_alias(tokens, pos)
     elif tok.type == TokenType.IDENTIFIER and pos + 1 < len(tokens):
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
@@ -1000,19 +1139,29 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
     return node, pos
 
 
-def _parse_func_with_visibility(tokens: list[Token], pos: int, visibility: str | None, tok: Token):
-    if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'def':
+def _parse_func_with_visibility(
+    tokens: list[Token], pos: int, visibility: str | None, tok: Token
+):
+    if (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.KEYWORD
+        and tokens[pos].value == "def"
+    ):
         pos += 1
     name, pos = _parse_func_name(tokens, pos)
     params, const_params, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return FuncDef(name, params, body, rettype, visibility, const_params=const_params, token=tok), pos
+    return FuncDef(
+        name, params, body, rettype, visibility, const_params=const_params, token=tok
+    ), pos
 
 
 def _parse_func_name(tokens: list[Token], pos: int):
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected function name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected function name", tokens[pos] if pos < len(tokens) else None
+        )
     name = tokens[pos].value
     assert name is not None
     return name, pos + 1
@@ -1039,18 +1188,27 @@ def _parse_func_params(tokens: list[Token], pos: int):
         pos += 1
         if is_const_view:
             if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-                raise ParseError('Expected ")" to close constant-view parameter name',
-                                 tokens[pos] if pos < len(tokens) else tok)
+                raise ParseError(
+                    'Expected ")" to close constant-view parameter name',
+                    tokens[pos] if pos < len(tokens) else tok,
+                )
             pos += 1
             const_params.append(param_name)
         if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
             pos += 1
-        if pos < len(tokens) and tokens[pos].type not in (TokenType.COMMA, TokenType.RPAREN):
+        if pos < len(tokens) and tokens[pos].type not in (
+            TokenType.COMMA,
+            TokenType.RPAREN,
+        ):
             param_type, pos = parse_type(tokens, pos)
-            param_type_str = _type_to_str(param_type) if isinstance(param_type, tuple) else param_type
+            param_type_str = (
+                _type_to_str(param_type)
+                if isinstance(param_type, tuple)
+                else param_type
+            )
             params[param_name] = param_type_str
         else:
-            params[param_name] = 'int'
+            params[param_name] = "int"
         if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
@@ -1064,14 +1222,22 @@ def _parse_func_rettype(tokens: list[Token], pos: int):
         pos += 1
         if pos < len(tokens):
             rettype_val, pos = parse_type(tokens, pos)
-            rettype = _type_to_str(rettype_val) if isinstance(rettype_val, tuple) else rettype_val
+            rettype = (
+                _type_to_str(rettype_val)
+                if isinstance(rettype_val, tuple)
+                else rettype_val
+            )
     return rettype, pos
 
 
 def parse_decorated_def(tokens: list[Token], pos: int):
     tok = tokens[pos]
     visibility = None
-    while pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value in ('public', 'private', 'static', 'virtual', 'override'):
+    while (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.KEYWORD
+        and tokens[pos].value in ("public", "private", "static", "virtual", "override")
+    ):
         visibility = tokens[pos].value
         pos += 1
     return _parse_func_with_visibility(tokens, pos, visibility, tok)
@@ -1081,7 +1247,9 @@ def parse_class(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected class name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected class name", tokens[pos] if pos < len(tokens) else None
+        )
     name = tokens[pos].value
     assert name is not None
     pos += 1
@@ -1090,11 +1258,16 @@ def parse_class(tokens: list[Token], pos: int):
     if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected base class name', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                "Expected base class name", tokens[pos] if pos < len(tokens) else None
+            )
         base = tokens[pos].value
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-            raise ParseError('Expected ")" after base class name', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                'Expected ")" after base class name',
+                tokens[pos] if pos < len(tokens) else None,
+            )
         pos += 1
     body, pos = parse_suite(tokens, pos)
     fields = []
@@ -1104,8 +1277,14 @@ def parse_class(tokens: list[Token], pos: int):
             methods.append(stmt)
         elif isinstance(stmt, VarDecl):
             fields.append(Field(stmt.name, stmt.var_type, token=stmt._token))
-    return ClassDef(name, base=base, fields=fields, methods=methods,
-                    generic_params=generic_params, token=tok), pos
+    return ClassDef(
+        name,
+        base=base,
+        fields=fields,
+        methods=methods,
+        generic_params=generic_params,
+        token=tok,
+    ), pos
 
 
 def parse_try(tokens: list[Token], pos: int):
@@ -1116,7 +1295,11 @@ def parse_try(tokens: list[Token], pos: int):
     while pos < len(tokens):
         while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
             pos += 1
-        if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'except':
+        if (
+            pos < len(tokens)
+            and tokens[pos].type == TokenType.KEYWORD
+            and tokens[pos].value == "except"
+        ):
             etok = tokens[pos]
             pos += 1
             type_name = None
@@ -1124,13 +1307,16 @@ def parse_try(tokens: list[Token], pos: int):
                 type_name = tokens[pos].value
                 pos += 1
             if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-                raise ParseError('Expected ":" after except', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    'Expected ":" after except',
+                    tokens[pos] if pos < len(tokens) else None,
+                )
             ebody, pos = parse_suite(tokens, pos)
             handlers.append(ExceptHandler(type_name, ebody, token=etok))
         else:
             break
     if not handlers:
-        raise ParseError('Expected at least one except clause', tok)
+        raise ParseError("Expected at least one except clause", tok)
     return Try(body, handlers, token=tok), pos
 
 
@@ -1138,16 +1324,24 @@ def parse_raise(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected exception class name after raise', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected exception class name after raise",
+            tokens[pos] if pos < len(tokens) else None,
+        )
     exc_type = tokens[pos].value
     assert exc_type is not None
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
-        raise ParseError('Expected "(" after exception class name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected "(" after exception class name',
+            tokens[pos] if pos < len(tokens) else None,
+        )
     pos += 1
     message, pos = parse_expression(tokens, pos)
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-        raise ParseError('Expected ")" after message', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected ")" after message', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
     _expect_newline(tokens, pos, tok)
     return Raise(exc_type, message, token=tok), pos
@@ -1157,7 +1351,9 @@ def parse_struct_def(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected struct name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected struct name", tokens[pos] if pos < len(tokens) else None
+        )
     name = tokens[pos].value
     assert name is not None
     pos += 1
@@ -1179,21 +1375,32 @@ def parse_struct_def(tokens: list[Token], pos: int):
         raise ParseError('Expected ":"', tokens[pos] if pos < len(tokens) else None)
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected newline after ":"', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected indented block', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
 
     fields = []
-    while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
         field_type, pos = parse_type(tokens, pos)
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected field name', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                "Expected field name", tokens[pos] if pos < len(tokens) else None
+            )
         field_name = tokens[pos].value
         assert field_name is not None
         pos += 1
-        field_type_str = _type_to_str(field_type) if isinstance(field_type, tuple) else field_type
+        field_type_str = (
+            _type_to_str(field_type) if isinstance(field_type, tuple) else field_type
+        )
         fields.append(Field(field_name, field_type_str, token=tok))
         if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
             pos += 1
@@ -1216,22 +1423,34 @@ def parse_for(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected loop variable', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected loop variable", tokens[pos] if pos < len(tokens) else None
+        )
     var = tokens[pos].value
     pos += 1
-    if pos >= len(tokens) or tokens[pos].type != TokenType.KEYWORD or tokens[pos].value != 'in':
+    if (
+        pos >= len(tokens)
+        or tokens[pos].type != TokenType.KEYWORD
+        or tokens[pos].value != "in"
+    ):
         raise ParseError('Expected "in"', tokens[pos] if pos < len(tokens) else None)
     pos += 1
     iterable, pos = parse_expression(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return {'type': 'for', 'var': var, 'iter': iterable, 'body': body, '_token': tok}, pos
+    return {
+        "type": "for",
+        "var": var,
+        "iter": iterable,
+        "body": body,
+        "_token": tok,
+    }, pos
 
 
 def parse_import(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens):
-        raise ParseError('Expected module name or quoted header path', tok)
+        raise ParseError("Expected module name or quoted header path", tok)
     t = tokens[pos]
     if t.type == TokenType.STRING:
         assert t.value is not None
@@ -1240,20 +1459,29 @@ def parse_import(tokens: list[Token], pos: int):
     elif t.type == TokenType.AT_SIGN:
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected package name after @', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                "Expected package name after @",
+                tokens[pos] if pos < len(tokens) else None,
+            )
         first = tokens[pos].value
         assert first is not None
         parts = [first]
         pos += 1
-        while pos < len(tokens) and tokens[pos].type == TokenType.DOT:
+        while pos < len(tokens) and tokens[pos].type in (
+            TokenType.DOT,
+            TokenType.SLASH,
+        ):
             pos += 1
             if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-                raise ParseError('Expected identifier after . in package name', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    "Expected identifier after package separator in package name",
+                    tokens[pos] if pos < len(tokens) else None,
+                )
             part = tokens[pos].value
             assert part is not None
             parts.append(part)
             pos += 1
-        module = '@' + '/'.join(parts)
+        module = "@" + "/".join(parts)
         node = Import(module, token=tok)
         return node, pos
     elif t.type == TokenType.IDENTIFIER:
@@ -1261,16 +1489,24 @@ def parse_import(tokens: list[Token], pos: int):
         module = t.value
         pos += 1
     else:
-        raise ParseError('Expected module name or quoted header path', t)
+        raise ParseError("Expected module name or quoted header path", t)
 
     sdk_path = None
-    if pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER and tokens[pos].value == 'sdk':
+    if (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.IDENTIFIER
+        and tokens[pos].value == "sdk"
+    ):
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
-            raise ParseError('Expected "(" after sdk', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                'Expected "(" after sdk', tokens[pos] if pos < len(tokens) else None
+            )
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-            raise ParseError('Expected SDK path string', tokens[pos] if pos < len(tokens) else None)
+            raise ParseError(
+                "Expected SDK path string", tokens[pos] if pos < len(tokens) else None
+            )
         sdk_path = tokens[pos].value
         assert sdk_path is not None
         pos += 1
@@ -1287,35 +1523,66 @@ def parse_import(tokens: list[Token], pos: int):
 
 
 class Assign(Node):
-    __slots__ = ('_token', 'dynamic', 'target', 'value')
+    __slots__ = ("_token", "dynamic", "target", "value")
+
     def __init__(self, target, value, token=None):
         self.target = target
         self.value = value
         self._token = token
+
     def __repr__(self):
-        return f'Assign({self.target}, {self.value})'
+        return f"Assign({self.target}, {self.value})"
+
 
 class Return(Node):
-    __slots__ = ('_token', 'value')
+    __slots__ = ("_token", "value")
+
     def __init__(self, value, token=None):
         self.value = value
         self._token = token
+
     def __repr__(self):
-        return f'Return({self.value})'
+        return f"Return({self.value})"
+
 
 class If(Node):
-    __slots__ = ('_token', 'body', 'cond', 'orelse')
+    __slots__ = ("_token", "body", "cond", "orelse")
+
     def __init__(self, cond, body, orelse=None, token=None):
         self.cond = cond
         self.body = body
         self.orelse = orelse
         self._token = token
+
     def __repr__(self):
-        return f'If({self.cond}, {self.body}, {self.orelse})'
+        return f"If({self.cond}, {self.body}, {self.orelse})"
+
 
 class FuncDef(Node):
-    __slots__ = ('_token', 'body', 'const_params', 'decorators', 'generic_params', 'name', 'params', 'rettype', 'visibility')
-    def __init__(self, name: str, params: dict, body, rettype: str | None = None, visibility: str | None = None, generic_params: list | None = None, const_params: list | None = None, decorators: list | None = None, token=None):
+    __slots__ = (
+        "_token",
+        "body",
+        "const_params",
+        "decorators",
+        "generic_params",
+        "name",
+        "params",
+        "rettype",
+        "visibility",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        params: dict,
+        body,
+        rettype: str | None = None,
+        visibility: str | None = None,
+        generic_params: list | None = None,
+        const_params: list | None = None,
+        decorators: list | None = None,
+        token=None,
+    ):
         self.name = name
         self.params = params
         self.rettype = rettype
@@ -1325,102 +1592,147 @@ class FuncDef(Node):
         self.const_params = const_params or []
         self.decorators = decorators or []
         self._token = token
+
     def __repr__(self):
-        vis = f'{self.visibility} ' if self.visibility else ''
-        decs = f', decorators={self.decorators}' if self.decorators else ''
-        return f'FuncDef({vis}{self.name}, {self.params}, ->{self.rettype}, {self.body}{decs})'
+        vis = f"{self.visibility} " if self.visibility else ""
+        decs = f", decorators={self.decorators}" if self.decorators else ""
+        return f"FuncDef({vis}{self.name}, {self.params}, ->{self.rettype}, {self.body}{decs})"
+
 
 class Decorator(Node):
     inferred_type: str | None
-    __slots__ = ('_token', "container", 'inferred_type')
-    def __init__(self, container : FuncDef, token=None):
+    __slots__ = ("_token", "container", "inferred_type")
 
+    def __init__(self, container: FuncDef, token=None):
         self._token = token
         self.container = container
         self.inferred_type = None
 
+
 class Decorated(Node):
     inferred_type: str | None
-    __slots__ = ('_token', "function", 'inferred_type')
-    def __init__(self, function : FuncDef, token=None):
+    __slots__ = ("_token", "function", "inferred_type")
 
+    def __init__(self, function: FuncDef, token=None):
         self._token = token
         self.function = function
         self.inferred_type = None
 
+
 class Print(Node):
-    __slots__ = ('_token', 'value')
+    __slots__ = ("_token", "value")
+
     def __init__(self, value, token=None):
         self.value = value
         self._token = token
+
     def __repr__(self):
-        return f'Print({self.value})'
+        return f"Print({self.value})"
+
 
 class Input(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'Input()'
+        return "Input()"
 
 
 class InputStr(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'InputStr()'
+        return "InputStr()"
 
 
 class InputBig(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'InputBig()'
+        return "InputBig()"
 
 
 class Signed67(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'Signed67()'
+        return "Signed67()"
+
 
 class While(Node):
-    __slots__ = ('_token', 'body', 'cond')
+    __slots__ = ("_token", "body", "cond")
+
     def __init__(self, cond, body, token=None):
         self.cond = cond
         self.body = body
         self._token = token
+
     def __repr__(self):
-        return f'While({self.cond}, {self.body})'
+        return f"While({self.cond}, {self.body})"
+
 
 class ExprStmt(Node):
-    __slots__ = ('_token', 'expr')
+    __slots__ = ("_token", "expr")
+
     def __init__(self, expr, token=None):
         self.expr = expr
         self._token = token
+
     def __repr__(self):
-        return f'ExprStmt({self.expr})'
+        return f"ExprStmt({self.expr})"
+
 
 class VarDecl(Node):
-    __slots__ = ('_token', 'dynamic', 'init', 'is_const', 'name', 'var_type')
-    def __init__(self, name: str, var_type: str | None = None, init=None, is_const: bool = False, token=None):
+    __slots__ = ("_token", "dynamic", "init", "is_const", "name", "var_type")
+
+    def __init__(
+        self,
+        name: str,
+        var_type: str | None = None,
+        init=None,
+        is_const: bool = False,
+        token=None,
+    ):
         self.name = name
         self.var_type = var_type
         self.init = init
         self.is_const = is_const
         self._token = token
+
     def __repr__(self):
-        return f'VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})'
+        return f"VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})"
+
 
 class Import(Node):
     src_file: str | None
     sub_ast: list | None
     sdk_path: str | None
     prebuilt_ll_files: list | None
-    __slots__ = ('_token', 'constants', 'frameworks', 'is_package', 'module', 'prebuilt_ll_files', 'sdk_path', 'src_file', 'sub_ast', 'symbols', 'var_names')
+    __slots__ = (
+        "_token",
+        "constants",
+        "frameworks",
+        "is_package",
+        "module",
+        "prebuilt_ll_files",
+        "sdk_path",
+        "src_file",
+        "sub_ast",
+        "symbols",
+        "var_names",
+    )
+
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
         self.symbols = symbols or []
@@ -1435,84 +1747,101 @@ class Import(Node):
         self.prebuilt_ll_files = None
 
     def __repr__(self):
-        return f'Import({self.module})'
+        return f"Import({self.module})"
 
 
 class ExceptHandler(Node):
-    __slots__ = ('_token', 'body', 'type_name')
+    __slots__ = ("_token", "body", "type_name")
+
     def __init__(self, type_name: str | None, body: list, token=None):
         self.type_name = type_name
         self.body = body
         self._token = token
+
     def __repr__(self):
-        return f'ExceptHandler({self.type_name})'
+        return f"ExceptHandler({self.type_name})"
 
 
 class Try(Node):
-    __slots__ = ('_token', 'body', 'handlers')
+    __slots__ = ("_token", "body", "handlers")
+
     def __init__(self, body: list, handlers: list[ExceptHandler], token=None):
         self.body = body
         self.handlers = handlers
         self._token = token
+
     def __repr__(self):
-        return f'Try({self.body}, handlers={self.handlers})'
+        return f"Try({self.body}, handlers={self.handlers})"
 
 
 class Raise(Node):
-    __slots__ = ('_token', 'exc_type', 'message')
+    __slots__ = ("_token", "exc_type", "message")
+
     def __init__(self, exc_type: str, message, token=None):
         self.exc_type = exc_type
         self.message = message
         self._token = token
+
     def __repr__(self):
-        return f'Raise({self.exc_type}, {self.message})'
+        return f"Raise({self.exc_type}, {self.message})"
+
 
 class NewExpr(Node):
-    __slots__ = ('_token', 'size', 'type_expr')
+    __slots__ = ("_token", "size", "type_expr")
+
     def __init__(self, type_expr, size=None, token=None):
         self.type_expr = type_expr
         self.size = size
         self._token = token
+
     def __repr__(self):
-        return f'NewExpr({self.type_expr}, {self.size})'
+        return f"NewExpr({self.type_expr}, {self.size})"
 
 
 class Deref(Node):
-    __slots__ = ('_token', 'operand')
+    __slots__ = ("_token", "operand")
+
     def __init__(self, operand, token=None):
         self.operand = operand
         self._token = token
+
     def __repr__(self):
-        return f'Deref({self.operand})'
+        return f"Deref({self.operand})"
 
 
 class AddrOf(Node):
-    __slots__ = ('_token', 'operand')
+    __slots__ = ("_token", "operand")
+
     def __init__(self, operand, token=None):
         self.operand = operand
         self._token = token
+
     def __repr__(self):
-        return f'AddrOf({self.operand})'
+        return f"AddrOf({self.operand})"
 
 
 class SizeOf(Node):
-    __slots__ = ('_token', 'type_expr')
+    __slots__ = ("_token", "type_expr")
+
     def __init__(self, type_expr, token=None):
         self.type_expr = type_expr
         self._token = token
+
     def __repr__(self):
-        return f'SizeOf({self.type_expr})'
+        return f"SizeOf({self.type_expr})"
 
 
 class CastExpr(Node):
-    __slots__ = ('_token', 'inferred_type', 'type_expr', 'expr')
+    __slots__ = ("_token", "inferred_type", "type_expr", "expr")
+
     def __init__(self, type_expr: str, expr, token=None):
         self.type_expr = type_expr
         self.expr = expr
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'CastExpr({self.type_expr}, {self.expr})'
+        return f"CastExpr({self.type_expr}, {self.expr})"
 
 
 class BorrowExpr(Node):
@@ -1522,14 +1851,17 @@ class BorrowExpr(Node):
     `borrow mut x` is a mutable borrow. Both lower to taking x's address, but
     the semantic/ownership pass enforces borrow rules.
     """
-    __slots__ = ('_token', 'operand', 'mutable', 'inferred_type')
+
+    __slots__ = ("_token", "operand", "mutable", "inferred_type")
+
     def __init__(self, operand, mutable: bool = False, token=None):
         self.operand = operand
         self.mutable = mutable
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'BorrowExpr(mut={self.mutable}, {self.operand})'
+        return f"BorrowExpr(mut={self.mutable}, {self.operand})"
 
 
 class MoveExpr(Node):
@@ -1538,13 +1870,16 @@ class MoveExpr(Node):
     After a move, x is no longer valid to use; the ownership pass errors if x is
     used afterward unless it is reassigned.
     """
-    __slots__ = ('_token', 'operand', 'inferred_type')
+
+    __slots__ = ("_token", "operand", "inferred_type")
+
     def __init__(self, operand, token=None):
         self.operand = operand
         self._token = token
         self.inferred_type = None
+
     def __repr__(self):
-        return f'MoveExpr({self.operand})'
+        return f"MoveExpr({self.operand})"
 
 
 class DeferStmt(Node):
@@ -1554,60 +1889,88 @@ class DeferStmt(Node):
     order) just before every function exit point: return statements and the
     implicit end-of-function return.
     """
-    __slots__ = ('_token', 'body')
+
+    __slots__ = ("_token", "body")
+
     def __init__(self, body, token=None):
         self.body = body
         self._token = token
+
     def __repr__(self):
-        return f'DeferStmt({self.body!r})'
+        return f"DeferStmt({self.body!r})"
 
 
 class StructDef(Node):
-    __slots__ = ('_token', 'fields', 'generic_params', 'name')
-    def __init__(self, name: str, fields: list, generic_params: list | None = None, token=None):
+    __slots__ = ("_token", "fields", "generic_params", "name")
+
+    def __init__(
+        self, name: str, fields: list, generic_params: list | None = None, token=None
+    ):
         self.name = name
         self.fields = fields
         self.generic_params = generic_params or []
         self._token = token
+
     def __repr__(self):
-        return f'StructDef({self.name}, {self.fields})'
+        return f"StructDef({self.name}, {self.fields})"
 
 
 class Field(Node):
-    __slots__ = ('_token', 'name', 'type_expr')
+    __slots__ = ("_token", "name", "type_expr")
+
     def __init__(self, name: str, type_expr, token=None):
         self.name = name
         self.type_expr = type_expr
         self._token = token
+
     def __repr__(self):
-        return f'Field({self.name}: {self.type_expr})'
+        return f"Field({self.name}: {self.type_expr})"
 
 
 class InlineAsm(Node):
-    __slots__ = ('_token', 'clobbers', 'inputs', 'outputs', 'template', 'volatile')
-    def __init__(self, template: str, outputs=None, inputs=None, clobbers=None, volatile=False, token=None):
+    __slots__ = ("_token", "clobbers", "inputs", "outputs", "template", "volatile")
+
+    def __init__(
+        self,
+        template: str,
+        outputs=None,
+        inputs=None,
+        clobbers=None,
+        volatile=False,
+        token=None,
+    ):
         self.template = template
         self.outputs = outputs or []
         self.inputs = inputs or []
         self.clobbers = clobbers or []
         self.volatile = volatile
         self._token = token
+
     def __repr__(self):
-        return f'InlineAsm({self.template}, volatile={self.volatile})'
+        return f"InlineAsm({self.template}, volatile={self.volatile})"
 
 
 class ClassDef(Node):
-    __slots__ = ('_token', 'base', 'fields', 'generic_params', 'methods', 'name')
-    def __init__(self, name: str, base: str | None = None, fields: list | None = None,
-                 methods: list | None = None, generic_params: list | None = None, token=None):
+    __slots__ = ("_token", "base", "fields", "generic_params", "methods", "name")
+
+    def __init__(
+        self,
+        name: str,
+        base: str | None = None,
+        fields: list | None = None,
+        methods: list | None = None,
+        generic_params: list | None = None,
+        token=None,
+    ):
         self.name = name
         self.base = base
         self.fields = fields or []
         self.methods = methods or []
         self.generic_params = generic_params or []
         self._token = token
+
     def __repr__(self):
-        return f'ClassDef({self.name}, base={self.base}, fields={self.fields}, methods={self.methods})'
+        return f"ClassDef({self.name}, base={self.base}, fields={self.fields}, methods={self.methods})"
 
 
 def parse_ccode(tokens: list[Token], pos: int):
@@ -1619,24 +1982,34 @@ def parse_ccode(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-        raise ParseError('Expected ":" after ccode', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected ":" after ccode', tokens[pos] if pos < len(tokens) else tok
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected a newline after "ccode:"', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected a newline after "ccode:"',
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected an indented C block after "ccode:"',
-                         tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected an indented C block after "ccode:"',
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-        raise ParseError('Expected C source in ccode block', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            "Expected C source in ccode block",
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     value = tokens[pos].value
     pos += 1
     if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
         pos += 1
     if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
         pos += 1
-    return CCode(value or '', token=tok), pos
+    return CCode(value or "", token=tok), pos
 
 
 def parse_llvm(tokens: list[Token], pos: int, unsafe: bool = False):
@@ -1647,48 +2020,76 @@ def parse_llvm(tokens: list[Token], pos: int, unsafe: bool = False):
     """
     tok = tokens[pos]
     if unsafe:
-        if tok.type != TokenType.KEYWORD or tok.value != 'unsafe':
-            raise ParseError('Expected "unsafe"', tokens[pos] if pos < len(tokens) else tok)
+        if tok.type != TokenType.KEYWORD or tok.value != "unsafe":
+            raise ParseError(
+                'Expected "unsafe"', tokens[pos] if pos < len(tokens) else tok
+            )
         pos += 1
-        if pos >= len(tokens) or tokens[pos].type != TokenType.KEYWORD or tokens[pos].value != 'llvm':
-            raise ParseError('Expected "llvm" after unsafe', tokens[pos] if pos < len(tokens) else tok)
+        if (
+            pos >= len(tokens)
+            or tokens[pos].type != TokenType.KEYWORD
+            or tokens[pos].value != "llvm"
+        ):
+            raise ParseError(
+                'Expected "llvm" after unsafe',
+                tokens[pos] if pos < len(tokens) else tok,
+            )
     else:
-        if tok.type != TokenType.KEYWORD or tok.value != 'llvm':
-            raise ParseError('Expected "llvm"', tokens[pos] if pos < len(tokens) else tok)
+        if tok.type != TokenType.KEYWORD or tok.value != "llvm":
+            raise ParseError(
+                'Expected "llvm"', tokens[pos] if pos < len(tokens) else tok
+            )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-        raise ParseError('Expected ":" after llvm', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected ":" after llvm', tokens[pos] if pos < len(tokens) else tok
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected a newline after "llvm:"', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected a newline after "llvm:"',
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected an indented LLVM IR block after "llvm:"',
-                         tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected an indented LLVM IR block after "llvm:"',
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-        raise ParseError('Expected LLVM IR in llvm block', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            "Expected LLVM IR in llvm block", tokens[pos] if pos < len(tokens) else tok
+        )
     value = tokens[pos].value
     pos += 1
     if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
         pos += 1
     if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
         pos += 1
-    return Llvm(value or '', unsafe=unsafe, token=tok), pos
+    return Llvm(value or "", unsafe=unsafe, token=tok), pos
 
 
 def parse_inline_asm(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     volatile = False
-    if pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER and tokens[pos].value == 'volatile':
+    if (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.IDENTIFIER
+        and tokens[pos].value == "volatile"
+    ):
         volatile = True
         pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
-        raise ParseError('Expected "(" after asm', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected "(" after asm', tokens[pos] if pos < len(tokens) else tok
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-        raise ParseError('Expected asm template string', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            "Expected asm template string", tokens[pos] if pos < len(tokens) else tok
+        )
     template = tokens[pos].value
     assert template is not None
     pos += 1
@@ -1697,18 +2098,29 @@ def parse_inline_asm(tokens: list[Token], pos: int):
     clobbers = []
     if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
         pos += 1
-        if pos < len(tokens) and tokens[pos].type not in (TokenType.COLON, TokenType.RPAREN):
+        if pos < len(tokens) and tokens[pos].type not in (
+            TokenType.COLON,
+            TokenType.RPAREN,
+        ):
             while True:
                 if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-                    raise ParseError('Expected constraint string', tokens[pos] if pos < len(tokens) else tok)
+                    raise ParseError(
+                        "Expected constraint string",
+                        tokens[pos] if pos < len(tokens) else tok,
+                    )
                 constraint = tokens[pos].value
                 pos += 1
                 if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
-                    raise ParseError('Expected "(" after constraint', tokens[pos] if pos < len(tokens) else tok)
+                    raise ParseError(
+                        'Expected "(" after constraint',
+                        tokens[pos] if pos < len(tokens) else tok,
+                    )
                 pos += 1
                 var_expr, pos = parse_expression(tokens, pos)
                 if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-                    raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else tok)
+                    raise ParseError(
+                        'Expected ")"', tokens[pos] if pos < len(tokens) else tok
+                    )
                 pos += 1
                 outputs.append((constraint, var_expr))
                 if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
@@ -1717,18 +2129,29 @@ def parse_inline_asm(tokens: list[Token], pos: int):
                     break
         if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
             pos += 1
-            if pos < len(tokens) and tokens[pos].type not in (TokenType.COLON, TokenType.RPAREN):
+            if pos < len(tokens) and tokens[pos].type not in (
+                TokenType.COLON,
+                TokenType.RPAREN,
+            ):
                 while True:
                     if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-                        raise ParseError('Expected constraint string', tokens[pos] if pos < len(tokens) else tok)
+                        raise ParseError(
+                            "Expected constraint string",
+                            tokens[pos] if pos < len(tokens) else tok,
+                        )
                     constraint = tokens[pos].value
                     pos += 1
                     if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
-                        raise ParseError('Expected "(" after constraint', tokens[pos] if pos < len(tokens) else tok)
+                        raise ParseError(
+                            'Expected "(" after constraint',
+                            tokens[pos] if pos < len(tokens) else tok,
+                        )
                     pos += 1
                     arg_expr, pos = parse_expression(tokens, pos)
                     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-                        raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else tok)
+                        raise ParseError(
+                            'Expected ")"', tokens[pos] if pos < len(tokens) else tok
+                        )
                     pos += 1
                     inputs.append((constraint, arg_expr))
                     if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
@@ -1739,7 +2162,10 @@ def parse_inline_asm(tokens: list[Token], pos: int):
             pos += 1
             while True:
                 if pos >= len(tokens) or tokens[pos].type != TokenType.STRING:
-                    raise ParseError('Expected clobber string', tokens[pos] if pos < len(tokens) else tok)
+                    raise ParseError(
+                        "Expected clobber string",
+                        tokens[pos] if pos < len(tokens) else tok,
+                    )
                 clobbers.append(tokens[pos].value)
                 pos += 1
                 if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
@@ -1747,14 +2173,21 @@ def parse_inline_asm(tokens: list[Token], pos: int):
                 else:
                     break
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-        raise ParseError('Expected ")" after asm', tokens[pos] if pos < len(tokens) else tok)
+        raise ParseError(
+            'Expected ")" after asm', tokens[pos] if pos < len(tokens) else tok
+        )
     pos += 1
-    return InlineAsm(template, outputs, inputs, clobbers, volatile=volatile, token=tok), pos
+    return InlineAsm(
+        template, outputs, inputs, clobbers, volatile=volatile, token=tok
+    ), pos
 
 
 def parse_block(tokens: list[Token], pos: int = 0):
     stmts = []
-    while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
         stmt, pos = parse_statement(tokens, pos)
         if stmt is not None:
             stmts.append(stmt)
@@ -1771,18 +2204,40 @@ def parse_suite(tokens: list[Token], pos: int):
     pos += 1
 
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected newline after ":"', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
 
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected indented block', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
 
     body, pos = parse_block(tokens, pos)
     return body, pos
 
 
-_TYPE_NAMES = {'int', 'int64', 'uint64', 'float', 'double', 'bool', 'str', 'char', 'void', 'auto', 'string', 'unsigned', 'long', 'short', 'signed', 'size_t', 'dynamic'}
+_TYPE_NAMES = {
+    "int",
+    "int64",
+    "uint64",
+    "float",
+    "double",
+    "bool",
+    "str",
+    "char",
+    "void",
+    "auto",
+    "string",
+    "unsigned",
+    "long",
+    "short",
+    "signed",
+    "size_t",
+    "dynamic",
+}
 
 
 def _looks_like_type(tokens, pos):
@@ -1794,10 +2249,18 @@ def _looks_like_type(tokens, pos):
         if t.type == TokenType.IDENTIFIER:
             i += 1
             continue
-        if t.type in (TokenType.STAR, TokenType.POW, TokenType.AMPERSAND, TokenType.LBRACKET):
+        if t.type in (
+            TokenType.STAR,
+            TokenType.POW,
+            TokenType.AMPERSAND,
+            TokenType.LBRACKET,
+        ):
             i += 1
             if t.type == TokenType.LBRACKET:
-                if i < len(tokens) and tokens[i].type in (TokenType.RBRACKET, TokenType.NUMBER):
+                if i < len(tokens) and tokens[i].type in (
+                    TokenType.RBRACKET,
+                    TokenType.NUMBER,
+                ):
                     i += 1 if tokens[i].type == TokenType.RBRACKET else 2
                     continue
                 return False
@@ -1818,7 +2281,11 @@ def _looks_like_type(tokens, pos):
         break
     # Constant syntax: <type> (NAME) = <value>
     if i < len(tokens) and tokens[i].type == TokenType.LPAREN:
-        if (i + 2) < len(tokens) and tokens[i + 1].type == TokenType.IDENTIFIER and tokens[i + 2].type == TokenType.RPAREN:
+        if (
+            (i + 2) < len(tokens)
+            and tokens[i + 1].type == TokenType.IDENTIFIER
+            and tokens[i + 2].type == TokenType.RPAREN
+        ):
             if (i + 3) < len(tokens) and tokens[i + 3].type == TokenType.EQUAL:
                 return True
     return i > pos + 1
@@ -1833,7 +2300,7 @@ def _type_to_str(t: str | tuple) -> str:
 
 def parse_type(tokens: list[Token], pos: int):
     if pos >= len(tokens):
-        raise ParseError('Expected type', None)
+        raise ParseError("Expected type", None)
 
     tok = tokens[pos]
     if tok.type == TokenType.IDENTIFIER:
@@ -1841,24 +2308,28 @@ def parse_type(tokens: list[Token], pos: int):
         base = tok.value
         pos += 1
     else:
-        raise ParseError(f'Expected type name, got {tok.value}', tok)
+        raise ParseError(f"Expected type name, got {tok.value}", tok)
 
     while pos < len(tokens):
         t = tokens[pos]
         if t.type == TokenType.LBRACKET:
             if pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.RBRACKET:
                 pos += 2
-                base = _type_to_str(base) + '[]' if not isinstance(base, str) else base + '[]'
+                base = (
+                    _type_to_str(base) + "[]"
+                    if not isinstance(base, str)
+                    else base + "[]"
+                )
                 continue
             break
         elif t.type == TokenType.STAR:
-            base = _type_to_str(base) + '*'
+            base = _type_to_str(base) + "*"
             pos += 1
         elif t.type == TokenType.POW:
-            base = _type_to_str(base) + '**'
+            base = _type_to_str(base) + "**"
             pos += 1
         elif t.type == TokenType.AMPERSAND:
-            base = _type_to_str(base) + '&'
+            base = _type_to_str(base) + "&"
             pos += 1
         elif t.type == TokenType.LESS and isinstance(base, str):
             pos += 1
@@ -1888,16 +2359,22 @@ def parse_var_decl(tokens: list[Token], pos: int):
         is_const = True
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected constant name after "("', tokens[pos] if pos < len(tokens) else tok)
+            raise ParseError(
+                'Expected constant name after "("',
+                tokens[pos] if pos < len(tokens) else tok,
+            )
         name = tokens[pos].value
         assert name is not None
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
-            raise ParseError('Expected ")" to close constant name', tokens[pos] if pos < len(tokens) else tok)
+            raise ParseError(
+                'Expected ")" to close constant name',
+                tokens[pos] if pos < len(tokens) else tok,
+            )
         pos += 1
     else:
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected variable name after type', tok)
+            raise ParseError("Expected variable name after type", tok)
         name = tokens[pos].value
         assert name is not None
         pos += 1
@@ -1916,7 +2393,7 @@ def parse_defer(tokens: list[Token], pos: int):
     tok = tokens[pos]  # 'defer'
     pos += 1
     if pos >= len(tokens):
-        raise ParseError('Expected a statement after `defer`', tok)
+        raise ParseError("Expected a statement after `defer`", tok)
     stmt, pos = parse_statement(tokens, pos)
     if stmt is None:
         stmt = parse_expr_stmt(tokens, pos)
@@ -1929,56 +2406,72 @@ def parse_statement(tokens: list[Token], pos: int):
 
     tok = tokens[pos]
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'return':
+    if tok.type == TokenType.KEYWORD and tok.value == "return":
         return parse_return(tokens, pos)
 
     if tok.type == TokenType.AT_SIGN:
         return parse_at_def(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'if':
+    if tok.type == TokenType.KEYWORD and tok.value == "if":
         return parse_if(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'def':
+    if tok.type == TokenType.KEYWORD and tok.value == "def":
         return parse_def(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'print':
+    if tok.type == TokenType.KEYWORD and tok.value == "print":
         return parse_print(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'break':
+    if tok.type == TokenType.KEYWORD and tok.value == "break":
         return parse_break(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'continue':
+    if tok.type == TokenType.KEYWORD and tok.value == "continue":
         return parse_continue(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'assert':
+    if tok.type == TokenType.KEYWORD and tok.value == "assert":
         return parse_assert(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'switch':
+    if tok.type == TokenType.KEYWORD and tok.value == "switch":
         return parse_switch(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value in ('while', 'for', 'class', 'struct', 'import', 'enum', 'type'):
-        handler = {'while': parse_while, 'for': parse_for, 'class': parse_class, 'struct': parse_struct_def, 'import': parse_import, 'enum': parse_enum, 'type': parse_type_alias}[tok.value]
+    if tok.type == TokenType.KEYWORD and tok.value in (
+        "while",
+        "for",
+        "class",
+        "struct",
+        "import",
+        "enum",
+        "type",
+    ):
+        handler = {
+            "while": parse_while,
+            "for": parse_for,
+            "class": parse_class,
+            "struct": parse_struct_def,
+            "import": parse_import,
+            "enum": parse_enum,
+            "type": parse_type_alias,
+        }[tok.value]
         return handler(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'try':
+    if tok.type == TokenType.KEYWORD and tok.value == "try":
         return parse_try(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'raise':
+    if tok.type == TokenType.KEYWORD and tok.value == "raise":
         return parse_raise(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'asm':
+    if tok.type == TokenType.KEYWORD and tok.value == "asm":
         return parse_inline_asm(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'ccode':
+    if tok.type == TokenType.KEYWORD and tok.value == "ccode":
         return parse_ccode(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'llvm':
+    if tok.type == TokenType.KEYWORD and tok.value == "llvm":
         return parse_llvm(tokens, pos)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'unsafe':
+    if tok.type == TokenType.KEYWORD and tok.value == "unsafe":
         return parse_llvm(tokens, pos, unsafe=True)
 
-    if tok.type == TokenType.KEYWORD and tok.value == 'defer':
+    if tok.type == TokenType.KEYWORD and tok.value == "defer":
         return parse_defer(tokens, pos)
 
     if tok.type == TokenType.IDENTIFIER:
@@ -1992,14 +2485,22 @@ def parse_statement(tokens: list[Token], pos: int):
 
 
 def _expect_newline(tokens: list[Token], pos: int, tok: Token):
-    if pos < len(tokens) and tokens[pos].type not in (TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
-        raise ParseError('Expected newline after statement', tok)
+    if pos < len(tokens) and tokens[pos].type not in (
+        TokenType.NEWLINE,
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
+        raise ParseError("Expected newline after statement", tok)
 
 
 def parse_return(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
-    if pos < len(tokens) and tokens[pos].type not in (TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
+    if pos < len(tokens) and tokens[pos].type not in (
+        TokenType.NEWLINE,
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
         value, pos = parse_expression(tokens, pos)
     else:
         value = None
@@ -2024,7 +2525,7 @@ def parse_print(tokens: list[Token], pos: int):
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
             raise ParseError(
                 'Expected ")" after print arguments',
-                tokens[pos] if pos < len(tokens) else None
+                tokens[pos] if pos < len(tokens) else None,
             )
         pos += 1
     else:
@@ -2045,7 +2546,7 @@ def parse_if(tokens: list[Token], pos: int):
         pos += 1
 
     if pos < len(tokens) and tokens[pos].type == TokenType.KEYWORD:
-        if tokens[pos].value == 'else':
+        if tokens[pos].value == "else":
             pos += 1
             if pos < len(tokens) and tokens[pos].type == TokenType.COLON:
                 orelse_body, pos = parse_suite(tokens, pos)
@@ -2053,7 +2554,7 @@ def parse_if(tokens: list[Token], pos: int):
             else:
                 body2, pos = parse_suite(tokens, pos)
                 orelse = body2
-        elif tokens[pos].value == 'elif':
+        elif tokens[pos].value == "elif":
             elif_node, pos = parse_if(tokens, pos)
             orelse = [elif_node]
 
@@ -2061,31 +2562,37 @@ def parse_if(tokens: list[Token], pos: int):
 
 
 class Break(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'Break()'
+        return "Break()"
 
 
 class Continue(Node):
-    __slots__ = ('_token',)
+    __slots__ = ("_token",)
+
     def __init__(self, token=None):
         self._token = token
+
     def __repr__(self):
-        return 'Continue()'
+        return "Continue()"
 
 
 class Assert(Node):
-    __slots__ = ('_token', 'cond', 'message')
+    __slots__ = ("_token", "cond", "message")
+
     def __init__(self, cond, message=None, token=None):
         self.cond = cond
         self.message = message
         self._token = token
+
     def __repr__(self):
         if self.message:
-            return f'Assert({self.cond}, {self.message})'
-        return f'Assert({self.cond})'
+            return f"Assert({self.cond}, {self.message})"
+        return f"Assert({self.cond})"
 
 
 def parse_break(tokens: list[Token], pos: int):
@@ -2119,28 +2626,33 @@ class Switch(Node):
         self.value = value
         self.cases = cases
         self._token = token
+
     def __repr__(self):
-        return f'Switch({self.value}, {self.cases})'
+        return f"Switch({self.value}, {self.cases})"
 
 
 class EnumDef(Node):
-    __slots__ = ('_token', 'members', 'name')
+    __slots__ = ("_token", "members", "name")
+
     def __init__(self, name: str, members: list, token=None):
         self.name = name
         self.members = members
         self._token = token
+
     def __repr__(self):
-        return f'EnumDef({self.name}, {self.members})'
+        return f"EnumDef({self.name}, {self.members})"
 
 
 class TypeAlias(Node):
-    __slots__ = ('_token', 'name', 'target_type')
+    __slots__ = ("_token", "name", "target_type")
+
     def __init__(self, name: str, target_type, token=None):
         self.name = name
         self.target_type = target_type
         self._token = token
+
     def __repr__(self):
-        return f'TypeAlias({self.name}, {self.target_type})'
+        return f"TypeAlias({self.name}, {self.target_type})"
 
 
 def parse_switch(tokens: list[Token], pos: int):
@@ -2149,37 +2661,53 @@ def parse_switch(tokens: list[Token], pos: int):
     value, pos = parse_expression(tokens, pos)
 
     if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-        raise ParseError('Expected ":" after switch expression', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected ":" after switch expression',
+            tokens[pos] if pos < len(tokens) else None,
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected newline after ":"', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected indented block', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
 
     cases = []
-    while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
-        if tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'case':
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
+        if tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "case":
             tok2 = tokens[pos]
             pos += 1
             case_val, pos = parse_expression(tokens, pos)
             if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-                raise ParseError('Expected ":" after case value', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    'Expected ":" after case value',
+                    tokens[pos] if pos < len(tokens) else None,
+                )
             pos += 1
             case_body = _parse_case_body(tokens, pos)
             pos = case_body[1]
             cases.append((case_val, case_body[0]))
-        elif tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'default':
+        elif tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "default":
             pos += 1
             if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-                raise ParseError('Expected ":" after default', tokens[pos] if pos < len(tokens) else None)
+                raise ParseError(
+                    'Expected ":" after default',
+                    tokens[pos] if pos < len(tokens) else None,
+                )
             pos += 1
             case_body = _parse_case_body(tokens, pos)
             pos = case_body[1]
             cases.append((None, case_body[0]))
         else:
-            raise ParseError('Expected case or default in switch block', tokens[pos])
+            raise ParseError("Expected case or default in switch block", tokens[pos])
         while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
             pos += 1
 
@@ -2223,31 +2751,44 @@ def parse_enum(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected enum name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected enum name", tokens[pos] if pos < len(tokens) else None
+        )
     name = tokens[pos].value
     assert name is not None
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-        raise ParseError('Expected ":" after enum name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected ":" after enum name', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
-        raise ParseError('Expected newline after ":"', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
-        raise ParseError('Expected indented block', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
     pos += 1
 
     members = []
-    while pos < len(tokens) and tokens[pos].type not in (TokenType.DEDENT, TokenType.EOF):
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
         if tokens[pos].type != TokenType.IDENTIFIER:
-            raise ParseError('Expected enum member name', tokens[pos])
+            raise ParseError("Expected enum member name", tokens[pos])
         member_name = tokens[pos].value
         pos += 1
         member_value = None
         if pos < len(tokens) and tokens[pos].type == TokenType.EQUAL:
             pos += 1
             member_value, pos = parse_expression(tokens, pos)
-        members.append({'name': member_name, 'value': member_value, '_token': tokens[pos - 1]})
+        members.append(
+            {"name": member_name, "value": member_value, "_token": tokens[pos - 1]}
+        )
         if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
             pos += 1
 
@@ -2261,7 +2802,9 @@ def parse_type_alias(tokens: list[Token], pos: int):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
-        raise ParseError('Expected type alias name', tokens[pos] if pos < len(tokens) else None)
+        raise ParseError(
+            "Expected type alias name", tokens[pos] if pos < len(tokens) else None
+        )
     name = tokens[pos].value
     assert name is not None
     pos += 1
@@ -2269,7 +2812,9 @@ def parse_type_alias(tokens: list[Token], pos: int):
         raise ParseError('Expected "="', tokens[pos] if pos < len(tokens) else None)
     pos += 1
     target_type, pos = parse_type(tokens, pos)
-    target_type_str = _type_to_str(target_type) if isinstance(target_type, tuple) else target_type
+    target_type_str = (
+        _type_to_str(target_type) if isinstance(target_type, tuple) else target_type
+    )
     _expect_newline(tokens, pos, tok)
     if pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
         pos += 1
@@ -2283,10 +2828,19 @@ def parse_at_def(tokens: list[Token], pos: int):
         pos += 1
         expr, pos = parse_expression(tokens, pos)
         decorators.append(expr)
-    while pos < len(tokens) and tokens[pos].type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+    while pos < len(tokens) and tokens[pos].type in (
+        TokenType.NEWLINE,
+        TokenType.INDENT,
+        TokenType.DEDENT,
+    ):
         pos += 1
-    if pos >= len(tokens) or not (tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == 'def'):
-        raise ParseError('Expected "def" after decorator(s)', tokens[pos] if pos < len(tokens) else tok)
+    if pos >= len(tokens) or not (
+        tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "def"
+    ):
+        raise ParseError(
+            'Expected "def" after decorator(s)',
+            tokens[pos] if pos < len(tokens) else tok,
+        )
     node, pos = parse_def(tokens, pos)
     node.decorators = decorators
     return node, pos
@@ -2300,7 +2854,15 @@ def parse_def(tokens: list[Token], pos: int):
     params, const_params, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
-    return FuncDef(name, params, body, rettype, generic_params=generic_params, const_params=const_params, token=tok), pos
+    return FuncDef(
+        name,
+        params,
+        body,
+        rettype,
+        generic_params=generic_params,
+        const_params=const_params,
+        token=tok,
+    ), pos
 
 
 def _is_assignable(expr):
@@ -2309,16 +2871,16 @@ def _is_assignable(expr):
 
 def parse_expr_stmt(tokens: list[Token], pos: int):
     tok = tokens[pos]
-    if tok.type == TokenType.KEYWORD and tok.value == 'let':
+    if tok.type == TokenType.KEYWORD and tok.value == "let":
         pos += 1
         if pos >= len(tokens):
-            raise ParseError('Expected variable name after let', tok)
+            raise ParseError("Expected variable name after let", tok)
         tok = tokens[pos]
     expr, pos = parse_expression(tokens, pos)
 
     if pos < len(tokens) and tokens[pos].type == TokenType.EQUAL:
         if not _is_assignable(expr):
-            raise ParseError('Invalid assignment target', tokens[pos])
+            raise ParseError("Invalid assignment target", tokens[pos])
         target = expr
         pos += 1
         value, pos = parse_expression(tokens, pos)
@@ -2326,22 +2888,35 @@ def parse_expr_stmt(tokens: list[Token], pos: int):
         return Assign(target, value, token=tok), pos
 
     compound_assign_ops = {
-        TokenType.PLUS_EQ: '+=',
-        TokenType.MINUS_EQ: '-=',
-        TokenType.STAR_EQ: '*=',
-        TokenType.SLASH_EQ: '/=',
-        TokenType.SLASH_SLASH_EQ: '//=',
+        TokenType.PLUS_EQ: "+=",
+        TokenType.MINUS_EQ: "-=",
+        TokenType.STAR_EQ: "*=",
+        TokenType.SLASH_EQ: "/=",
+        TokenType.SLASH_SLASH_EQ: "//=",
     }
     if pos < len(tokens) and tokens[pos].type in compound_assign_ops:
         if not _is_assignable(expr):
-            raise ParseError('Invalid assignment target', tokens[pos])
+            raise ParseError("Invalid assignment target", tokens[pos])
         target = expr
         binop_type = tokens[pos].type
         pos += 1
         value, pos = parse_expression(tokens, pos)
         _expect_newline(tokens, pos, tok)
-        binop_op = getattr(TokenType, binop_type.name.replace('_EQ', ''), TokenType.PLUS)
-        return Assign(target, BinOp(Variable(target.name, token=expr._token) if isinstance(target, Variable) else target, binop_op, value, token=tok), token=tok), pos
+        binop_op = getattr(
+            TokenType, binop_type.name.replace("_EQ", ""), TokenType.PLUS
+        )
+        return Assign(
+            target,
+            BinOp(
+                Variable(target.name, token=expr._token)
+                if isinstance(target, Variable)
+                else target,
+                binop_op,
+                value,
+                token=tok,
+            ),
+            token=tok,
+        ), pos
 
     _expect_newline(tokens, pos, tok)
     return ExprStmt(expr, token=tok), pos

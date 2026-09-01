@@ -7,14 +7,14 @@ if __package__:
     from .astparse import Import, ParseError, parse_file
     from .bytecoding import LLVM
     from .compiling import (
-        _RUNTIME_C,
         _GC_RUNTIME_C,
+        _RUNTIME_C,
         optimize,
         run_aot,
         run_jit,
         run_scorpion,
     )
-    from .extension_hooks import HookLoader, HookStage, get_global_hook_registry
+    from .extension_hooks import HookStage, get_global_hook_registry
     from .lexar import Lexer, LexerError, register_keywords
     from .linker import Linker
     from .package_manifest import (
@@ -32,14 +32,14 @@ else:
     from cpyte.astparse import Import, ParseError, parse_file
     from cpyte.bytecoding import LLVM
     from cpyte.compiling import (
-        _RUNTIME_C,
         _GC_RUNTIME_C,
+        _RUNTIME_C,
         optimize,
         run_aot,
         run_jit,
         run_scorpion,
     )
-    from cpyte.extension_hooks import HookLoader, HookStage, get_global_hook_registry
+    from cpyte.extension_hooks import HookStage, get_global_hook_registry
     from cpyte.lexar import Lexer, LexerError, register_keywords
     from cpyte.linker import Linker
     from cpyte.package_manifest import (
@@ -312,24 +312,35 @@ _DEEP_INTEGRATION_STAGES = {
 def _notify_deep_hook_usage() -> None:
     """Emit a small notice when packages integrate into compiler internals."""
     registry = get_global_hook_registry()
-    deep = [
-        hook
-        for hook in registry.all()
-        if hook.stage in _DEEP_INTEGRATION_STAGES
-    ]
+    deep = [hook for hook in registry.all() if hook.stage in _DEEP_INTEGRATION_STAGES]
     if not deep:
         return
     names = sorted({hook.package_name for hook in deep})
-    ui.print_status(
-        "deep extension integration active: "
-        + ", ".join(names)
-    )
+    ui.print_status("deep extension integration active: " + ", ".join(names))
 
 
-def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=False):
+def _find_workspace_root(filepath: str | None) -> str:
+    if not filepath:
+        return os.getcwd()
+    path = os.path.abspath(filepath)
+    dirpath = os.path.dirname(path)
+    while True:
+        if os.path.isdir(os.path.join(dirpath, ".cpm")):
+            return dirpath
+        parent = os.path.dirname(dirpath)
+        if parent == dirpath:
+            return os.getcwd()
+        dirpath = parent
+
+
+def _compile(
+    source, tab_size=4, strict=False, enable_extensions=True, no_gc=False, filepath=None
+):
+    workspace_root = _find_workspace_root(filepath)
+
     # Pre-load package manifests if extensions are enabled
     if enable_extensions:
-        _load_package_manifests_from_source(os.getcwd())
+        _load_package_manifests_from_source(workspace_root)
 
     lex = Lexer(source, tab_size=tab_size, enable_extensions=enable_extensions)
     tokens = lex.get_tokens()
@@ -342,7 +353,8 @@ def _compile(source, tab_size=4, strict=False, enable_extensions=True, no_gc=Fal
         source,
         parsed,
         strict=strict,
-        workspace_root=os.getcwd(),
+        workspace_root=workspace_root,
+        filepath=filepath,
         enable_extensions=enable_extensions,
         no_gc=no_gc,
     )
@@ -839,6 +851,7 @@ def _main():
         strict=strict,
         enable_extensions=not no_userspace,
         no_gc=no_gc,
+        filepath=os.path.abspath(args[0]),
     )
 
     if mode == "ast":

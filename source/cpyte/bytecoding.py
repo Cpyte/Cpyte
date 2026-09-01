@@ -222,8 +222,8 @@ class LLVM:
         """Raise a clear codegen error instead of a bare llvmlite assertion."""
         loc = ""
         if node is not None:
-            tok = getattr(node, '_token', None)
-            if tok is not None and getattr(tok, 'line', None) is not None:
+            tok = getattr(node, "_token", None)
+            if tok is not None and getattr(tok, "line", None) is not None:
                 loc = f" at line {tok.line}:{tok.column}"
         raise RuntimeError(f"codegen error{loc}: {msg}")
 
@@ -313,7 +313,11 @@ class LLVM:
     def _is_ir_constant_zero(self, val):
         if isinstance(val, ir.Constant) and val.constant == 0:
             return True
-        return bool(isinstance(val, ir.Constant) and isinstance(val.type, ir.PointerType) and val.constant is None)
+        return bool(
+            isinstance(val, ir.Constant)
+            and isinstance(val.type, ir.PointerType)
+            and val.constant is None
+        )
 
     @staticmethod
     def _norm_signed(v, width):
@@ -443,7 +447,11 @@ class LLVM:
                 val = self.builder.sext(val, _i64)
             else:
                 val = self.builder.zext(val, _i64)
-        if isinstance(val.type, ir.IntType) and "i64" in str(val.type) or isinstance(val.type, ir.IntType):
+        if (
+            isinstance(val.type, ir.IntType)
+            and "i64" in str(val.type)
+            or isinstance(val.type, ir.IntType)
+        ):
             fn = self.functions["bigint_from_int"]
         else:
             return val
@@ -669,8 +677,12 @@ class LLVM:
         # Decorator support: code() function pointer + result slot
         self._code_fn_ptr = ir.GlobalVariable(self.module, _i8ptr, name="__code_fn")
         self._code_fn_ptr.initializer = ir.Constant(_i8ptr, None)  # type: ignore[attr-defined]
-        self._code_result = ir.GlobalVariable(self.module, _DynValue, name="__code_result")
-        self._code_result.initializer = ir.Constant(_DynValue, (ir.Constant(_i32, _DYN_NONE), ir.Constant(_i64, 0)))  # type: ignore[attr-defined]
+        self._code_result = ir.GlobalVariable(
+            self.module, _DynValue, name="__code_result"
+        )
+        self._code_result.initializer = ir.Constant(
+            _DynValue, (ir.Constant(_i32, _DYN_NONE), ir.Constant(_i64, 0))
+        )  # type: ignore[attr-defined]
 
     @register_emitter(Switch)
     def emit_switch(self, node):
@@ -1067,7 +1079,7 @@ class LLVM:
                 if isinstance(node, CCode):
                     self.emit(node)
                 elif isinstance(node, FuncDef):
-                    _collect_ccodes(getattr(node, 'body', None) or [])
+                    _collect_ccodes(getattr(node, "body", None) or [])
 
         _collect_ccodes(toplevel)
         _collect_ccodes(funcdefs)
@@ -1129,7 +1141,7 @@ class LLVM:
                     )
                 )
             else:
-                val = self.emit(payload) # pyright: ignore[reportArgumentType]
+                val = self.emit(payload)  # pyright: ignore[reportArgumentType]
                 strings.append(self._stringify_value(payload, val))
         result = strings[0] if strings else self._string_const("")
         for s in strings[1:]:
@@ -1184,9 +1196,7 @@ class LLVM:
         left_len = self.builder.call(strlen_fn, [left])
         right_len = self.builder.call(strlen_fn, [right])
         total_len = self.builder.add(left_len, right_len)
-        plus_one = self.builder.add(
-            total_len, ir.Constant(total_len.type, 1)
-        )
+        plus_one = self.builder.add(total_len, ir.Constant(total_len.type, 1))
         new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
         self.builder.call(memcpy_fn, [new_str, left, left_len])
         dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
@@ -1657,7 +1667,7 @@ class LLVM:
         elem_ty = self.llvm_type(node.type_expr)
         if isinstance(elem_ty, ir.VoidType):
             self._codegen_error(
-                f"cannot allocate `new void` (use `new void*` for a pointer to void)",
+                "cannot allocate `new void` (use `new void*` for a pointer to void)",
                 node,
             )
         if node.type_expr.endswith("[]"):
@@ -1873,7 +1883,7 @@ class LLVM:
             return self.builder.inttoptr(val, target)
         if isinstance(target, ir.VoidType):
             self._codegen_error(
-                f"cannot cast to type `void` (use `void*` for a pointer to void)",
+                "cannot cast to type `void` (use `void*` for a pointer to void)",
                 node,
             )
         return self.builder.bitcast(val, target)
@@ -2050,7 +2060,10 @@ class LLVM:
             if parent_struct and parent_struct in self.struct_fields:
                 return self._field_type_name(parent_struct, node.name)
         if isinstance(node, Index):
-            return self._struct_name_from_node(node.obj)
+            base = self._struct_name_from_node(node.obj)
+            if base:
+                return self._base_type_name(base)
+            return None
         return None
 
     def _emit_lvalue_attr(self, node: Attr):
@@ -2232,7 +2245,8 @@ class LLVM:
             elif ret_ty == _DynValue:
                 out = self.builder.insert_value(
                     ir.Constant(_DynValue, ir.Undefined),
-                    ir.Constant(_i32, _DYN_NONE), 0,
+                    ir.Constant(_i32, _DYN_NONE),
+                    0,
                 )
                 out = self.builder.insert_value(out, ir.Constant(_i64, 0), 1)
                 self.builder.ret(out)
@@ -2739,26 +2753,29 @@ class LLVM:
             return self._emit_string_concat(node)
 
         # Runtime dispatch when either operand is dynamically typed.
-        if not self.no_userspace and (
-            self._is_dynamic_expr(node.left) or self._is_dynamic_expr(node.right)
-        ) and node.op in (
-            TokenType.PLUS,
-            TokenType.MINUS,
-            TokenType.STAR,
-            TokenType.SLASH,
-            TokenType.SLASH_SLASH,
-            TokenType.PERCENT,
-            TokenType.EQ_EQ,
-            TokenType.NOT_EQ,
-            TokenType.LESS,
-            TokenType.GREATER,
-            TokenType.LESS_EQ,
-            TokenType.GREATER_EQ,
-            TokenType.AMPERSAND,
-            TokenType.PIPE,
-            TokenType.CARET,
-            TokenType.SHL,
-            TokenType.SHR,
+        if (
+            not self.no_userspace
+            and (self._is_dynamic_expr(node.left) or self._is_dynamic_expr(node.right))
+            and node.op
+            in (
+                TokenType.PLUS,
+                TokenType.MINUS,
+                TokenType.STAR,
+                TokenType.SLASH,
+                TokenType.SLASH_SLASH,
+                TokenType.PERCENT,
+                TokenType.EQ_EQ,
+                TokenType.NOT_EQ,
+                TokenType.LESS,
+                TokenType.GREATER,
+                TokenType.LESS_EQ,
+                TokenType.GREATER_EQ,
+                TokenType.AMPERSAND,
+                TokenType.PIPE,
+                TokenType.CARET,
+                TokenType.SHL,
+                TokenType.SHR,
+            )
         ):
             return self._emit_dyn_binop(node)
 
@@ -3006,7 +3023,10 @@ class LLVM:
             and self.local_types.get(node.left.name) == "str"
         ):
             return True
-        return bool(isinstance(node.right, Variable) and self.local_types.get(node.right.name) == "str")
+        return bool(
+            isinstance(node.right, Variable)
+            and self.local_types.get(node.right.name) == "str"
+        )
 
     def _emit_dyn_binop(self, node):
         dynop_map = {
@@ -3306,7 +3326,9 @@ class LLVM:
         if isinstance(node.target, Variable) and node.target.name == "result":
             value = self.emit(node.value)
             if value.type != _DynValue:
-                kind, bits = self._box_dyn(value, getattr(node.value, "inferred_type", None))
+                kind, bits = self._box_dyn(
+                    value, getattr(node.value, "inferred_type", None)
+                )
                 value = self.builder.insert_value(
                     ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0
                 )
@@ -3474,17 +3496,11 @@ class LLVM:
             return self._emit_builtin_range(node)
 
         # Builtin str_split(str, sep=" ") — split a string into a DynValue list.
-        if (
-            isinstance(node.callee, Variable)
-            and node.callee.name == "str_split"
-        ):
+        if isinstance(node.callee, Variable) and node.callee.name == "str_split":
             return self._emit_builtin_str_split(node)
 
         # Builtin code() — call the original function through __code_fn pointer.
-        if (
-            isinstance(node.callee, Variable)
-            and node.callee.name == "code"
-        ):
+        if isinstance(node.callee, Variable) and node.callee.name == "code":
             return self._emit_builtin_code(node)
 
         # Handle known macro functions by inlining
@@ -3762,7 +3778,9 @@ class LLVM:
         fn = self.functions.get("str_split")
         if fn is None:
             fn = ir.Function(
-                self.module, ir.FunctionType(_DynValuePtr, [_i8ptr, _i8ptr]), name="str_split"
+                self.module,
+                ir.FunctionType(_DynValuePtr, [_i8ptr, _i8ptr]),
+                name="str_split",
             )
             self.functions["str_split"] = fn
         return self.builder.call(fn, [str_val, sep_val])
@@ -4209,7 +4227,7 @@ class LLVM:
     def _alloca(self, ty, name=""):
         if isinstance(ty, ir.VoidType):
             self._codegen_error(
-                f"cannot allocate variable of type `void` (use `void*` for a pointer to void)"
+                "cannot allocate variable of type `void` (use `void*` for a pointer to void)"
             )
         entry_block = self.builder.function.entry_basic_block
         saved_block = self.builder.block

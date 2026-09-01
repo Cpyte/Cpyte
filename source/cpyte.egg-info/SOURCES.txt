@@ -4,7 +4,6 @@ readme.md
 source/cpyte/__init__.py
 source/cpyte/__main__.py
 source/cpyte/_bignum_bc.py
-source/cpyte/_gc_bc.py
 source/cpyte/_runtime_bc.py
 source/cpyte/astparse.py
 source/cpyte/bignum.c
@@ -24,6 +23,7 @@ source/cpyte/runtime.c
 source/cpyte/runtime_scorpion.c
 source/cpyte/sef.py
 source/cpyte/semantic_analasis.py
+source/cpyte/ugc.h
 source/cpyte/ui.py
 source/cpyte/update_check.py
 source/cpyte.egg-info/PKG-INFO

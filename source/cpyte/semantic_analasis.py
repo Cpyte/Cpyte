@@ -529,10 +529,12 @@ class SemanticAnalyzer:
         self._analyze_depth = 0
         self._infer_memo: dict[int, str] = {}
         self._in_iterative = False
+        self._in_decorator = False
         self._lazy_imports: list[dict] = []
         self._lazy_header_cache: dict[tuple, tuple] = {}
         self._lazy_load_error: str | None = None
         self._promoted_vars: set[str] = set()
+        self._forward_names: set[str] = set()
 
     def _hook_context(self) -> CompilerContext:
         """Build a cached CompilerContext exposing this analyzer to hooks."""
@@ -738,6 +740,7 @@ class SemanticAnalyzer:
         "float",
         "double",
         "big",
+        "ubig",
         "char",
         "size_t",
     )
@@ -762,6 +765,18 @@ class SemanticAnalyzer:
             ):
                 return "double" if "double" in (t1, t2) else "float"
             return None
+        if "ubig" in (t1, t2):
+            # ubig is unsigned big: it dominates all other integer/big types.
+            if t1 in ("int", "int64", "uint64", "size_t", "big", "ubig") and t2 in (
+                "int",
+                "int64",
+                "uint64",
+                "size_t",
+                "big",
+                "ubig",
+            ):
+                return "ubig"
+            return None
         if "big" in (t1, t2):
             if t1 in ("int", "int64", "uint64", "big") and t2 in (
                 "int",
@@ -780,6 +795,7 @@ class SemanticAnalyzer:
         return None
 
     def analyze(self, nodes: list) -> bool:
+        self._predeclare(nodes)
         for node in nodes:
             self._visit(node)
         if self._promoted_vars:
@@ -788,6 +804,56 @@ class SemanticAnalyzer:
             return False
         return True
 
+    def _predeclare(self, nodes: list) -> None:
+        """Pre-register top-level declarations before the main single-pass
+        analysis so functions/structs/classes/enums/type-aliases may be
+        referenced before their textual definition (forward references).
+
+        Placeholder symbols carry enough metadata (return type / kind) for
+        callers and type resolution; the real ``_visit_*`` handlers overwrite
+        them in place, so ``_forward_names`` is used to suppress the normal
+        redefinition error exactly once per forward-declared name.
+        """
+        stack = list(reversed(nodes))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, FuncDef):
+                if node.name and node.name not in self._forward_names:
+                    if self.globals.lookup_local(node.name) is None:
+                        self.globals.define(
+                            node.name, Symbol("function", node.rettype or "void", node)
+                        )
+                        self._forward_names.add(node.name)
+            elif isinstance(node, StructDef):
+                if node.name and node.name not in self._forward_names:
+                    if self.globals.lookup_local(node.name) is None:
+                        self.globals.define(node.name, Symbol("struct", None, node))
+                        self._forward_names.add(node.name)
+            elif isinstance(node, ClassDef):
+                if node.name and node.name not in self._forward_names:
+                    if self.globals.lookup_local(node.name) is None:
+                        self.globals.define(node.name, Symbol("class", node.name, node))
+                        self._forward_names.add(node.name)
+            elif isinstance(node, EnumDef):
+                if node.name and node.name not in self._forward_names:
+                    if self.globals.lookup_local(node.name) is None:
+                        self.globals.define(node.name, Symbol("enum", None, node))
+                        self._forward_names.add(node.name)
+            elif isinstance(node, TypeAlias):
+                if node.name and node.name not in self._forward_names:
+                    if self.globals.lookup_local(node.name) is None:
+                        self.globals.define(
+                            node.name, Symbol("type_alias", node.target_type, node)
+                        )
+                        self._forward_names.add(node.name)
+
+    def _promoted_key(self, name: str) -> tuple:
+        """Promotion identity is scoped to the enclosing function so that a
+        variable promoted to ``dynamic`` in one function never contaminates an
+        unrelated same-named variable in another function."""
+        fn = self.current_func.name if self.current_func else ""
+        return (fn, name)
+
     def _stamp_dynamic(self, nodes: list) -> None:
         """Mark every AST node referencing a promoted variable as dynamic.
 
@@ -795,44 +861,53 @@ class SemanticAnalyzer:
         assignments) after some read/write sites have already been analyzed.
         Code generation needs the *final* dynamic status at every site, so we
         walk the whole AST once analysis is complete and stamp the nodes.
+
+        Promotions are scoped to their enclosing function, so a promotion of
+        ``cb`` inside ``main`` never stamps an unrelated ``CountingBloom cb``
+        declared in ``create_counting_bloom``.
         """
         visited: set[int] = set()
-        stack: list = list(nodes)
+        stack: list = [(n, "") for n in nodes]
         while stack:
-            item = stack.pop()
+            item, fn = stack.pop()
             if id(item) in visited:
                 continue
             visited.add(id(item))
+            if isinstance(item, FuncDef):
+                sub = (item.name, "")
+                for child in item.body:
+                    stack.append((child, item.name))
+                continue
             if isinstance(item, Variable):
-                if item.name in self._promoted_vars:
+                if (fn, item.name) in self._promoted_vars:
                     item.dynamic = True
                 continue
             if isinstance(item, VarDecl):
-                if item.name in self._promoted_vars:
+                if (fn, item.name) in self._promoted_vars:
                     item.dynamic = True
                 if item.init is not None:
-                    stack.append(item.init)
+                    stack.append((item.init, fn))
                 continue
             if isinstance(item, Assign):
                 target = item.target
                 if isinstance(target, Variable):
-                    if target.name in self._promoted_vars:
+                    if (fn, target.name) in self._promoted_vars:
                         item.dynamic = True
                         target.dynamic = True
-                    stack.append(target)
-                elif isinstance(target, str) and target in self._promoted_vars:
+                    stack.append((target, fn))
+                elif isinstance(target, str) and (fn, target) in self._promoted_vars:
                     item.dynamic = True
                 else:
-                    stack.append(target)
-                stack.append(item.value)
+                    stack.append((target, fn))
+                stack.append((item.value, fn))
                 continue
             if isinstance(item, (list, tuple)):
                 for child in item:
-                    stack.append(child)
+                    stack.append((child, fn))
                 continue
             if isinstance(item, dict):
                 for child in item.values():
-                    stack.append(child)
+                    stack.append((child, fn))
                 continue
             slots = getattr(type(item), "__slots__", ())
             if isinstance(slots, str):
@@ -848,12 +923,12 @@ class SemanticAnalyzer:
                     continue
                 if isinstance(child, (list, tuple)):
                     for c in child:
-                        stack.append(c)
+                        stack.append((c, fn))
                 elif isinstance(child, dict):
                     for c in child.values():
-                        stack.append(c)
+                        stack.append((c, fn))
                 else:
-                    stack.append(child)
+                    stack.append((child, fn))
 
     def _infer_type(self, node):
         key = id(node)
@@ -924,7 +999,7 @@ class SemanticAnalyzer:
             return "str"
 
         if isinstance(node, Variable):
-            if node.name == "result":
+            if self._in_decorator and node.name == "result":
                 node.inferred_type = "dynamic"
                 node.dynamic = True
                 return "dynamic"
@@ -1035,12 +1110,22 @@ class SemanticAnalyzer:
                     ok = (
                         ok
                         or left_t == "big"
-                        and right_t in ("int", "int64", "uint64", "big")
+                        and right_t in ("int", "int64", "uint64", "ubig", "big")
                     )
                     ok = (
                         ok
                         or right_t == "big"
-                        and left_t in ("int", "int64", "uint64", "big")
+                        and left_t in ("int", "int64", "uint64", "ubig", "big")
+                    )
+                    ok = (
+                        ok
+                        or left_t == "ubig"
+                        and right_t in ("int", "int64", "uint64", "ubig", "big")
+                    )
+                    ok = (
+                        ok
+                        or right_t == "ubig"
+                        and left_t in ("int", "int64", "uint64", "ubig", "big")
                     )
                     if not ok:
                         self.error(
@@ -1048,7 +1133,7 @@ class SemanticAnalyzer:
                             node,
                             note=f"both sides of `{node.op.name}` must be the same type",
                         )
-                if left_t == "big" or right_t == "big":
+                if left_t in ("big", "ubig") or right_t in ("big", "ubig"):
                     node.inferred_type = "bool"
                     return "bool"
                 node.inferred_type = "bool"
@@ -1063,8 +1148,10 @@ class SemanticAnalyzer:
                 "PERCENT",
             ):
                 if node.op.name in ("SHL", "SHR", "AMPERSAND", "PIPE", "CARET"):
-                    # Bitwise operations not supported for big
-                    valid_int_types = ("int", "int64", "uint64", "size_t")
+                    # Bitwise operations are unsupported for signed `big` but are
+                    # provided for unsigned `ubig` (which has no sign bit), so
+                    # AND/OR/XOR/shift operate over the full magnitude.
+                    valid_int_types = ("int", "int64", "uint64", "size_t", "ubig")
                     if left_t == "big" or right_t == "big":
                         self.error(
                             f"bitwise operator `{node.op.name}` not supported for `big` operands",
@@ -1079,6 +1166,9 @@ class SemanticAnalyzer:
                             node,
                             note=f"got `{left_t}` and `{right_t}`",
                         )
+                    if left_t == "ubig" or right_t == "ubig":
+                        node.inferred_type = "ubig"
+                        return "ubig"
                     if left_t in ("int64", "uint64") or right_t in ("int64", "uint64"):
                         node.inferred_type = "int64"
                         return "int64"
@@ -1088,7 +1178,7 @@ class SemanticAnalyzer:
                     node.inferred_type = "int"
                     return "int"
                 # PERCENT
-                valid_int_types = ("int", "int64", "uint64", "big", "size_t")
+                valid_int_types = ("int", "int64", "uint64", "big", "ubig", "size_t")
                 if (left_t is not None and left_t not in valid_int_types) or (
                     right_t is not None and right_t not in valid_int_types
                 ):
@@ -1104,6 +1194,9 @@ class SemanticAnalyzer:
                         note="cannot divide or mod by zero",
                     )
                 # Type promotion for mixed integer types
+                if left_t == "ubig" or right_t == "ubig":
+                    node.inferred_type = "ubig"
+                    return "ubig"
                 if left_t == "big" or right_t == "big":
                     node.inferred_type = "big"
                     return "big"
@@ -1170,6 +1263,9 @@ class SemanticAnalyzer:
                     )
                     return node.inferred_type
                 # Return the larger integer type
+                if left_t == "ubig" or right_t == "ubig":
+                    node.inferred_type = "ubig"
+                    return "ubig"
                 if left_t == "big" or right_t == "big":
                     node.inferred_type = "big"
                     return "big"
@@ -1194,6 +1290,14 @@ class SemanticAnalyzer:
                 node.inferred_type = "int"
                 return "int"
             if node.op.name == "MINUS":
+                if operand_t == "ubig":
+                    self.error(
+                        "cannot negate a `ubig` value",
+                        node,
+                        note="`ubig` is unsigned and can never be negative",
+                    )
+                    node.inferred_type = "ubig"
+                    return "ubig"
                 valid_types = (
                     "int",
                     "float",
@@ -1223,6 +1327,12 @@ class SemanticAnalyzer:
                         "decrement (`--`) not supported for `big`",
                         node,
                         note="big integers do not support decrement",
+                    )
+                if operand_t == "ubig":
+                    self.error(
+                        "decrement (`--`) not supported for `ubig`",
+                        node,
+                        note="`ubig` is unsigned and cannot be decremented below zero",
                     )
             node.inferred_type = operand_t
             return operand_t
@@ -1273,7 +1383,7 @@ class SemanticAnalyzer:
                             return None
                         node.inferred_type = "dynamic[]"
                         return "dynamic[]"
-                if node.callee.name == "code":
+                if self._in_decorator and node.callee.name == "code":
                     for arg in node.args:
                         self._infer_type(arg)
                     if len(node.args) != 0:
@@ -1660,6 +1770,20 @@ class SemanticAnalyzer:
         candidates = [module]
         if self._filedir:
             candidates.append(os.path.normpath(os.path.join(self._filedir, module)))
+            # Walk up from the source file's directory so an import that lives in a
+            # parent directory of the file (e.g. a vendored sibling package or the
+            # stdlib math library) resolves no matter where the LSP workspace root is.
+            # This mirrors the CLI behavior, which falls back to cwd when inside the
+            # stdlib dir. Plain first-match search path, same as C's quoted #include.
+            d = os.path.normpath(self._filedir)
+            seen = set()
+            while True:
+                parent = os.path.dirname(d)
+                if parent == d or parent in seen:
+                    break
+                seen.add(parent)
+                candidates.append(os.path.normpath(os.path.join(parent, module)))
+                d = parent
         if self._workspace_root:
             candidates.append(
                 os.path.normpath(os.path.join(self._workspace_root, module))
@@ -1703,6 +1827,18 @@ class SemanticAnalyzer:
             or module.endswith(".cpy")
             or module.startswith('"')
         )
+
+        if not is_file_import and not module.startswith("@"):
+            # Bare imports of built-in C libraries (e.g. `import "math"`) must
+            # take precedence over local package names of the same identifier.
+            # Users can still force a package import via the explicit `@scope/name`
+            # syntax when a package intentionally shadows a C library.
+            if resolve_library(module) is not None:
+                result = resolve_library(module)
+                if result is not None:
+                    symbols, kind = result
+                    self._register_import_symbols(symbols, node)
+                    return
 
         if not is_file_import:
             if self._try_cpm_import(node, module):
@@ -1961,7 +2097,11 @@ class SemanticAnalyzer:
         for dir_candidate in (search_dir, os.path.join(search_dir, "src")):
             if not os.path.isdir(dir_candidate):
                 continue
-            for entry_name in (f"{pkg_name}.cpy", "package.cpy"):
+            for entry_name in (
+                f"{pkg_name}.cpy",
+                "package.cpy",
+                "main.cpy",
+            ):
                 entry_path = os.path.join(dir_candidate, entry_name)
                 if os.path.isfile(entry_path):
                     return entry_path
@@ -2130,7 +2270,28 @@ class SemanticAnalyzer:
         symbols = {}
         sub_ast = []
         for ast_node in imported_ast:
-            if isinstance(ast_node, FuncDef) and ast_node.visibility == "public":
+            if isinstance(ast_node, (CCode, Llvm)):
+                # Propagate embedded `ccode:`/`llvm:` blocks from the imported
+                # module so (a) their functions become callable from the
+                # importing program and (b) codegen emits and links the C/LLVM
+                # body. The sub-analyzer already parsed the block and cached the
+                # symbols on the node under its own scope; re-register them on
+                # this analyzer's globals and keep the node in sub_ast so
+                # `emit_ccode`/`emit_llvm` runs at codegen.
+                existing_syms = getattr(ast_node, "symbols", None) or []
+                if existing_syms:
+                    self._register_import_symbols(
+                        dict(existing_syms),
+                        ast_node,
+                        var_names=getattr(ast_node, "var_names", set()) or set(),
+                    )
+                else:
+                    if isinstance(ast_node, CCode):
+                        self._visit_ccode(ast_node)
+                    else:
+                        self._visit_llvm(ast_node)
+                sub_ast.append(ast_node)
+            elif isinstance(ast_node, FuncDef) and ast_node.visibility == "public":
                 params = [(name, ptype) for name, ptype in ast_node.params.items()]
                 ret_type = ast_node.rettype or "int"
                 symbols[ast_node.name] = (ret_type, params, False)
@@ -2165,13 +2326,15 @@ class SemanticAnalyzer:
     def _visit_funcdef(self, node: FuncDef, scope: Scope | None = None):
         s = scope or self.globals
         existing = s.lookup_local(node.name)
-        if existing:
+        if existing and node.name not in self._forward_names:
             self.error(
                 f"redefinition of `{node.name}`",
                 node,
                 note="a function with this name already exists in this scope",
             )
             return
+        if existing:
+            self._forward_names.discard(node.name)
 
         if node.rettype == "decorated":
             has_code = any(
@@ -2194,6 +2357,8 @@ class SemanticAnalyzer:
 
         old_func = self.current_func
         self.current_func = node
+        old_in_decorator = self._in_decorator
+        self._in_decorator = node.rettype == "decorated"
         old_locals = self.locals
         self.locals = Scope(s)
 
@@ -2218,6 +2383,7 @@ class SemanticAnalyzer:
         self._check_lints(node.body, node)
 
         self.current_func = old_func
+        self._in_decorator = old_in_decorator
         self.locals = old_locals
 
     def _check_lints(self, body, fn):
@@ -2723,6 +2889,13 @@ class SemanticAnalyzer:
                         ("int64", "big"),
                         ("uint64", "big"),
                         ("big", "big"),
+                        ("int", "ubig"),
+                        ("int64", "ubig"),
+                        ("uint64", "ubig"),
+                        ("size_t", "ubig"),
+                        ("big", "ubig"),
+                        ("ubig", "ubig"),
+                        ("ubig", "big"),
                     ]
                     ok = (val_type, expected) in valid_conversions
                     ok = ok or (val_type == "int" and expected.endswith("*"))
@@ -2752,13 +2925,31 @@ class SemanticAnalyzer:
                     note=f"function `{self.current_func.name}` expects a return value of type `{self.current_func.rettype}`",
                 )
 
+    def _is_negative_constant(self, expr):
+        # True for compile-time-negative literals like `-5`. ubig is "its own
+        # parse (no minus)", so a negative constant must never enter an unsigned
+        # big value.
+        if isinstance(expr, UnaryOp):
+            if getattr(expr, "op", None) is not None and expr.op.name == "MINUS":
+                return isinstance(expr.operand, Number)
+        return False
+
+    def _check_ubig_no_negative(self, expr, node, ctx):
+        if self._is_negative_constant(expr):
+            self.error(
+                "cannot store a negative constant in a `ubig`",
+                node,
+                note="`ubig` is unsigned (its own parse has no minus); use a `big` "
+                f"or non-negative value instead ({ctx})",
+            )
+
     def _visit_assign(self, node: Assign, scope: Scope | None = None):
         val_type = self._infer_type(node.value)
         if isinstance(node.target, (Variable, str)):
             name = (
                 node.target.name if isinstance(node.target, Variable) else node.target
             )
-            if name == "result":
+            if self._in_decorator and name == "result":
                 if isinstance(node.target, Variable):
                     node.target.inferred_type = "dynamic"
                     node.target.dynamic = True
@@ -2768,7 +2959,8 @@ class SemanticAnalyzer:
             if existing is None:
                 existing = s.lookup(name)
             if existing is None:
-                s.define(name, Symbol("variable", val_type, node))
+                existing = Symbol("variable", val_type, node)
+                s.define(name, existing)
             elif existing.kind == "const":
                 self.error(
                     f"cannot assign to constant `{name}`",
@@ -2795,6 +2987,8 @@ class SemanticAnalyzer:
                 # the runtime kind is checked/coerced at run time.
                 if existing.kind == "variable":
                     existing.initialized = True
+            if existing is not None and existing.type == "ubig":
+                self._check_ubig_no_negative(node.value, node, "assignment")
             elif (
                 val_type is not None
                 and existing.type is not None
@@ -2834,6 +3028,13 @@ class SemanticAnalyzer:
                     ("uint64", "big"),
                     ("size_t", "big"),
                     ("big", "big"),
+                    ("int", "ubig"),
+                    ("int64", "ubig"),
+                    ("uint64", "ubig"),
+                    ("size_t", "ubig"),
+                    ("big", "ubig"),
+                    ("ubig", "ubig"),
+                    ("ubig", "big"),
                 ]
                 ok = (val_type, existing.type) in valid_conversions
                 ok = ok or (val_type == "int" and existing.type.endswith("*"))
@@ -2868,7 +3069,7 @@ class SemanticAnalyzer:
                         # are then allowed.
                         existing.dynamic = True
                         existing.initialized = True
-                        self._promoted_vars.add(name)
+                        self._promoted_vars.add(self._promoted_key(name))
                         existing.node.dynamic = True
                     else:
                         self.error(
@@ -2965,6 +3166,8 @@ class SemanticAnalyzer:
             )
         if node.init is not None:
             init_type = self._infer_type(node.init)
+            if val_type == "ubig":
+                self._check_ubig_no_negative(node.init, node, "declaration")
             if val_type == "dynamic":
                 # Dynamically-typed variable: accepts any initializer type.
                 node.dynamic = True
@@ -3008,6 +3211,13 @@ class SemanticAnalyzer:
                     ("uint64", "big"),
                     ("size_t", "big"),
                     ("big", "big"),
+                    ("int", "ubig"),
+                    ("int64", "ubig"),
+                    ("uint64", "ubig"),
+                    ("size_t", "ubig"),
+                    ("big", "ubig"),
+                    ("ubig", "ubig"),
+                    ("ubig", "big"),
                 ]
                 ok = (init_type, val_type) in valid_conversions
                 ok = ok or (init_type == "int" and val_type.endswith("*"))
@@ -3137,9 +3347,11 @@ class SemanticAnalyzer:
     def _visit_struct(self, node: StructDef, scope: Scope | None = None):
         s = scope or self.globals
         existing = s.lookup_local(node.name)
-        if existing:
+        if existing and node.name not in self._forward_names:
             self.error(f"redefinition of struct `{node.name}`", node)
             return
+        if existing:
+            self._forward_names.discard(node.name)
         s.define(node.name, Symbol("struct", None, node))
         struct_scope = Scope(s)
         for param in node.generic_params:
@@ -3150,9 +3362,11 @@ class SemanticAnalyzer:
     def _visit_enum(self, node: EnumDef, scope: Scope | None = None):
         s = scope or self.globals
         existing = s.lookup_local(node.name)
-        if existing:
+        if existing and node.name not in self._forward_names:
             self.error(f"redefinition of enum `{node.name}`", node)
             return
+        if existing:
+            self._forward_names.discard(node.name)
         s.define(node.name, Symbol("enum", None, node))
         prev_ctx = self._enum_context_name
         self._enum_context_name = node.name
@@ -3217,9 +3431,11 @@ class SemanticAnalyzer:
     def _visit_type_alias(self, node: TypeAlias, scope: Scope | None = None):
         s = scope or self.globals
         existing = s.lookup_local(node.name)
-        if existing:
+        if existing and node.name not in self._forward_names:
             self.error(f"redefinition of type alias `{node.name}`", node)
             return
+        if existing:
+            self._forward_names.discard(node.name)
         s.define(node.name, Symbol("type_alias", node.target_type, node))
 
     def _eval_const_expr(self, node, scope: Scope | None = None):

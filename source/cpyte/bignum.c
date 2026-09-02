@@ -466,7 +466,7 @@ void* bigint_pow(void* a, void* b) {
     cb->used = base->used;
     cb->negative = base->negative;
 
-    BigNum exp_copy;
+    BigNum exp_copy = {0};
     _bn_reserve(&exp_copy, exp->used);
     memcpy(exp_copy.limbs, exp->limbs, exp->used * sizeof(uint64_t));
     exp_copy.used = exp->used;
@@ -591,4 +591,137 @@ char* bigint_to_str(void* p) {
     out[o + digits] = '\0';
     free(buf);
     return out;
+}
+
+// --- Unsigned big (ubig) support ---
+// ubig shares the BigNum sign-magnitude representation but is constrained to
+// non-negative values. add/mul/div/mod/pow are mathematically identical to the
+// signed versions for two non-negative operands, so `bigint_*` is reused for
+// those. The operations below are where unsigned semantics genuinely differ:
+// underflow-checked subtraction, unsigned comparison, and bitwise ops over the
+// full magnitude (which `big` deliberately does not support).
+
+void* ubigint_sub(void* a, void* b) {
+    if (!a) return b ? bigint_from_uint64(0) : bigint_from_uint64(0);
+    if (!b) return a;
+    void* r = bigint_sub(a, b);
+    BigNum* rt = (BigNum*)r;
+    if (rt->negative) {
+        bigint_free(r);
+        _bn_fail("ubig underflow: result of subtraction is negative");
+    }
+    return r;
+}
+
+int ubigint_cmp(void* a, void* b) {
+    BigNum* x = (BigNum*)a;
+    BigNum* y = (BigNum*)b;
+    if (!x && !y) return 0;
+    if (!x) return -1;
+    if (!y) return 1;
+    return _bn_cmp_mag(x, y);
+}
+
+void* ubigint_and(void* a, void* b) {
+    if (!a || !b) return bigint_from_uint64(0);
+    BigNum* x = (BigNum*)a;
+    BigNum* y = (BigNum*)b;
+    BigNum* r = _bn_alloc();
+    size_t n = x->used < y->used ? x->used : y->used;
+    _bn_reserve(r, n);
+    for (size_t i = 0; i < n; i++)
+        r->limbs[i] = x->limbs[i] & y->limbs[i];
+    r->used = n;
+    _bn_trim(r);
+    return r;
+}
+
+void* ubigint_or(void* a, void* b) {
+    if (!a && !b) return bigint_from_uint64(0);
+    if (!a) return b;
+    if (!b) return a;
+    BigNum* x = (BigNum*)a;
+    BigNum* y = (BigNum*)b;
+    BigNum* r = _bn_alloc();
+    size_t n = x->used > y->used ? x->used : y->used;
+    _bn_reserve(r, n);
+    for (size_t i = 0; i < n; i++)
+        r->limbs[i] = (i < x->used ? x->limbs[i] : 0) | (i < y->used ? y->limbs[i] : 0);
+    r->used = n;
+    _bn_trim(r);
+    return r;
+}
+
+void* ubigint_xor(void* a, void* b) {
+    if (!a && !b) return bigint_from_uint64(0);
+    if (!a) return b;
+    if (!b) return a;
+    BigNum* x = (BigNum*)a;
+    BigNum* y = (BigNum*)b;
+    BigNum* r = _bn_alloc();
+    size_t n = x->used > y->used ? x->used : y->used;
+    _bn_reserve(r, n);
+    for (size_t i = 0; i < n; i++)
+        r->limbs[i] = (i < x->used ? x->limbs[i] : 0) ^ (i < y->used ? y->limbs[i] : 0);
+    r->used = n;
+    _bn_trim(r);
+    return r;
+}
+
+// Left shift. `count` is a non-negative ubig; shifting left never underflows.
+void* ubigint_shl(void* a, void* count) {
+    if (!a) return bigint_from_uint64(0);
+    BigNum* x = (BigNum*)a;
+    BigNum* c = (BigNum*)count;
+    uint64_t s = (c && c->used) ? c->limbs[0] : 0;
+    size_t limb_shift = (size_t)(s / 64);
+    unsigned bit_shift = (unsigned)(s % 64);
+    BigNum* r = _bn_alloc();
+    size_t n = x->used + limb_shift + (bit_shift ? 1 : 0);
+    _bn_reserve(r, n);
+    memset(r->limbs, 0, n * sizeof(uint64_t));
+    if (bit_shift == 0) {
+        for (size_t i = x->used; i > 0; i--)
+            r->limbs[i - 1 + limb_shift] = x->limbs[i - 1];
+    } else {
+        uint64_t carry = 0;
+        for (size_t i = 0; i < x->used; i++) {
+            uint64_t v = (x->limbs[i] << bit_shift) | carry;
+            carry = x->limbs[i] >> (64 - bit_shift);
+            r->limbs[i + limb_shift] = v;
+        }
+        if (carry)
+            r->limbs[x->used + limb_shift] = carry;
+    }
+    r->used = n;
+    _bn_trim(r);
+    r->negative = 0;
+    return r;
+}
+
+// Right shift. Counts >= the bit-width produce zero.
+void* ubigint_shr(void* a, void* count) {
+    if (!a) return bigint_from_uint64(0);
+    BigNum* x = (BigNum*)a;
+    BigNum* c = (BigNum*)count;
+    uint64_t s = (c && c->used) ? c->limbs[0] : 0;
+    size_t limb_shift = (size_t)(s / 64);
+    unsigned bit_shift = (unsigned)(s % 64);
+    if (limb_shift >= x->used)
+        return bigint_from_uint64(0);
+    BigNum* r = _bn_alloc();
+    size_t n = x->used - limb_shift;
+    _bn_reserve(r, n);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t hi = x->limbs[i + limb_shift];
+        uint64_t lo = (i + 1 + limb_shift < x->used) ? x->limbs[i + 1 + limb_shift] : 0;
+        if (bit_shift == 0)
+            r->limbs[i] = hi;
+        else
+            r->limbs[i] = (hi >> bit_shift) | (lo << (64 - bit_shift));
+    }
+    r->used = n;
+    _bn_trim(r);
+    r->negative = 0;
+    return r;
 }

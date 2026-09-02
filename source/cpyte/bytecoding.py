@@ -171,6 +171,12 @@ class LLVM:
             return ir.IntType(64)
         if t == "uint64":
             return ir.IntType(64)
+        if t == "size_t":
+            # Pointer-sized unsigned integer (i64 on every 64-bit cpyte target,
+            # incl. macOS/Linux arm64 & x86-64 LP64). Keeping it i64 (not the
+            # i32 fallthrough) lets `(size_t)ptr`/`(ptr)(size_t)` round-trips
+            # preserve the full address instead of truncating to 32 bits.
+            return ir.IntType(64)
         if t == "bool":
             return ir.IntType(1)
         if t in ("float", "double"):
@@ -184,6 +190,8 @@ class LLVM:
         if t == "void*":
             return ir.PointerType(ir.IntType(8))
         if t == "big":
+            return ir.PointerType(ir.IntType(8))
+        if t == "ubig":
             return ir.PointerType(ir.IntType(8))
         if t == "dynamic":
             # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
@@ -434,14 +442,23 @@ class LLVM:
         clamped_to_max = self.builder.select(gt_max, max_shift, val)
         return self.builder.select(lt_zero, zero, clamped_to_max)
 
-    def _is_big(self, node):
-        if getattr(node, "inferred_type", "") == "big":
+    def _is_type(self, node, t):
+        if getattr(node, "inferred_type", "") == t:
             return True
         if isinstance(node, Variable):
-            return self.local_types.get(node.name, "") == "big"
+            return self.local_types.get(node.name, "") == t
         return False
 
-    def _promote_to_big(self, val):
+    def _is_big(self, node):
+        return self._is_type(node, "big")
+
+    def _is_ubig(self, node):
+        return self._is_type(node, "ubig")
+
+    def _is_biglike(self, node):
+        return self._is_big(node) or self._is_ubig(node)
+
+    def _promote_to_big(self, val, src_t=None):
         if isinstance(val.type, ir.IntType) and val.type.width < 64:
             if val.type.width == 32:
                 val = self.builder.sext(val, _i64)
@@ -452,7 +469,28 @@ class LLVM:
             and "i64" in str(val.type)
             or isinstance(val.type, ir.IntType)
         ):
-            fn = self.functions["bigint_from_int"]
+            # An unsigned 64-bit source (uint64/size_t) must zero-extend into
+            # the sign-magnitude representation, otherwise a literal like
+            # 12345678901234567890 (fits uint64, not int64) becomes a negative
+            # `big`. Signed sources keep the signed bigint_from_int path.
+            if src_t in ("uint64", "size_t", "ubig"):
+                fn = self.functions["bigint_from_uint64"]
+            else:
+                fn = self.functions["bigint_from_int"]
+        else:
+            return val
+        return self.builder.call(fn, [val])
+
+    def _promote_to_ubig(self, val):
+        # ubig is unsigned: always zero-extend the 64-bit intermediate.
+        if isinstance(val.type, ir.IntType) and val.type.width < 64:
+            val = self.builder.zext(val, _i64)
+        if (
+            isinstance(val.type, ir.IntType)
+            and "i64" in str(val.type)
+            or isinstance(val.type, ir.IntType)
+        ):
+            fn = self.functions["bigint_from_uint64"]
         else:
             return val
         return self.builder.call(fn, [val])
@@ -472,10 +510,11 @@ class LLVM:
         try:
             import llvmlite.binding as _binding
 
-            _binding.initialize_native_target()
             if target_triple:
+                _binding.initialize_all_targets()
                 _target = _binding.Target.from_triple(target_triple)
             else:
+                _binding.initialize_native_target()
                 _target = _binding.Target.from_default_triple()
             _tm = _target.create_target_machine()
             self.module.triple = _tm.triple
@@ -515,6 +554,7 @@ class LLVM:
         self._emit_depth = 0
         self._emit_memo = {}
         self._in_emit_iterative = False
+        self._in_decorator = False
 
         if not no_userspace:
             print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -575,6 +615,21 @@ class LLVM:
             ("bigint_pow", _i8ptr, [_i8ptr, _i8ptr]),
         ]
         for name, ret, args in bignum_fns:
+            fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+            self.functions[name] = fn
+
+        # Unsigned big (ubig) runtime. sub is underflow-checked; cmp and the
+        # bitwise ops operate over the full magnitude (no sign bit to worry about).
+        ubig_fns = [
+            ("ubigint_sub", _i8ptr, [_i8ptr, _i8ptr]),
+            ("ubigint_cmp", _i32, [_i8ptr, _i8ptr]),
+            ("ubigint_and", _i8ptr, [_i8ptr, _i8ptr]),
+            ("ubigint_or", _i8ptr, [_i8ptr, _i8ptr]),
+            ("ubigint_xor", _i8ptr, [_i8ptr, _i8ptr]),
+            ("ubigint_shl", _i8ptr, [_i8ptr, _i8ptr]),
+            ("ubigint_shr", _i8ptr, [_i8ptr, _i8ptr]),
+        ]
+        for name, ret, args in ubig_fns:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
 
@@ -1072,11 +1127,12 @@ class LLVM:
         for node in imports:
             self.emit(node)
 
-        # Emit all ccode blocks before function definitions so that
-        # ccode-declared functions are available to every function body.
+        # Emit all ccode/llvm blocks before function definitions so that
+        # ccode-declared and llvm-declared functions are available to every
+        # function body (including public funcs pulled in from imports).
         def _collect_ccodes(nodes):
             for node in nodes:
-                if isinstance(node, CCode):
+                if isinstance(node, (CCode, Llvm)):
                     self.emit(node)
                 elif isinstance(node, FuncDef):
                     _collect_ccodes(getattr(node, "body", None) or [])
@@ -1169,7 +1225,7 @@ class LLVM:
         ):
             as_i64 = self._extend_to_i64(val)
             return self.builder.call(self.functions["str_of_ptr"], [as_i64])
-        if getattr(node, "inferred_type", None) == "big":
+        if getattr(node, "inferred_type", None) in ("big", "ubig"):
             return self.builder.call(self.functions["bigint_to_str"], [val])
         ty = val.type
         if isinstance(ty, ir.PointerType):
@@ -1270,11 +1326,19 @@ class LLVM:
 
         if getattr(self, "_ccode_emitted", None) is None:
             self._ccode_emitted = set()
+        symbols = getattr(node, "symbols", None)
+        # Dedup by declared symbol names + body so a shared helper module (e.g.
+        # mem.cpy) imported from many containers emits one temp .c instead of N
+        # identical copies that collide at link time.
         key = id(node)
+        if node.value:
+            names = tuple(
+                sorted(fname for fname, _sig in (symbols or []))
+            )
+            key = (names, node.value)
         if key in self._ccode_emitted:
             return
         self._ccode_emitted.add(key)
-        symbols = getattr(node, "symbols", None)
         if symbols:
             var_names = getattr(node, "var_names", set()) or set()
             for fname, (ret_type, params, vararg) in symbols:
@@ -1320,11 +1384,16 @@ class LLVM:
 
         if getattr(self, "_llvm_emitted", None) is None:
             self._llvm_emitted = set()
+        symbols = getattr(node, "symbols", None)
         key = id(node)
+        if node.value:
+            names = tuple(
+                sorted(fname for fname, _sig in (symbols or []))
+            )
+            key = (names, node.value)
         if key in self._llvm_emitted:
             return
         self._llvm_emitted.add(key)
-        symbols = getattr(node, "symbols", None)
         if symbols:
             for fname, (ret_type, params, vararg) in symbols:
                 if fname in self.functions or fname in self.global_vars:
@@ -1865,6 +1934,14 @@ class LLVM:
         target = self.llvm_type(node.type_expr)
         if val.type == target:
             return val
+        cast_ty = node.type_expr
+        if cast_ty == "ubig" or cast_ty == "big":
+            # Casting any integer/pointer source into an arbitrary-precision big.
+            # ubig treats the source as unsigned (zero-extend); big sign-extends.
+            src_t = getattr(node.expr, "inferred_type", None)
+            if cast_ty == "ubig":
+                return self._promote_to_ubig(val)
+            return self._promote_to_big(val, src_t)
         if isinstance(val.type, ir.IntType) and isinstance(target, ir.IntType):
             if val.type.width < target.width:
                 return self.builder.sext(val, target)
@@ -2146,6 +2223,8 @@ class LLVM:
         old_ssa_types = self.ssa_types
         old_scope_stack = self.scope_stack
         old_deferred = self._deferred
+        old_in_decorator = self._in_decorator
+        self._in_decorator = node.rettype == "decorated"
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
@@ -2196,6 +2275,7 @@ class LLVM:
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
         self._deferred = old_deferred
+        self._in_decorator = old_in_decorator
 
     def _emit_decorated_funcdef(self, node: FuncDef):
         """Emit a decorated function: original as __name, trampoline, and wrapper."""
@@ -2220,6 +2300,8 @@ class LLVM:
         old_ssa = self.ssa_values
         old_ssa_types = self.ssa_types
         old_scope_stack = self.scope_stack
+        old_in_decorator = self._in_decorator
+        self._in_decorator = True
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
@@ -2260,6 +2342,7 @@ class LLVM:
         self.ssa_values = old_ssa
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
+        self._in_decorator = old_in_decorator
 
         # 2. Generate trampoline: calls __name and returns DynValue
         tramp_fnty = ir.FunctionType(_DynValue, [])
@@ -2466,12 +2549,12 @@ class LLVM:
         ):
             return self.builder.fptosi(left, _i64), self.builder.ptrtoint(right, _i64)
 
+        # Pointer + integer -> integer arithmetic on the pointer's address
+        # (byte offset). char*/i8* pointers are included: string concatenation
+        # is gated earlier by `_is_string_concat` (a `str` operand never reaches
+        # _promote), so an i8* here is a genuine character/byte pointer.
         if (
             isinstance(left.type, ir.PointerType)
-            and not (
-                isinstance(left.type.pointee, ir.IntType)
-                and left.type.pointee.width == 8
-            )
             and isinstance(right.type, ir.IntType)
         ):  # type: ignore[attr-defined]
             left = self.builder.ptrtoint(left, _i64)
@@ -2479,10 +2562,6 @@ class LLVM:
             return left, right
         if (
             isinstance(right.type, ir.PointerType)
-            and not (
-                isinstance(right.type.pointee, ir.IntType)
-                and right.type.pointee.width == 8
-            )
             and isinstance(left.type, ir.IntType)
         ):  # type: ignore[attr-defined]
             right = self.builder.ptrtoint(right, _i64)
@@ -2566,7 +2645,7 @@ class LLVM:
             return _DYN_DOUBLE
         if ty == "str":
             return _DYN_STR
-        if ty == "big":
+        if ty in ("big", "ubig"):
             return _DYN_BIG
         if ty.endswith(("*", "&")):
             return _DYN_PTR
@@ -2596,7 +2675,7 @@ class LLVM:
             p = self.builder.ptrtoint(value, _i64)
             if ty == "dynamic[]":
                 return _DYN_LIST, p
-            if ty == "big":
+            if ty in ("big", "ubig"):
                 return _DYN_BIG, p
             if isinstance(t.pointee, ir.IntType) and t.pointee.width == 8:  # type: ignore[attr-defined]
                 return _DYN_STR, p
@@ -2646,7 +2725,7 @@ class LLVM:
 
     def _dyn_struct(self, node):
         """Evaluate an expression and return it as a {i32,i64} DynValue struct."""
-        if isinstance(node, Variable) and node.name == "result":
+        if self._in_decorator and isinstance(node, Variable) and node.name == "result":
             return self.builder.load(self._code_result, "result")
         if isinstance(node, Variable) and getattr(node, "dynamic", False):
             ptr = self._dyn_local_ptr(node.name)
@@ -2815,12 +2894,94 @@ class LLVM:
         left = self.emit(node.left)
         right = self.emit(node.right)
 
+        # ubig (unsigned big) arithmetic + bitwise before _promote. add/mul/div/
+        # mod/pow are magnitude ops (identical to signed for non-negative
+        # operands), so bigint_* is reused; subtraction is underflow-checked and
+        # comparisons are unsigned via ubigint_*. Bitwise ops (and/or/xor/shift)
+        # work over the full magnitude and are unsupported on signed `big`.
+        if self._is_ubig(node.left) or self._is_ubig(node.right):
+            if not isinstance(left.type, ir.PointerType):
+                left = self._promote_to_ubig(left)
+            if not isinstance(right.type, ir.PointerType):
+                right = self._promote_to_ubig(right)
+            match node.op:
+                case TokenType.PLUS:
+                    return self.builder.call(
+                        self.functions["bigint_add"], [left, right]
+                    )
+                case TokenType.MINUS:
+                    return self.builder.call(
+                        self.functions["ubigint_sub"], [left, right]
+                    )
+                case TokenType.STAR:
+                    return self.builder.call(
+                        self.functions["bigint_mul"], [left, right]
+                    )
+                case TokenType.SLASH:
+                    return self.builder.call(
+                        self.functions["bigint_div"], [left, right]
+                    )
+                case TokenType.SLASH_SLASH:
+                    return self.builder.call(
+                        self.functions["bigint_floor_div"], [left, right]
+                    )
+                case TokenType.PERCENT:
+                    return self.builder.call(
+                        self.functions["bigint_mod"], [left, right]
+                    )
+                case TokenType.POW:
+                    return self.builder.call(
+                        self.functions["bigint_pow"], [left, right]
+                    )
+                case TokenType.AMPERSAND:
+                    return self.builder.call(
+                        self.functions["ubigint_and"], [left, right]
+                    )
+                case TokenType.PIPE:
+                    return self.builder.call(
+                        self.functions["ubigint_or"], [left, right]
+                    )
+                case TokenType.CARET:
+                    return self.builder.call(
+                        self.functions["ubigint_xor"], [left, right]
+                    )
+                case TokenType.SHL:
+                    return self.builder.call(
+                        self.functions["ubigint_shl"], [left, right]
+                    )
+                case TokenType.SHR:
+                    return self.builder.call(
+                        self.functions["ubigint_shr"], [left, right]
+                    )
+                case TokenType.EQ_EQ:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed("==", cmp, ir.Constant(_i32, 0))
+                case TokenType.NOT_EQ:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed("!=", cmp, ir.Constant(_i32, 0))
+                case TokenType.LESS:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed("<", cmp, ir.Constant(_i32, 0))
+                case TokenType.GREATER:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed(">", cmp, ir.Constant(_i32, 0))
+                case TokenType.LESS_EQ:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed("<=", cmp, ir.Constant(_i32, 0))
+                case TokenType.GREATER_EQ:
+                    cmp = self.builder.call(self.functions["ubigint_cmp"], [left, right])
+                    return self.builder.icmp_signed(">=", cmp, ir.Constant(_i32, 0))
+
         # Handle big arithmetic before _promote (which would corrupt i8* big values)
         if self._is_big(node.left) or self._is_big(node.right):
             if not isinstance(left.type, ir.PointerType):
-                left = self._promote_to_big(left)
+                left = self._promote_to_big(
+                    left, getattr(node.left, "inferred_type", None)
+                )
             if not isinstance(right.type, ir.PointerType):
-                right = self._promote_to_big(right)
+                right = self._promote_to_big(
+                    right, getattr(node.right, "inferred_type", None)
+                )
             match node.op:
                 case TokenType.PLUS:
                     return self.builder.call(
@@ -3170,7 +3331,7 @@ class LLVM:
     # Is it good man?
     @register_emitter(Variable)
     def emit_variable(self, node):
-        if node.name == "result":
+        if self._in_decorator and node.name == "result":
             return self.builder.load(self._code_result, "result")
 
         const = self.const_vars.get(node.name)
@@ -3323,7 +3484,7 @@ class LLVM:
 
     @register_emitter(Assign)
     def emit_assign(self, node):
-        if isinstance(node.target, Variable) and node.target.name == "result":
+        if self._in_decorator and isinstance(node.target, Variable) and node.target.name == "result":
             value = self.emit(node.value)
             if value.type != _DynValue:
                 kind, bits = self._box_dyn(
@@ -3369,17 +3530,20 @@ class LLVM:
                     value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
-                    if self.local_types.get(name) == "big" and not self._is_big(
-                        node.value
-                    ):
-                        value = self._promote_to_big(value)
-                    else:
+                    decl_ty = self.local_types.get(name)
+                    if decl_ty in ("big", "ubig") and not self._is_biglike(node.value):
+                        src_t = getattr(node.value, "inferred_type", None)
+                        value = (
+                            self._promote_to_ubig(value)
+                            if decl_ty == "ubig"
+                            else self._promote_to_big(value, src_t)
+                        )
+                    elif not isinstance(value.type, ir.PointerType):
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ("int64", "uint64"):
                     value = self._extend_to_i64(value)
                 self.builder.store(value, ptr)
-                self.ssa_types[name] = var_type
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
@@ -3413,11 +3577,15 @@ class LLVM:
                     value = self.emit(node.value)
                 pointee = self._pointee_type(ptr)
                 if pointee and value.type != pointee:
-                    if self.local_types.get(name) == "big" and not self._is_big(
-                        node.value
-                    ):
-                        value = self._promote_to_big(value)
-                    else:
+                    decl_ty = self.local_types.get(name)
+                    if decl_ty in ("big", "ubig") and not self._is_biglike(node.value):
+                        src_t = getattr(node.value, "inferred_type", None)
+                        value = (
+                            self._promote_to_ubig(value)
+                            if decl_ty == "ubig"
+                            else self._promote_to_big(value, src_t)
+                        )
+                    elif not isinstance(value.type, ir.PointerType):
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ("int64", "uint64"):
@@ -3500,7 +3668,7 @@ class LLVM:
             return self._emit_builtin_str_split(node)
 
         # Builtin code() — call the original function through __code_fn pointer.
-        if isinstance(node.callee, Variable) and node.callee.name == "code":
+        if self._in_decorator and isinstance(node.callee, Variable) and node.callee.name == "code":
             return self._emit_builtin_code(node)
 
         # Handle known macro functions by inlining
@@ -3609,7 +3777,7 @@ class LLVM:
             )
             return self.builder.trunc(bits, _i32)
         val = self.emit(arg)
-        if getattr(arg, "inferred_type", None) == "big":
+        if getattr(arg, "inferred_type", None) in ("big", "ubig"):
             s = self.builder.call(self.functions["bigint_to_str"], [val])
             atoi = self._get_or_create_fn("atoi", _i32, [_i8ptr])
             return self.builder.call(atoi, [s])
@@ -3636,7 +3804,7 @@ class LLVM:
             )
             return self.builder.bitcast(bits, ir.DoubleType())
         val = self.emit(arg)
-        if getattr(arg, "inferred_type", None) == "big":
+        if getattr(arg, "inferred_type", None) in ("big", "ubig"):
             s = self.builder.call(self.functions["bigint_to_str"], [val])
             atof = self._get_or_create_fn("atof", ir.DoubleType(), [_i8ptr])
             return self.builder.call(atof, [s])
@@ -3836,7 +4004,7 @@ class LLVM:
             k = self.builder.extract_value(value, 0)
             b = self.builder.extract_value(value, 1)
             return self.builder.call(self.functions["dyn_print_v"], [k, b])
-        if self._is_big(expr):
+        if self._is_biglike(expr):
             return self.builder.call(self.functions["bigint_print"], [value])
         if isinstance(value.type, ir.DoubleType):
             return self.builder.call(self.functions["print_double"], [value])
@@ -4161,7 +4329,7 @@ class LLVM:
 
     @register_emitter(Number)
     def emit_number(self, node):
-        if getattr(node, "inferred_type", "") == "big":
+        if getattr(node, "inferred_type", "") in ("big", "ubig"):
             s = node.value
             if s.startswith("0x") or s.startswith("0X"):
                 s = str(int(s, 16))
@@ -4178,16 +4346,18 @@ class LLVM:
             ptr = self.builder.bitcast(g, _i8ptr)
             return self.builder.call(self.functions["bigint_from_str"], [ptr])
 
-        if "." in node.value:
-            return ir.Constant(ir.DoubleType(), float(node.value))
-
-        # Handle hexadecimal literals
+        # Handle hexadecimal literals BEFORE the float 'e' check: hex values
+        # legitimately contain the letter 'e' as a digit (0-9a-f).
         if node.value.startswith("0x") or node.value.startswith("0X"):
             value = int(node.value, 16)
-            # Use 64-bit for large hex values
             if value > 2**31 - 1 or value < -(2**31):
+                if value > 0 and value > 2**63 - 1:
+                    return ir.Constant(ir.IntType(64), value - 2**64)
                 return ir.Constant(ir.IntType(64), value)
             return ir.Constant(ir.IntType(32), value)
+
+        if "." in node.value or "e" in node.value.lower():
+            return ir.Constant(ir.DoubleType(), float(node.value))
 
         value = int(node.value)
         # Use 64-bit for large decimal values
@@ -4336,8 +4506,13 @@ class LLVM:
         if node.is_const:
             if node.init:
                 value = self.emit(node.init)
-                if node.var_type == "big" and not self._is_big(node.init):
-                    value = self._promote_to_big(value)
+                if node.var_type in ("big", "ubig") and not self._is_biglike(node.init):
+                    src_t = getattr(node.init, "inferred_type", None)
+                    value = (
+                        self._promote_to_ubig(value)
+                        if node.var_type == "ubig"
+                        else self._promote_to_big(value, src_t)
+                    )
                 elif node.var_type in ("int64", "uint64"):
                     value = self._extend_to_i64(value)
                 if isinstance(value, ir.Constant):
@@ -4356,9 +4531,14 @@ class LLVM:
                 value = self._unbox_dyn_to(node.init, node.var_type)
             else:
                 value = self.emit(node.init)
-            if node.var_type == "big" and not self._is_big(node.init):
-                value = self._promote_to_big(value)
-            elif self._is_big(node.init) and node.var_type != "big":
+            if node.var_type in ("big", "ubig") and not self._is_biglike(node.init):
+                src_t = getattr(node.init, "inferred_type", None)
+                value = (
+                    self._promote_to_ubig(value)
+                    if node.var_type == "ubig"
+                    else self._promote_to_big(value, src_t)
+                )
+            elif self._is_biglike(node.init) and node.var_type not in ("big", "ubig"):
                 pass
             elif node.var_type in ("int64", "uint64"):
                 value = self._extend_to_i64(value)

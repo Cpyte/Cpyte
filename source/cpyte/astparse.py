@@ -2241,6 +2241,8 @@ _TYPE_NAMES = {
     "long",
     "short",
     "signed",
+    "big",
+    "ubig",
     "size_t",
     "dynamic",
 }

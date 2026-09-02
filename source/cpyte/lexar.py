@@ -250,6 +250,21 @@ class _LineLexer:
             while self.pos < len(self.line) and self.peek().isdigit():
                 self.advance()
 
+        # Scientific notation exponent (e/E [+/-]digits). Only consume it when
+        # at least one digit follows the exponent marker, so `1e5` lexes as a
+        # single NUMBER while an identifier-friendly `e` isn't swallowed.
+        if self.pos < len(self.line) and self.peek().lower() == 'e':
+            save = self.pos
+            self.advance()  # consume 'e'/'E'
+            if self.pos < len(self.line) and self.peek() in ('+', '-'):
+                self.advance()
+            exp_start = self.pos
+            while self.pos < len(self.line) and self.peek().isdigit():
+                self.advance()
+            if self.pos == exp_start:
+                # no exponent digits — not scientific notation; rewind
+                self.pos = save
+
         value = self.line[start:self.pos]
         return Token(TokenType.NUMBER, value, self.line_number, start_col)
 

@@ -517,7 +517,7 @@ def run_program(source, label='', save=True):
         return 'reject'
 
     try:
-        err, _ = analyze(source, parsed, strict=False)
+        err, _, _ = analyze(source, parsed, strict=False)
     except Exception as e:
         _save_crash(source, f'analyzer crash: {e}')
         return 'crash'
@@ -942,7 +942,7 @@ def run_differential(path):
         return
 
     try:
-        err, _ = analyze(source, parsed, strict=False)
+        err, _, _ = analyze(source, parsed, strict=False)
     except Exception as e:
         print(f'ANALYZER CRASH: {e}')
         traceback.print_exc()

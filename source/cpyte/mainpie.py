@@ -13,10 +13,12 @@ if __package__:
         _find_llvm_cc,
         _host_default_pic,
         _remove_probe_stack_ir,
+        make_target_machine,
         optimize,
         run_aot,
         run_jit,
         run_scorpion,
+        set_target_cpu,
     )
     from .extension_hooks import HookStage, get_global_hook_registry
     from .lexar import Lexer, LexerError, register_keywords
@@ -41,10 +43,12 @@ else:
         _find_llvm_cc,
         _host_default_pic,
         _remove_probe_stack_ir,
+        make_target_machine,
         optimize,
         run_aot,
         run_jit,
         run_scorpion,
+        set_target_cpu,
     )
     from cpyte.extension_hooks import HookStage, get_global_hook_registry
     from cpyte.lexar import Lexer, LexerError, register_keywords
@@ -70,6 +74,8 @@ Global options:
   --no-userspace      Compile without the userspace runtime
   --nogc              Disable automatic GC and add the free() builtin
   --pic               Position-independent code
+  --cpu CPU           Override the target CPU (e.g. skylake, apple-m1, native)
+  --mattr FEATURES    Override LLVM target-features (e.g. +avx2,+fma)
   --export NAME       Export NAME as a library symbol (dynamic SEF; repeatable)
   --lto               Enable link-time optimization (requires clang)
   --ast               Print the parsed AST
@@ -486,6 +492,12 @@ def cmd_build(
         elif a == "--opt" and i + 1 < len(args):
             opt = int(args[i + 1])
             i += 2
+        elif a in ("--cpu", "--march") and i + 1 < len(args):
+            set_target_cpu(cpu=args[i + 1])
+            i += 2
+        elif a == "--mattr" and i + 1 < len(args):
+            set_target_cpu(features=args[i + 1])
+            i += 2
         elif not a.startswith("-"):
             src_file = a
             i += 1
@@ -495,7 +507,8 @@ def cmd_build(
 
     if not src_file:
         ui.print_usage(
-            "Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--pic] [--lto] <source.cpy>"
+            "Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--pic]"
+            " [--cpu CPU] [--mattr FEATURES] [--lto] <source.cpy>"
         )
         sys.exit(1)
 
@@ -569,15 +582,13 @@ def cmd_build(
     binding.link_modules(mod, bignum_mod)
     mod.verify()
 
-    if lto or opt_size:
-        optimize(mod, opt, opt_size=opt_size)
-        mod.verify()
+    # Always run module optimization so the LLVM passes (SROA, inlining and the
+    # loop/SLP auto-vectorizer) run at the chosen -O level — this is what emits
+    # SIMD/NEON/AVX. `optimize` opts out internally for -O0 and honors opt_size.
+    optimize(mod, opt, opt_size=opt_size)
+    mod.verify()
 
-    target = binding.Target.from_default_triple()
-    if pic:
-        target_machine = target.create_target_machine(reloc="pic")
-    else:
-        target_machine = target.create_target_machine()
+    target_machine = make_target_machine(pic=pic)
     obj = target_machine.emit_object(mod)
     with open(obj_file, "wb") as f:
         f.write(obj)
@@ -822,6 +833,10 @@ def _main():
             pic = True
         elif flag == "--export":
             exports.append(args.pop(0))
+        elif flag in ("--cpu", "--march") and args:
+            set_target_cpu(cpu=args.pop(0))
+        elif flag == "--mattr" and args:
+            set_target_cpu(features=args.pop(0))
         elif flag == "--lto":
             lto = True
         elif flag == "--ast":

@@ -711,6 +711,42 @@ dyn_str(const char *name) {
 // the length is kept in this side table keyed by the array pointer. The GC
 // release callback unregisters entries when an object is collected, and the
 // `free()` builtin unregisters under #nogc, so entries never go stale.
+//
+// PERFORMANCE FIX: Store length in a length-prefixed header layout to avoid
+// hash table lookups in tight loops. The header is placed immediately before
+// the array data, so we can retrieve the length with a single memory access.
+
+typedef struct {
+    size_t length;
+    uint8_t data[]; // Flexible array member
+} CpyArrayHeader;
+
+void*
+cpyte_array_alloc(size_t elem_size, size_t count) {
+    size_t total_size = sizeof(CpyArrayHeader) + elem_size * count;
+    CpyArrayHeader *header = (CpyArrayHeader*)malloc(total_size);
+    if (header == NULL) {
+        return NULL;
+    }
+    header->length = count;
+    return header->data;
+}
+
+int64_t
+cpyte_array_len(void *arr) {
+    if (arr == NULL) return 0;
+    CpyArrayHeader *header = (CpyArrayHeader*)((char*)arr - sizeof(CpyArrayHeader));
+    return (int64_t)header->length;
+}
+
+void
+cpyte_array_unregister(void *arr) {
+    // No-op with length-prefixed header: the header is freed with the array
+    (void)arr;
+}
+
+// Legacy hash table implementation (kept for compatibility with existing code)
+// New code should use cpyte_array_alloc/cpyte_array_len instead
 
 #define ARR_TABLE_BITS 12
 #define ARR_TABLE_SIZE (1 << ARR_TABLE_BITS)
@@ -766,44 +802,6 @@ cpyte_array_register(void *arr, int64_t n) {
     CPY_MUTEX_UNLOCK(&arr_lock);
 }
 
-int64_t
-cpyte_array_len(void *arr) {
-    if (arr == NULL) return 0;
-    ARR_LOCK_INIT();
-    unsigned long h = hash_arr_ptr(arr);
-    CPY_MUTEX_LOCK(&arr_lock);
-    arr_entry_t *e = arr_table[h];
-    while (e) {
-        if (e->arr == arr) {
-            int64_t n = (int64_t)e->len;
-            CPY_MUTEX_UNLOCK(&arr_lock);
-            return n;
-        }
-        e = e->next;
-    }
-    CPY_MUTEX_UNLOCK(&arr_lock);
-    return 0;
-}
-
-void
-cpyte_array_unregister(void *arr) {
-    if (arr == NULL) return;
-    ARR_LOCK_INIT();
-    unsigned long h = hash_arr_ptr(arr);
-    CPY_MUTEX_LOCK(&arr_lock);
-    arr_entry_t **pp = &arr_table[h];
-    while (*pp != NULL) {
-        if ((*pp)->arr == arr) {
-            arr_entry_t *tmp = *pp;
-            *pp = tmp->next;
-            free(tmp);
-            break;
-        }
-        pp = &(*pp)->next;
-    }
-    CPY_MUTEX_UNLOCK(&arr_lock);
-}
-
 // ---------------------------------------------------------------------------
 // Slot-indexed dynamic values + polymorphic runtime dispatch.
 //
@@ -814,33 +812,102 @@ cpyte_array_unregister(void *arr) {
 // usable directly in arithmetic, comparisons, printing and function calls.
 // ---------------------------------------------------------------------------
 
-#define DYN_ARENA_SLOTS 2048
+#define DYN_ARENA_INITIAL_SLOTS 2048
+#define DYN_ARENA_MAX_SLOTS (1024 * 1024)  /* Safety limit */
 
 typedef struct {
     int      kind;
     uint64_t data;
 } DynValue;
 
-static DynValue dyn_arena[DYN_ARENA_SLOTS];
+static DynValue *dyn_arena;
+static size_t dyn_arena_capacity;
+static size_t dyn_arena_slots_used;
+
+static int
+dyn_arena_ensure_capacity(size_t required_slot) {
+    if (required_slot < dyn_arena_capacity) {
+        return 0;  /* Already have capacity */
+    }
+    
+    if (dyn_arena_capacity == 0) {
+        /* First allocation */
+        dyn_arena_capacity = DYN_ARENA_INITIAL_SLOTS;
+        dyn_arena = (DynValue*)calloc(dyn_arena_capacity, sizeof(DynValue));
+        if (dyn_arena == NULL) {
+            fprintf(stderr, "dyn_arena: initial allocation failed\n");
+            return -1;
+        }
+        return 0;
+    }
+    
+    /* Expand capacity (double until we have enough room) */
+    while (dyn_arena_capacity <= required_slot) {
+        size_t new_capacity = dyn_arena_capacity * 2;
+        if (new_capacity > DYN_ARENA_MAX_SLOTS) {
+            fprintf(stderr, "dyn_arena: exceeds maximum capacity (%zu slots)\n", 
+                    (size_t)DYN_ARENA_MAX_SLOTS);
+            return -1;
+        }
+        
+        DynValue *new_arena = (DynValue*)realloc(dyn_arena, new_capacity * sizeof(DynValue));
+        if (new_arena == NULL) {
+            fprintf(stderr, "dyn_arena: expansion failed (from %zu to %zu slots)\n",
+                    dyn_arena_capacity, new_capacity);
+            return -1;
+        }
+        
+        /* Zero-initialize the new portion */
+        memset(new_arena + dyn_arena_capacity, 0, 
+               (new_capacity - dyn_arena_capacity) * sizeof(DynValue));
+        
+        dyn_arena = new_arena;
+        dyn_arena_capacity = new_capacity;
+    }
+    
+    return 0;
+}
 
 DynValue *
 dyn_slot_ptr(int slot) {
+    if (slot < 0) {
+        fprintf(stderr, "dyn_slot_ptr: invalid slot %d\n", slot);
+        abort();
+    }
+    
+    if (dyn_arena_ensure_capacity((size_t)slot) != 0) {
+        fprintf(stderr, "dyn_slot_ptr: failed to ensure capacity for slot %d\n", slot);
+        abort();
+    }
+    
+    if ((size_t)slot >= dyn_arena_slots_used) {
+        dyn_arena_slots_used = (size_t)slot + 1;
+    }
+    
     return &dyn_arena[slot];
 }
 
 void
 dyn_set(int slot, int kind, uint64_t data) {
-    dyn_arena[slot].kind = kind;
-    dyn_arena[slot].data = data;
+    DynValue *slot_ptr = dyn_slot_ptr(slot);
+    slot_ptr->kind = kind;
+    slot_ptr->data = data;
 }
 
 int
 dyn_kind(int slot) {
+    if (slot < 0 || (size_t)slot >= dyn_arena_slots_used) {
+        return DYN_NONE;
+    }
     return dyn_arena[slot].kind;
 }
 
 uint64_t
 dyn_get(int slot, int want_kind) {
+    if (slot < 0 || (size_t)slot >= dyn_arena_slots_used) {
+        return 0;
+    }
+    
     int k = dyn_arena[slot].kind;
     uint64_t data = dyn_arena[slot].data;
     if (k == want_kind)
@@ -1256,8 +1323,8 @@ str_split(const char *str, const char *sep) {
         p = hit + sep_len;
     }
 
-    /* Allocate DynValue array. */
-    DynValue *arr = (DynValue *)malloc(sizeof(DynValue) * count);
+    /* Allocate DynValue array using length-prefixed header. */
+    DynValue *arr = (DynValue *)cpyte_array_alloc(sizeof(DynValue), count);
     if (arr == NULL) {
         fprintf(stderr, "split: allocation failed\n");
         abort();
@@ -1288,8 +1355,6 @@ str_split(const char *str, const char *sep) {
         start = hit + sep_len;
     }
 
-    /* Register the array so for-in iteration works. */
-    cpyte_array_register(arr, (int64_t)count);
     return arr;
 }
 

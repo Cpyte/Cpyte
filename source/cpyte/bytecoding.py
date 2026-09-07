@@ -1950,6 +1950,19 @@ class LLVM:
         elem_size = self._sizeof_type(elem_ty)
         if elem_size.type != count.type:
             elem_size = self.builder.zext(elem_size, count.type)
+        
+        # Use length-prefixed header allocation for arrays to avoid hash table lookups
+        if node.size is not None:
+            alloc_fn = self.functions.get("cpyte_array_alloc")
+            if alloc_fn is not None and not self.no_userspace:
+                # Call cpyte_array_alloc(elem_size, count)
+                if elem_size.type != _i64:
+                    elem_size = self.builder.zext(elem_size, _i64)
+                ptr = self.builder.call(alloc_fn, [elem_size, count])
+                ptr = self.builder.bitcast(ptr, malloc_ty)
+                return ptr
+        
+        # Fallback to legacy allocation for non-arrays or when cpyte_array_alloc unavailable
         total_size = self.builder.mul(count, elem_size)
         malloc_fn = self._get_malloc_fn()
         ptr = self.builder.call(malloc_fn, [total_size])
@@ -1969,14 +1982,25 @@ class LLVM:
         n = len(node.items)
         elem_size = self._sizeof_type(_DynValue)
         count = ir.Constant(_i64, n)
-        total_size = self.builder.mul(count, self.builder.zext(elem_size, _i64))
-        malloc_fn = self._get_malloc_fn()
-        ptr = self.builder.call(malloc_fn, [total_size])
-        ptr = self.builder.bitcast(ptr, _DynValuePtr)
-        reg_fn = self.functions.get("cpyte_array_register")
-        if reg_fn is not None and not self.no_userspace:
-            arr8 = self.builder.bitcast(ptr, _i8ptr)
-            self.builder.call(reg_fn, [arr8, count])
+        
+        # Use length-prefixed header allocation for arrays to avoid hash table lookups
+        alloc_fn = self.functions.get("cpyte_array_alloc")
+        if alloc_fn is not None and not self.no_userspace:
+            if elem_size.type != _i64:
+                elem_size = self.builder.zext(elem_size, _i64)
+            ptr = self.builder.call(alloc_fn, [elem_size, count])
+            ptr = self.builder.bitcast(ptr, _DynValuePtr)
+        else:
+            # Fallback to legacy allocation
+            total_size = self.builder.mul(count, self.builder.zext(elem_size, _i64))
+            malloc_fn = self._get_malloc_fn()
+            ptr = self.builder.call(malloc_fn, [total_size])
+            ptr = self.builder.bitcast(ptr, _DynValuePtr)
+            reg_fn = self.functions.get("cpyte_array_register")
+            if reg_fn is not None and not self.no_userspace:
+                arr8 = self.builder.bitcast(ptr, _i8ptr)
+                self.builder.call(reg_fn, [arr8, count])
+        
         for i, item in enumerate(node.items):
             value = self.emit(item)
             if value.type == _DynValue:
@@ -2270,6 +2294,8 @@ class LLVM:
             idx = self.builder.ptrtoint(idx, _i64)
         elif isinstance(idx.type, (ir.DoubleType, ir.FloatType)):
             idx = self.builder.fptosi(idx, _i64)
+        # inbounds=True enables LLVM auto-vectorization via strength reduction
+        # LLVM will transform base[i] into pointer arithmetic when profitable
         return self.builder.gep(obj, [idx], inbounds=True)
 
     @register_emitter(Attr)
@@ -5263,6 +5289,8 @@ class LLVM:
 
         self.builder.position_at_end(body_bb)
         idx_body = self.builder.load(idx_ptr)
+        # GEP with inbounds=True enables LLVM auto-vectorization via strength reduction
+        # LLVM will transform arr[i] into pointer arithmetic (ptr + i * sizeof(T)) when profitable
         elem_ptr = self.builder.gep(arr_ptr, [idx_body], inbounds=True)
         elem_val = self.builder.load(elem_ptr)
         self.builder.store(elem_val, var_ptr)

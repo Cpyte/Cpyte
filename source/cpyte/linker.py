@@ -150,6 +150,10 @@ class Linker:
             cmd.extend(['-framework', fw])
         if not shared:
             cmd.append('-lm')
+        # On Linux with -fPIC, use -no-pie to avoid "relocation R_X86_64_32 against .rodata" errors
+        # This occurs when mixing PIC objects with PIE linkers on modern Linux distributions
+        if sys.platform != 'darwin' and sys.platform != 'win32' and pic and not shared:
+            cmd.append('-no-pie')
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             _cc_error('link error: ', r.stderr)

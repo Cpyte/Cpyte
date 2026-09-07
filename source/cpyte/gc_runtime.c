@@ -61,6 +61,9 @@ typedef struct {
 #define TO_USER(hdr)   ((void*)PAYLOAD(hdr))
 #define TO_HDR(user)   ((cpyte_obj_t*)((char*)(user) - sizeof(cpyte_obj_t)))
 
+/* Forward declarations for functions used by TLAB */
+static void obj_track(void* hdr);
+
 /* ── Global GC state ────────────────────────────────────────────── */
 
 static ugc_t         gc;
@@ -78,6 +81,64 @@ static void gc_lock_init(void) {
 /* allocation pressure for triggering collection */
 static volatile size_t gc_alloc_bytes = 0;
 static size_t          gc_threshold   = 1024 * 1024;  /* 1 MB default */
+
+/* ── Reduced Lock Contention (Simplified TLAB) ─────────────────────
+ * Full TLABs (Thread-Local Allocation Buffers) reduce lock contention but
+ * complicate conservative GC scanning. This simplified implementation:
+ * 1. Uses thread-local bump allocation for small objects
+ * 2. Falls back to global lock for large objects or TLAB refill
+ * 3. TLAB blocks are registered with GC for conservative scanning
+ * ─────────────────────────────────────────────────────────────────── */
+
+#define TLAB_SIZE (64 * 1024)  /* 64 KB per TLAB */
+#define TLAB_MAX_ALLOC (2 * 1024)  /* Max size for TLAB fast path */
+
+typedef struct {
+    char *start;   /* Start of current TLAB */
+    char *end;     /* End of current TLAB */
+    char *current; /* Current bump pointer */
+} tlab_t;
+
+/* Thread-local storage for TLAB */
+#ifdef _WIN32
+__declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
+#else
+__thread static tlab_t tlab = {NULL, NULL, NULL};
+#endif
+
+static void* tlab_alloc(size_t size) {
+    /* Round up to pointer alignment */
+    size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+    
+    if (tlab.start == NULL || tlab.current + size > tlab.end) {
+        /* TLAB exhausted or not initialized: allocate new block from global heap */
+        size_t block_size = (size > TLAB_SIZE) ? size : TLAB_SIZE;
+        
+        gc_lock_init();
+        CPY_MUTEX_LOCK(&gc_lock_);
+        
+        /* Allocate the TLAB block through the normal GC path */
+        cpyte_obj_t* hdr = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + block_size);
+        if (hdr == NULL) {
+            CPY_MUTEX_UNLOCK(&gc_lock_);
+            return NULL;
+        }
+        hdr->size = block_size;
+        ugc_register(&gc, &hdr->base);
+        obj_track(hdr);
+        
+        CPY_MUTEX_UNLOCK(&gc_lock_);
+        
+        tlab.start = PAYLOAD(hdr);
+        tlab.end = tlab.start + block_size;
+        tlab.current = tlab.start;
+    }
+    
+    /* Bump-pointer allocation (lock-free) */
+    void *ptr = tlab.current;
+    tlab.current += size;
+    return ptr;
+}
 
 /* ── Object hash table (conservative scan validation) ───────────── */
 
@@ -230,9 +291,24 @@ void gc_init(void) {
     ugc_init(&gc, gc_scan_cb, gc_release_cb);
     gc_alloc_bytes = 0;
     gc_running = 1;
+    
+    /* Initialize TLAB for the current thread */
+    tlab.start = NULL;
+    tlab.end = NULL;
+    tlab.current = NULL;
 }
 
 void* gc_malloc(size_t size) {
+    /* Try TLAB first for small allocations (fast path, lock-free) */
+    if (size <= TLAB_MAX_ALLOC) {
+        void *ptr = tlab_alloc(size);
+        if (ptr != NULL) {
+            gc_alloc_bytes += size;
+            return ptr;
+        }
+    }
+    
+    /* Fallback to global allocation for large objects or TLAB failure */
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
 
@@ -346,4 +422,9 @@ void gc_shutdown(void) {
         }
         obj_table[i] = NULL;
     }
+    
+    /* Reset TLAB for current thread */
+    tlab.start = NULL;
+    tlab.end = NULL;
+    tlab.current = NULL;
 }

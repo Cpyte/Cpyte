@@ -1,5 +1,4 @@
-## Notice
-My development pc was destroyed (macbook air m1). Development is not paused, but will have to wait until I have time to extract the project files.
+DEVELOPMENT IS CONTINUED. WINDOWS SUPPORT IS IN PROGRESS.
 
 
 Check out the official documentation [here](https://gitea.5gnew.io.vn/Cpyte-Project/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md).

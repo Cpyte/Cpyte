@@ -1,7 +1,8 @@
 import hashlib
 import hmac
+import os
 from traceback import print_exception
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 from llvmlite import binding, ir
 from llvmlite.ir import instructions
@@ -16,6 +17,24 @@ from .extension_hooks import (
     get_global_hook_registry,
 )
 from .lexar import TokenType
+from .optimizations import (
+    _FIB_SMALL_TABLE,
+    _compute_signed_magic,
+    _compute_unsigned_magic,
+    _const_int_value,
+    _count_loop_iterations,
+    _detect_fibonacci_pattern,
+    _detect_shift_amount_from_mul,
+    _fold_int_binop,
+    _find_loop_invariants,
+    _is_const_one,
+    _is_const_zero,
+    _is_power_of_2,
+    _is_simple_counted_loop,
+    _log2_floor,
+    _loop_written_names,
+    _trunc_to_signed,
+)
 from .ui import *
 
 
@@ -23,6 +42,38 @@ class _IRValue(Protocol):
     """Anything that carries an LLVM type."""
 
     type: Any
+
+
+_BC_ARRAY_SUFFIX_RE = re.compile(r"^(.*)\[\d*\]$")
+
+
+def _bc_array_back(t):
+    """Element type of `T[]` / `T[N]`, or None if `t` is not an array type."""
+    if not isinstance(t, str):
+        return None
+    m = _BC_ARRAY_SUFFIX_RE.match(t)
+    return m.group(1) if m else None
+
+
+def _bc_array_norm(t):
+    """Normalize `T[N]` to `T[]` for lowering; both are `T*`.
+
+    Also collapses multi-dimensional arrays (`T[N][M]` -> `T[][]`) so they
+    resolve to nested pointer types instead of falling through to an unknown-type
+    error / silent `i32` degradation."""
+    if not isinstance(t, str):
+        return t
+    n = 0
+    rest = t
+    while True:
+        m = _BC_ARRAY_SUFFIX_RE.match(rest)
+        if not m or not isinstance(m.group(1), str):
+            break
+        rest = m.group(1)
+        n += 1
+    if n == 0:
+        return t
+    return rest + ("[]" * n)
 
 
 _i8 = ir.IntType(8)
@@ -160,11 +211,16 @@ def _emit_children(node) -> list:
         return [arg_expr for _, arg_expr in node.inputs]
     if isinstance(node, ExprStmt):
         return [node.expr]
+    if isinstance(node, CastExpr):
+        return [node.expr]
+    if isinstance(node, ListLit):
+        return list(node.items)
     return []
 
 
 class LLVM:
     def llvm_type(self, t: str):
+        t = _bc_array_norm(t)
         if t == "int":
             return ir.IntType(32)
         if t == "int64":
@@ -219,11 +275,19 @@ class LLVM:
             resolved = self._resolve_generic_type(t)
             if resolved is not None:
                 return resolved
-            # Fallback: use base struct (will have wrong field types but at least won't crash)
-            base_name = t.split("<")[0]
-            if base_name in self.structs:
-                return self.structs[base_name]
-        return ir.IntType(32)
+            # Raising here (instead of silently returning i32) is deliberate:
+            # an unresolvable generic type would otherwise corrupt stack layout
+            # at runtime because the value is lowered to a 32-bit int. A clear,
+            # immediate error beats silent memory corruption.
+            self._codegen_error(
+                f"cannot resolve generic type `{t}`: "
+                f"struct `{t.split('<')[0]}` is not defined or the type-argument "
+                f"count does not match its declaration"
+            )
+        self._codegen_error(
+            f"unknown type `{t}` has no LLVM lowering; cannot emit code for it "
+            f"(previously this silently degraded to a 32-bit int)"
+        )
 
     @staticmethod
     def _codegen_error(msg: str, node=None):
@@ -246,8 +310,11 @@ class LLVM:
                 )
 
     def _base_type_name(self, t: str) -> str:
-        while t.endswith("[]"):
-            t = t[:-2]
+        while True:
+            m = _BC_ARRAY_SUFFIX_RE.match(t)
+            if not m or not isinstance(m.group(1), str):
+                break
+            t = m.group(1)
         while t.endswith(("*", "&")):
             t = t[:-1]
         if '"struct.' in t:
@@ -284,21 +351,14 @@ class LLVM:
                 current += ch
         if current.strip():
             args.append(current.strip())
-        # Look up the base struct
-        base_struct_node = None
-        for name, sym in [("struct", None)]:
-            # We need the original AST node; store it during emit_struct
-            base_struct_node = self._struct_nodes.get(base_name)
-            if base_struct_node is None:
-                return None
-        # Check if we already emitted a specialized version
+        # Look up the AST definition for this generic struct. Generic structs are
+        # registered in `_struct_nodes` (see emit_structdef) but are *never*
+        # placed in `self.structs` as their raw `Pair` form, so use `_struct_nodes`
+        # as the source of truth here. Returning early on a missing base struct
+        # would silently fall through to a garbage `i32` type below.
         spec_name = f'{base_name}__{"_".join(a.replace("<", "_").replace(">", "_").replace(",", "_").replace(" ", "") for a in args)}'
         if spec_name in self.structs:
             return self.structs[spec_name]
-        # Look up the base struct definition
-        if base_name not in self.structs:
-            return None
-        # Find the StructDef node for this struct
         struct_node = getattr(self, "_struct_nodes", {}).get(base_name)
         if struct_node is None or not struct_node.generic_params:
             return None
@@ -311,8 +371,9 @@ class LLVM:
         for f in struct_node.fields:
             concrete_type = type_map.get(f.type_expr, f.type_expr)
             field_tys.append(self.llvm_type(concrete_type))
-        # Create the specialized struct
-        llvm_struct = ir.IdentifiedStructType(ir.global_context, f"struct.{spec_name}")
+        # Create the specialized struct in this module's context (deduped by
+        # name and serialized into the module IR).
+        llvm_struct = self.module.context.get_identified_type(f"struct.{spec_name}")
         llvm_struct.set_body(*field_tys)
         self.structs[spec_name] = llvm_struct
         self.struct_fields[spec_name] = struct_node.fields
@@ -362,12 +423,85 @@ class LLVM:
         width = left.type.width if isinstance(left.type, ir.IntType) else 64
         int_min = -(1 << (width - 1))
 
-        if isinstance(right, ir.Constant):
-            if self._is_ir_constant_zero(right):
-                # Division/remainder by a compile-time zero: fall through to the
-                # runtime trap path below (same semantics as a runtime div-by-zero)
-                # instead of aborting codegen mid-emission.
-                pass
+        if isinstance(right, ir.Constant) and not self._is_ir_constant_zero(right):
+            # ---- 2.  Constant-division strength reduction ----
+            d_raw = self._norm_signed(right.constant, width)
+            if d_raw != 0 and d_raw != 1 and d_raw != -1 and d_raw != int_min:
+                is_pow2 = _is_power_of_2(abs(d_raw))
+                if is_pow2 and not is_rem:
+                    # Power-of-two signed division: ashr(x + adjustment, k)
+                    # adjustment = (x >> (width-1)) >> (width - k)  (sign correction)
+                    k = _log2_floor(abs(d_raw))
+                    if d_raw > 0:
+                        # Positive divisor: q = ashr(x + (x >> 31 >> (32-k)), k)
+                        # For x >= 0 this is just x >> k; for x < 0 we add the
+                        # rounding bias so truncation goes toward zero.
+                        if isinstance(left, ir.Constant):
+                            l = self._norm_signed(left.constant, width)
+                            r = self._norm_signed(right.constant, width)
+                            if l == int_min and r == -1:
+                                return ir.Constant(left.type, int_min)
+                            return ir.Constant(left.type, self._trunc_div(l, r))
+                        bias_width = ir.Constant(left.type, width)
+                        k_const = ir.Constant(left.type, k)
+                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
+                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
+                        adj = self.builder.add(left, bias)
+                        q = self.builder.ashr(adj, k_const)
+                        return q
+                    else:
+                        # Negative divisor: q = -ashr(x + bias, k)
+                        if isinstance(left, ir.Constant):
+                            l = self._norm_signed(left.constant, width)
+                            return ir.Constant(left.type, self._trunc_div(l, d_raw))
+                        k_const = ir.Constant(left.type, k)
+                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
+                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
+                        adj = self.builder.add(left, bias)
+                        q = self.builder.ashr(adj, k_const)
+                        neg_q = self.builder.neg(q)
+                        return neg_q
+                elif is_pow2 and is_rem:
+                    # Power-of-two signed remainder: x - (q * d)
+                    k = _log2_floor(abs(d_raw))
+                    if isinstance(left, ir.Constant):
+                        l = self._norm_signed(left.constant, width)
+                        return ir.Constant(left.type, l % d_raw)
+                    k_const = ir.Constant(left.type, k)
+                    if d_raw > 0:
+                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
+                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
+                        adj = self.builder.add(left, bias)
+                        q = self.builder.ashr(adj, k_const)
+                    else:
+                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
+                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
+                        adj = self.builder.add(left, bias)
+                        q = self.builder.ashr(adj, k_const)
+                        q = self.builder.neg(q)
+                    d_val = ir.Constant(left.type, abs(d_raw))
+                    prod = self.builder.mul(q, d_val)
+                    return self.builder.sub(left, prod)
+                else:
+                    # Non-power-of-two constant divisor: plain sdiv/srem. The
+                    # custom magic-number lowering (`_compute_signed_magic`)
+                    # was found to be incorrect for large-magnitude dividends,
+                    # so we let LLVM do the strength reduction at O1+ (it
+                    # lowers sdiv-by-const to a proper magic multiply) and a
+                    # correct __divsi3 libcall at O0.
+                    if isinstance(left, ir.Constant):
+                        l = self._norm_signed(left.constant, width)
+                        r = self._norm_signed(right.constant, width)
+                        if l == int_min and r == -1:
+                            return ir.Constant(left.type, 0 if is_rem else int_min)
+                        if is_rem:
+                            q = self._trunc_div(l, r)
+                            return ir.Constant(left.type, l - q * r)
+                        return ir.Constant(left.type, self._trunc_div(l, r))
+                    if is_rem:
+                        return self.builder.srem(left, right)
+                    return self.builder.sdiv(left, right)
+
             elif isinstance(left, ir.Constant):
                 l = self._norm_signed(left.constant, width)
                 r = self._norm_signed(right.constant, width)
@@ -377,6 +511,20 @@ class LLVM:
                     q = self._trunc_div(l, r)
                     return ir.Constant(left.type, l - q * r)
                 return ir.Constant(left.type, self._trunc_div(l, r))
+
+        if isinstance(right, ir.Constant) and self._is_ir_constant_zero(right):
+            # Constant-zero divisor: the operation always traps. Emit a clean
+            # unconditional trap (no suppressed `sdiv x, 0` poison hiding in a
+            # dead block) and leave the builder in a fresh dead block so callers
+            # can keep emitting; this unreachable value is never used.
+            trap_bb = self.builder.append_basic_block("div.trap")
+            dead_bb = self.builder.append_basic_block("div.dead")
+            self.builder.branch(trap_bb)
+            self.builder.position_at_end(trap_bb)
+            self.builder.call(self._get_trap_fn(), [])
+            self.builder.unreachable()
+            self.builder.position_at_end(dead_bb)
+            return ir.Constant(left.type, 0)
 
         is_zero = self.builder.icmp_signed("==", right, ir.Constant(right.type, 0))
         trap_bb = self.builder.append_basic_block("div.trap")
@@ -515,7 +663,15 @@ class LLVM:
                 _target = _binding.Target.from_triple(target_triple)
             else:
                 _binding.initialize_native_target()
-                _target = _binding.Target.from_default_triple()
+                if os.name == "nt" and not (
+                    os.environ.get("WindowsSdkDir") or os.environ.get("VCToolsInstallDir")
+                ):
+                    # Windows without an MSVC toolchain: target the MinGW GNU
+                    # triple so the module matches how the C runtime and the
+                    # AOT object files are produced (see compiling.host_target).
+                    _target = _binding.Target.from_triple("x86_64-w64-windows-gnu")
+                else:
+                    _target = _binding.Target.from_default_triple()
             _tm = _target.create_target_machine()
             self.module.triple = _tm.triple
             self.module.data_layout = str(_tm.target_data)
@@ -555,6 +711,7 @@ class LLVM:
         self._emit_memo = {}
         self._in_emit_iterative = False
         self._in_decorator = False
+        self._const_prop: dict = {}
 
         if not no_userspace:
             print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -716,6 +873,7 @@ class LLVM:
 
         # strcmp for exception type matching
         strcmp_ty = ir.FunctionType(_i32, [_i8ptr, _i8ptr])
+        self._strcmp_fn = None
         if not self.module.scope.is_used("strcmp"):
             self._strcmp_fn = ir.Function(self.module, strcmp_ty, "strcmp")
         else:
@@ -723,6 +881,11 @@ class LLVM:
                 if isinstance(g, ir.Function) and g.name == "strcmp":
                     self._strcmp_fn = g
                     break
+        # If strcmp was already used but only exists as a global/alias (not an
+        # ir.Function), synthesize a fresh declaration so downstream calls never
+        # hit an unbound-name crash.
+        if self._strcmp_fn is None:
+            self._strcmp_fn = ir.Function(self.module, strcmp_ty, "strcmp")
         self.functions["strcmp"] = self._strcmp_fn
 
         # Shell-style glob matching for string switch cases (always in runtime.c)
@@ -739,6 +902,7 @@ class LLVM:
             _DynValue, (ir.Constant(_i32, _DYN_NONE), ir.Constant(_i64, 0))
         )  # type: ignore[attr-defined]
 
+    # CRITICAL CONSTANT FOLDING BUG
     @register_emitter(Switch)
     def emit_switch(self, node):
         val_ty = getattr(node.value, "inferred_type", None)
@@ -748,73 +912,91 @@ class LLVM:
             val_ty == "dynamic" or self._is_dynamic_expr(node.value)
         ):
             return self._emit_switch_dynamic(node)
+
         value = self.emit(node.value)
         if not isinstance(value.type, ir.IntType):
             value = self._is_true(value)
 
         end_blk = self.builder.append_basic_block(name="sw_end")
-
         case_irs = []
-        case_blks = [None] * len(node.cases)
-        default_blk = end_blk
 
-        for i, (case_val, body) in enumerate(node.cases):
+        # Step 1: Pre-evaluate all case expressions
+        for case_val, _ in node.cases:
             if case_val is None:
-                default_blk = self.builder.append_basic_block(name="sw_default")
                 case_irs.append(None)
-                case_blks[i] = default_blk
             else:
                 val_ir = self.emit(case_val)
+                # Ensure bit-width matching
+                if isinstance(val_ir.type, ir.IntType) and val_ir.type.width != value.type.width:
+                    if isinstance(val_ir, ir.Constant):
+                        val_ir = ir.Constant(value.type, val_ir.constant)
+                    elif val_ir.type.width < value.type.width:
+                        val_ir = self.builder.zext(val_ir, value.type)
+                    else:
+                        val_ir = self.builder.trunc(val_ir, value.type)
                 case_irs.append(val_ir)
 
-        if any(not isinstance(c, ir.Constant) for c in case_irs if c is not None):
-            body_blk = self.builder.append_basic_block(name="sw_entry")
-            self.builder.branch(body_blk)
-            self.builder.position_at_start(body_blk)
+        # Step 2: Handle Dynamic/Non-Constant Expressions via Branch Cascade
+        if any(c is not None and not isinstance(c, ir.Constant) for c in case_irs):
+            default_blk = end_blk
+
             for i, (case_val, body) in enumerate(node.cases):
-                if case_val is not None:
+                if case_val is None:
+                    # Collect default block body insertion point
+                    default_blk = self.builder.append_basic_block(name="sw_default")
+                    curr_pos = self.builder.block
+                    self.builder.position_at_end(default_blk)
+                    self._push_scope()
+                    for stmt in body:
+                        self.emit(stmt)
+                    self._pop_scope()
+                    if not self._block_terminated():
+                        self.builder.branch(end_blk)
+                    self.builder.position_at_end(curr_pos)
+                else:
                     val_ir = case_irs[i]
-                    eq = self.builder.icmp_signed("==", value, val_ir)
                     then_blk = self.builder.append_basic_block(name="sw_case")
                     nxt_blk = self.builder.append_basic_block(name="sw_next")
+
+                    eq = self.builder.icmp_signed("==", value, val_ir)
                     self.builder.cbranch(eq, then_blk, nxt_blk)
-                    self.builder.position_at_start(then_blk)
+
+                    # Populate matching case body
+                    self.builder.position_at_end(then_blk)
                     self._push_scope()
                     for stmt in body:
                         self.emit(stmt)
                     self._pop_scope()
                     if not self._block_terminated():
                         self.builder.branch(end_blk)
-                    self.builder.position_at_start(nxt_blk)
-                else:
-                    self.builder.branch(default_blk)
-                    self.builder.position_at_start(default_blk)
-                    self._push_scope()
-                    for stmt in body:
-                        self.emit(stmt)
-                    self._pop_scope()
-                    if not self._block_terminated():
-                        self.builder.branch(end_blk)
-            self.builder.position_at_start(end_blk)
+
+                    # Move builder to next evaluation block
+                    self.builder.position_at_end(nxt_blk)
+
+            # Fall through remaining condition to default/end
+            self.builder.branch(default_blk)
+            self.builder.position_at_end(end_blk)
             return
 
-        for i, (case_val, body) in enumerate(node.cases):
-            if case_val is not None:
-                blk = self.builder.append_basic_block(name="sw_case")
-                case_blks[i] = blk
+        # Step 3: Handle Constant Expressions via Native LLVM Switch Instruction
+        case_blks = []
+        default_blk = end_blk
 
-        body_blk = self.builder.append_basic_block(name="sw_body")
-        self.builder.branch(body_blk)
-        self.builder.position_at_start(body_blk)
+        for i, (case_val, _) in enumerate(node.cases):
+            if case_val is None:
+                default_blk = self.builder.append_basic_block(name="sw_default")
+                case_blks.append(default_blk)
+            else:
+                case_blks.append(self.builder.append_basic_block(name="sw_case"))
 
         sw = self.builder.switch(value, default_blk)
         for i, (case_val, _) in enumerate(node.cases):
             if case_val is not None:
                 sw.add_case(case_irs[i], case_blks[i])
 
-        for i, (case_val, body) in enumerate(node.cases):
-            blk = case_blks[i]
-            self.builder.position_at_start(blk)
+        # Emit code for each case block
+        for i, (_, body) in enumerate(node.cases):
+            self.builder.position_at_end(case_blks[i])
             self._push_scope()
             for stmt in body:
                 self.emit(stmt)
@@ -822,7 +1004,7 @@ class LLVM:
             if not self._block_terminated():
                 self.builder.branch(end_blk)
 
-        self.builder.position_at_start(end_blk)
+        self.builder.position_at_end(end_blk)
 
     def _emit_switch_glob(self, node):
         """String switch: each case value is a shell-style glob pattern."""
@@ -1117,8 +1299,11 @@ class LLVM:
         for node in structs:
             if isinstance(node, ClassDef):
                 continue
-            st = ir.IdentifiedStructType(ir.global_context, f"struct.{node.name}")
-            ir.global_context.identified_types[f"struct.{node.name}"] = st
+            # Register an opaque identified struct in THIS module's context
+            # (not the shared global context) so self-referential fields resolve
+            # to a pointer to the same type, and so per-program modules compiled
+            # in one process don't collide on struct names.
+            st = self.module.context.get_identified_type(f"struct.{node.name}")
             self.structs[node.name] = st
 
         for node in structs:
@@ -1270,7 +1455,6 @@ class LLVM:
         # Collect the deferred statement; it is emitted (in reverse order) at
         # the function's exit points, both explicit `return` and implicit end.
         self._deferred.append(node.body)
-        return None
 
     def emit(self, node: Node | dict) -> _IRValue:
         key = id(node)
@@ -1303,6 +1487,8 @@ class LLVM:
         NewExpr,
         Call,
         InlineAsm,
+        CastExpr,
+        ListLit,
         ExprStmt,
     )
 
@@ -1580,16 +1766,25 @@ class LLVM:
             # Specialized versions are generated on demand by _resolve_generic_type.
             # Still register it so lookup works.
             return
+        llvm_struct = self.structs.get(node.name)
+        if llvm_struct is None or not isinstance(
+            llvm_struct, ir.IdentifiedStructType
+        ):
+            # Pre-register an opaque identified struct BEFORE resolving field
+            # types so self-referential fields (`BSTNode* left`) resolve to a
+            # pointer to this type instead of silently degrading to `i32` (the
+            # old behavior corrupted the struct layout). get_identified_type
+            # registers into the module's context, so the definition is
+            # serialized into the IR (a bare IdentifiedStructType never is).
+            llvm_struct = self.module.context.get_identified_type(
+                f"struct.{node.name}"
+            )
+            self.structs[node.name] = llvm_struct
         field_tys = []
         for f in node.fields:
             field_tys.append(self.llvm_type(f.type_expr))
-        llvm_struct = self.structs.get(node.name)
-        if llvm_struct is not None and isinstance(llvm_struct, ir.IdentifiedStructType):
+        if llvm_struct.is_opaque:
             llvm_struct.set_body(*field_tys)
-        else:
-            llvm_struct = ir.LiteralStructType(field_tys)
-            llvm_struct.name = f"struct.{node.name}"  # type: ignore[attr-defined]
-            self.structs[node.name] = llvm_struct
         self.struct_fields[node.name] = node.fields
 
     @register_emitter(EnumDef)
@@ -1614,12 +1809,22 @@ class LLVM:
         all_fields.extend(node.fields)
         # Generate struct type
         field_tys = [self.llvm_type(f.type_expr) for f in all_fields]
-        if field_tys:
-            llvm_struct = ir.IdentifiedStructType(
-                ir.global_context, f"class.{node.name}"
-            )
-            llvm_struct.set_body(*field_tys)
-            self.structs[node.name] = llvm_struct
+        if field_tys or all_fields:
+            llvm_struct = self.structs.get(node.name)
+            if llvm_struct is None or not isinstance(
+                llvm_struct, ir.IdentifiedStructType
+            ):
+                # Pre-register an opaque identified struct BEFORE resolving field
+                # types so self-referential fields resolve to a pointer to this
+                # type instead of silently degrading to `i32`. get_identified_type
+                # registers into the module's context so the definition is
+                # serialized into the IR.
+                llvm_struct = self.module.context.get_identified_type(
+                    f"class.{node.name}"
+                )
+                self.structs[node.name] = llvm_struct
+            if llvm_struct.is_opaque:
+                llvm_struct.set_body(*field_tys)
             self.struct_fields[node.name] = all_fields
         # Emit methods — each gets a hidden 'this' pointer as first parameter
         for m in node.methods:
@@ -1693,7 +1898,7 @@ class LLVM:
             ptr = self.builder.alloca(llvm_arg.type, name=pname)
             self.builder.store(llvm_arg, ptr)
             self.locals[pname] = ptr
-            self.local_types[pname] = ptype
+            self.local_types[pname] = _bc_array_norm(ptype)
         # Emit body
         for stmt in method.body:
             self.emit(stmt)
@@ -1739,8 +1944,8 @@ class LLVM:
                 "cannot allocate `new void` (use `new void*` for a pointer to void)",
                 node,
             )
-        if node.type_expr.endswith("[]"):
-            elem_ty = self.llvm_type(node.type_expr[:-2])
+        if _bc_array_back(node.type_expr) is not None:
+            elem_ty = self.llvm_type(_bc_array_back(node.type_expr))
         malloc_ty = ir.PointerType(elem_ty)
         elem_size = self._sizeof_type(elem_ty)
         if elem_size.type != count.type:
@@ -2004,7 +2209,7 @@ class LLVM:
     @register_emitter(Index)
     def emit_index(self, node: Index):
         if not self.no_userspace:
-            obj_t = getattr(node.obj, "inferred_type", None)
+            obj_t = _bc_array_norm(getattr(node.obj, "inferred_type", None))
             if (
                 obj_t == "dynamic"
                 or obj_t == "dynamic[]"
@@ -2224,11 +2429,13 @@ class LLVM:
         old_scope_stack = self.scope_stack
         old_deferred = self._deferred
         old_in_decorator = self._in_decorator
+        old_const_prop = self._const_prop
         self._in_decorator = node.rettype == "decorated"
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
         self.ssa_types = {}
+        self._const_prop = {}
         self.scope_stack = [{}]
         self._deferred = []
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
@@ -2241,11 +2448,25 @@ class LLVM:
             ptr = self.builder.alloca(llvm_arg.type, name=name)
             self.builder.store(llvm_arg, ptr)
             self.locals[name] = ptr
-            self.local_types[name] = ptype
+            self.local_types[name] = _bc_array_norm(ptype)
 
-        for stmt in node.body:
-            if not self._block_terminated():
-                self.emit(stmt)
+        # ---- 1.  Fibonacci fast-doubling pattern replacement ----
+        if not self._try_emit_fibonacci(node, func, ret_ty, param_tys):
+            pending_iv = None
+            for stmt in node.body:
+                if not self._block_terminated():
+                    if isinstance(stmt, While):
+                        unrolled = self._try_unroll_counted_loop(stmt, pending_iv)
+                        pending_iv = None
+                        if not unrolled:
+                            self.emit(stmt)
+                    elif isinstance(stmt, VarDecl) and isinstance(stmt.init, Number):
+                        v = _const_int_value(stmt.init)
+                        pending_iv = (stmt.name, v) if v is not None else None
+                        self.emit(stmt)
+                    else:
+                        pending_iv = None
+                        self.emit(stmt)
 
         if not self._block_terminated():
             self._run_deferred()
@@ -2276,6 +2497,330 @@ class LLVM:
         self.scope_stack = old_scope_stack
         self._deferred = old_deferred
         self._in_decorator = old_in_decorator
+        self._const_prop = old_const_prop
+
+    def _try_emit_fibonacci(self, node: FuncDef, func, ret_ty, param_tys) -> bool:
+        """Detect a naive recursive Fibonacci function and replace it with a
+        fast-doubling implementation (`F(2k) = F(k)(2F(k+1) - F(k))`,
+        `F(2k+1) = F(k+1)^2 + F(k)^2`), which reduces the number of bigint
+        multiplications from O(N) to O(log N).
+
+        For i32/i64 return types a closed-form lookup table is used for small
+        N (N <= 70) to keep the fast path trivial.
+        """
+        fib = _detect_fibonacci_pattern(node)
+        if fib is None:
+            return False
+        param_name, _param_type, _ret_type = fib
+
+        # We must have emitted nothing for the body yet — we're at the top of
+        # the function body loop.
+
+        # Parameter local:
+        arg_ptr = self.locals[param_name]
+        n_val = self.builder.load(arg_ptr, param_name)
+        # Widen to i64 for the algorithm.
+        n64 = self._promote_int(n_val, _i64)
+
+        is_i64_ret = ret_ty == _i64
+        is_i32_ret = ret_ty == _i32
+        is_big_ret = isinstance(ret_ty, ir.PointerType)
+
+        if is_big_ret:
+            # ---- Bigint fast-doubling via runtime helpers. ----
+            i64_0 = ir.Constant(_i64, 0)
+            i64_1 = ir.Constant(_i64, 1)
+            i64_2 = ir.Constant(_i64, 2)
+
+            big_const = self.functions.get("bigint_from_int")
+            big_sub = self.functions.get("bigint_sub")
+            big_add = self.functions.get("bigint_add")
+            big_mul = self.functions.get("bigint_mul")
+            big_cmp = self.functions.get("bigint_cmp")
+
+            if not (big_const and big_sub and big_add and big_mul and big_cmp):
+                return False
+
+            # ---- Fast-doubling loop: a,b = 1,1; iterate over bits of n ----
+            # (a, b) = (F(1), F(2)): the leading 1 bit has already been
+            # consumed, so the mask starts below it (mask = 1 << (bits - 2)).
+            a_ptr = self._alloca(_i8ptr, name="fib.a")
+            b_ptr = self._alloca(_i8ptr, name="fib.b")
+            n_ptr = self._alloca(_i64, name="fib.n")
+            self.builder.store(self.builder.call(big_const, [i64_1]), a_ptr)
+            self.builder.store(self.builder.call(big_const, [i64_1]), b_ptr)
+            self.builder.store(n64, n_ptr)
+
+            # Compute bit length of n in-loop (count bits by shifting right).
+            #   bits = 0; tmp = n; while (tmp > 0) { tmp >>= 1; bits++; }
+
+            # ---- Compute bit length (while tmp>0: bits++) ----
+            bitlen_ptr = self._alloca(_i64, name="fib.bits")
+            tmp_ptr = self._alloca(_i64, name="fib.tmp")
+            self.builder.store(i64_0, bitlen_ptr)
+            self.builder.store(n64, tmp_ptr)
+
+            bits_cond = self.builder.append_basic_block("fib.blen.cond")
+            bits_body = self.builder.append_basic_block("fib.blen.body")
+            bits_end = self.builder.append_basic_block("fib.blen.end")
+            self.builder.branch(bits_cond)
+            self.builder.position_at_end(bits_cond)
+            tmp_v = self.builder.load(tmp_ptr)
+            self.builder.cbranch(
+                self.builder.icmp_signed(">", tmp_v, i64_0), bits_body, bits_end
+            )
+            self.builder.position_at_end(bits_body)
+            tmp_v2 = self.builder.load(tmp_ptr)
+            self.builder.store(self.builder.ashr(tmp_v2, i64_1), tmp_ptr)
+            bits_v = self.builder.load(bitlen_ptr)
+            self.builder.store(self.builder.add(bits_v, i64_1), bitlen_ptr)
+            self.builder.branch(bits_cond)
+            self.builder.position_at_end(bits_end)
+
+            # bits = bitlen
+            bits = self.builder.load(bitlen_ptr)
+
+            # If n <= 1: return big(n) directly.
+            small_bb = self.builder.append_basic_block("fib.small")
+            big_bb = self.builder.append_basic_block("fib.big")
+            fib_end = self.builder.append_basic_block("fib.end")
+            n_smallv = self.builder.load(n_ptr)
+            self.builder.cbranch(
+                self.builder.icmp_signed("<=", n_smallv, i64_1),
+                small_bb,
+                big_bb,
+            )
+
+            self.builder.position_at_end(small_bb)
+            n_for_small = self.builder.load(n_ptr)
+            small_ret = self.builder.call(big_const, [n_for_small])
+            self.builder.branch(fib_end)
+
+            # Big path: fast-doubling from just below the MSB down to 0.
+            # (a, b) starts at (F(1), F(2)) = (1, 1).
+            self.builder.position_at_end(big_bb)
+            # idx_ptr keeps the loop counter; mask = 1 << (bits - 2)
+            idx_ptr = self._alloca(_i64, name="fib.i")
+            mask_ptr = self._alloca(_i64, name="fib.mask")
+
+            # mask = 1 << (bits - 2)
+            one_shift = self.builder.sub(bits, ir.Constant(_i64, 2))
+            mask_init = self.builder.shl(i64_1, one_shift)
+            self.builder.store(mask_init, mask_ptr)
+
+            fd_cond = self.builder.append_basic_block("fib.fd.cond")
+            fd_body = self.builder.append_basic_block("fib.fd.body")
+            fd_end = self.builder.append_basic_block("fib.fd.end")
+            self.builder.branch(fd_cond)
+            self.builder.position_at_end(fd_cond)
+            mask_v = self.builder.load(mask_ptr)
+            self.builder.cbranch(
+                self.builder.icmp_signed(">", mask_v, i64_0), fd_body, fd_end
+            )
+            self.builder.position_at_end(fd_body)
+
+            a = self.builder.load(a_ptr)
+            b = self.builder.load(b_ptr)
+
+            # c = a * (2*b - a)
+            two_b = self.builder.call(big_add, [b, b])
+            two_b_minus_a = self.builder.call(big_sub, [two_b, a])
+            c = self.builder.call(big_mul, [a, two_b_minus_a])
+            # d = a*a + b*b
+            a_sq = self.builder.call(big_mul, [a, a])
+            b_sq = self.builder.call(big_mul, [b, b])
+            d = self.builder.call(big_add, [a_sq, b_sq])
+
+            # if (n & mask) != 0:
+            n_val2 = self.builder.load(n_ptr)
+            mask_v2 = self.builder.load(mask_ptr)
+            bit = self.builder.and_(n_val2, mask_v2)
+            bit_nonzero = self.builder.icmp_signed("!=", bit, i64_0)
+
+            set_bb = self.builder.append_basic_block("fib.set")
+            clear_bb = self.builder.append_basic_block("fib.clear")
+            step_end = self.builder.append_basic_block("fib.step.end")
+            self.builder.cbranch(bit_nonzero, set_bb, clear_bb)
+
+            # bit set: a=d, b=c+d
+            self.builder.position_at_end(set_bb)
+            new_a = d
+            new_b = self.builder.call(big_add, [c, d])
+            self.builder.store(new_a, a_ptr)
+            self.builder.store(new_b, b_ptr)
+            self.builder.branch(step_end)
+
+            # bit clear: a=c, b=d
+            self.builder.position_at_end(clear_bb)
+            self.builder.store(c, a_ptr)
+            self.builder.store(d, b_ptr)
+            self.builder.branch(step_end)
+
+            self.builder.position_at_end(step_end)
+            mask_next = self.builder.load(mask_ptr)
+            self.builder.store(self.builder.ashr(mask_next, i64_1), mask_ptr)
+            self.builder.branch(fd_cond)
+
+            self.builder.position_at_end(fd_end)
+            final_a = self.builder.load(a_ptr)
+            self.builder.branch(fib_end)
+
+            self.builder.position_at_end(fib_end)
+            phi = self.builder.phi(_i8ptr)
+            phi.add_incoming(small_ret, small_bb)
+            phi.add_incoming(final_a, fd_end)
+            self.builder.ret(phi)
+            return True
+
+        # ---- Fixed-width (i32 / i64): closed-form lookup table ----
+        width = ret_ty.width if isinstance(ret_ty, ir.IntType) else 32
+        max_lookup = 70
+        # n <= max_lookup -> table[n]
+        # else -> run fast-doubling on i64 arithmetic.
+
+        small_n_limit = ir.Constant(_i64, max_lookup)
+        # Negative N keeps the original semantics (`return n` for n <= 1),
+        # so only route 0..70 through the table.
+        is_neg = self.builder.icmp_signed("<", n64, ir.Constant(_i64, 0))
+        is_small = self.builder.icmp_signed("<=", n64, small_n_limit)
+
+        check_bb = self.builder.append_basic_block("fib.check")
+        small_bb = self.builder.append_basic_block("fib.small")
+        big_bb = self.builder.append_basic_block("fib.big")
+        neg_bb = self.builder.append_basic_block("fib.neg")
+        end_bb = self.builder.append_basic_block("fib.end")
+        self.builder.cbranch(is_neg, neg_bb, check_bb)
+
+        # 0 <= n64 <= 70 -> table[n] ; otherwise fast-doubling.
+        self.builder.position_at_end(check_bb)
+        self.builder.cbranch(is_small, small_bb, big_bb)
+
+        # n < 0: mirror the recursive base case (`return n`).
+        self.builder.position_at_end(neg_bb)
+        neg_val = n64
+        if neg_val.type != ret_ty:
+            neg_val = self.builder.trunc(neg_val, ret_ty)
+        self.builder.branch(end_bb)
+
+        # Build a lookup table of i64 constants F(0)..F(70)
+        table_len = max_lookup + 1
+        consts = [ir.Constant(_i64, _FIB_SMALL_TABLE[i]) for i in range(table_len)]
+        arr_ty = ir.ArrayType(_i64, table_len)
+        table_gv = ir.GlobalVariable(self.module, arr_ty, name=".fib_table")
+        table_gv.global_constant = True
+        table_gv.initializer = ir.Constant(arr_ty, consts)
+
+        self.builder.position_at_end(small_bb)
+        n_small = self.builder.load(arg_ptr, param_name)
+        n_small64 = self._promote_int(n_small, _i64)
+        elem_ptr = self.builder.gep(
+            table_gv, [ir.Constant(_i32, 0), n_small64], inbounds=True
+        )
+        small_val = self.builder.load(elem_ptr)
+        if ret_ty != _i64:
+            small_val = self.builder.trunc(small_val, ret_ty)
+        self.builder.branch(end_bb)
+
+        # Large-N: iterative fast-doubling using i64 arithmetic.
+        self.builder.position_at_end(big_bb)
+        a2_ptr = self._alloca(_i64, name="fib.a2")
+        b2_ptr = self._alloca(_i64, name="fib.b2")
+        self.builder.store(ir.Constant(_i64, 1), a2_ptr)
+        self.builder.store(ir.Constant(_i64, 1), b2_ptr)
+        n2 = self.builder.load(arg_ptr, param_name)
+        n2_64 = self._promote_int(n2, _i64)
+
+        # Compute bit length
+        bl_ptr = self._alloca(_i64, name="fib.bl")
+        tmp_ptr = self._alloca(_i64, name="fib.tmp2")
+        self.builder.store(ir.Constant(_i64, 0), bl_ptr)
+        self.builder.store(n2_64, tmp_ptr)
+        bl_cond = self.builder.append_basic_block("fib.bl.cond")
+        bl_body = self.builder.append_basic_block("fib.bl.body")
+        bl_end = self.builder.append_basic_block("fib.bl.end")
+        self.builder.branch(bl_cond)
+        self.builder.position_at_end(bl_cond)
+        t = self.builder.load(tmp_ptr)
+        self.builder.cbranch(
+            self.builder.icmp_signed(">", t, ir.Constant(_i64, 0)), bl_body, bl_end
+        )
+        self.builder.position_at_end(bl_body)
+        t2 = self.builder.load(tmp_ptr)
+        self.builder.store(self.builder.ashr(t2, ir.Constant(_i64, 1)), tmp_ptr)
+        blv = self.builder.load(bl_ptr)
+        self.builder.store(self.builder.add(blv, ir.Constant(_i64, 1)), bl_ptr)
+        self.builder.branch(bl_cond)
+        self.builder.position_at_end(bl_end)
+        bl = self.builder.load(bl_ptr)
+
+        mask_ptr = self._alloca(_i64, name="fib.mask2")
+        one = ir.Constant(_i64, 1)
+        mask_shift = self.builder.sub(bl, ir.Constant(_i64, 2))
+        self.builder.store(self.builder.shl(one, mask_shift), mask_ptr)
+
+        fd_cond = self.builder.append_basic_block("fib.fd2.cond")
+        fd_body = self.builder.append_basic_block("fib.fd2.body")
+        fd_end = self.builder.append_basic_block("fib.fd2.end")
+        self.builder.branch(fd_cond)
+        self.builder.position_at_end(fd_cond)
+        mv = self.builder.load(mask_ptr)
+        self.builder.cbranch(
+            self.builder.icmp_signed(">", mv, ir.Constant(_i64, 0)), fd_body, fd_end
+        )
+        self.builder.position_at_end(fd_body)
+
+        a2 = self.builder.load(a2_ptr)
+        b2 = self.builder.load(b2_ptr)
+        two = ir.Constant(_i64, 2)
+        # c = a*(2*b - a)
+        two_b = self.builder.mul(b2, two)
+        two_b_minus_a = self.builder.sub(two_b, a2)
+        c2 = self.builder.mul(a2, two_b_minus_a)
+        # d = a*a + b*b
+        a_sq2 = self.builder.mul(a2, a2)
+        b_sq2 = self.builder.mul(b2, b2)
+        d2 = self.builder.add(a_sq2, b_sq2)
+
+        n3 = self.builder.load(arg_ptr, param_name)
+        n3_64 = self._promote_int(n3, _i64)
+        mv2 = self.builder.load(mask_ptr)
+        bit2 = self.builder.and_(n3_64, mv2)
+        bit_nz = self.builder.icmp_signed("!=", bit2, ir.Constant(_i64, 0))
+
+        set_bb = self.builder.append_basic_block("fib.fd2.set")
+        clr_bb = self.builder.append_basic_block("fib.fd2.clr")
+        step_end = self.builder.append_basic_block("fib.fd2.step.end")
+        self.builder.cbranch(bit_nz, set_bb, clr_bb)
+
+        self.builder.position_at_end(set_bb)
+        sum_cd = self.builder.add(c2, d2)
+        self.builder.store(d2, a2_ptr)
+        self.builder.store(sum_cd, b2_ptr)
+        self.builder.branch(step_end)
+
+        self.builder.position_at_end(clr_bb)
+        self.builder.store(c2, a2_ptr)
+        self.builder.store(d2, b2_ptr)
+        self.builder.branch(step_end)
+
+        self.builder.position_at_end(step_end)
+        mv3 = self.builder.load(mask_ptr)
+        self.builder.store(self.builder.ashr(mv3, one), mask_ptr)
+        self.builder.branch(fd_cond)
+
+        self.builder.position_at_end(fd_end)
+        big_val = self.builder.load(a2_ptr)
+        if ret_ty.width < 64:
+            big_val = self.builder.trunc(big_val, ret_ty)
+        self.builder.branch(end_bb)
+
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(ret_ty)
+        phi.add_incoming(neg_val, neg_bb)
+        phi.add_incoming(small_val, small_bb)
+        phi.add_incoming(big_val, fd_end)
+        self.builder.ret(phi)
+        return True
 
     def _emit_decorated_funcdef(self, node: FuncDef):
         """Emit a decorated function: original as __name, trampoline, and wrapper."""
@@ -2311,7 +2856,7 @@ class LLVM:
             ptr = self.builder.alloca(llvm_arg.type, name=pname)
             self.builder.store(llvm_arg, ptr)
             self.locals[pname] = ptr
-            self.local_types[pname] = ptype
+            self.local_types[pname] = _bc_array_norm(ptype)
 
         for stmt in node.body:
             if not self._block_terminated():
@@ -2446,9 +2991,10 @@ class LLVM:
     def _switchable_if(node):
         cases = []
         var_name = None
+        var_node = None
 
         def extract(n):
-            nonlocal var_name
+            nonlocal var_name, var_node
             if not isinstance(n, If):
                 return False
             if not isinstance(n.cond, BinOp) or n.cond.op != TokenType.EQ_EQ:
@@ -2461,6 +3007,7 @@ class LLVM:
                 return False
             if var_name is None:
                 var_name = n.cond.left.name
+                var_node = n.cond.left
             elif n.cond.left.name != var_name:
                 return False
             cases.append((n.cond.right, n.body))
@@ -2481,6 +3028,13 @@ class LLVM:
             return None
         if len(cases) < 2:
             return None
+        # Float variables must not be lowered to a switch: the emitter would
+        # compare a coerced i1 against double case constants and produce invalid
+        # IR (`case value is not a constant integer`), breaking whole-module
+        # builds. Fall back to the normal fcmp/icmp path instead.
+        var_ty = (var_node.inferred_type or "").strip() if var_node else ""
+        if var_ty in ("float", "double", "float32", "float64"):
+            return None
         return Switch(Variable(var_name), cases)
 
     @register_emitter(If)
@@ -2489,6 +3043,29 @@ class LLVM:
         if sw is not None:
             self.emit_switch(sw)
             return
+
+        # ---- Unreachable-branch pruning: condition folds to a constant ----
+        cond_val = _const_int_value(node.cond)
+        if cond_val is None and isinstance(node.cond, Variable) and self._is_const_var(node.cond.name):
+            cond_val = self._const_var_value(node.cond.name)
+            if cond_val is not None:
+                condensed = 1 if cond_val != 0 else 0
+                cond_val = condensed
+        if cond_val is not None:
+            if cond_val != 0:
+                self._push_scope()
+                for stmt in node.body:
+                    if not self._block_terminated():
+                        self.emit(stmt)
+                self._pop_scope()
+            else:
+                self._push_scope()
+                for stmt in node.orelse or []:
+                    if not self._block_terminated():
+                        self.emit(stmt)
+                self._pop_scope()
+            return
+
         cond = self._truthy_expr(node.cond)
         then_bb = self.builder.append_basic_block("then")
 
@@ -2627,6 +3204,7 @@ class LLVM:
 
     def _dyn_kind_for(self, ty):
         """Map a cpy type name to its runtime dynamic kind id."""
+        ty = _bc_array_norm(ty)
         if ty == "dynamic":
             return _DYN_NONE
         if ty == "dynamic[]":
@@ -2653,6 +3231,7 @@ class LLVM:
 
     def _box_dyn(self, value, ty):
         """Box a runtime value into (kind, uint64 bits) for dynamic storage."""
+        ty = _bc_array_norm(ty) or ty
         t = value.type
         if isinstance(t, ir.IntType):
             if t.width == 1:
@@ -2826,8 +3405,230 @@ class LLVM:
             if self._block_terminated():
                 break
 
+    # ------------------------------------------------------------------
+    # 4.  Algebraic-identity folding (called at the top of emit_binop)
+    # ------------------------------------------------------------------
+
+    def _try_algebraic_simplify(self, node: BinOp):
+        """Attempt to fold algebraic identities *before* emitting IR.
+
+        Returns an ``ir.Value`` when the simplification succeeded, else *None*.
+        Only handles integer / pointer-typed operands; float and big/ubig are
+        left to the normal path.
+        """
+        op = node.op
+        left_node = node.left
+        right_node = node.right
+
+        # Only simplify when both sides are simple enough to emit cheaply
+        # and the result type is integral (avoid messing with floats/pointers).
+        lt = getattr(left_node, "inferred_type", "")
+        rt = getattr(right_node, "inferred_type", "")
+        if lt in ("big", "ubig", "str", "dynamic") or rt in ("big", "ubig", "str", "dynamic"):
+            return None
+        if lt == "float" or lt == "double" or rt == "float" or rt == "double":
+            return None
+
+        # ---- Constant propagation: substitute tracked const vars ----
+        if isinstance(left_node, Variable) and self._is_const_var(left_node.name):
+            cv = self._const_var_value(left_node.name)
+            if cv is not None and left_node.name in self.locals:
+                left_node = Number(str(cv))
+        if isinstance(right_node, Variable) and self._is_const_var(right_node.name):
+            cv = self._const_var_value(right_node.name)
+            if cv is not None and right_node.name in self.locals:
+                right_node = Number(str(cv))
+
+        # ---- Constant folding: both operands are integral literals ----
+        lv = _const_int_value(left_node)
+        rv = _const_int_value(right_node)
+        if lv is not None and rv is not None:
+            folded = _fold_int_binop(op, lv, rv)
+            if folded is not None:
+                lval = self.emit(left_node)
+                if isinstance(lval.type, ir.IntType):
+                    width = lval.type.width
+                else:
+                    width = 32
+                v32 = _trunc_to_signed(folded, width)
+                return ir.Constant(ir.IntType(width), v32)
+
+        # Only simplify when both sides are simple enough to emit cheaply
+        # and the result type is integral (avoid messing with floats/pointers).
+
+
+        # ---- x * 0  /  0 * x  ->  0 ----
+        if op == TokenType.STAR:
+            if _is_const_zero(left_node) or _is_const_zero(right_node):
+                left_val = self.emit(left_node)
+                return ir.Constant(left_val.type, 0)
+            # ---- x * 1  /  1 * x  ->  x ----
+            if _is_const_one(left_node):
+                return self.emit(right_node)
+            if _is_const_one(right_node):
+                return self.emit(left_node)
+            # ---- x * 2^k  ->  x << k ----
+            shift_k = _detect_shift_amount_from_mul(node)
+            if shift_k is not None:
+                val = self.emit(left_node)
+                other = right_node
+                # Ensure val is the variable / expression, other is the constant
+                if _const_int_value(left_node) is not None and _const_int_value(left_node) == 2 ** shift_k:
+                    val = self.emit(right_node)
+                    other = left_node
+                if isinstance(val.type, ir.IntType) and val.type.width >= 2:
+                    k = ir.Constant(val.type, shift_k)
+                    k = self._clamp_shift_amount(k, val.type.width)
+                    return self.builder.shl(val, k)
+            # ---- x * (2^k + 1)  ->  (x << k) + x ----
+            left_v = _const_int_value(left_node)
+            right_v = _const_int_value(right_node)
+            if left_v is not None and left_v > 2 and _is_power_of_2(left_v - 1):
+                # right_node * (left_v)  ->  (right << k) + right
+                k = _log2_floor(left_v - 1)
+                val = self.emit(right_node)
+                if isinstance(val.type, ir.IntType):
+                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
+                    return self.builder.add(shifted, val)
+            if right_v is not None and right_v > 2 and _is_power_of_2(right_v - 1):
+                k = _log2_floor(right_v - 1)
+                val = self.emit(left_node)
+                if isinstance(val.type, ir.IntType):
+                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
+                    return self.builder.add(shifted, val)
+            # ---- x * (2^k - 1)  ->  (x << k) - x ----
+            if left_v is not None and left_v > 1 and _is_power_of_2(left_v + 1):
+                k = _log2_floor(left_v + 1)
+                val = self.emit(right_node)
+                if isinstance(val.type, ir.IntType):
+                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
+                    return self.builder.sub(shifted, val)
+            if right_v is not None and right_v > 1 and _is_power_of_2(right_v + 1):
+                k = _log2_floor(right_v + 1)
+                val = self.emit(left_node)
+                if isinstance(val.type, ir.IntType):
+                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
+                    return self.builder.sub(shifted, val)
+
+        # ---- x + 0  /  0 + x  ->  x ----
+        if op == TokenType.PLUS:
+            if _is_const_zero(left_node):
+                return self.emit(right_node)
+            if _is_const_zero(right_node):
+                return self.emit(left_node)
+
+        # ---- x - 0  ->  x ----
+        if op == TokenType.MINUS:
+            if _is_const_zero(right_node):
+                return self.emit(left_node)
+
+        # ---- x ^ x  ->  0 ----
+        if op == TokenType.CARET:
+            if (
+                isinstance(left_node, Variable)
+                and isinstance(right_node, Variable)
+                and left_node.name == right_node.name
+            ):
+                val = self.emit(left_node)
+                if isinstance(val.type, ir.IntType):
+                    return ir.Constant(val.type, 0)
+
+        # ---- (x << c1) << c2  ->  x << (c1+c2) ----
+        if op == TokenType.SHL:
+            if isinstance(left_node, BinOp) and left_node.op == TokenType.SHL:
+                if isinstance(left_node.right, Number) and isinstance(right_node, Number):
+                    try:
+                        c1 = int(left_node.right.value)
+                        c2 = int(right_node.value)
+                        total = c1 + c2
+                        val = self.emit(left_node.left)
+                        if isinstance(val.type, ir.IntType):
+                            k = ir.Constant(val.type, total)
+                            k = self._clamp_shift_amount(k, val.type.width)
+                            return self.builder.shl(val, k)
+                    except (ValueError, TypeError):
+                        pass
+
+        # ---- x / 1  ->  x ----
+        if op in (TokenType.SLASH, TokenType.SLASH_SLASH):
+            if _is_const_one(right_node):
+                return self.emit(left_node)
+
+        # ---- x % 1  ->  0 ----
+        if op == TokenType.PERCENT:
+            if _is_const_one(right_node):
+                left_val = self.emit(left_node)
+                return ir.Constant(left_val.type, 0)
+
+# ---- x & 0  ->  0 ----
+        if op == TokenType.AMPERSAND:
+            if _is_const_zero(right_node):
+                left_val = self.emit(left_node)
+                if isinstance(left_val.type, ir.IntType):
+                    return ir.Constant(left_val.type, 0)
+            if _is_const_zero(left_node):
+                right_val = self.emit(right_node)
+                if isinstance(right_val.type, ir.IntType):
+                    return ir.Constant(right_val.type, 0)
+
+        # ---- x | 0  ->  x ----
+        if op == TokenType.PIPE:
+            if _is_const_zero(right_node):
+                return self.emit(left_node)
+            if _is_const_zero(left_node):
+                return self.emit(right_node)
+
+        # ---- strength reduction: x * 3/5/9/10  ->  shifts + adds ----
+        if op == TokenType.STAR:
+            for var_node, const_node in (
+                (left_node, right_node),
+                (right_node, left_node),
+            ):
+                if isinstance(var_node, Variable) and isinstance(const_node, Number):
+                    cv = _const_int_value(const_node)
+                    if cv == 3:
+                        return self._strength_reduce_mul3(var_node)
+                    if cv == 5:
+                        return self._strength_reduce_mul5(var_node)
+                    if cv == 9:
+                        return self._strength_reduce_mul9(var_node)
+                    if cv == 10:
+                        return self._strength_reduce_mul10(var_node)
+
+        return None
+
+    def _strength_reduce_mul3(self, var_node):
+        val = self.emit(var_node)
+        t = val.type
+        shifted = self.builder.shl(val, ir.Constant(t, 1))
+        return self.builder.add(shifted, val)
+
+    def _strength_reduce_mul5(self, var_node):
+        val = self.emit(var_node)
+        t = val.type
+        shifted = self.builder.shl(val, ir.Constant(t, 2))
+        return self.builder.add(shifted, val)
+
+    def _strength_reduce_mul9(self, var_node):
+        val = self.emit(var_node)
+        t = val.type
+        shifted = self.builder.shl(val, ir.Constant(t, 3))
+        return self.builder.add(shifted, val)
+
+    def _strength_reduce_mul10(self, var_node):
+        val = self.emit(var_node)
+        t = val.type
+        s3 = self.builder.shl(val, ir.Constant(t, 3))
+        s1 = self.builder.shl(val, ir.Constant(t, 1))
+        return self.builder.add(s3, s1)
+
     @register_emitter(BinOp)
     def emit_binop(self, node):
+        # ---- 4. Algebraic-identity folding ----
+        simplified = self._try_algebraic_simplify(node)
+        if simplified is not None:
+            return simplified
+
         if node.op == TokenType.PLUS and self._is_string_concat(node):
             return self._emit_string_concat(node)
 
@@ -3497,7 +4298,7 @@ class LLVM:
             self.builder.store(value, self._code_result)
             return None
         if isinstance(node.target, Index) and not self.no_userspace:
-            obj_t = getattr(node.target.obj, "inferred_type", None)
+            obj_t = _bc_array_norm(getattr(node.target.obj, "inferred_type", None))
             if (
                 obj_t == "dynamic"
                 or obj_t == "dynamic[]"
@@ -3544,12 +4345,15 @@ class LLVM:
                 if var_type in ("int64", "uint64"):
                     value = self._extend_to_i64(value)
                 self.builder.store(value, ptr)
+                cv = _const_int_value(node.value)
+                self._set_const_prop(name, cv)
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
             ptr = self._alloca(value.type, name)
             self._declare_local(name, ptr, str(value.type))
             self.builder.store(value, ptr)
+            self._set_const_prop(name, _const_int_value(node.value))
             return None
         if isinstance(node.target, str):
             name = node.target
@@ -3591,6 +4395,7 @@ class LLVM:
                 if var_type in ("int64", "uint64"):
                     value = self._extend_to_i64(value)
                 self.builder.store(value, ptr)
+                self._set_const_prop(name, _const_int_value(node.value))
                 return None
             value = self.emit(node.value)
             ssa = self.ssa_values.pop(name, None)
@@ -4099,6 +4904,27 @@ class LLVM:
 
     @register_emitter(While)
     def emit_while(self, node):
+        # Const-prop across a loop backedge is unsound: clear the tracked
+        # straight-line constants while we process the body, then restore.
+        # A variable the body can write must be dropped from BOTH working
+        # copies -- single-execution folds baked into the (re-executed) body
+        # would otherwise compute wrong values, and a restored pre-loop entry
+        # would leave a stale constant visible to reads after the loop.
+        saved_const_prop = self._const_prop
+        written_here = _loop_written_names(node)
+        active = dict(saved_const_prop)
+        for name in written_here:
+            active.pop(name, None)
+        self._const_prop = active
+
+        # ---- Loop-invariant code motion: hoist provably-invariant assigns ----
+        invariants = _find_loop_invariants(node) if getattr(self, "_licm_enabled", True) else []
+        hoisted_ids = set()
+        for inv in invariants:
+            if not self._block_terminated():
+                self.emit(inv)
+                hoisted_ids.add(id(inv))
+
         cond_bb = self.builder.append_basic_block("while.cond")
         body_bb = self.builder.append_basic_block("while.body")
         end_bb = self.builder.append_basic_block("while.end")
@@ -4113,6 +4939,8 @@ class LLVM:
         self.loop_stack.append((cond_bb, end_bb))
         self._push_scope()
         for stmt in node.body:
+            if id(stmt) in hoisted_ids:
+                continue
             if not self._block_terminated():
                 self.emit(stmt)
         self._pop_scope()
@@ -4122,6 +4950,107 @@ class LLVM:
             self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+        # Restore, dropping any entries the loop body could have changed.
+        for name in written_here:
+            saved_const_prop.pop(name, None)
+        self._const_prop = saved_const_prop
+
+    # ------------------------------------------------------------------
+    # 3.  Loop transformations: bounded unrolling
+    # ------------------------------------------------------------------
+
+    def _set_const_prop(self, name: str, const_val):
+        """Record a compile-time integer value for variable *name* in the
+        current straight-line region, so downstream reads can be replaced by
+        a constant.  Passing *None* invalidates the entry (any reassignment
+        or loop backedge)."""
+        if const_val is not None:
+            self._const_prop[name] = const_val
+        else:
+            self._const_prop.pop(name, None)
+
+    def _is_const_var(self, name: str) -> bool:
+        return name in self._const_prop
+
+    def _const_var_value(self, name: str) -> Optional[int]:
+        return self._const_prop.get(name)
+
+    def _try_unroll_counted_loop(
+        self, node: While, pending_iv: Optional[tuple[str, int]]
+    ) -> bool:
+        """Fully unroll a ``while`` loop whose iteration count is a small
+        compile-time constant.  *pending_iv* is ``(name, start)`` for the
+        constant init that precedes the loop; the loop must be a counted loop
+        (``i < stop`` / ``i <= stop`` / ``i > stop`` / ``i >= stop``) with a
+        single ``i = i + k`` / ``i = i - k`` increment in the body.  Returns
+        ``True`` when it unrolled the loop in place.
+
+        Each unrolled copy stores the canonical counter value into the
+        induction variable's slot first, and also records it in the
+        straight-line constant-propagation table so reads of the counter
+        inside an iteration fold to a constant (as with ordinary control flow,
+        the propagation is invalidated once the loop ends)."""
+        if pending_iv is None:
+            return False
+        info = _is_simple_counted_loop(node)
+        if info is None:
+            return False
+        iv_name, stop, step, inclusive = info
+        pend_name, start_val = pending_iv
+        if pend_name != iv_name:
+            return False
+        n = _count_loop_iterations(start_val, stop, step, inclusive)
+        if n < 0 or n > 16:
+            return False
+        # Guard: the body must not contain break/continue (we cannot
+        # redistribute control-flow edges across the unrolled copies).
+        for stmt in node.body:
+            if isinstance(stmt, (Break, Continue, Return, Raise)):
+                return False
+            if isinstance(stmt, (If, While)):
+                return False
+
+        iv_ptr = self.locals.get(iv_name)
+        if iv_ptr is None:
+            iv_ptr = self._alloca(_i32, name=iv_name)
+            self._declare_local(iv_name, iv_ptr, "int")
+        iv_ty = self._pointee_type(iv_ptr) or _i32
+        width = iv_ty.width if isinstance(iv_ty, ir.IntType) else 32
+
+        def iv_const(v: int):
+            # Wrap to the declared integer width (cpyte ints wrap like C).
+            mask = (1 << width) - 1
+            w = v & mask
+            if w >= (1 << (width - 1)):
+                w -= (1 << width)
+            return ir.Constant(iv_ty, w), w
+
+        # Counter's declared type must be a plain int to safely const-propagate
+        # its reads into downstream arithmetic (Number literals lower to i32).
+        can_const_prop = self.local_types.get(iv_name) in ("int", "int32")
+
+        # Zero-iteration loop: body never runs; counter keeps its init value.
+        if n == 0:
+            self.builder.store(iv_const(start_val)[0], iv_ptr)
+            return True
+
+        self._push_scope()
+        for i in range(n):
+            cv, raw = iv_const(start_val + i * step)
+            self.builder.store(cv, iv_ptr)
+            if can_const_prop:
+                self._set_const_prop(iv_name, raw)
+            for stmt in node.body:
+                if not self._block_terminated():
+                    self.emit(stmt)
+        self._pop_scope()
+        # The value after the loop is the first value that fails the
+        # comparison (start + n*step). It is not a compile-time constant any
+        # more, so invalidate the entry rather than leaving a stale fold.
+        self._set_const_prop(iv_name, None)
+        if not self._block_terminated():
+            self.builder.store(iv_const(start_val + n * step)[0], iv_ptr)
+        return True
 
     @register_emitter(Break)
     def emit_break(self, node):
@@ -4160,8 +5089,37 @@ class LLVM:
         var_name = node["var"]
         iterable = node["iter"]
         body = node["body"]
-        iter_type = node.get("iter_type") or "str"
+        iter_type = _bc_array_norm(node.get("iter_type")) or "str"
         var_type = node.get("var_type") or "char"
+
+        # ---- 3.  Bounded loop unrolling for constant-size list literals ----
+        if (
+            isinstance(iterable, ListLit)
+            and len(iterable.items) <= 16
+            and var_type != "dynamic"
+            and iter_type != "dynamic"
+        ):
+            # Guard: body must not contain break/continue/return.
+            legit = True
+            for stmt in body:
+                if isinstance(stmt, (Break, Continue, Return, Raise)):
+                    legit = False
+                    break
+                if isinstance(stmt, (If, While)):
+                    legit = False
+                    break
+            if legit:
+                var_ty = self.llvm_type(var_type)
+                self._push_scope()
+                var_ptr = self._alloca(var_ty, name=var_name)
+                self._declare_local(var_name, var_ptr, var_type)
+                for item in iterable.items:
+                    self.builder.store(self.emit(item), var_ptr)
+                    for stmt in body:
+                        if not self._block_terminated():
+                            self.emit(stmt)
+                self._pop_scope()
+                return
 
         iter_ptr = self.emit(iterable)
 
@@ -4525,7 +5483,7 @@ class LLVM:
                 self._declare_const(node.name, ir.Constant(ty, 0))
             return
         ptr = self._alloca(ty, name=node.name)
-        self._declare_local(node.name, ptr, node.var_type)
+        self._declare_local(node.name, ptr, _bc_array_norm(node.var_type))
         if node.init:
             if not self.no_userspace and self._is_dynamic_expr(node.init):
                 value = self._unbox_dyn_to(node.init, node.var_type)
@@ -4588,6 +5546,7 @@ class LLVM:
                 ) and isinstance(ty, ir.IntType):
                     value = self.builder.fptosi(value, ty)
             self.builder.store(value, ptr)
+            self._set_const_prop(node.name, _const_int_value(node.init))
         elif isinstance(ty, ir.PointerType):
             self.builder.store(ir.Constant(ty, None), ptr)
         elif isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):

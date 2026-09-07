@@ -157,6 +157,24 @@ from .extension_hooks import (
 from .lexar import Lexer, LexerError, register_keywords
 from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
 
+_ARRAY_SUFFIX_RE = re.compile(r"^(.*)\[\d*\]$")
+_FIXED_ARRAY_RE = re.compile(r"^(.*?)\[(\d+)\]$")
+
+
+def _array_back(t):
+    """Element type of an array type `T[]` / `T[N]`, or None if not an array."""
+    if not isinstance(t, str):
+        return None
+    m = _ARRAY_SUFFIX_RE.match(t)
+    return m.group(1) if m else None
+
+
+def _array_family(t):
+    """Normalize `T[N]` to `T[]`. Both are `T*` at the LLVM level, so type
+    compatibility checks treat a fixed-size array as an array of its element."""
+    b = _array_back(t)
+    return b + "[]" if b is not None else t
+
 
 def _c(text, *styles):
     """Colorize `text` with ANSI codes when stdout is a terminal (and color is
@@ -1428,9 +1446,11 @@ class SemanticAnalyzer:
             if obj_t == "dynamic":
                 node.inferred_type = "dynamic"
                 return "dynamic"
-            if obj_t and obj_t.endswith("[]"):
-                node.inferred_type = obj_t[:-2]
-                return obj_t[:-2]
+            if obj_t:
+                elem_t = _array_back(obj_t)
+                if elem_t is not None:
+                    node.inferred_type = elem_t
+                    return elem_t
             if obj_t == "str":
                 node.inferred_type = "char"
                 return "char"
@@ -1465,6 +1485,7 @@ class SemanticAnalyzer:
                 ):
                     for field in struct_sym.node.fields:
                         if field.name == node.name:
+                            node.inferred_type = field.type_expr
                             return field.type_expr
                     self.error(f"type `{obj_t}` has no field `{node.name}`", node)
                     return None
@@ -1478,6 +1499,7 @@ class SemanticAnalyzer:
         if isinstance(node, Deref):
             operand_t = self._infer_type(node.operand)
             if operand_t is not None and operand_t.endswith("*"):
+                node.inferred_type = operand_t[:-1]
                 return operand_t[:-1]
             if operand_t is not None:
                 self.error(f"cannot dereference non-pointer type `{operand_t}`", node)
@@ -1505,6 +1527,11 @@ class SemanticAnalyzer:
         if isinstance(node, NewExpr):
             if node.size is not None:
                 self._infer_type(node.size)
+                # A literal size makes a fixed-size array type `T[N]` (e.g.
+                # `new dynamic[1]` -> `dynamic[1]`, NOT `dynamic[]`). A runtime
+                # size stays a dynamic array `T[]`.
+                if isinstance(node.size, Number):
+                    return f"{node.type_expr}[{node.size.value}]"
                 return node.type_expr + "[]"
             return node.type_expr + "*"
 
@@ -2587,6 +2614,7 @@ class SemanticAnalyzer:
         state: dict = {}
         borrowed: dict = {}
         visited: set = set()
+        escaped: set = set()  # names mentioned in any `return` value
 
         def is_new_expr(v):
             if isinstance(v, NewExpr):
@@ -2595,6 +2623,25 @@ class SemanticAnalyzer:
                 return is_new_expr(v.expr)
             if isinstance(v, BorrowExpr) or isinstance(v, MoveExpr):
                 return False
+            return False
+
+        _HEAP_ALLOC_FNS = ("malloc", "calloc", "realloc")
+
+        def is_heap_alloc_expr(v):
+            """True for `new` allocations and raw C heap allocs (`malloc`,
+            `calloc`, `realloc`), so ownership tracking matches how these are
+            actually reclaimed (manual `free`)."""
+            if isinstance(v, NewExpr):
+                return True
+            if isinstance(v, CastExpr):
+                return is_heap_alloc_expr(v.expr)
+            if (
+                isinstance(v, Call)
+                and isinstance(v.callee, Variable)
+                and v.callee.name in _HEAP_ALLOC_FNS
+                and len(v.args) >= 1
+            ):
+                return True
             return False
 
         def free_target(v):
@@ -2624,7 +2671,7 @@ class SemanticAnalyzer:
         def mark_owned(name, node):
             if state.get(name) == "owned":
                 self.warning(
-                    f"unmanaged memory: `{name}` already holds a `new` allocation "
+                    f"unmanaged memory: `{name}` already holds a heap allocation "
                     f"that is never freed before being overwritten",
                     node,
                     note=f"use `free({name})` (or `defer free({name})`) before reassigning",
@@ -2635,7 +2682,7 @@ class SemanticAnalyzer:
             if id(stmt) in visited:
                 return
             if isinstance(stmt, VarDecl):
-                if is_new_expr(stmt.init):
+                if is_heap_alloc_expr(stmt.init):
                     mark_owned(stmt.name, stmt)
                 elif isinstance(stmt.init, MoveExpr) and isinstance(
                     stmt.init.operand, Variable
@@ -2650,7 +2697,7 @@ class SemanticAnalyzer:
                     if state.get(stmt.name) == "owned":
                         self.warning(
                             f"assigning `move {src}` to `{stmt.name}` drops its previous "
-                            f"`new` allocation without freeing it",
+                            f"heap allocation without freeing it",
                             stmt,
                         )
                     state[stmt.name] = state.get(src) or "plain"
@@ -2676,7 +2723,7 @@ class SemanticAnalyzer:
                             f"cannot reinitialize `{name}`; it was already moved",
                             stmt,
                         )
-                    if is_new_expr(stmt.value):
+                    if is_heap_alloc_expr(stmt.value):
                         mark_owned(name, stmt)
                     elif isinstance(stmt.value, MoveExpr) and isinstance(
                         stmt.value.operand, Variable
@@ -2691,7 +2738,7 @@ class SemanticAnalyzer:
                         if state.get(name) == "owned":
                             self.warning(
                                 f"moving `{src}` into `{name}` drops its previous "
-                                f"`new` allocation without freeing it",
+                                f"heap allocation without freeing it",
                                 stmt,
                             )
                         st = state.get(src) or "plain"
@@ -2703,7 +2750,7 @@ class SemanticAnalyzer:
                             # allocation unless it is an internal pointer update.
                             self.warning(
                                 f"unmanaged memory: reassigning `{name}` discards its "
-                                f"previous `new` allocation without freeing it",
+                                f"previous heap allocation without freeing it",
                                 stmt,
                                 note=f"call `free({name})` first (e.g. `defer free({name})`)",
                             )
@@ -2713,8 +2760,38 @@ class SemanticAnalyzer:
                         borrowed.setdefault(stmt.value.operand.name, set()).add(
                             "mut" if stmt.value.mutable else "ro"
                         )
+                else:
+                    # Store through a non-variable target (`p[0] = v`,
+                    # `(*p).f = v`, `p.f = v`): reads of freed/moved pointers in
+                    # the target and value are still use-after-free.
+                    names = set()
+                    used_names(stmt.target, names)
+                    if stmt.value is not None:
+                        used_names(stmt.value, names)
+                    for n in names:
+                        if state.get(n) == "freed":
+                            self.warning(
+                                f"use of `{n}` after it was freed",
+                                stmt,
+                                note="`free()` releases the memory; the value is dangling",
+                            )
                 return
             if isinstance(stmt, Return):
+                names = set()
+                if stmt.value is not None:
+                    if isinstance(stmt.value, (list, tuple)):
+                        for item in stmt.value:
+                            used_names(item, names)
+                    else:
+                        used_names(stmt.value, names)
+                for n in names:
+                    if state.get(n) == "freed":
+                        self.warning(
+                            f"use of `{n}` after it was freed",
+                            stmt,
+                            note="`free()` releases the memory; the value is dangling",
+                        )
+                escaped.update(names)
                 return
             if isinstance(stmt, Print):
                 names = set()
@@ -2730,6 +2807,12 @@ class SemanticAnalyzer:
                             f"use of `{n}` after it was moved",
                             stmt,
                             note="`move` transfers ownership; the value is no longer valid",
+                        )
+                    elif state.get(n) == "freed":
+                        self.warning(
+                            f"use of `{n}` after it was freed",
+                            stmt,
+                            note="`free()` releases the memory; the value is dangling",
                         )
                 return
             if isinstance(stmt, (If, While)):
@@ -2753,12 +2836,21 @@ class SemanticAnalyzer:
                         self.warning(
                             f"`{ft}` is already freed",
                             stmt,
-                            note="double-free of a `new` allocation",
+                            note="double-free of a heap allocation",
+                        )
+                    elif state.get(ft) == "moved":
+                        self.warning(
+                            f"`free({ft})` called on a value that was already moved",
+                            stmt,
+                        )
+                    elif state.get(ft) == "plain":
+                        self.warning(
+                            f"`free({ft})` called on a value that was not allocated "
+                            f"with `new`/`malloc` in this function",
+                            stmt,
                         )
                     state[ft] = "freed"
-                else:
-                    walk_stmt(stmt.body, frame)
-                return
+                    return
             if isinstance(stmt, ExprStmt):
                 e = stmt.expr
                 ft = free_target(stmt)
@@ -2775,12 +2867,17 @@ class SemanticAnalyzer:
                         self.warning(
                             f"`{ft}` is freed more than once",
                             stmt,
-                            note="double-free of a `new` allocation",
+                            note="double-free of a heap allocation",
                         )
-                    elif state.get(ft) not in ("owned", None):
+                    elif state.get(ft) == "moved":
+                        self.warning(
+                            f"`free({ft})` called on a value that was already moved",
+                            stmt,
+                        )
+                    elif state.get(ft) == "plain":
                         self.warning(
                             f"`free({ft})` called on a value that was not allocated "
-                            f"with `new` in this function",
+                            f"with `new`/`malloc` in this function",
                             stmt,
                         )
                     state[ft] = "freed"
@@ -2804,6 +2901,12 @@ class SemanticAnalyzer:
                             f"use of `{n}` after it was moved",
                             stmt,
                             note="`move` transfers ownership; the value is no longer valid",
+                        )
+                    elif state.get(n) == "freed":
+                        self.warning(
+                            f"use of `{n}` after it was freed",
+                            stmt,
+                            note="`free()` releases the memory; the value is dangling",
                         )
                 # detect writes to immutably-borrowed variables (best effort)
                 tgt = None
@@ -2839,9 +2942,9 @@ class SemanticAnalyzer:
         # reclaimed automatically, so a manual "leak" is not an actual leak.
         if self.no_gc:
             for name, st in state.items():
-                if st == "owned":
+                if st == "owned" and name not in escaped:
                     self.warning(
-                        f"unmanaged memory: `new` allocation held by `{name}` is never freed",
+                        f"unmanaged memory: heap allocation held by `{name}` is never freed",
                         fn,
                         note=f"add `defer free({name})` to release it on scope exit",
                     )
@@ -2868,7 +2971,7 @@ class SemanticAnalyzer:
                 if (
                     expected
                     and val_type
-                    and expected != val_type
+                    and _array_family(expected) != _array_family(val_type)
                     and expected != "dynamic"
                     and val_type != "dynamic"
                 ):
@@ -2992,7 +3095,7 @@ class SemanticAnalyzer:
             elif (
                 val_type is not None
                 and existing.type is not None
-                and val_type != existing.type
+                and _array_family(val_type) != _array_family(existing.type)
             ):
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64
@@ -3158,6 +3261,13 @@ class SemanticAnalyzer:
                 node,
                 note="another symbol with this name already exists in this scope",
             )
+        if node.init is None and val_type:
+            # A bare fixed-size array declaration `int[5] x` allocates the array
+            # like `x = new int[5]`; the fixed size is a type property, not a
+            # runtime shape (unlike `T[]` which gets a value via `new`).
+            m = _FIXED_ARRAY_RE.match(val_type)
+            if m is not None:
+                node.init = NewExpr(m.group(1), Number(m.group(2)), token=node._token)
         if node.is_const and node.init is None:
             self.error(
                 f"constant `{node.name}` requires an initializer",
@@ -3175,7 +3285,9 @@ class SemanticAnalyzer:
                 # Dynamically-typed initializer coerced to the declared type at run time.
                 pass
             elif (
-                init_type is not None and val_type is not None and init_type != val_type
+                init_type is not None
+                and val_type is not None
+                and _array_family(init_type) != _array_family(val_type)
             ):
                 # Allow implicit conversion from int to int64/uint64
                 # Allow implicit conversion between int64 and uint64
@@ -3564,8 +3676,11 @@ class SemanticAnalyzer:
         loop_scope = Scope(s)
         iterable = node.get("iter")
         iter_t = self._infer_type(iterable) if iterable is not None else None
-        if iter_t is not None and iter_t.endswith("[]"):
-            var_t = iter_t[:-2]
+        if iter_t is not None and _array_back(iter_t) is not None:
+            # `T[]` and `T[N]` both iterate their element type; normalize the
+            # stored iterable type to `T[]` so codegen dispatches uniformly.
+            var_t = _array_back(iter_t)
+            iter_t = var_t + "[]"
             if var_t == "void":
                 self.error(
                     "cannot iterate a void array",

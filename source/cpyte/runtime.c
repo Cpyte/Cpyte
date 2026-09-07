@@ -407,6 +407,12 @@ cpy_resume(void *exception_object) {
 
 #else /* _WIN32 — Windows stubs */
 
+typedef struct {
+    uintptr_t landing_pad;
+    int found;
+    int is_handler;
+} cpy_call_site;
+
 static void
 cpy_find_call_site(cpy_unwind_ctx_t *context, cpy_call_site *out) {
     (void)context;

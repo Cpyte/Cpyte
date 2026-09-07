@@ -9,6 +9,7 @@ import warnings
 from .generate_bc import _remove_probe_stack_ir
 from .linker import format_cc_diag, LinkerNotFoundError, Linker
 from .ui import print_err, print_ok
+from .winjit_patch import link_jit_anchors, patch_windows_gnu_relocs
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
 warnings.filterwarnings(
@@ -30,10 +31,16 @@ if getattr(sys, "frozen", False):
 else:
     _BIGNUM_C = os.path.join(os.path.dirname(__file__), "bignum.c")
 
+if getattr(sys, "frozen", False):
+    _WINJIT_STUB_C = os.path.join(getattr(sys, "_MEIPASS", ""), "winjit_stubs.c")
+else:
+    _WINJIT_STUB_C = os.path.join(os.path.dirname(__file__), "winjit_stubs.c")
+
 _llvm_cc_cache = None
 
 
 def _host_default_pic():
+
     """Return True when the host linker requires PIC (PIE) by default.
 
     Both macOS and Linux on AArch64 link position-independent executables by
@@ -43,6 +50,314 @@ def _host_default_pic():
     import platform
 
     return platform.machine().lower() in ("arm64", "aarch64")
+
+
+def _use_windows_gnu():
+    """True on Windows when the MSVC dev environment is not available.
+
+    The prebuilt llvmlite wheels default to an ``x86_64-pc-windows-msvc``
+    triple which requires the MSVC headers/libs. On machines that only have a
+    Unix-flavoured toolchain (MinGW-w64, msys2, Cygwin, WSL-driverless clang)
+    the compiler instead targets ``x86_64-w64-windows-gnu`` so the C runtime
+    and libc resolve through MinGW without an MSVC install.
+    """
+    if os.name != "nt":
+        return False
+    if os.environ.get("WindowsSdkDir") or os.environ.get("VCToolsInstallDir"):
+        return False
+    return True
+
+
+def host_target():
+    """Return the :class:`llvmlite.binding.Target` for the host program.
+
+    Uses llvmlite's default triple, except on Windows without a detected MSVC
+    toolchain where the MinGW GNU triple is used so that (a) the C runtime can
+    be compiled by clang against MinGW headers, and (b) AOT object emission is
+    COFF (linkable by the MinGW linker) instead of an unlinkable msvc-ELF.
+    """
+    from llvmlite import binding
+
+    binding.initialize_native_target()
+    binding.initialize_native_asmprinter()
+    if _use_windows_gnu():
+        return binding.Target.from_triple("x86_64-w64-windows-gnu")
+    return binding.Target.from_default_triple()
+
+
+# clang (GNU/MinGW target) emits ``call __main`` at the entry of every compiled
+# C function and ``call ___chkstk_ms`` when a frame needs more than 4 KiB of
+# stack. Both are CRT-lib helpers (supplied by libmingw32/crtbegin in real AOT
+# binaries) that no Windows DLL exports, so MCJIT resolves them to address 0
+# and the JIT'd program segfaults on the first call. Define no-op / probing
+# equivalents in IR so the JIT'd module is self-contained.
+_JIT_WINDOWS_GNU_STUBS_IR = """\
+define void @"__main"() {
+  ret void
+}
+
+define void @"___chkstk_ms"() {
+  ; Called with RAX = frame size N (entered as `call ___chkstk_ms; sub rsp, rax`).
+  ; Touch every page down to (entry rsp - N) so the guard page is hit before
+  ; any deep write lands past it, then return with RAX intact.
+  call void asm sideeffect "
+    push %rax
+    lea 16(%rsp), %rcx
+    sub %rax, %rcx
+  chtkloop:
+    cmp %rcx, %rsp
+    jbe chtkdone
+    sub $$4096, %rsp
+    movl $$0, (%rsp)
+    jmp chtkloop
+  chtkdone:
+    pop %rax
+  ", "~{rcx},~{memory},~{cc},~{rsp},~{rax}"()
+  ret void
+}
+"""
+
+
+def _link_windows_gnu_jit_stubs(mod):
+    """Link the MinGW-CRT JIT stubs into ``mod`` when the host needs them."""
+    if not _use_windows_gnu():
+        return
+    from llvmlite import binding
+
+    binding.initialize_native_asmparser()
+    stub_mod = binding.parse_assembly(_JIT_WINDOWS_GNU_STUBS_IR)
+    binding.link_modules(mod, stub_mod)
+
+
+def _windows_imp_mappings():
+    """Return ``{import_thunk_name: address}`` for every DLL export this
+    process can see.
+
+    MinGW objects call imported DLL functions through ``__imp_X`` *data*
+    symbols (PE IAT thunks).  MCJIT cannot back those with addresses by
+    itself, so the engine is told where each one lives.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    kernel32.GetProcAddress.restype = ctypes.c_void_p
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    psapi = ctypes.WinDLL("Psapi.dll")
+    psapi.EnumProcessModulesEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_ulong,
+    ]
+    psapi.EnumProcessModulesEx.restype = ctypes.c_long
+    psapi.GetModuleBaseNameA.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+    ]
+    psapi.GetModuleBaseNameA.restype = ctypes.c_ulong
+    proc = kernel32.GetCurrentProcess()
+
+    imports = {}
+
+    def add_module_imports(handle):
+        b = ctypes.create_string_buffer(260)
+        psapi.GetModuleBaseNameA(proc, handle, b, 260)
+        mname = b.value.decode(errors="replace")
+        dll = None
+        if mname.lower() in ("kernel32.dll", "kernelbase.dll"):
+            dll = ("kernel32", "kernelbase")
+        elif mname.lower() in ("ucrtbase.dll", "msvcrt.dll", "ntdll.dll"):
+            dll = (mname.lower(),)
+        if dll is None:
+            return
+        for d in dll:
+            try:
+                h = ctypes.WinDLL(d, use_last_error=True)._handle
+            except OSError:
+                continue
+            for sym in _IMPORT_CANDIDATES:
+                if sym in imports:
+                    continue
+                addr = kernel32.GetProcAddress(ctypes.c_void_p(h), sym.encode())
+                if addr:
+                    imports[sym] = addr
+
+    hmods = (ctypes.c_void_p * 2048)()
+    cb = ctypes.c_ulong(0)
+    psapi.EnumProcessModulesEx(proc, hmods, ctypes.sizeof(hmods), ctypes.byref(cb), 3)
+    n = cb.value // ctypes.sizeof(ctypes.c_void_p)
+    for i in range(n):
+        add_module_imports(hmods[i])
+    return imports
+
+
+# The DLL entry points the MinGW-compiled cpyte C runtime reaches through PE
+# IAT thunks.  Extend this list if a new runtime call starts faulting.
+_IMPORT_CANDIDATES = (
+    "__acrt_iob_func",
+    "EnterCriticalSection",
+    "LeaveCriticalSection",
+    "InitializeCriticalSection",
+    "GetCurrentThreadStackLimits",
+    "_beginthreadex",
+    "Sleep",
+    "WaitForSingleObject",
+    "CloseHandle",
+)
+
+
+def _map_windows_gnu_imp_globals(engine, mod):
+    """Give the JIT engine real addresses for ``__imp_*`` IAT thunks."""
+    if not _use_windows_gnu():
+        return
+    imports = _windows_imp_mappings()
+    for gv in mod.global_variables:
+        name = gv.name
+        if not name.startswith("__imp_"):
+            continue
+        sym = name[len("__imp_"):]
+        if sym not in imports:
+            continue
+        try:
+            engine.add_global_mapping(gv, imports[sym])
+        except Exception:
+            pass
+
+
+_WINDOWS_EXPORT_DLLS = (
+    "ucrtbase",
+    "msvcrt",
+    "kernel32",
+    "kernelbase",
+    "ntdll",
+)
+
+
+def _windows_resolve_exports(names, cache=None):
+    """Resolve an arbitrary set of symbol names to addresses in the standard
+    Windows DLLs, in priority order ``ucrtbase > msvcrt > kernel32 >
+    kernelbase > ntdll``.
+
+    ``cache`` (``dict``) optionally persists resolved names across calls. The
+    returned mapping contains only names that were found.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    kernel32.GetProcAddress.restype = ctypes.c_void_p
+
+    if cache is None:
+        cache = {}
+    handles = []
+    for d in _WINDOWS_EXPORT_DLLS:
+        h = cache["_handles"].get(d)
+        if h is None:
+            try:
+                h = ctypes.WinDLL(d, use_last_error=True)._handle
+            except OSError:
+                h = 0
+            cache["_handles"][d] = h
+        if h:
+            handles.append(h)
+
+    resolved = {}
+    todo = [n for n in names if n not in cache]
+    for h in handles:
+        if not todo:
+            break
+        nxt = []
+        for sym in todo:
+            try:
+                addr = kernel32.GetProcAddress(ctypes.c_void_p(h), sym.encode())
+            except Exception:
+                addr = 0
+            if addr:
+                cache[sym] = addr
+            else:
+                nxt.append(sym)
+        todo = nxt
+    for n in names:
+        if n in cache:
+            resolved[n] = cache[n]
+    # `snprintf` has no export in ucrtbase/msvcrt (only `_snprintf`), yet the
+    # runtime and user code call it through clib.py; back it with `_snprintf`.
+    if "snprintf" in names and "snprintf" not in cache:
+        for alias in ("_snprintf", "vsnprintf"):
+            for h in handles:
+                try:
+                    addr = kernel32.GetProcAddress(ctypes.c_void_p(h), alias.encode())
+                except Exception:
+                    addr = 0
+                if addr:
+                    cache["snprintf"] = addr
+                    resolved["snprintf"] = addr
+                    break
+            if "snprintf" in cache:
+                break
+    return resolved
+
+
+def _map_windows_gnu_externals(engine, mod):
+    """Give the JIT engine explicit addresses for every external symbol the
+    merged module references.
+
+    On Windows the large-model ELF codegen emitted by the ``-elf`` JIT target
+    reaches DLL functions through absolute ``movabs`` addresses.  MCJIT's
+    on-demand process search for those symbols is unreliable (members have
+    been observed resolving to 0), so every external function/global is mapped
+    to its real ``GetProcAddress`` address up front — the same technique numba
+    uses for its runtime symbols.
+    """
+    if not _use_windows_gnu():
+        return
+    cache = {}
+    externs = set()
+    try:
+        for f in mod.functions:
+            if len(f.blocks) == 0 and not f.name.startswith("llvm."):
+                externs.add(f.name)
+        for gv in mod.global_variables:
+            if gv.name.startswith("__imp_"):
+                externs.add(gv.name[len("__imp_"):])
+    except Exception:
+        return
+    if not externs:
+        return
+    addrs = _windows_resolve_exports(sorted(externs), cache=cache)
+    # Process-global symbol registration.  MCJIT's runtime symbol search is
+    # unreliable on this platform, so make every external resolvable through
+    # LLVM's symbol table before the object is finalized.
+    try:
+        from llvmlite import binding as _lb
+
+        for name, addr in addrs.items():
+            try:
+                _lb.add_symbol(name, addr)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if engine is None:
+        return
+    for f in mod.functions:
+        if len(f.blocks) == 0 and not f.name.startswith("llvm.") and f.name in addrs:
+            try:
+                engine.add_global_mapping(f, addrs[f.name])
+            except Exception:
+                pass
+    for gv in mod.global_variables:
+        if gv.name.startswith("__imp_"):
+            sym = gv.name[len("__imp_"):]
+            if sym in addrs:
+                try:
+                    engine.add_global_mapping(gv, addrs[sym])
+                except Exception:
+                    pass
 
 
 # Optional global CPU / target-features override, set via ``--cpu``/``--mattr``
@@ -85,7 +400,7 @@ def host_cpu_features():
     return cpu, features
 
 
-def make_target_machine(pic=False, cpu=None, features=None):
+def make_target_machine(pic=False, cpu=None, features=None, codemodel=None):
     """Build a :class:`llvmlite.binding.TargetMachine` for the host (or an
     explicit cpu/features override) with SIMD enabled.
 
@@ -95,6 +410,11 @@ def make_target_machine(pic=False, cpu=None, features=None):
     of the conservative baseline the ``from_default_triple()`` target machine
     produces. ``pic`` selects the relocation model (PIE is required on modern
     AArch64 linkers).
+
+    ``codemodel`` (``"small"``/``"large"``/``"default"``/``"jitdefault"``)
+    overrides the LLVM code model. On Windows, ``jitdefault`` (the default)
+    forces ELF objects for MCJIT; AOT output must use a non-jit code model so
+    the emitted object is COFF and can be linked with the native toolchain.
     """
     from llvmlite import binding
 
@@ -110,7 +430,7 @@ def make_target_machine(pic=False, cpu=None, features=None):
         cpu = host_cpu
         features = host_feats
 
-    target = binding.Target.from_default_triple()
+    target = host_target()
     kwargs = {}
     if pic:
         kwargs["reloc"] = "pic"
@@ -118,6 +438,8 @@ def make_target_machine(pic=False, cpu=None, features=None):
         kwargs["cpu"] = cpu
     if features:
         kwargs["features"] = features
+    if codemodel:
+        kwargs["codemodel"] = codemodel
     return target.create_target_machine(**kwargs)
 
 
@@ -137,7 +459,7 @@ def _find_llvm_cc():
         if exe:
             try:
                 r = subprocess.run(
-                    [exe, "-S", "-emit-llvm", "-O0", "-o", "/dev/null", "-xc", "-"],
+                    [exe, "-S", "-emit-llvm", "-O0", "-o", "-", "-xc", "-"],
                     input="int __x = 0;",
                     capture_output=True,
                     text=True,
@@ -645,7 +967,7 @@ def run_jit(
     mod = binding.parse_assembly(llvm_ir)
     llvm_cc = _find_llvm_cc()
     if src_files:
-        target = binding.Target.from_default_triple()
+        target = host_target()
         for src in src_files:
             if src.endswith(".ll"):
                 with open(src) as f:
@@ -678,7 +1000,7 @@ def run_jit(
 
     # Link the C runtime (print/assign/dynamic dispatch/array registry) so the
     # JIT can resolve native helpers that have no Python callback mirror.
-    target = binding.Target.from_default_triple()
+    target = host_target()
     r = subprocess.run(
         [
             llvm_cc,
@@ -750,9 +1072,46 @@ def run_jit(
     gc_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
     binding.link_modules(mod, gc_mod)
 
+    # The GNU/MinGW lowering sprinkles `call __main` / `call ___chkstk_ms`
+    # into every compiled runtime function; without prior CG libraries the
+    # symbols do not exist in the RTDyld symbol table, so link IR stubs.
+    _link_windows_gnu_jit_stubs(mod)
+
+    if _use_windows_gnu():
+        # ucrtbase/msvcrt leave memcpy/memset/memmove/floor/snprintf injected
+        # via intrinsic libcalls, and i128 div/mod needs __udivti3/__umodti3,
+        # none of which are reliably exported -- link our own definitions so
+        # the emitted object has no undefined references to them.
+        r = subprocess.run(
+            [
+                llvm_cc,
+                "-S",
+                "-emit-llvm",
+                "-O0",
+                "-fno-builtin",
+                "-target",
+                target.triple,
+                "-fno-stack-protector",
+                "-o",
+                "-",
+                _WINJIT_STUB_C,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            print_err(f"error compiling {_WINJIT_STUB_C}: {format_cc_diag(r.stderr)}")
+            raise SystemExit(1)
+        winjit_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+        binding.link_modules(mod, winjit_mod)
+
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()
+
+    if _use_windows_gnu():
+        link_jit_anchors(mod, host_target().triple)
+        mod.verify()
 
     target_machine = make_target_machine()
 
@@ -760,7 +1119,17 @@ def run_jit(
     engine = binding.create_mcjit_compiler(backing_mod, target_machine)
     engine.add_module(mod)
 
-    if not no_userspace:
+    # MinGW-compiled C runtime reaches DLL functions through absolute
+    # large-model relocs (and __imp_* IAT thunks); hand the engine explicit
+    # addresses so MCJIT never leaves an external symbol at NULL.
+    _map_windows_gnu_externals(engine, mod)
+
+    if not no_userspace and not _use_windows_gnu():
+        # On the MinGW GNU JIT path these symbols are full native definitions
+        # in runtime.c (print_*, dyn_*, assign, str_of_*, input_int) and
+        # gc_runtime.c/runtime.c (cpyte_array_*); overriding them with libffi
+        # closures crashes at runtime on Windows, so let the C implementations
+        # (which now route through the winjit print/snprintf shims) serve.
         cb = ctypes.CFUNCTYPE(None, ctypes.c_int)(_runtime_print)
         _callbacks.append(cb)
         try:
@@ -1016,6 +1385,45 @@ def run_jit(
         pass
 
     engine.finalize_object()
+    if _use_windows_gnu():
+        externs = sorted(
+            {
+                g.name
+                for g in list(mod.functions) + list(mod.global_variables)
+                if g.is_declaration
+                and not g.name.startswith("llvm.")
+                and g.name != "_GLOBAL_OFFSET_TABLE_"
+            }
+        )
+        resolved = _windows_resolve_exports(externs, cache={"_handles": {}})
+        if os.environ.get("CPYTE_JIT_DEBUG"):
+            import sys as _sys
+
+            missing = [n for n in externs if n not in resolved]
+            print(
+                f"[winjit] externs({len(externs)})={externs}",
+                flush=True,
+                file=_sys.stderr,
+            )
+            print(
+                f"[winjit] missing={missing}",
+                flush=True,
+                file=_sys.stderr,
+            )
+        # Symbols only knowable through the engine (userland callbacks like
+        # cpyte_array_unregister or _map_libc_fn natives) never appear in DLL
+        # exports; pull their post-finalize addresses so the patcher can fix
+        # their reloc immediates if MCJIT left them at 0.
+        for name in externs:
+            if name in resolved:
+                continue
+            try:
+                addr = engine.get_function_address(name)
+            except Exception:
+                continue
+            if addr:
+                resolved[name] = addr
+        patch_windows_gnu_relocs(engine, target_machine, mod, resolved)
     engine.run_static_constructors()
 
     global _bigint_from_str_cb
@@ -1099,7 +1507,7 @@ def run_aot(
             "-emit-llvm",
             "-O0",
             "-target",
-            binding.Target.from_default_triple().triple,
+            host_target().triple,
             "-fno-stack-protector",
             "-o",
             "-",
@@ -1117,7 +1525,7 @@ def run_aot(
     optimize(mod, opt_level)
     mod.verify()
 
-    target_machine = make_target_machine(pic=pic)
+    target_machine = make_target_machine(pic=pic, codemodel="small")
 
     obj = target_machine.emit_object(mod)
 

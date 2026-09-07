@@ -75,18 +75,16 @@ corpus (8/8) green on macOS arm64 after these changes.
   caller** — no forward references are resolved, even across `public` defs in
   the same or imported module. Order callees before callers or you get
   `use of undeclared identifier`.
-- **Compiler bug: `_switchable_if` breaks on floats.** `emit_if` auto-converts
-  any `if <double-var> == <number>: ... else:/elif: ...` chain into an LLVM
-  `switch`. It emits `switch i1` (the var coerced to bool) with the `double`
-  constants as case values -> invalid IR:
-  `string:LINE: error: case value is not a constant integer
-  switch i1 %".." [double 0x0, label sw_case]`.
-  This crashes the whole module build because the JIT compiles ALL public
-  functions of imported modules (not just reachable ones).
-  Fix: never test a float variable against a numeric literal in an if/else or
-  if/elif. Compare against a pre-declared local instead:
-  `double zero = 0.0; if aii == zero: ... else: ...` (right operand is a
-  `Variable`, so `_switchable_if` bails and emits a normal `icmp`).
+- **`_switchable_if` is float-safe now (was a crash bug).** Previously
+  `emit_if` auto-converted any `if <double-var> == <number>: ... else:/elif: ...`
+  chain into an LLVM `switch`, emitting `switch i1` (the var coerced to bool)
+  with the `double` constants as case values -> invalid IR
+  (`case value is not a constant integer`), breaking whole-module builds because
+  the JIT compiles ALL public functions of imported modules. Fixed: the
+  `Variable` compares are checked for a `float`/`double` inferred type, and such
+  chains now bail to the normal `fcmp` path (no switch). The old workaround
+  (compare against a pre-declared local `double zero = 0.0`) is no longer
+  required; int/enum chains still lower to `switch`.
 - **Whole-module compile**: every `public` function in an imported `.cpy` is
   lowered. A bad construct anywhere (even in uncalled funcs) breaks the whole
   import. Keep every function clean.
@@ -120,6 +118,49 @@ corpus (8/8) green on macOS arm64 after these changes.
 - Debug workhorse: `/tmp/dbganalyze.py <file.cpy>` prints
   `=== result: True/False n_diags: N ===` + `[line:col]` warnings. Parse errors
   surface as a traceback; run it and read the full output.
+
+### Codegen hardening (codegen fallbacks → hard errors; struct types; div by const 0)
+- **Identified structs must be created via `module.context.get_identified_type(name)`,
+  never `ir.IdentifiedStructType(ir.global_context, ...)`.** A bare
+  `IdentifiedStructType` is never registered in the module's
+  `context.identified_types`, so `str(module)` omits the `= type {...}` body and
+  the LLVM parser treats the struct as opaque — every GEP/alloc fails
+  (`base element of getelementptr must be sized`, `Cannot allocate unsized
+  type`). `get_identified_type` registers + dedups by name. `emit_program`
+  pre-registers all `StructDef`s opaque BEFORE emitting (so self-referential
+  fields like `BSTNode* left` resolve to a pointer to the same type);
+  `emit_structdef`/`emit_classdef` then `set_body` when `is_opaque`. Sections
+  using the global context also collide across modules JITted in one process.
+- **Unresolved types are hard errors now.** `llvm_type`'s fallbacks raise a
+  codegen error naming the type instead of silently returning `i32` (that
+  silently corrupted struct field layouts — e.g. `BSTNode` fields lowered to
+  `i32`). Same for unresolvable generic instantiations (`Pair<int>` arity
+  mismatch) and multi-dim `_bc_array_norm` edge cases.
+- **Integer division by constant zero emits a clean unconditional trap** with
+  the builder parked in a fresh dead block (value is never used). Do not emit
+  `sdiv x, 0` in a dead block to keep well-formedness (it verifies, but is
+  poison-by-construction). `_emit_int_divmod` already handles INT_MIN/-1 via a
+  phi and power-of-two/magic-multiplier strength reduction.
+
+### Memory-check warnings (semantic_analasis.py `_check_ownership`)
+- Walks `malloc`/`calloc`/`realloc` as owned heap allocations (not just `new`),
+  so the AGENTS-endorsed `(char*)malloc(n)` + `free()` pool pattern does NOT
+  false-warn. Emits: use-after-free (read/store through a freed pointer),
+  double-free, `free()` after `move`, freeing a never-allocated value,
+  reassignment/overwrite leaks, and end-of-function leak warnings (skips names
+  that escape via `return`). All gated on `#nogc` for the leak class.
+
+### Codegen fallback / reviewed-bug notes (Sept 2026)
+- `_is_type`/codegen now reuses `inferred_type` on `Attr`/`Deref`/`AddrOf` nodes
+  (slots added in `astparse.py`; set in semantic analysis) instead of failing to
+  recognize struct field expressions of big/ubig/array type.
+- `_emit_children` (iterative engine) covers `CastExpr` (→ `[expr]`) and
+  `ListLit` (→ `list(items)`); this fixed `test_opt_fib` (`[71 x i64]`)
+  truncation errors.
+- `strcmp` global scanning no longer raises `UnboundLocalError` when no
+  pre-existing `strcmp` function is found — it synthesizes one.
+- `_bc_array_norm` strips ALL consecutive `[N]` suffixes (`int[10][20]` →
+  `i32**`), not just one.
 
 ### ubig (unsigned arbitrary-precision int) — NEW (Sept 2026)
 - `ubig` is a **distinct unsigned** sibling of `big`: sign-magnitude BigNum

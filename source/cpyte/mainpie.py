@@ -13,6 +13,7 @@ if __package__:
         _find_llvm_cc,
         _host_default_pic,
         _remove_probe_stack_ir,
+        host_target,
         make_target_machine,
         optimize,
         run_aot,
@@ -43,6 +44,7 @@ else:
         _find_llvm_cc,
         _host_default_pic,
         _remove_probe_stack_ir,
+        host_target,
         make_target_machine,
         optimize,
         run_aot,
@@ -61,6 +63,11 @@ else:
     from cpyte.sef import cmd_check, cmd_dump, cmd_pack, cmd_size
     from cpyte.semantic_analasis import analyze
     from cpyte.update_check import report_update, start_check
+
+
+def _host_target_triple():
+    """Target triple used when compiling C sources with clang."""
+    return host_target().triple
 
 
 _USAGE = """Usage: cpy [options] <source.cpy>
@@ -420,6 +427,8 @@ def _emit(
         raise
     except Exception as e:
         ui.print_err(f"codegen error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     return prog, src_files
 
@@ -566,7 +575,7 @@ def cmd_build(
             "-emit-llvm",
             "-O0",
             "-target",
-            binding.Target.from_default_triple().triple,
+            _host_target_triple(),
             "-fno-stack-protector",
             "-o",
             "-",
@@ -588,7 +597,7 @@ def cmd_build(
     optimize(mod, opt, opt_size=opt_size)
     mod.verify()
 
-    target_machine = make_target_machine(pic=pic)
+    target_machine = make_target_machine(pic=pic, codemodel="small")
     obj = target_machine.emit_object(mod)
     with open(obj_file, "wb") as f:
         f.write(obj)

@@ -1,6 +1,13 @@
+import re
 from typing import Any
 
 from .lexar import Lexer, Token, TokenType, _unescape_run
+
+# `T[N]` (fixed-size array type, e.g. `int[5]`, `dynamic[1]`) vs `T[]`
+# (dynamic array type). A fixed-array suffix carries a numeric literal size;
+# in `dynamic[1]` the `dynamic` is the element type, NOT a marker for a
+# runtime-typed array.
+_FIXED_ARRAY_RE = re.compile(r"^(.*?)\[(\d+)\]$")
 
 _parser_hooks: list[Any] = []
 
@@ -160,13 +167,15 @@ class Index(Node):
 
 
 class Attr(Node):
-    __slots__ = ("_enum_member_value", "_token", "name", "obj")
+    inferred_type: str | None
+    __slots__ = ("_enum_member_value", "_token", "inferred_type", "name", "obj")
 
     def __init__(self, obj, name: str, token=None):
         self.obj = obj
         self.name = name
         self._token = token
         self._enum_member_value = None
+        self.inferred_type = None
 
     def __repr__(self):
         return f"Attr({self.obj}, {self.name})"
@@ -412,6 +421,17 @@ def _try_parse_cast_type(tokens, pos):
                 base = _type_to_str(base) + "[]"
                 has_suffix = True
                 pos += 2
+            elif (
+                isinstance(base, str)
+                and pos + 2 < len(tokens)
+                and tokens[pos + 1].type == TokenType.NUMBER
+                and tokens[pos + 2].type == TokenType.RBRACKET
+            ):
+                # Fixed-size array cast target `(int[5])`, `(dynamic[1])`.
+                size = tokens[pos + 1].value
+                base = f"{base}[{size}]"
+                has_suffix = True
+                pos += 3
             else:
                 break
         elif t == TokenType.AMPERSAND:
@@ -549,6 +569,13 @@ def _parse_atom(tokens: list[Token], pos: int):
             if pos >= len(tokens) or tokens[pos].type != TokenType.RBRACKET:
                 raise ParseError('Expected "]"', tok)
             pos += 1
+        else:
+            # `new int[5]` collapsed into the type string `int[5]` by parse_type;
+            # recover the base type and the numeric size.
+            m = _FIXED_ARRAY_RE.match(type_str)
+            if m is not None:
+                type_str = m.group(1)
+                size = Number(m.group(2), token=tok)
         return NewExpr(type_str, size, token=tok), pos
 
     if tok.type == TokenType.KEYWORD and tok.value == "asm":
@@ -869,7 +896,14 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
                     frames.append(("new_size_done", tok, type_str))
                     frames.append(("binary", 0))
                     continue
-                vals.append(NewExpr(type_str, None, token=tok))
+                m = _FIXED_ARRAY_RE.match(type_str)
+                if m is not None:
+                    type_str = m.group(1)
+                    vals.append(
+                        NewExpr(type_str, Number(m.group(2), token=tok), token=tok)
+                    )
+                else:
+                    vals.append(NewExpr(type_str, None, token=tok))
                 continue
             if tok.type == TokenType.KEYWORD and tok.value == "asm":
                 node, pos = parse_inline_asm(tokens, pos)
@@ -1805,22 +1839,24 @@ class NewExpr(Node):
 
 
 class Deref(Node):
-    __slots__ = ("_token", "operand")
+    __slots__ = ("_token", "operand", "inferred_type")
 
     def __init__(self, operand, token=None):
         self.operand = operand
         self._token = token
+        self.inferred_type = None
 
     def __repr__(self):
         return f"Deref({self.operand})"
 
 
 class AddrOf(Node):
-    __slots__ = ("_token", "operand")
+    __slots__ = ("_token", "operand", "inferred_type")
 
     def __init__(self, operand, token=None):
         self.operand = operand
         self._token = token
+        self.inferred_type = None
 
     def __repr__(self):
         return f"AddrOf({self.operand})"
@@ -2328,6 +2364,19 @@ def parse_type(tokens: list[Token], pos: int):
                     if not isinstance(base, str)
                     else base + "[]"
                 )
+                continue
+            # Fixed-size array type `T[N]` (e.g. `int[5]`, `dynamic[1]`).
+            # The size must be a numeric literal; any other expression is left
+            # for the caller (e.g. `new T[N]` allocation) to parse.
+            if (
+                isinstance(base, str)
+                and pos + 2 < len(tokens)
+                and tokens[pos + 1].type == TokenType.NUMBER
+                and tokens[pos + 2].type == TokenType.RBRACKET
+            ):
+                size = tokens[pos + 1].value
+                pos += 3
+                base = f"{base}[{size}]"
                 continue
             break
         elif t.type == TokenType.STAR:

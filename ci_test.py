@@ -35,6 +35,7 @@ CORPUS: tuple[str, ...] = (
     "test/test_big_hex.cpy",
     "test/test_big_mixed.cpy",
     "test/test_decorator.cpy",
+    "test/test_decorator_access.cpy",
     "test/test_hex_e.cpy",
     "test/most_complex.cpy",
 )

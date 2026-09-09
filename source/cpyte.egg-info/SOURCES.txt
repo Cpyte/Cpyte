@@ -18,6 +18,7 @@ source/cpyte/lexar.py
 source/cpyte/linker.py
 source/cpyte/lsp_server.py
 source/cpyte/mainpie.py
+source/cpyte/optimizations.py
 source/cpyte/package_manifest.py
 source/cpyte/runtime.c
 source/cpyte/runtime_scorpion.c
@@ -26,6 +27,8 @@ source/cpyte/semantic_analasis.py
 source/cpyte/ugc.h
 source/cpyte/ui.py
 source/cpyte/update_check.py
+source/cpyte/winjit_patch.py
+source/cpyte/winjit_stubs.c
 source/cpyte.egg-info/PKG-INFO
 source/cpyte.egg-info/SOURCES.txt
 source/cpyte.egg-info/dependency_links.txt

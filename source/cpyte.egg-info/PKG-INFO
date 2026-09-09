@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cpyte
-Version: 3.4.0
+Version: 4.1.0
 Summary: The Cpyte programming language compiler
 Author: Hoang Duy Tung
 License: MIT
@@ -9,8 +9,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: llvmlite>=0.45
 Requires-Dist: lsprotocol>=2025.0.0
 
-## Notice
-My development pc was destroyed (macbook air m1). Development is not paused, but will have to wait until I have time to extract the project files.
+DEVELOPMENT IS CONTINUED. WINDOWS SUPPORT IS IN PROGRESS.
 
 
 Check out the official documentation [here](https://gitea.5gnew.io.vn/Cpyte-Project/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md).

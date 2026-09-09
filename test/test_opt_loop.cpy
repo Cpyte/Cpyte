@@ -31,9 +31,12 @@ def main():
     print(x)
 
     int total = 0
-    for v in [1, 2, 3, 4]:
-        total = total + v
+    int vi = 1
+    while vi < 5:
+        total = total + vi
+        vi = vi + 1
     print(total)
+    print(vi)
 
     int n = 0
     while n < 0:

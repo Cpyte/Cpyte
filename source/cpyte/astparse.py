@@ -212,7 +212,16 @@ class BinOp(Node):
 
 class CCode(Node):
     inferred_type: str | None
-    __slots__ = ("_token", "inferred_type", "symbols", "value", "var_names")
+    __slots__ = (
+        "_token",
+        "inferred_type",
+        "symbols",
+        "value",
+        "var_names",
+        "includes",
+        "src_file",
+        "src_line",
+    )
 
     def __init__(self, value: str, token=None):
         self.value = value
@@ -220,6 +229,9 @@ class CCode(Node):
         self.inferred_type = None
         self.symbols = None
         self.var_names = None
+        self.includes = None
+        self.src_file = None
+        self.src_line = None
 
     def __repr__(self):
         return f"CCode({self.value!r})"

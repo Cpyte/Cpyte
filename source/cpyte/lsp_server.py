@@ -11,15 +11,20 @@ from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
 from .astparse import (
+    Assign,
+    Call,
     ClassDef,
     EnumDef,
     FuncDef,
     If,
+    Import,
+    NewExpr,
     ParseError,
     StructDef,
     Switch,
     Try,
     VarDecl,
+    Variable,
     While,
     parse_file,
 )
@@ -244,7 +249,7 @@ def _make_error_diagnostic(error):
         rng = lsp.Range(start=lsp.Position(line=0, character=0),
                         end=lsp.Position(line=0, character=0))
     severity = lsp.DiagnosticSeverity.Error
-    return lsp.Diagnostic(message=msg, severity=severity, range=rng)
+    return lsp.Diagnostic(message=msg, severity=severity, range=rng, source="cpyte")
 
 
 def _reporter_diagnostics(analyzer):
@@ -263,6 +268,8 @@ def _reporter_diagnostics(analyzer):
             message=d.message,
             severity=_LEVEL_SEVERITY.get(d.level, lsp.DiagnosticSeverity.Error),
             range=rng,
+            code=d.code,
+            source="cpyte",
         ))
     return diagnostics
 
@@ -279,7 +286,12 @@ def _analyze_bundle(source, filepath=None, workspace_root=None):
         source, filepath=filepath, workspace_root=workspace_root)
     diagnostics = []
     if error:
-        diagnostics.append(_make_error_diagnostic(error))
+        # Skip the (0,0) fallback error if the analyzer already reported the
+        # same message at a real location (raise-during-analyze cases often
+        # leave the exact diagnostic in reporter.diagnostics).
+        msg = str(error[1])
+        if not any(d.message == msg for d in getattr(analyzer, "reporter", None).diagnostics or []):
+            diagnostics.append(_make_error_diagnostic(error))
     if analyzer:
         diagnostics.extend(_reporter_diagnostics(analyzer))
     elapsed = time.time() - t0
@@ -726,14 +738,33 @@ def _keyword_on_line(tokens, line, col, keyword):
 
 
 def _is_new_context(tokens, line, col):
-    """True if the cursor is completing a `new T` expression (the token before
-    the prefix on the same line is the `new` keyword)."""
-    for t in tokens:
-        if t is None or (t.line - 1) != line:
-            continue
-        if t.column - 1 >= col:
-            continue
-        if t.value == 'new':
+    """True if the cursor is completing the type name in a `new T` expression
+    (the token under/just before the cursor is an identifier immediately
+    preceded by the `new` keyword)."""
+    tok = _find_token_at(tokens, line, col)
+    if tok is not None and tok.type in (TokenType.IDENTIFIER, TokenType.KEYWORD):
+        idx = tokens.index(tok)
+    else:
+        prev = None
+        for t in tokens:
+            if t is None:
+                continue
+            if (t.line - 1) > line or (
+                (t.line - 1) == line and (t.column - 1) >= col
+            ):
+                break
+            prev = t
+        if prev is None:
+            return False
+        idx = tokens.index(prev)
+    if idx - 2 >= 0:
+        a = tokens[idx - 2]
+        b = tokens[idx - 1]
+        if (
+            a is not None and b is not None
+            and a.type == TokenType.KEYWORD and a.value == "new"
+            and b.type == TokenType.IDENTIFIER
+        ):
             return True
     return False
 
@@ -1113,9 +1144,9 @@ def signature_help(ls: CpyLanguageServer, params: lsp.SignatureHelpParams):
                             for t2 in tokens:
                                 if t2 is None:
                                     continue
-                                if t2.line == tok.line and t2.column == tok.column - 1:
-                                    prev = t2
-                                    break
+                                if t2.line == tok.line and t2.column < tok.column:
+                                    if prev is None or t2.column > prev.column:
+                                        prev = t2
                             if prev and prev.type == TokenType.IDENTIFIER:
                                 func_name = prev.value
                             elif prev and prev.type == TokenType.KEYWORD and prev.value in _BUILTIN_FUNC_PARAMS:
@@ -1313,6 +1344,33 @@ def _find_local_decl(func, name):
     return None
 
 
+def _find_param_token(tokens, func, name):
+    """Resolve a parameter name to its declaration token by scanning the
+    function signature (identifier tokens directly followed by `:`)."""
+    if name not in func.params:
+        return None
+    sig_line = getattr(func._token, "line", None)
+    if sig_line is None:
+        return None
+    order = list(func.params)
+    idx = {o: i for i, o in enumerate(order)}
+    seen = 0
+    within = False
+    for i, t in enumerate(tokens):
+        if t is None or t.line != sig_line or t.type != TokenType.IDENTIFIER:
+            continue
+        if not within:
+            if t.value == func.name:
+                within = True
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is not None and nxt.type == TokenType.COLON:
+            if idx.get(t.value, -1) == seen:
+                return t
+            seen += 1
+    return None
+
+
 @server.feature(lsp.TEXT_DOCUMENT_DEFINITION)
 @server.thread()
 def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
@@ -1354,9 +1412,13 @@ def definition(ls: CpyLanguageServer, params: lsp.DefinitionParams):
             func = _find_containing_function(parsed, line + 1)
             if func is not None:
                 target = _find_local_decl(func, word)
+                if target is None:
+                    target = _find_param_token(tokens, func, word)
         if target is None:
             return None
         t = getattr(target, '_token', None)
+        if t is None and getattr(target, 'type', None) is not None:
+            t = target  # raw lexer token (e.g. a parameter declaration)
         if t is None or t.line is None:
             return None
         start = lsp.Position(line=t.line - 1, character=t.column - 1)
@@ -1401,6 +1463,351 @@ def document_highlight(ls: CpyLanguageServer, params: lsp.DocumentHighlightParam
     except Exception:
         logger.error(f"document_highlight error:\n{traceback.format_exc()}")
         return []
+
+
+_CALL_WALK_ATTRS = ("body", "orelse", "handlers", "items", "cases")
+_EXPR_WALK_ATTRS = (
+    "expr", "value", "cond", "target", "callee", "obj", "operand", "index",
+)
+_FOLD_KIND = {}
+for _cls in (FuncDef, ClassDef, StructDef, EnumDef):
+    _FOLD_KIND[_cls] = lsp.FoldingRangeKind.Region
+
+
+def _block_end_line(stmt, cur=0):
+    """Deepest source line spanned by a statement's body (for folding)."""
+    top = max(cur, _stmt_line(stmt) or 0)
+    for child in _stmt_children(stmt):
+        top = max(top, _block_end_line(child, top))
+    return top
+
+
+def _iter_calls_in_stmt(stmt, _seen=None):
+    """Yield every Call node nested inside a statement (bodies, conditions,
+    initializers, call arguments, attribute chains ...)."""
+    if _seen is None:
+        _seen = set()
+    s_id = id(stmt)
+    if s_id in _seen:
+        return
+    _seen.add(s_id)
+    if isinstance(stmt, (list, tuple)):
+        for s in stmt:
+            yield from _iter_calls_in_stmt(s, _seen)
+        return
+    if isinstance(stmt, dict):
+        for v in stmt.values():
+            yield from _iter_calls_in_stmt(v, _seen)
+        return
+    if isinstance(stmt, Call):
+        yield stmt
+    for attr in _CALL_WALK_ATTRS:
+        v = getattr(stmt, attr, False)
+        if v is not None:
+            yield from _iter_calls_in_stmt(v, _seen)
+    for attr in _EXPR_WALK_ATTRS:
+        v = getattr(stmt, attr, False)
+        if v is not None and hasattr(v, "_token"):
+            if id(v) != s_id:
+                yield from _iter_calls_in_stmt(v, _seen)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance (used for 'did you mean' quick fixes)."""
+    if a == b:
+        return 0
+    n, m = len(a), len(b)
+    if not n:
+        return m
+    if not m:
+        return n
+    prev = list(range(m + 1))
+    for i in range(1, n + 1):
+        cur = [i] + [0] * m
+        for j in range(1, m + 1):
+            cur[j] = min(
+                prev[j] + 1,
+                cur[j - 1] + 1,
+                prev[j - 1] + (a[i - 1] != b[j - 1]),
+            )
+        prev = cur
+    return prev[m]
+
+
+def _similar_names(word, candidates, max_results=3):
+    out = []
+    for cand in candidates:
+        if cand == word:
+            continue
+        if cand.startswith("_") and not word.startswith("_"):
+            continue
+        if "." in cand or cand in _KEYWORD_DESC:
+            continue
+        d = _edit_distance(word, cand)
+        if d <= 1 or (len(word) >= 4 and d <= 2):
+            out.append((d, cand))
+    out.sort()
+    return [c for _, c in out[:max_results]]
+
+
+def _candidate_names(analyzer, parsed, line):
+    names: set = set(_KEYWORDS) | set(_TYPES) | set(_BUILTIN_FUNCS)
+    if analyzer:
+        names.update(
+            n for n in analyzer.globals.symbols if "." not in n
+        )
+    func = _find_containing_function(parsed, line)
+    if func is not None:
+        names.update(func.params)
+        names.update(_collect_locals(func, line))
+    return names
+
+
+def _rng_from_token(tok):
+    if tok is None:
+        return lsp.Range(start=lsp.Position(line=0, character=0),
+                         end=lsp.Position(line=0, character=0))
+    line = tok.line - 1
+    col = tok.column - 1
+    return lsp.Range(
+        start=lsp.Position(line=line, character=col),
+        end=lsp.Position(line=line, character=col + len(tok.value or "")),
+    )
+
+
+@server.feature(lsp.TEXT_DOCUMENT_REFERENCES)
+@server.thread()
+def references(ls: CpyLanguageServer, params: lsp.ReferenceParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, _, analyzer, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value or tok.type not in (
+            TokenType.IDENTIFIER, TokenType.KEYWORD,
+        ):
+            return None
+        word = tok.value
+        if word in _TYPES or word in _BUILTIN_FUNCS or word in _KEYWORD_DESC:
+            return None
+        results = []
+        for t_line, t_col, t_len in _walk_all_tokens(tokens, word, line, col):
+            results.append(lsp.Location(
+                uri=uri,
+                range=lsp.Range(
+                    start=lsp.Position(line=t_line, character=t_col),
+                    end=lsp.Position(line=t_line, character=t_col + t_len),
+                ),
+            ))
+        t0 = time.time()
+        logger.info(f"[references] {os.path.basename(_uri_to_path(uri))} `{word}`: "
+                    f"{len(results)} ref(s) in {(time.time()-t0)*1000:.0f}ms")
+        return results or None
+    except Exception:
+        logger.error(f"references error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_FOLDING_RANGE)
+@server.thread()
+def folding_range(ls: CpyLanguageServer, params: lsp.FoldingRangeParams):
+    try:
+        uri = params.text_document.uri
+        _, _, parsed, _, _, _ = _get_bundle(ls, uri)
+        out = []
+        for node in parsed:
+            start = _stmt_line(node)
+            if start is None:
+                continue
+            end = _block_end_line(node, start)
+            if end <= start:
+                continue
+            kind = _FOLD_KIND.get(type(node)) or (
+                lsp.FoldingRangeKind.Region
+                if isinstance(node, (If, While, Switch, Try))
+                else None
+            )
+            out.append(lsp.FoldingRange(
+                start_line=start - 1,
+                start_character=0,
+                end_line=end - 1,
+                end_character=0,
+                kind=kind,
+            ))
+            for child in _stmt_children(node):
+                cs = _stmt_line(child)
+                if cs is None:
+                    continue
+                ce = _block_end_line(child, cs)
+                if ce > cs:
+                    out.append(lsp.FoldingRange(
+                        start_line=cs - 1,
+                        start_character=0,
+                        end_line=ce - 1,
+                        end_character=0,
+                        kind=lsp.FoldingRangeKind.Region,
+                    ))
+        return out or None
+    except Exception:
+        logger.error(f"folding_range error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_INLAY_HINT)
+@server.thread()
+def inlay_hints(ls: CpyLanguageServer, params: lsp.InlayHintParams):
+    try:
+        uri = params.text_document.uri
+        _, _, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        if analyzer is None:
+            return None
+        hints = []
+        for node in parsed:
+            for call in _iter_calls_in_stmt(node):
+                if not isinstance(call.callee, Variable):
+                    continue
+                sym = analyzer.globals.lookup(call.callee.name)
+                if not sym or sym.kind != "function":
+                    continue
+                fnode = getattr(sym, "node", None)
+                params_map = getattr(fnode, "params", None) or {}
+                pnames = list(params_map)
+                n = 0
+                for arg in call.args:
+                    if n >= len(pnames):
+                        break
+                    if isinstance(arg, Variable):
+                        n += 1
+                        continue
+                    tok = getattr(arg, "_token", None)
+                    if tok is None:
+                        n += 1
+                        continue
+                    hints.append(lsp.InlayHint(
+                        position=lsp.Position(
+                            line=tok.line - 1, character=tok.column - 1),
+                        label=f"{pnames[n]}:",
+                        kind=lsp.InlayHintKind.Parameter,
+                        padding_right=True,
+                    ))
+                    n += 1
+        return hints or None
+    except Exception:
+        logger.error(f"inlay_hints error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
+def did_save(ls: CpyLanguageServer, params: lsp.DidSaveTextDocumentParams):
+    """Cross-file invalidation: when an imported file is saved, drop the
+    cached analysis of every document that imports it and re-run it."""
+    try:
+        saved = _uri_to_path(params.text_document.uri)
+        cache = getattr(ls, "_analysis_cache", None) or {}
+        for uri, bundle in list(cache.items()):
+            if uri == params.text_document.uri:
+                continue
+            analyzer = bundle[3]
+            deps = set()
+            for imp in getattr(analyzer, "_imports", None) or []:
+                deps.add(getattr(imp, "src_file", None))
+                deps.add(getattr(imp, "_source_file", None))
+            if saved in deps:
+                cache.pop(uri, None)
+                _schedule_analysis(ls, uri, _ANALYSIS_DEBOUNCE)
+    except Exception:
+        logger.error(f"did_save error:\n{traceback.format_exc()}")
+
+
+def _ranges_intersect(r1: lsp.Range, r2: lsp.Range) -> bool:
+    if r2 is None:
+        return True
+    if r1 is None:
+        return False
+    return not (
+        r1.end.line < r2.start.line
+        or r2.end.line < r1.start.line
+        or (r1.end.line == r2.start.line and r1.end.character < r2.start.character)
+        or (r2.end.line == r1.start.line and r2.end.character < r1.start.character)
+    )
+
+
+@server.feature(lsp.TEXT_DOCUMENT_CODE_ACTION,
+                lsp.CodeActionOptions())
+@server.thread()
+def code_action(ls: CpyLanguageServer, params: lsp.CodeActionParams):
+    try:
+        import re
+        uri = params.text_document.uri
+        _, tokens, parsed, analyzer, diagnostics, _ = _get_bundle(ls, uri)
+        if not diagnostics:
+            return None
+        doc = ls.workspace.get_text_document(uri)
+        actions = []
+        for d in diagnostics:
+            if not d.code or not d.range:
+                continue
+            if not _ranges_intersect(d.range, params.range):
+                continue
+            line0 = d.range.start.line
+            text = (d.message or "")
+            if d.code == "W1001":
+                m = re.search(r"local `(\w+)` is assigned but never used", text)
+                if m:
+                    name = m.group(1)
+                    actions.append(lsp.CodeAction(
+                        title=f"Rename to `_{name}`",
+                        kind=lsp.CodeActionKind.QuickFix,
+                        edit=lsp.WorkspaceEdit(changes={
+                            uri: [lsp.TextEdit(range=d.range, new_text=f"_{name}")]
+                        }),
+                    ))
+            elif d.code in ("E0001", "E1001"):
+                m = re.search(r"undeclared identifier `(\w+)`", text)
+                if not m:
+                    m = re.search(r"identifier `(\w+)`", text)
+                if m and analyzer:
+                    word = m.group(1)
+                    for cand in _similar_names(
+                        word, _candidate_names(analyzer, parsed, line0 + 1)
+                    ):
+                        actions.append(lsp.CodeAction(
+                            title=f"Did you mean `{cand}`?",
+                            kind=lsp.CodeActionKind.QuickFix,
+                            edit=lsp.WorkspaceEdit(changes={
+                                uri: [lsp.TextEdit(range=d.range, new_text=cand)]
+                            }),
+                        ))
+            elif d.code == "W1002":
+                m = re.search(r"missing `return` in function `(\w+)`", text)
+                if m:
+                    func = _find_containing_function(parsed, line0 + 1)
+                    end_line = 0
+                    for stmt in getattr(func, "body", None) or []:
+                        l = _stmt_line(stmt)
+                        if l:
+                            end_line = max(end_line, l)
+                    if func is not None and end_line:
+                        tail_range = lsp.Range(
+                            start=lsp.Position(line=end_line - 1, character=0),
+                            end=lsp.Position(line=end_line - 1, character=0),
+                        )
+                        indent = "    "
+                        actions.append(lsp.CodeAction(
+                            title="Append `return 0`",
+                            kind=lsp.CodeActionKind.QuickFix,
+                            edit=lsp.WorkspaceEdit(changes={
+                                uri: [lsp.TextEdit(
+                                    range=tail_range,
+                                    new_text=f"\n{indent}return 0",
+                                )]
+                            }),
+                        ))
+        return actions or None
+    except Exception:
+        logger.error(f"code_action error:\n{traceback.format_exc()}")
+        return None
 
 
 if __name__ == "__main__":

@@ -13,11 +13,19 @@ from __future__ import annotations
 from typing import Optional
 
 from .astparse import (
+    AddrOf,
     Assign,
+    Attr,
     BinOp,
+    BorrowExpr,
     Call,
+    Deref,
     FuncDef,
     If,
+    Index,
+    InlineAsm,
+    MoveExpr,
+    NewExpr,
     Number,
     Return,
     VarDecl,
@@ -100,47 +108,6 @@ def _log2_floor(n: int) -> int:
 # ---------------------------------------------------------------------------
 # 2. Constant-division strength reduction
 # ---------------------------------------------------------------------------
-
-def _compute_unsigned_magic(d: int, bits: int = 32) -> tuple[int, int] | None:
-    """Compute the Barrett multiplier *M* and shift *s* for **unsigned** division.
-
-    Returns ``(M, s)`` such that ``floor(n / d) == (n * M) >> s`` for all
-    ``0 <= n < 2**bits``, or ``None`` if the caller should fall back to the
-    hardware instruction (should not happen for a non-zero constant).
-    """
-    if d == 0:
-        return None
-    if d == 1:
-        return (1, 0)
-    if _is_power_of_2(d):
-        return (1, _log2_floor(d))
-
-    for s in range(bits):
-        m = ((1 << (bits + s)) + d - 1) // d
-        if m < (1 << bits):
-            return (m, bits + s)
-    return None
-
-
-def _compute_signed_magic(d: int, bits: int = 32) -> Optional[tuple[int, int]]:
-    """Compute the Barrett multiplier *M* and shift *s* for **signed** division.
-
-    Returns ``(M, s)`` such that ``floor(n / d) == ashr(n * M, s)`` for
-    all signed *n*, or ``None`` for power-of-two / trivial cases.
-    """
-    if d in (0, 1, -1):
-        return None
-    abs_d = abs(d)
-    if _is_power_of_2(abs_d):
-        return None  # caller uses arithmetic shift
-    if d == -(1 << (bits - 1)):
-        return None  # INT_MIN edge-case
-
-    for s in range(bits):
-        m = ((1 << (bits + s - 1)) + abs_d - 1) // abs_d
-        if m < (1 << (bits - 1)):
-            return (m if d > 0 else -m, bits + s - 1)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +295,44 @@ def _loop_written_names(node) -> frozenset[str]:
     return frozenset(written)
 
 
+def _loop_has_alias_risk(body) -> bool:
+    """True when a loop body may write or observe scalar state through a
+    pointer/field/array path that the name-based unrolling/counter bookkeeping
+    cannot see (``*p = ...``, ``a[i] = ...``, ``obj.field = ...`` writes, or
+    address-taking).  Such loops must not be unrolled with canonical counter
+    stores, because those stores can clobber aliased writes."""
+    stack: list = [list(body)]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        if isinstance(obj, (Deref, AddrOf, Attr, Index, NewExpr, BorrowExpr, MoveExpr)):
+            return True
+        if isinstance(obj, Assign):
+            stack.append(obj.target)
+            stack.append(obj.value)
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, If):
+            stack.extend((obj.cond, obj.body, obj.orelse))
+        elif isinstance(obj, While):
+            stack.extend((obj.cond, obj.body))
+        elif hasattr(obj, "_token"):
+            slots = getattr(obj, "__slots__", None)
+            if slots:
+                if isinstance(slots, str):
+                    slots = (slots,)
+                stack.extend(getattr(obj, s, None) for s in slots)
+            else:
+                try:
+                    stack.extend(vars(obj).values())
+                except TypeError:
+                    pass
+    return False
+
+
 def _is_simple_counted_loop(node) -> tuple[str, int, int, bool] | None:
     """Detect a simple ``while`` counted loop and return
     ``(counter_name, stop, step, inclusive)`` or *None*.
@@ -432,28 +437,70 @@ def _collect_assigned_names(stmts) -> set[str]:
     return names
 
 
-def _get_used_variables(expr) -> set[str]:
-    """Collect variable names referenced inside *expr*."""
-    if isinstance(expr, Variable):
-        return {expr.name}
-    used: set[str] = set()
-    for child in getattr(expr, "_children", ()) or ():
-        used |= _get_used_variables(child)
-    return used
+def _get_used_variables(entity) -> set[str]:
+    """Collect the names of variables *read* anywhere inside an AST node.
+
+    Walks the generic ``__slots__``/``vars()`` structure of the node.  An
+    ``Assign``'s plain-variable target is treated as a *write*, not a read;
+    everything else, including the right-hand side, is walked.  Used by the
+    loop-invariant analysis for its read set."""
+    names: set[str] = set()
+    stack: list = [entity]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        if isinstance(obj, Variable):
+            names.add(obj.name)
+        elif isinstance(obj, Assign):
+            stack.append(obj.value)
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, If):
+            stack.extend((obj.cond, obj.body, obj.orelse))
+        elif isinstance(obj, While):
+            stack.extend((obj.cond, obj.body))
+        elif hasattr(obj, "_token"):
+            slots = getattr(obj, "__slots__", None)
+            if slots:
+                if isinstance(slots, str):
+                    slots = (slots,)
+                stack.extend(getattr(obj, s, None) for s in slots)
+            else:
+                try:
+                    stack.extend(vars(obj).values())
+                except TypeError:
+                    pass
+    return names
 
 
 def _find_loop_invariants(loop: While) -> list[Assign]:
-    """Identify assign statements inside *loop* whose right-hand side does
-    not read (and whose target is not) any variable mutated inside the loop —
-    these can be hoisted before the loop safely.
+    """Identify assign statements inside *loop* that can be hoisted before
+    the loop and *removed* from its body (store-once LICM).
 
-    A conservative restriction applies: the statement must be a plain
-    ``Variable = <expr>`` assignment, and the target name must also not
-    appear in the loop condition (which is re-evaluated each iteration)."""
-    mutated = _collect_assigned_names(loop.body)
-    cond_names: set[str] = set()
-    for child in (loop.cond,):
-        cond_names |= _get_used_variables(child)
+    ``Variable = <expr>`` is hoistable when:
+    * ``<expr>`` reads no variable the loop writes anywhere (deep, including
+      nested branches; ``y = y + 1`` is excluded by its self-read), and
+    * the target is never *read* in the loop body (a read preceding the
+      hoisted store in the original ordering would observe a different
+      value), and
+    * the target does not appear in the loop condition (moving the store out
+      could change how many times the loop runs), and
+    * the RHS performs no function call and no memory dereference (calls may
+      have side effects, and pointer/field reads might alias writes the loop
+      makes through a different name that our name-based analysis cannot
+      see).
+
+    Writes to the target *elsewhere* in the loop are fine: the hoisted store
+    simply establishes a value that those later stores overwrite, which
+    preserves every read and the post-loop value."""
+    mutated = _loop_written_names(loop)
+    cond_names = _get_used_variables(loop.cond)
+    all_read: set[str] = set()
+    for stmt in loop.body:
+        all_read |= _get_used_variables(stmt)
     invariants: list[Assign] = []
     for stmt in loop.body:
         if not isinstance(stmt, Assign):
@@ -461,14 +508,52 @@ def _find_loop_invariants(loop: While) -> list[Assign]:
         target = stmt.target
         if not isinstance(target, Variable):
             continue
-        if target.name in mutated:
+        rhs_vars = _get_used_variables(stmt.value)
+        if not rhs_vars.isdisjoint(mutated):
+            continue
+        if target.name in all_read:
             continue
         if target.name in cond_names:
             continue
-        used_vars = _get_used_variables(stmt.value)
-        if used_vars.isdisjoint(mutated):
-            invariants.append(stmt)
+        if _expr_may_violate_invariance(stmt.value):
+            continue
+        invariants.append(stmt)
     return invariants
+
+
+def _expr_may_violate_invariance(node) -> bool:
+    """True if *node* mentions a call, dereference, field access, or array
+    index anywhere -- anything that could observe or perform effects that
+    our name-based Hoist analysis cannot reason about (side-effectful calls
+    must NOT be moved out of a loop, and pointer/field reads might alias a
+    write the loop performs through a different name)."""
+    stack = [node]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        if isinstance(obj, (Call, Deref, Attr, Index, NewExpr, InlineAsm)):
+            return True
+        if isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, If):
+            stack.extend((obj.cond, obj.body, obj.orelse))
+        elif isinstance(obj, While):
+            stack.extend((obj.cond, obj.body))
+        elif hasattr(obj, "_token"):
+            slots = getattr(obj, "__slots__", None)
+            if slots:
+                if isinstance(slots, str):
+                    slots = (slots,)
+                stack.extend(getattr(obj, s, None) for s in slots)
+            else:
+                try:
+                    stack.extend(vars(obj).values())
+                except TypeError:
+                    pass
+    return False
 
 
 def _is_const_zero(node) -> bool:
@@ -496,6 +581,24 @@ def _const_int_value(node) -> Optional[int]:
         except (ValueError, TypeError):
             return None
     return None
+
+
+def _const_fp_value(node) -> Optional[float]:
+    """Return the floating-point value of a numeric literal *node* that is
+    NOT integer-parseable (``2.0``, ``1e3``), else *None*.  Integral literals
+    (``2``) are left to ``_const_int_value`` -- a double-typed context is
+    decided by the caller from ``inferred_type``."""
+    if not isinstance(node, Number):
+        return None
+    try:
+        int(node.value, 0)
+        return None
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(node.value)
+    except (ValueError, TypeError):
+        return None
 
 
 def _detect_shift_amount_from_mul(node) -> Optional[int]:

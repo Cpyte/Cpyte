@@ -946,6 +946,63 @@ def _maybe_compile(module, use_native_eh=False):
     return module, None
 
 
+def _cached_c_ir(llvm_cc, src_path, triple, opt="-O0", extra_flags=()):
+    """Compile a C runtime source to LLVM IR text, caching by content.
+    The three runtime files (runtime.c/bignum.c/gc_runtime.c and the Windows
+    GNU JIT stubs) are recompiled by clang on every JIT run, which dominates
+    startup cost; content-addressed caching makes repeat runs skip clang.
+    """
+    import hashlib
+    import tempfile
+
+    with open(src_path, "rb") as f:
+        content = f.read()
+    key = hashlib.sha1(
+        content + triple.encode() + opt.encode() + b"".join(map(str.encode, extra_flags))
+    ).hexdigest()
+
+    cache_dir = os.path.join(tempfile.gettempdir(), "cpyte_rtcache")
+    cache_path = os.path.join(cache_dir, key + ".ll")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+            cached = f.read()
+        if cached and cached.lstrip().startswith(";"):
+            return cached, None
+    except OSError:
+        pass
+
+    r = subprocess.run(
+        [
+            llvm_cc,
+            "-S",
+            "-emit-llvm",
+            opt,
+            *extra_flags,
+            "-target",
+            triple,
+            "-fno-stack-protector",
+            "-o",
+            "-",
+            src_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None, r
+    ir_text = r.stdout
+    if ir_text and ir_text.lstrip().startswith(";"):
+        try:
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(ir_text)
+            os.replace(tmp_path, cache_path)
+        except OSError:
+            pass
+    return ir_text, None
+
+
 def run_jit(
     module,
     opt_level=3,
@@ -991,7 +1048,17 @@ def run_jit(
                 )
 
                 if r.returncode != 0:
-                    print_err(f"error compiling {src}: {format_cc_diag(r.stderr)}")
+                    ccmap = getattr(module, "_ccode_src_map", None) or {}
+                    where = ccmap.get(src)
+                    if where:
+                        print_err(
+                            f"error compiling ccode block from {where}: "
+                            f"{format_cc_diag(r.stderr)}"
+                        )
+                    else:
+                        print_err(
+                            f"error compiling {src}: {format_cc_diag(r.stderr)}"
+                        )
                     raise SystemExit(1)
                 src_ir = r.stdout
             src_ir = _remove_probe_stack_ir(src_ir)
@@ -1001,75 +1068,30 @@ def run_jit(
     # Link the C runtime (print/assign/dynamic dispatch/array registry) so the
     # JIT can resolve native helpers that have no Python callback mirror.
     target = host_target()
-    r = subprocess.run(
-        [
-            llvm_cc,
-            "-S",
-            "-emit-llvm",
-            "-O0",
-            "-target",
-            target.triple,
-            "-fno-stack-protector",
-            "-o",
-            "-",
-            _RUNTIME_C,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        print_err(f"error compiling {_RUNTIME_C}: {format_cc_diag(r.stderr)}")
+    runtime_ir, err = _cached_c_ir(llvm_cc, _RUNTIME_C, target.triple)
+    if runtime_ir is None:
+        print_err(f"error compiling {_RUNTIME_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
-    runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(runtime_ir))
     binding.link_modules(mod, runtime_mod)
 
     # Compile the bignum runtime from source at JIT time so it matches the
     # host platform (macOS/Linux/Windows) instead of relying on pre-built
     # bitcode that bakes in a single platform's libc symbol names.
-    r = subprocess.run(
-        [
-            llvm_cc,
-            "-S",
-            "-emit-llvm",
-            "-O0",
-            "-target",
-            target.triple,
-            "-fno-stack-protector",
-            "-o",
-            "-",
-            _BIGNUM_C,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+    bignum_ir, err = _cached_c_ir(llvm_cc, _BIGNUM_C, target.triple)
+    if bignum_ir is None:
+        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
-    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(bignum_ir))
     binding.link_modules(mod, bignum_mod)
 
     # Compile the GC runtime from source at JIT time so it matches the host
     # platform (macOS/Linux/Windows) instead of relying on pre-built bitcode.
-    r = subprocess.run(
-        [
-            llvm_cc,
-            "-S",
-            "-emit-llvm",
-            "-O0",
-            "-target",
-            target.triple,
-            "-fno-stack-protector",
-            "-o",
-            "-",
-            _GC_RUNTIME_C,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        print_err(f"error compiling {_GC_RUNTIME_C}: {format_cc_diag(r.stderr)}")
+    gc_ir, err = _cached_c_ir(llvm_cc, _GC_RUNTIME_C, target.triple)
+    if gc_ir is None:
+        print_err(f"error compiling {_GC_RUNTIME_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
-    gc_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    gc_mod = binding.parse_assembly(_remove_probe_stack_ir(gc_ir))
     binding.link_modules(mod, gc_mod)
 
     # The GNU/MinGW lowering sprinkles `call __main` / `call ___chkstk_ms`
@@ -1082,27 +1104,15 @@ def run_jit(
         # via intrinsic libcalls, and i128 div/mod needs __udivti3/__umodti3,
         # none of which are reliably exported -- link our own definitions so
         # the emitted object has no undefined references to them.
-        r = subprocess.run(
-            [
-                llvm_cc,
-                "-S",
-                "-emit-llvm",
-                "-O0",
-                "-fno-builtin",
-                "-target",
-                target.triple,
-                "-fno-stack-protector",
-                "-o",
-                "-",
-                _WINJIT_STUB_C,
-            ],
-            capture_output=True,
-            text=True,
+        winjit_ir, err = _cached_c_ir(
+            llvm_cc, _WINJIT_STUB_C, target.triple, extra_flags=("-fno-builtin",)
         )
-        if r.returncode != 0:
-            print_err(f"error compiling {_WINJIT_STUB_C}: {format_cc_diag(r.stderr)}")
+        if winjit_ir is None:
+            print_err(
+                f"error compiling {_WINJIT_STUB_C}: {format_cc_diag(err.stderr)}"
+            )
             raise SystemExit(1)
-        winjit_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+        winjit_mod = binding.parse_assembly(_remove_probe_stack_ir(winjit_ir))
         binding.link_modules(mod, winjit_mod)
 
     mod.verify()

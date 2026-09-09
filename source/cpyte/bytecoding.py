@@ -8,6 +8,7 @@ from llvmlite import binding, ir
 from llvmlite.ir import instructions
 
 from .astparse import *
+from .clib import _BUILTIN_LIB_HEADERS
 from .extension_hooks import (
     CodegenHook,
     CompilerContext,
@@ -19,19 +20,19 @@ from .extension_hooks import (
 from .lexar import TokenType
 from .optimizations import (
     _FIB_SMALL_TABLE,
-    _compute_signed_magic,
-    _compute_unsigned_magic,
+    _const_fp_value,
     _const_int_value,
     _count_loop_iterations,
     _detect_fibonacci_pattern,
     _detect_shift_amount_from_mul,
-    _fold_int_binop,
     _find_loop_invariants,
+    _fold_int_binop,
     _is_const_one,
     _is_const_zero,
     _is_power_of_2,
     _is_simple_counted_loop,
     _log2_floor,
+    _loop_has_alias_risk,
     _loop_written_names,
     _trunc_to_signed,
 )
@@ -220,74 +221,86 @@ def _emit_children(node) -> list:
 
 class LLVM:
     def llvm_type(self, t: str):
+        # PERFORMANCE: Cache type resolution to avoid repeated string parsing
+        if t in self._llvm_type_cache:
+            return self._llvm_type_cache[t]
+        
         t = _bc_array_norm(t)
         if t == "int":
-            return ir.IntType(32)
-        if t == "int64":
-            return ir.IntType(64)
-        if t == "uint64":
-            return ir.IntType(64)
-        if t == "size_t":
+            result = ir.IntType(32)
+        elif t == "int64":
+            result = ir.IntType(64)
+        elif t == "uint64":
+            result = ir.IntType(64)
+        elif t == "size_t":
             # Pointer-sized unsigned integer (i64 on every 64-bit cpyte target,
             # incl. macOS/Linux arm64 & x86-64 LP64). Keeping it i64 (not the
             # i32 fallthrough) lets `(size_t)ptr`/`(ptr)(size_t)` round-trips
             # preserve the full address instead of truncating to 32 bits.
-            return ir.IntType(64)
-        if t == "bool":
-            return ir.IntType(1)
-        if t in ("float", "double"):
-            return ir.DoubleType()
-        if t == "void":
-            return ir.VoidType()
-        if t == "str":
-            return ir.PointerType(ir.IntType(8))
-        if t == "char":
-            return ir.IntType(8)
-        if t == "void*":
-            return ir.PointerType(ir.IntType(8))
-        if t == "big":
-            return ir.PointerType(ir.IntType(8))
-        if t == "ubig":
-            return ir.PointerType(ir.IntType(8))
-        if t == "dynamic":
+            result = ir.IntType(64)
+        elif t == "bool":
+            result = ir.IntType(1)
+        elif t in ("float", "double"):
+            result = ir.DoubleType()
+        elif t == "void":
+            result = ir.VoidType()
+        elif t == "str":
+            result = ir.PointerType(ir.IntType(8))
+        elif t == "char":
+            result = ir.IntType(8)
+        elif t == "void*":
+            result = ir.PointerType(ir.IntType(8))
+        elif t == "big":
+            result = ir.PointerType(ir.IntType(8))
+        elif t == "ubig":
+            result = ir.PointerType(ir.IntType(8))
+        elif t == "dynamic":
             # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
-            return _DynValue
-        if t == "decorated":
+            result = _DynValue
+        elif t == "decorated":
             # Decorator return type: uses DynValue like dynamic.
-            return _DynValue
-        if t.endswith("[]"):
+            result = _DynValue
+        elif t.endswith("[]"):
             base = self.llvm_type(t[:-2])
-            return ir.PointerType(base)
-        if t.endswith("*"):
+            result = ir.PointerType(base)
+        elif t.endswith("*"):
             base = self.llvm_type(t[:-1])
-            return ir.PointerType(base)
-        if t.endswith("&"):
+            result = ir.PointerType(base)
+        elif t.endswith("&"):
             base = self.llvm_type(t[:-1])
-            return ir.PointerType(base)
-        if t in self.structs:
-            return self.structs[t]
-        # Handle generic types like Pair<int, string>
-        if "<" in t:
+            result = ir.PointerType(base)
+        elif t in self.structs:
+            result = self.structs[t]
+        elif "<" in t:
+            # Handle generic types like Pair<int, string>
             # Check if we have a monomorphized version
             if t in self.structs:
-                return self.structs[t]
-            # Try to generate it now
-            resolved = self._resolve_generic_type(t)
-            if resolved is not None:
-                return resolved
-            # Raising here (instead of silently returning i32) is deliberate:
-            # an unresolvable generic type would otherwise corrupt stack layout
-            # at runtime because the value is lowered to a 32-bit int. A clear,
-            # immediate error beats silent memory corruption.
+                result = self.structs[t]
+            else:
+                # Try to generate it now
+                resolved = self._resolve_generic_type(t)
+                if resolved is not None:
+                    result = resolved
+                else:
+                    # Raising here (instead of silently returning i32) is deliberate:
+                    # an unresolvable generic type would otherwise corrupt stack layout
+                    # at runtime because the value is lowered to a 32-bit int. A clear,
+                    # immediate error beats silent memory corruption.
+                    self._codegen_error(
+                        f"cannot resolve generic type `{t}`: "
+                        f"struct `{t.split('<')[0]}` is not defined or the type-argument "
+                        f"count does not match its declaration"
+                    )
+                    result = None  # Should never reach here
+        else:
             self._codegen_error(
-                f"cannot resolve generic type `{t}`: "
-                f"struct `{t.split('<')[0]}` is not defined or the type-argument "
-                f"count does not match its declaration"
+                f"unknown type `{t}` has no LLVM lowering; cannot emit code for it "
+                f"(previously this silently degraded to a 32-bit int)"
             )
-        self._codegen_error(
-            f"unknown type `{t}` has no LLVM lowering; cannot emit code for it "
-            f"(previously this silently degraded to a 32-bit int)"
-        )
+            result = None  # Should never reach here
+        
+        self._llvm_type_cache[t] = result
+        return result
 
     @staticmethod
     def _codegen_error(msg: str, node=None):
@@ -442,7 +455,6 @@ class LLVM:
                             if l == int_min and r == -1:
                                 return ir.Constant(left.type, int_min)
                             return ir.Constant(left.type, self._trunc_div(l, r))
-                        bias_width = ir.Constant(left.type, width)
                         k_const = ir.Constant(left.type, k)
                         sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
                         bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
@@ -468,16 +480,11 @@ class LLVM:
                         l = self._norm_signed(left.constant, width)
                         return ir.Constant(left.type, l % d_raw)
                     k_const = ir.Constant(left.type, k)
-                    if d_raw > 0:
-                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
-                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
-                        adj = self.builder.add(left, bias)
-                        q = self.builder.ashr(adj, k_const)
-                    else:
-                        sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
-                        bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
-                        adj = self.builder.add(left, bias)
-                        q = self.builder.ashr(adj, k_const)
+                    sign_bit = self.builder.ashr(left, ir.Constant(left.type, width - 1))
+                    bias = self.builder.and_(sign_bit, ir.Constant(left.type, (1 << k) - 1))
+                    adj = self.builder.add(left, bias)
+                    q = self.builder.ashr(adj, k_const)
+                    if d_raw < 0:
                         q = self.builder.neg(q)
                     d_val = ir.Constant(left.type, abs(d_raw))
                     prod = self.builder.mul(q, d_val)
@@ -558,18 +565,17 @@ class LLVM:
         return phi
 
     def _emit_floor_div(self, left, right):
-        """Floor division: truncates toward negative infinity (Python-style //).
-
-        result = trunc_div - (trunc_rem != 0 && (sign(a) != sign(b)))
-        """
         q = self._emit_int_divmod(left, right, is_rem=False)
-        r = self._emit_int_divmod(left, right, is_rem=True)
+        prod = self.builder.mul(q, right)
+        r = self.builder.sub(left, prod)
+
         zero = ir.Constant(left.type, 0)
         r_ne_zero = self.builder.icmp_signed("!=", r, zero)
         left_neg = self.builder.icmp_signed("<", left, zero)
         right_neg = self.builder.icmp_signed("<", right, zero)
         diff_signs = self.builder.xor(left_neg, right_neg)
         needs_fix = self.builder.and_(r_ne_zero, diff_signs)
+
         one = ir.Constant(left.type, 1)
         fix = self.builder.select(needs_fix, one, zero)
         return self.builder.sub(q, fix)
@@ -608,40 +614,27 @@ class LLVM:
 
     def _promote_to_big(self, val, src_t=None):
         if isinstance(val.type, ir.IntType) and val.type.width < 64:
-            if val.type.width == 32:
-                val = self.builder.sext(val, _i64)
-            else:
+            if src_t in ("uint64", "size_t", "ubig", "uint32", "uint16", "uint8"):
                 val = self.builder.zext(val, _i64)
-        if (
-            isinstance(val.type, ir.IntType)
-            and "i64" in str(val.type)
-            or isinstance(val.type, ir.IntType)
-        ):
-            # An unsigned 64-bit source (uint64/size_t) must zero-extend into
-            # the sign-magnitude representation, otherwise a literal like
-            # 12345678901234567890 (fits uint64, not int64) becomes a negative
-            # `big`. Signed sources keep the signed bigint_from_int path.
+            else:
+                val = self.builder.sext(val, _i64)
+
+        if isinstance(val.type, ir.IntType):
             if src_t in ("uint64", "size_t", "ubig"):
                 fn = self.functions["bigint_from_uint64"]
             else:
                 fn = self.functions["bigint_from_int"]
-        else:
-            return val
-        return self.builder.call(fn, [val])
+            return self.builder.call(fn, [val])
+        return val
 
     def _promote_to_ubig(self, val):
-        # ubig is unsigned: always zero-extend the 64-bit intermediate.
         if isinstance(val.type, ir.IntType) and val.type.width < 64:
             val = self.builder.zext(val, _i64)
-        if (
-            isinstance(val.type, ir.IntType)
-            and "i64" in str(val.type)
-            or isinstance(val.type, ir.IntType)
-        ):
+
+        if isinstance(val.type, ir.IntType):
             fn = self.functions["bigint_from_uint64"]
-        else:
-            return val
-        return self.builder.call(fn, [val])
+            return self.builder.call(fn, [val])
+        return val
 
     def __init__(
         self,
@@ -700,18 +693,27 @@ class LLVM:
         self._gc_alloc_fn = None
         self._gc_write_barrier_fn = None
         self._sizeof_cache = {}
+        self._llvm_type_cache = {}  # PERFORMANCE: Cache type resolution
         self._strlen_fn = None
         self._memcpy_fn = None
         self.no_userspace = no_userspace
         self.enable_extensions = enable_extensions
         self._hook_registry = get_global_hook_registry()
+        
+        # Decorator enhancement: special variables for advanced decorator features
+        self._decorator_args = None      # Access to function arguments
+        self._decorator_func_name = None # Function name metadata
+        self._decorator_params = None   # Parameter types metadata
+        self._decorator_skip = False     # Flag to skip original function
         self.generic_instantiations = {}  # name -> [(type_args_tuple, ...)]
         self._struct_nodes = {}  # name -> StructDef AST node (for generic resolution)
         self._emit_depth = 0
         self._emit_memo = {}
         self._in_emit_iterative = False
         self._in_decorator = False
+        self._is_decorator_factory = False
         self._const_prop: dict = {}
+        self._const_prop_f: dict = {}
 
         if not no_userspace:
             print_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
@@ -901,6 +903,22 @@ class LLVM:
         self._code_result.initializer = ir.Constant(
             _DynValue, (ir.Constant(_i32, _DYN_NONE), ir.Constant(_i64, 0))
         )  # type: ignore[attr-defined]
+        # Decorator access: the wrapper boxes the decorated function's incoming
+        # args, name and skip flag into these globals so decorator factory bodies
+        # (`rettype ... = "decorated"`) can read `args`/`func_name` and write
+        # `skip = true` (mirrors the existing __code_fn/__code_result routing).
+        self._code_args = ir.GlobalVariable(
+            self.module, _DynValuePtr, name="__code_args"
+        )
+        self._code_args.initializer = ir.Constant(_DynValuePtr, None)  # type: ignore[attr-defined]
+        self._code_fn_name = ir.GlobalVariable(
+            self.module, _i8ptr, name="__code_fn_name"
+        )
+        self._code_fn_name.initializer = ir.Constant(_i8ptr, None)  # type: ignore[attr-defined]
+        self._code_skip = ir.GlobalVariable(
+            self.module, ir.IntType(1), name="__code_skip"
+        )
+        self._code_skip.initializer = ir.Constant(ir.IntType(1), 0)  # type: ignore[attr-defined]
 
     # CRITICAL CONSTANT FOLDING BUG
     @register_emitter(Switch)
@@ -1549,9 +1567,28 @@ class LLVM:
                     self.functions[fname] = func
         if node.value:
             fd, tmp_path = tempfile.mkstemp(suffix=".c", prefix="ccode_")
+            includes = getattr(node, "includes", None) or []
+            if includes:
+                header_lines = "".join(
+                    f"#include <{_BUILTIN_LIB_HEADERS.get(lib, lib)}>\n"
+                    for lib in includes
+                )
+                body = header_lines + "\n" + node.value
+            else:
+                body = node.value
             with os.fdopen(fd, "w") as f:
-                f.write(node.value)
+                f.write(body)
             self.import_src_files.append(tmp_path)
+            if getattr(self.module, "_ccode_src_map", None) is None:
+                self.module._ccode_src_map = {}
+            src_file = getattr(node, "src_file", None)
+            src_line = getattr(node, "src_line", None)
+            label = (
+                f"{src_file}:{src_line}"
+                if src_file and src_line is not None
+                else (src_file or "main")
+            )
+            self.module._ccode_src_map[tmp_path] = label
         return
 
     @register_emitter(Llvm)
@@ -1950,7 +1987,7 @@ class LLVM:
         elem_size = self._sizeof_type(elem_ty)
         if elem_size.type != count.type:
             elem_size = self.builder.zext(elem_size, count.type)
-        
+
         # Use length-prefixed header allocation for arrays to avoid hash table lookups
         if node.size is not None:
             alloc_fn = self.functions.get("cpyte_array_alloc")
@@ -1961,20 +1998,13 @@ class LLVM:
                 ptr = self.builder.call(alloc_fn, [elem_size, count])
                 ptr = self.builder.bitcast(ptr, malloc_ty)
                 return ptr
-        
+
         # Fallback to legacy allocation for non-arrays or when cpyte_array_alloc unavailable
         total_size = self.builder.mul(count, elem_size)
         malloc_fn = self._get_malloc_fn()
         ptr = self.builder.call(malloc_fn, [total_size])
         ptr = self.builder.bitcast(ptr, malloc_ty)
-        # Register the element count so `for x in arr` can iterate this array.
-        if node.size is not None:
-            reg_fn = self.functions.get("cpyte_array_register")
-            if reg_fn is not None and not self.no_userspace:
-                arr8 = ptr
-                if arr8.type != _i8ptr:
-                    arr8 = self.builder.bitcast(arr8, _i8ptr)
-                self.builder.call(reg_fn, [arr8, count])
+        # No registration needed - fallback path doesn't support iteration
         return ptr
 
     @register_emitter(ListLit)
@@ -1982,7 +2012,7 @@ class LLVM:
         n = len(node.items)
         elem_size = self._sizeof_type(_DynValue)
         count = ir.Constant(_i64, n)
-        
+
         # Use length-prefixed header allocation for arrays to avoid hash table lookups
         alloc_fn = self.functions.get("cpyte_array_alloc")
         if alloc_fn is not None and not self.no_userspace:
@@ -2000,7 +2030,7 @@ class LLVM:
             if reg_fn is not None and not self.no_userspace:
                 arr8 = self.builder.bitcast(ptr, _i8ptr)
                 self.builder.call(reg_fn, [arr8, count])
-        
+
         for i, item in enumerate(node.items):
             value = self.emit(item)
             if value.type == _DynValue:
@@ -2455,13 +2485,17 @@ class LLVM:
         old_scope_stack = self.scope_stack
         old_deferred = self._deferred
         old_in_decorator = self._in_decorator
+        old_decorator_factory = self._is_decorator_factory
         old_const_prop = self._const_prop
+        old_const_prop_f = self._const_prop_f
         self._in_decorator = node.rettype == "decorated"
+        self._is_decorator_factory = node.rettype == "decorated"
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
         self.ssa_types = {}
         self._const_prop = {}
+        self._const_prop_f = {}
         self.scope_stack = [{}]
         self._deferred = []
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
@@ -2478,20 +2512,25 @@ class LLVM:
 
         # ---- 1.  Fibonacci fast-doubling pattern replacement ----
         if not self._try_emit_fibonacci(node, func, ret_ty, param_tys):
-            pending_iv = None
+            pending_ivs: dict = {}
             for stmt in node.body:
                 if not self._block_terminated():
                     if isinstance(stmt, While):
-                        unrolled = self._try_unroll_counted_loop(stmt, pending_iv)
-                        pending_iv = None
+                        unrolled = self._try_unroll_counted_loop(stmt, pending_ivs)
+                        # Any while invalidates every pending induction
+                        # variable (its body may take addresses / write any name).
+                        pending_ivs.clear()
                         if not unrolled:
                             self.emit(stmt)
                     elif isinstance(stmt, VarDecl) and isinstance(stmt.init, Number):
                         v = _const_int_value(stmt.init)
-                        pending_iv = (stmt.name, v) if v is not None else None
+                        if v is not None:
+                            pending_ivs[stmt.name] = v
+                        else:
+                            pending_ivs.pop(stmt.name, None)
                         self.emit(stmt)
                     else:
-                        pending_iv = None
+                        pending_ivs.clear()
                         self.emit(stmt)
 
         if not self._block_terminated():
@@ -2523,7 +2562,9 @@ class LLVM:
         self.scope_stack = old_scope_stack
         self._deferred = old_deferred
         self._in_decorator = old_in_decorator
+        self._is_decorator_factory = old_decorator_factory
         self._const_prop = old_const_prop
+        self._const_prop_f = old_const_prop_f
 
     def _try_emit_fibonacci(self, node: FuncDef, func, ret_ty, param_tys) -> bool:
         """Detect a naive recursive Fibonacci function and replace it with a
@@ -2872,17 +2913,54 @@ class LLVM:
         old_ssa_types = self.ssa_types
         old_scope_stack = self.scope_stack
         old_in_decorator = self._in_decorator
+        old_decorator_factory = self._is_decorator_factory
+        old_decorator_args = self._decorator_args
+        old_decorator_func_name = self._decorator_func_name
+        old_decorator_params = self._decorator_params
+        old_decorator_skip = self._decorator_skip
         self._in_decorator = True
+        # The decorated ORIGINAL is NOT a decorator factory: `result`/`args`/
+        # `func_name`/`skip` must stay ordinary identifiers in its body.
+        self._is_decorator_factory = False
+        self._decorator_args = []
+        self._decorator_func_name = node.name
+        self._decorator_params = list(node.params.keys())
+        self._decorator_skip = False
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
         self.ssa_types = {}
         self.scope_stack = [{}]
-        for llvm_arg, (pname, ptype) in zip(orig_func.args, node.params.items()):
+        
+        # ENHANCEMENT: Store argument values for decorator access
+        args_array_ty = ir.ArrayType(_DynValue, len(node.params))
+        args_array_ptr = self.builder.alloca(args_array_ty, name="decorator_args_array")
+        for i, (llvm_arg, (pname, ptype)) in enumerate(zip(orig_func.args, node.params.items())):
             ptr = self.builder.alloca(llvm_arg.type, name=pname)
             self.builder.store(llvm_arg, ptr)
             self.locals[pname] = ptr
             self.local_types[pname] = _bc_array_norm(ptype)
+            
+            # Box argument and store in args array
+            kind, bits = self._box_dyn(llvm_arg, ptype)
+            dyn_val = self.builder.insert_value(
+                ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0
+            )
+            dyn_val = self.builder.insert_value(dyn_val, bits, 1)
+            elem_ptr = self.builder.gep(args_array_ptr, [ir.Constant(_i64, 0), ir.Constant(_i64, i)])
+            self.builder.store(dyn_val, elem_ptr)
+            self._decorator_args.append((pname, ptype))
+        
+        # ENHANCEMENT: Make args array accessible via 'args' variable
+        self.locals["args"] = args_array_ptr
+        self.local_types["args"] = f"dynamic[{len(node.params)}]"
+        
+        # ENHANCEMENT: Make function name accessible via 'func_name' variable
+        func_name_str = self._string_const(node.name)
+        func_name_ptr = self.builder.alloca(_i8ptr, name="func_name")
+        self.builder.store(func_name_str, func_name_ptr)
+        self.locals["func_name"] = func_name_ptr
+        self.local_types["func_name"] = "str"
 
         for stmt in node.body:
             if not self._block_terminated():
@@ -2914,8 +2992,17 @@ class LLVM:
         self.ssa_types = old_ssa_types
         self.scope_stack = old_scope_stack
         self._in_decorator = old_in_decorator
+        self._is_decorator_factory = old_decorator_factory
+        self._decorator_args = old_decorator_args
+        self._decorator_func_name = old_decorator_func_name
+        self._decorator_params = old_decorator_params
+        self._decorator_skip = old_decorator_skip
 
-        # 2. Generate trampoline: calls __name and returns DynValue
+        # 2. Generate trampoline: calls __name and returns DynValue.
+        # The signature is () -> DynValue so decorator factories can call it via
+        # the __code_fn pointer without knowing the decorated signature. The
+        # incoming args are pulled from the __code_args global (filled by the
+        # wrapper) and unboxed here where the param types are static.
         tramp_fnty = ir.FunctionType(_DynValue, [])
         tramp = ir.Function(self.module, tramp_fnty, trampoline_name)
         self.functions[trampoline_name] = tramp
@@ -2923,8 +3010,22 @@ class LLVM:
         self.builder = ir.IRBuilder(tramp_entry)
         self.builder.position_at_end(tramp_entry)
 
-        args = list(tramp.args)
-        call_result = self.builder.call(orig_func, args)
+        args_ptr = self.builder.load(self._code_args, "code_args_ptr")
+        call_args = []
+        for i, (pname, ptype) in enumerate(node.params.items()):
+            elem_ptr = self.builder.gep(
+                args_ptr, [ir.Constant(_i64, i)], inbounds=True
+            )
+            dyn_val = self.builder.load(elem_ptr, pname)
+            kind = self.builder.extract_value(dyn_val, 0)
+            bits = self.builder.extract_value(dyn_val, 1)
+            want = self._dyn_kind_for(ptype)
+            as_v = self.builder.call(
+                self.functions.get("dyn_as_v"),
+                [kind, bits, ir.Constant(_i32, want)],
+            )
+            call_args.append(self._unbox_dyn(as_v, ptype))
+        call_result = self.builder.call(orig_func, call_args)
         if call_result.type == _DynValue:
             self.builder.store(call_result, self._code_result)
             self.builder.ret(call_result)
@@ -2945,6 +3046,33 @@ class LLVM:
         self.builder = ir.IRBuilder(wrap_entry)
         self.builder.position_at_end(wrap_entry)
 
+        # Box the wrapper's incoming args and store them (plus the decorated
+        # function's name and a fresh skip flag) into the decorator-access
+        # globals. The trampoline and any decorator factory body read these at
+        # runtime.
+        args_buf = self.builder.alloca(
+            ir.ArrayType(_DynValue, len(node.params)), name="decorator_args_buf"
+        )
+        for i, (llvm_arg, (pname, ptype)) in enumerate(
+            zip(wrapper.args, node.params.items())
+        ):
+            kind, bits = self._box_dyn(llvm_arg, ptype)
+            dyn_val = self.builder.insert_value(
+                ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, kind), 0
+            )
+            dyn_val = self.builder.insert_value(dyn_val, bits, 1)
+            elem_ptr = self.builder.gep(
+                args_buf,
+                [ir.Constant(_i64, 0), ir.Constant(_i64, i)],
+                inbounds=True,
+            )
+            self.builder.store(dyn_val, elem_ptr)
+        self.builder.store(
+            self.builder.bitcast(args_buf, _DynValuePtr), self._code_args
+        )
+        self.builder.store(self._string_const(node.name), self._code_fn_name)
+        self.builder.store(ir.Constant(ir.IntType(1), 0), self._code_skip)
+
         # Store trampoline pointer into __code_fn
         tramp_i8 = self.builder.bitcast(tramp, _i8ptr)
         self.builder.store(tramp_i8, self._code_fn_ptr)
@@ -2953,6 +3081,29 @@ class LLVM:
         for dec_expr in node.decorators:
             self.emit(dec_expr)
 
+        # Check skip flag - if a decorator factory body wrote `skip = true`,
+        # return early without calling the original via the trampoline.
+        skip_val = self.builder.load(self._code_skip, "dec_skip")
+        skip_bb = wrapper.append_basic_block("skip_original")
+        call_bb = wrapper.append_basic_block("call_original")
+        self.builder.cbranch(skip_val, skip_bb, call_bb)
+
+        self.builder.position_at_end(skip_bb)
+        # Return default value when skipped
+        if isinstance(ret_ty, ir.VoidType):
+            self.builder.ret_void()
+        elif ret_ty == _DynValue:
+            default_dyn = self.builder.insert_value(
+                ir.Constant(_DynValue, ir.Undefined), ir.Constant(_i32, _DYN_NONE), 0
+            )
+            default_dyn = self.builder.insert_value(default_dyn, ir.Constant(_i64, 0), 1)
+            self.builder.ret(default_dyn)
+        elif isinstance(ret_ty, ir.PointerType):
+            self.builder.ret(ir.Constant(ret_ty, None))
+        else:
+            self.builder.ret(ir.Constant(ret_ty, 0))
+
+        self.builder.position_at_end(call_bb)
         # Load __code_result and return it
         result_val = self.builder.load(self._code_result, "dec_result")
         ret_val = self._unbox_dyn(
@@ -3330,7 +3481,7 @@ class LLVM:
 
     def _dyn_struct(self, node):
         """Evaluate an expression and return it as a {i32,i64} DynValue struct."""
-        if self._in_decorator and isinstance(node, Variable) and node.name == "result":
+        if self._is_decorator_factory and isinstance(node, Variable) and node.name == "result":
             return self.builder.load(self._code_result, "result")
         if isinstance(node, Variable) and getattr(node, "dynamic", False):
             ptr = self._dyn_local_ptr(node.name)
@@ -3439,20 +3590,19 @@ class LLVM:
         """Attempt to fold algebraic identities *before* emitting IR.
 
         Returns an ``ir.Value`` when the simplification succeeded, else *None*.
-        Only handles integer / pointer-typed operands; float and big/ubig are
-        left to the normal path.
+        big/ubig/str/dynamic operands are left to the normal path.  Integer
+        operands get the classic identities; float/double operands get exact
+        IEEE-safe folds only (``x*1.0 -> x``, ``x/-1.0 -> -x``, ``x-0.0 -> x``,
+        ``pow(x,{0,1,2,0.5,-1}) -> 1/x/x*x/sqrt(x)/1-x``).
         """
         op = node.op
         left_node = node.left
         right_node = node.right
 
-        # Only simplify when both sides are simple enough to emit cheaply
-        # and the result type is integral (avoid messing with floats/pointers).
+        # Only simplify when both sides are simple enough to emit cheaply.
         lt = getattr(left_node, "inferred_type", "")
         rt = getattr(right_node, "inferred_type", "")
         if lt in ("big", "ubig", "str", "dynamic") or rt in ("big", "ubig", "str", "dynamic"):
-            return None
-        if lt == "float" or lt == "double" or rt == "float" or rt == "double":
             return None
 
         # ---- Constant propagation: substitute tracked const vars ----
@@ -3460,10 +3610,31 @@ class LLVM:
             cv = self._const_var_value(left_node.name)
             if cv is not None and left_node.name in self.locals:
                 left_node = Number(str(cv))
+                lt = "int"
         if isinstance(right_node, Variable) and self._is_const_var(right_node.name):
             cv = self._const_var_value(right_node.name)
             if cv is not None and right_node.name in self.locals:
                 right_node = Number(str(cv))
+                rt = "int"
+        if isinstance(left_node, Variable) and left_node.name in self._const_prop_f:
+            fv = self._const_prop_f.get(left_node.name)
+            if fv is not None and left_node.name in self.locals:
+                left_node = Number(repr(fv))
+                lt = "double"
+        if isinstance(right_node, Variable) and right_node.name in self._const_prop_f:
+            fv = self._const_prop_f.get(right_node.name)
+            if fv is not None and right_node.name in self.locals:
+                right_node = Number(repr(fv))
+                rt = "double"
+
+        lf = _const_fp_value(left_node)
+        rf = _const_fp_value(right_node)
+        is_fp = (
+            lt in ("float", "double")
+            or rt in ("float", "double")
+            or lf is not None
+            or rf is not None
+        )
 
         # ---- Constant folding: both operands are integral literals ----
         lv = _const_int_value(left_node)
@@ -3478,6 +3649,83 @@ class LLVM:
                     width = 32
                 v32 = _trunc_to_signed(folded, width)
                 return ir.Constant(ir.IntType(width), v32)
+
+        # ---- POW strength reduction: x**0/1/2/3 -> exact arithmetic ----
+        if op == TokenType.POW:
+            exp = rf if rf is not None else _const_int_value(right_node)
+            if exp is not None:
+                lval = self.emit(left_node)
+                if isinstance(exp, int) and isinstance(lval.type, ir.IntType):
+                    if exp == 0:
+                        return ir.Constant(lval.type, 1)
+                    if exp == 1:
+                        return lval
+                    if exp == 2:
+                        return self.builder.mul(lval, lval)
+                    if exp == 3:
+                        return self.builder.mul(
+                            self.builder.mul(lval, lval), lval
+                        )
+                if isinstance(lval.type, ir.DoubleType):
+                    e = float(exp)
+                    if e == 0.0:
+                        return ir.Constant(lval.type, 1.0)
+                    if e == 1.0:
+                        return lval
+                    if e == 2.0:
+                        if lf is not None:
+                            return ir.Constant(lval.type, lf * lf)
+                        return self.builder.fmul(lval, lval)
+                    if e == 0.5:
+                        return self._emit_sqrt_f64(lval)
+                    if e == -1.0:
+                        return self.builder.fdiv(
+                            ir.Constant(lval.type, 1.0), lval
+                        )
+
+        # ---- Floating-point constant folding + exact identities ----
+        if is_fp:
+            if lf is not None and rf is not None and op in (
+                TokenType.STAR,
+                TokenType.SLASH,
+                TokenType.PLUS,
+                TokenType.MINUS,
+            ):
+                if not (op == TokenType.SLASH and rf == 0.0):
+                    lval = self.emit(left_node)
+                    rval = self.emit(right_node)
+                    lval, rval = self._promote(lval, rval)
+                    if isinstance(lval.type, ir.DoubleType):
+                        if op == TokenType.STAR:
+                            v = lf * rf
+                        elif op == TokenType.SLASH:
+                            v = lf / rf
+                        elif op == TokenType.PLUS:
+                            v = lf + rf
+                        else:
+                            v = lf - rf
+                        return ir.Constant(lval.type, v)
+            if op == TokenType.STAR:
+                if rf is not None and rf == 1.0:
+                    return self.emit(left_node)
+                if rf is not None and rf == -1.0:
+                    return self._emit_fneg(self.emit(left_node))
+                if lf is not None and lf == 1.0:
+                    return self.emit(right_node)
+                if lf is not None and lf == -1.0:
+                    return self._emit_fneg(self.emit(right_node))
+            if op in (TokenType.SLASH, TokenType.SLASH_SLASH):
+                if rf is not None and rf == 1.0:
+                    return self.emit(left_node)
+                if rf is not None and rf == -1.0:
+                    return self._emit_fneg(self.emit(left_node))
+            if op == TokenType.MINUS:
+                if rf is not None and rf == 0.0:
+                    return self.emit(left_node)
+            # No exact identity for this float op; leave to emit_binop.
+            return None
+
+        # ---- x * 0  /  0 * x  ->  0 ----
 
         # Only simplify when both sides are simple enough to emit cheaply
         # and the result type is integral (avoid messing with floats/pointers).
@@ -3547,9 +3795,21 @@ class LLVM:
         if op == TokenType.MINUS:
             if _is_const_zero(right_node):
                 return self.emit(left_node)
+            if (
+                isinstance(left_node, Variable)
+                and isinstance(right_node, Variable)
+                and left_node.name == right_node.name
+            ):
+                val = self.emit(left_node)
+                if isinstance(val.type, ir.IntType):
+                    return ir.Constant(val.type, 0)
 
         # ---- x ^ x  ->  0 ----
         if op == TokenType.CARET:
+            if _is_const_zero(right_node):
+                return self.emit(left_node)
+            if _is_const_zero(left_node):
+                return self.emit(right_node)
             if (
                 isinstance(left_node, Variable)
                 and isinstance(right_node, Variable)
@@ -3596,6 +3856,14 @@ class LLVM:
                 right_val = self.emit(right_node)
                 if isinstance(right_val.type, ir.IntType):
                     return ir.Constant(right_val.type, 0)
+            if (
+                isinstance(left_node, Variable)
+                and isinstance(right_node, Variable)
+                and left_node.name == right_node.name
+            ):
+                val = self.emit(left_node)
+                if isinstance(val.type, ir.IntType):
+                    return val
 
         # ---- x | 0  ->  x ----
         if op == TokenType.PIPE:
@@ -3962,6 +4230,24 @@ class LLVM:
             case TokenType.POW:
                 return self._emit_pow(left, right)
 
+    def _emit_fneg(self, val):
+        """Exact IEEE negation (equivalent to XOR of the sign bit): multiply by
+        ``-1.0``.  ``fsub(0.0, x)`` would return ``+0.0`` for ``x = +0.0``, so
+        it is not exact."""
+        if isinstance(val.type, ir.DoubleType):
+            return self.builder.fmul(val, ir.Constant(ir.DoubleType(), -1.0))
+        if isinstance(val.type, ir.FloatType):
+            return self.builder.fmul(val, ir.Constant(ir.FloatType(), -1.0))
+        return val
+
+    def _emit_sqrt_f64(self, val):
+        fn = self.functions.get("llvm.sqrt.f64")
+        if fn is None:
+            fn_ty = ir.FunctionType(ir.DoubleType(), [ir.DoubleType()])
+            fn = ir.Function(self.module, fn_ty, name="llvm.sqrt.f64")
+            self.functions["llvm.sqrt.f64"] = fn
+        return self.builder.call(fn, [val])
+
     def _emit_pow(self, left, right):
         pow_func = self.functions.get("pow")
         if pow_func is None:
@@ -4158,8 +4444,13 @@ class LLVM:
     # Is it good man?
     @register_emitter(Variable)
     def emit_variable(self, node):
-        if self._in_decorator and node.name == "result":
-            return self.builder.load(self._code_result, "result")
+        if self._is_decorator_factory:
+            if node.name == "result":
+                return self.builder.load(self._code_result, "result")
+            if node.name == "func_name":
+                return self.builder.load(self._code_fn_name, "code_fn_name")
+            if node.name == "args":
+                return self.builder.load(self._code_args, "code_args")
 
         const = self.const_vars.get(node.name)
         if const is not None:
@@ -4311,7 +4602,7 @@ class LLVM:
 
     @register_emitter(Assign)
     def emit_assign(self, node):
-        if self._in_decorator and isinstance(node.target, Variable) and node.target.name == "result":
+        if self._is_decorator_factory and isinstance(node.target, Variable) and node.target.name == "result":
             value = self.emit(node.value)
             if value.type != _DynValue:
                 kind, bits = self._box_dyn(
@@ -4322,6 +4613,16 @@ class LLVM:
                 )
                 value = self.builder.insert_value(value, bits, 1)
             self.builder.store(value, self._code_result)
+            return None
+        if (
+            self._is_decorator_factory
+            and isinstance(node.target, Variable)
+            and node.target.name == "skip"
+        ):
+            sk = self.emit(node.value)
+            if sk.type != ir.IntType(1):
+                sk = self._is_true(sk)
+            self.builder.store(sk, self._code_skip)
             return None
         if isinstance(node.target, Index) and not self.no_userspace:
             obj_t = _bc_array_norm(getattr(node.target.obj, "inferred_type", None))
@@ -4365,7 +4666,16 @@ class LLVM:
                             if decl_ty == "ubig"
                             else self._promote_to_big(value, src_t)
                         )
-                    elif not isinstance(value.type, ir.PointerType):
+                    elif isinstance(value.type, ir.PointerType) and isinstance(
+                        pointee, ir.PointerType
+                    ):
+                        # llvmlite can mint two distinct pointer type objects
+                        # (opaque `ptr` vs `_TypedPointerType`) that both print
+                        # `i8*` but compare unequal; bitcast re-unifies them.
+                        value = self.builder.bitcast(value, pointee)
+                        if value.type != pointee:
+                            value = self._coerce_store(value, pointee)
+                    else:
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ("int64", "uint64"):
@@ -4415,7 +4725,16 @@ class LLVM:
                             if decl_ty == "ubig"
                             else self._promote_to_big(value, src_t)
                         )
-                    elif not isinstance(value.type, ir.PointerType):
+                    elif isinstance(value.type, ir.PointerType) and isinstance(
+                        pointee, ir.PointerType
+                    ):
+                        # llvmlite can mint two distinct pointer type objects
+                        # (opaque `ptr` vs `_TypedPointerType`) that both print
+                        # `i8*` but compare unequal; bitcast re-unifies them.
+                        value = self.builder.bitcast(value, pointee)
+                        if value.type != pointee:
+                            value = self._coerce_store(value, pointee)
+                    else:
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
                 if var_type in ("int64", "uint64"):
@@ -4499,7 +4818,7 @@ class LLVM:
             return self._emit_builtin_str_split(node)
 
         # Builtin code() — call the original function through __code_fn pointer.
-        if self._in_decorator and isinstance(node.callee, Variable) and node.callee.name == "code":
+        if self._is_decorator_factory and isinstance(node.callee, Variable) and node.callee.name == "code":
             return self._emit_builtin_code(node)
 
         # Handle known macro functions by inlining
@@ -4930,6 +5249,12 @@ class LLVM:
 
     @register_emitter(While)
     def emit_while(self, node):
+        # ---- Static zero-trip loop: `while 0:` body never executes ----
+        if isinstance(node.cond, Number):
+            cv = _const_int_value(node.cond)
+            if cv is not None and cv == 0:
+                return
+
         # Const-prop across a loop backedge is unsound: clear the tracked
         # straight-line constants while we process the body, then restore.
         # A variable the body can write must be dropped from BOTH working
@@ -4942,9 +5267,14 @@ class LLVM:
         for name in written_here:
             active.pop(name, None)
         self._const_prop = active
+        saved_const_prop_f = self._const_prop_f
+        active_f = dict(saved_const_prop_f)
+        for name in written_here:
+            active_f.pop(name, None)
+        self._const_prop_f = active_f
 
         # ---- Loop-invariant code motion: hoist provably-invariant assigns ----
-        invariants = _find_loop_invariants(node) if getattr(self, "_licm_enabled", True) else []
+        invariants = _find_loop_invariants(node)
         hoisted_ids = set()
         for inv in invariants:
             if not self._block_terminated():
@@ -4979,7 +5309,9 @@ class LLVM:
         # Restore, dropping any entries the loop body could have changed.
         for name in written_here:
             saved_const_prop.pop(name, None)
+            saved_const_prop_f.pop(name, None)
         self._const_prop = saved_const_prop
+        self._const_prop_f = saved_const_prop_f
 
     # ------------------------------------------------------------------
     # 3.  Loop transformations: bounded unrolling
@@ -4992,8 +5324,10 @@ class LLVM:
         or loop backedge)."""
         if const_val is not None:
             self._const_prop[name] = const_val
+            self._const_prop_f.pop(name, None)
         else:
             self._const_prop.pop(name, None)
+            self._const_prop_f.pop(name, None)
 
     def _is_const_var(self, name: str) -> bool:
         return name in self._const_prop
@@ -5002,28 +5336,29 @@ class LLVM:
         return self._const_prop.get(name)
 
     def _try_unroll_counted_loop(
-        self, node: While, pending_iv: Optional[tuple[str, int]]
+        self, node: While, pending_ivs: dict
     ) -> bool:
         """Fully unroll a ``while`` loop whose iteration count is a small
-        compile-time constant.  *pending_iv* is ``(name, start)`` for the
-        constant init that precedes the loop; the loop must be a counted loop
-        (``i < stop`` / ``i <= stop`` / ``i > stop`` / ``i >= stop``) with a
-        single ``i = i + k`` / ``i = i - k`` increment in the body.  Returns
-        ``True`` when it unrolled the loop in place.
+        compile-time constant.  *pending_ivs* maps constant-init variable
+        names (``VarDecl`` with a numeric ``Number`` init) to their start
+        value; the loop's induction variable must be one of them and the loop
+        must be a counted loop (``i < stop`` ...) with a single ``i = i + k``
+        / ``i = i - k`` increment in the body.  Returns ``True`` when it
+        unrolled the loop in place.
 
         Each unrolled copy stores the canonical counter value into the
         induction variable's slot first, and also records it in the
         straight-line constant-propagation table so reads of the counter
         inside an iteration fold to a constant (as with ordinary control flow,
         the propagation is invalidated once the loop ends)."""
-        if pending_iv is None:
+        if not pending_ivs:
             return False
         info = _is_simple_counted_loop(node)
         if info is None:
             return False
         iv_name, stop, step, inclusive = info
-        pend_name, start_val = pending_iv
-        if pend_name != iv_name:
+        start_val = pending_ivs.get(iv_name)
+        if start_val is None:
             return False
         n = _count_loop_iterations(start_val, stop, step, inclusive)
         if n < 0 or n > 16:
@@ -5035,6 +5370,11 @@ class LLVM:
                 return False
             if isinstance(stmt, (If, While)):
                 return False
+        # Guard: pointer/field/array writes (`*p = ...`, `a[i] = ...`) or
+        # address-taking in the body could alias the counter's slot; unrolling
+        # stores canonical counter values that would clobber those writes.
+        if _loop_has_alias_risk(node.body):
+            return False
 
         iv_ptr = self.locals.get(iv_name)
         if iv_ptr is None:
@@ -5575,6 +5915,17 @@ class LLVM:
                     value = self.builder.fptosi(value, ty)
             self.builder.store(value, ptr)
             self._set_const_prop(node.name, _const_int_value(node.init))
+            if (
+                _const_int_value(node.init) is None
+                and node.var_type in ("float", "double")
+            ):
+                fv = _const_fp_value(node.init)
+                if fv is not None:
+                    self._const_prop_f[node.name] = fv
+                else:
+                    self._const_prop_f.pop(node.name, None)
+            else:
+                self._const_prop_f.pop(node.name, None)
         elif isinstance(ty, ir.PointerType):
             self.builder.store(ir.Constant(ty, None), ptr)
         elif isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):

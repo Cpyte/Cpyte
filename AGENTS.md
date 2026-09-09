@@ -1,5 +1,66 @@
 # Notes
 
+## Sept 2026 emitter optimization work (FP math, pow, unroll breadth)
+
+- **FP identity/strength-reduction + double const-prop now fire at every
+  `--opt` level** (`_try_algebraic_simplify` in `bytecoding.py`). New
+  double/float lane runs alongside the integer lane: literal const folding on
+  `+ - * /` (div-by-0 skipped), `x*1.0 -> x`, `x*-1.0 -> -x`
+  (`_emit_fneg`, mul-by--1 = exact sign xor; `fsub(0,x)` would NOT be, it
+  breaks `-0.0`), `x/1.0 -> x`, `x/-1.0 -> -x`, `x-0.0 -> x`. NOT folded (in
+  each case rounding/NaN/signed-zero unsafe): `x+0.0`, `x*0.0`, `x-x`,
+  `x/0.0` (frem/`//` too). `pow`/`**` is strength-reduced BEFORE the libm
+  call for const exponents: int lanes `x**{0,1,2} -> 1/x/x*x` and `x**3 ->
+  x*x*x` (exact integer arithmetic, replaces the old sitofp/pow/fptosi double
+  round-trip), fp lanes `x**0.0->1.0`, `x**1.0->x`, `x**2.0->x*x`, `x**0.5->
+  llvm.sqrt.f64` (intrinsic, no libm), `x**-1.0->1.0/x`. `x**3.0` (fp) is
+  deliberately NOT folded (1-ulp); negative int exponents keep the float
+  path (semantics of the old fptosi).
+- **`double`/`float` constants are tracked (`_const_prop_f`)** alongside int
+  const-prop: `double two = 2.0; d * two; pow(d, two)` substitute the literal
+  so the FP folds apply. `_set_const_prop` now invalidates the FP entry too,
+  and `emit_while` mirrors the `_loop_written_names` save/restore for
+  `_const_prop_f` (the stale-FP-constant-across-a-loop bug that `d2 = d2 +
+  1.0` inside a `while` would otherwise have produced is regression-tested in
+  `test_opt_fp.cpy`: `d2 * 3.0` after the loop prints 15, not stale 6).
+- **Counted-loop unrolling now survives intervening constants.** The
+  single `pending_iv` tuple in `emit_funcdef` is a `pending_ivs` DICT
+  (`name -> start`); `int i = 0; int total = 0; while i < 5:` unrolls (the
+  old code cleared on the second VarDecl). Non-`Number` VarDecls (incl.
+  `int* p = &i`) and every `While` clear the whole dict, so addr-taken ivs
+  still never unroll. `_try_unroll_counted_loop` takes the dict and looks the
+  iv up by name.
+- **`while 0:` skips emission entirely** (`emit_while` tops out on a literal
+  `0` cond); `while j < 0` also short-circuits via the existing n==0 unroll
+  path. Regression suite: `test_opt_fp.cpy` (opt3 == opt0, 9 golden values).
+
+## Sept 2026 bug-hunt findings (structural hazards in optimizations.py / bytecoding.py)
+
+- **LICM was silent dead code; now it runs.** `_find_loop_invariants` used
+  `_collect_assigned_names` (top-level targets only), so every hoist candidate's
+  own target was always in `mutated` -> `[]` forever. Additionally
+  `_get_used_variables` read `expr._children`, which does NOT exist on AST
+  classes (`__slots__ = ("_token","inferred_type",...)`), so it returned an
+  empty set for non-Variable expressions. Both were rewritten as deep stack
+  walkers; `_collect_assigned_names` is now dead code (left in place).
+- **LICM must not hoist side-effecting calls or memory reads.** Hoisting
+  `x = g(k)` out of a loop where `g` does `print` changed output (verified
+  miscompile: prints once instead of 8x). `_find_loop_invariants` now rejects
+  any RHS containing `Call`/`Deref`/`Attr`/`Index`/`NewExpr`/`InlineAsm`
+  (`_expr_may_violate_invariance`). Regression: `test_opt_alg.cpy` `tick` block.
+- **Unrolling walks through aliasing writes.** Unroll stores canonical counter
+  values into the iv alloca; a loop body that does `*p = ...`/`a[i] = ...`/
+  `obj.field = ...` (or takes `&x`) could have those writes clobbered.
+  `_try_unroll_counted_loop` now bails when `_loop_has_alias_risk(body)`
+  (Deref/AddrOf/Attr/Index/NewExpr/Borrow/Move anywhere in the body).
+- Owl-eyed honesty check that saved two false reproductions: for
+  `int* p = &i; while i < 2: *p = *p + 3; i = i + 1`, the *intervening*
+  `int* p = &i` VarDecl already breaks the "VarDecl immediately before the
+  loop" pending-iv machinery, so no unroll happened; and `//` is FLOOR division
+  (`7 // -4 == -2`), not trunc. Negative literal divisors also never reach the
+  pow2 const path at runtime (`-4` lowers to `sub i32 0, 4`, so the divisor is
+  not a constant -> plain `srem`, which is C-truncation-correct).
+
 ## v2.7.3 ast parse syntax error (line ~635) — TODO: yank
 
 - Reported: `ast.parse` had a syntax error around line 635 in the v2.7.3 (HEAD
@@ -97,11 +158,36 @@ corpus (8/8) green on macOS arm64 after these changes.
   and the `code()` builtin are routed through the compiler's internal
   `@__code_result`/`@__code_fn` slots **only when the current function returns
   `decorated`** (i.e. it is a decorator factory). Both semantic analysis
-  (`_in_decorator`) and codegen (`_in_decorator` in `bytecoding.py`) scope the
-  special-casing to that context. Outside a decorator, `result` is an ordinary
-  identifier (a struct variable, accumulator, etc.) and `code()` is not a
-  builtin. Do NOT rename real variables that happen to be called `result`; the
-  old workaround ("rename the accumulator") is no longer required.
+  (`_in_decorator`) and codegen gate the special-casing on the factory context
+  (`_is_decorator_factory` in `bytecoding.py`, set only for `rettype ==
+  "decorated"` — the decorated ORIGINAL function is emitted with this flag
+  `False`, so its body never misroutes ordinary locals named `result`/`args`).
+  Outside a decorator, `result` is an ordinary identifier (a struct variable,
+  accumulator, etc.) and `code()` is not a builtin. Do NOT rename real
+  variables that happen to be called `result`; the old workaround ("rename the
+  accumulator") is no longer required.
+- **Decorator access variabables `args` / `func_name` / `skip` (Sept 2026).**
+  A decorator factory body (`-> decorated`, using `@name` on a func) can
+  additionally read **`args`** (the decorated function's incoming arguments as
+  dynamic values; `int a = args[i]` unboxes) and **`func_name`** (the
+  decorated function's name as a `str`), and can write **`skip = true`** to
+  make the wrapper return the default value **without calling the original**.
+  Routing: the wrapper boxes its incoming args into a runtime buffer and stores
+  a `DynValue*` into global `@__code_args`, stores the name into
+  `@__code_fn_name` and `0` into `i1 @__code_skip` BEFORE running the
+  decorators; `args`/`func_name`/`skip` in the factory read/write those
+  globals at runtime (mirroring the existing `@__code_result`/`@__code_fn`
+  pattern). The trampoline (`__name_trampoline`) has a **fixed `() -> DynValue`
+  signature** — it pulls the args back out of `@__code_args` itself and unboxes
+  them (via `dyn_as_v` + `_unbox_dyn`) where the param types ARE static, so
+  `code()` never needs to know the decorated signature. Regression:
+  `test/test_decorator_access.cpy` (paramful `add(a,b)` + `skipcompute`;
+  prints `add`/`28`/`0`); `test_decorator.cpy` still prints `52`. The semantic
+  "must call code()" check is a **deep walk** now (a `code()` call nested under
+  `if`/`while`/`try` satisfies it), so a factory can legitimately gate the
+  original call behind a condition and use `skip = true` otherwise. Note:
+  multiple decorators are not Python-chained — each re-calls the original via
+  the trampoline and the last decorator's `result` wins.
 - **Cross-module struct field access is fragile.** Field-accessing a struct
   returned by a function works only when the user module *directly* imports
   the module that *defines* the struct (e.g. `SparseMatrix` from `sparse.cpy`).

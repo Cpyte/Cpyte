@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 AGENTS.md
+
+# Build artifacts
+dist/
+build/
+test/crashes/*.o
+test/crashes/*.gc.o
+test/crashes/*.runtime.o
+*.gc.o
+*.runtime.o

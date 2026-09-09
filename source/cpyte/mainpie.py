@@ -427,7 +427,12 @@ def _emit(
         raise
     except Exception as e:
         ui.print_err(f"codegen error: {type(e).__name__}: {e}")
+        if isinstance(e, RuntimeError):
+            sys.exit(1)
+        if getattr(e, "user_facing", False):
+            sys.exit(1)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     return prog, src_files

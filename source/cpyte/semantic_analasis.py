@@ -553,6 +553,7 @@ class SemanticAnalyzer:
         self._lazy_load_error: str | None = None
         self._promoted_vars: set[str] = set()
         self._forward_names: set[str] = set()
+        self._imported_clibs: set[str] = set()
 
     def _hook_context(self) -> CompilerContext:
         """Build a cached CompilerContext exposing this analyzer to hooks."""
@@ -1021,6 +1022,12 @@ class SemanticAnalyzer:
                 node.inferred_type = "dynamic"
                 node.dynamic = True
                 return "dynamic"
+            if self._in_decorator and node.name == "args":
+                node.inferred_type = "dynamic[]"
+                return "dynamic[]"
+            if self._in_decorator and node.name == "func_name":
+                node.inferred_type = "str"
+                return "str"
             sym = self.current_scope.lookup(node.name)
             if sym is None and self._enum_context_name:
                 sym = self.current_scope.lookup(
@@ -1672,6 +1679,16 @@ class SemanticAnalyzer:
                 call,
                 note=f"expects {expected_count}, got {actual_count}",
             )
+        if sym.node and isinstance(sym.node, FuncDef):
+            for arg in call.args:
+                if self._infer_type(arg) == "void":
+                    self.error(
+                        "passing a void expression as an argument",
+                        arg,
+                        code="E1002",
+                        note="`void` functions/expressions return nothing to "
+                        "pass to a parameter",
+                    )
 
     def _visit(self, node, scope: Scope | None = None):
         for hook in self._hook_registry.get(HookStage.SEMANTIC):
@@ -1844,6 +1861,22 @@ class SemanticAnalyzer:
                 return candidate
         return None
 
+    def _maybe_header_impl_file(self, resolved):
+        """If a C header import has a same-basename .c/.cc definition file
+        beside it (e.g. project-local `foo.h` + `foo.c`), return its path so
+        the compiler compiles/links the definitions. System and framework
+        headers have no sibling source, so callers get None and keep the lazy
+        extern-only behavior."""
+        low = resolved.lower()
+        if not (low.endswith(".h") or low.endswith(".hpp")):
+            return None
+        base = resolved.rsplit(".", 1)[0]
+        for ext in (".c", ".cc"):
+            impl = base + ext
+            if os.path.exists(impl):
+                return impl
+        return None
+
     def _visit_import(self, node: Import):
         module = node.module
 
@@ -1864,6 +1897,7 @@ class SemanticAnalyzer:
                 result = resolve_library(module)
                 if result is not None:
                     symbols, kind = result
+                    self._imported_clibs.add(module)
                     self._register_import_symbols(symbols, node)
                     return
 
@@ -1883,6 +1917,7 @@ class SemanticAnalyzer:
                 self.error(f"unknown library `{module}`", node)
             else:
                 symbols, kind = result
+                self._imported_clibs.add(module)
                 self._register_import_symbols(symbols, node)
             return
 
@@ -1918,6 +1953,9 @@ class SemanticAnalyzer:
                     "loaded": False,
                 }
             )
+            impl = self._maybe_header_impl_file(resolved)
+            if impl is not None and not framework:
+                node.src_file = impl
             return
         elif module.endswith(".cpy"):
             result = self._import_cpy(resolved, node)
@@ -1948,6 +1986,9 @@ class SemanticAnalyzer:
                         "loaded": False,
                     }
                 )
+                impl = self._maybe_header_impl_file(resolved)
+                if impl is not None and not framework:
+                    node.src_file = impl
                 return
         else:
             result = None
@@ -2005,6 +2046,10 @@ class SemanticAnalyzer:
             return
         node.symbols = list(result[0].items())
         node.var_names = set()
+        node.includes = sorted(self._imported_clibs)
+        node.src_file = self.filepath
+        tok = getattr(node, "_token", None)
+        node.src_line = getattr(tok, "line", None) if tok is not None else None
         self._register_import_symbols(result[0], node)
 
     def _visit_llvm(self, node):
@@ -2364,13 +2409,33 @@ class SemanticAnalyzer:
             self._forward_names.discard(node.name)
 
         if node.rettype == "decorated":
-            has_code = any(
-                isinstance(stmt, ExprStmt)
-                and isinstance(stmt.expr, Call)
-                and isinstance(stmt.expr.callee, Variable)
-                and stmt.expr.callee.name == "code"
-                for stmt in node.body
-            )
+            has_code = False
+
+            def _find_code(stmts):
+                nonlocal has_code
+                if has_code:
+                    return
+                for stmt in stmts:
+                    if (
+                        isinstance(stmt, ExprStmt)
+                        and isinstance(stmt.expr, Call)
+                        and isinstance(stmt.expr.callee, Variable)
+                        and stmt.expr.callee.name == "code"
+                    ):
+                        has_code = True
+                        return
+                    subs = []
+                    for attr in ("body", "orelse"):
+                        sub = getattr(stmt, attr, None)
+                        if isinstance(sub, list):
+                            subs.extend(sub)
+                    if isinstance(stmt, Try):
+                        for h in getattr(stmt, "handlers", None) or []:
+                            subs.extend(getattr(h, "body", None) or [])
+                    if subs:
+                        _find_code(subs)
+
+            _find_code(node.body)
             if not has_code:
                 self.error(
                     "decorator function with return type `decorated` must call code()",
@@ -3048,6 +3113,14 @@ class SemanticAnalyzer:
 
     def _visit_assign(self, node: Assign, scope: Scope | None = None):
         val_type = self._infer_type(node.value)
+        if val_type == "void":
+            self.error(
+                "cannot assign the result of a void expression",
+                node.value,
+                code="E1002",
+                note="`void` functions/expressions return nothing and cannot be "
+                "used as values",
+            )
         if isinstance(node.target, (Variable, str)):
             name = (
                 node.target.name if isinstance(node.target, Variable) else node.target
@@ -3056,6 +3129,16 @@ class SemanticAnalyzer:
                 if isinstance(node.target, Variable):
                     node.target.inferred_type = "dynamic"
                     node.target.dynamic = True
+                return
+            # ENHANCEMENT: Handle decorator special variables
+            if self._in_decorator and name in ("args", "func_name", "skip"):
+                if isinstance(node.target, Variable):
+                    if name == "args":
+                        node.target.inferred_type = "dynamic[]"  # Array of dynamic values
+                    elif name == "func_name":
+                        node.target.inferred_type = "str"
+                    elif name == "skip":
+                        node.target.inferred_type = "bool"
                 return
             s = scope or self.current_scope
             existing = s.lookup_local(name)
@@ -3341,6 +3424,14 @@ class SemanticAnalyzer:
                     val_type == "str"
                     and (init_type.endswith("*") or init_type == "char")
                 )
+                if init_type == "void":
+                    self.error(
+                        "cannot initialize a variable with the result of a void expression",
+                        node,
+                        code="E1002",
+                        note="`void` functions/expressions return nothing and cannot "
+                        "be used as values",
+                    )
                 if ok and (init_type, val_type) in narrowing:
                     self._strict_error(
                         f"narrowing conversion from `{init_type}` to `{val_type}` in variable declaration",
@@ -3352,7 +3443,7 @@ class SemanticAnalyzer:
                         node,
                         note="use 0 literal for null pointer",
                     )
-                if not ok:
+                if not ok and init_type != "void":
                     self.error(
                         f"cannot initialize `{val_type}` variable with value of type `{init_type}`",
                         node,
@@ -3396,7 +3487,14 @@ class SemanticAnalyzer:
 
     def _visit_print(self, node: Print):
         for expr in node.value:
-            self._infer_type(expr)
+            t = self._infer_type(expr)
+            if t == "void":
+                self.error(
+                    "cannot print a void expression",
+                    expr,
+                    code="E1002",
+                    note="`void` functions/expressions return nothing to print",
+                )
 
     def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals

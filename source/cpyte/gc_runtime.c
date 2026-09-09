@@ -16,6 +16,8 @@
 
 #define UGC_IMPLEMENTATION
 #define UGC_USE_TAGGED_POINTER 0
+#include <stddef.h>
+extern void gc_trace(const char* what, size_t v);
 #include "ugc.h"
 
 #include <stdlib.h>
@@ -64,6 +66,10 @@ typedef struct {
 /* Forward declarations for functions used by TLAB */
 static void obj_track(void* hdr);
 
+/* Forward declaration: collection is triggered from gc_malloc (foreground,
+ * on the mutator thread) once the allocation threshold is crossed. */
+void gc_collect(void);
+
 /* ── Global GC state ────────────────────────────────────────────── */
 
 static ugc_t         gc;
@@ -80,7 +86,12 @@ static void gc_lock_init(void) {
 
 /* allocation pressure for triggering collection */
 static volatile size_t gc_alloc_bytes = 0;
-static size_t          gc_threshold   = 1024 * 1024;  /* 1 MB default */
+static size_t          gc_threshold   = 0;  /* 0 = never auto-collect */
+
+void gc_trace(const char* what, size_t v) {
+    const char* d = getenv("CPYTE_GC_DEBUG");
+    if (d && *d) fprintf(stderr, "[gc] %s %zu\n", what, v);
+}
 
 /* ── Reduced Lock Contention (Simplified TLAB) ─────────────────────
  * Full TLABs (Thread-Local Allocation Buffers) reduce lock contention but
@@ -103,7 +114,7 @@ typedef struct {
 #ifdef _WIN32
 __declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
 #else
-__thread static tlab_t tlab = {NULL, NULL, NULL};
+static __thread tlab_t tlab = {NULL, NULL, NULL};
 #endif
 
 static void* tlab_alloc(size_t size) {
@@ -146,11 +157,14 @@ static void* tlab_alloc(size_t size) {
 #define OBJ_TABLE_SIZE (1 << OBJ_TABLE_BITS)
 
 typedef struct obj_entry_s {
-    void*               addr;   /* cpyte_obj_t* */
-    struct obj_entry_s* next;
+    cpyte_obj_t*        hdr;    /* block header */
+    size_t              size;   /* payload size (for interior-pointer containment) */
+    struct obj_entry_s* next;   /* hash bucket chain */
+    struct obj_entry_s* all;    /* containment list chain */
 } obj_entry_t;
 
 static obj_entry_t* obj_table[OBJ_TABLE_SIZE];
+static obj_entry_t* obj_list = NULL;  /* all tracked blocks, for containment search */
 
 static unsigned long hash_ptr(const void* p) {
     unsigned long v = (unsigned long)p;
@@ -161,18 +175,30 @@ static unsigned long hash_ptr(const void* p) {
 static void obj_track(void* hdr) {
     unsigned long h = hash_ptr(hdr);
     obj_entry_t* e = (obj_entry_t*)malloc(sizeof(obj_entry_t));
-    e->addr = hdr;
+    e->hdr = (cpyte_obj_t*)hdr;
+    e->size = ((cpyte_obj_t*)hdr)->size;
     e->next = obj_table[h];
     obj_table[h] = e;
+    e->all = obj_list;
+    obj_list = e;
 }
 
 static void obj_untrack(void* hdr) {
     unsigned long h = hash_ptr(hdr);
     obj_entry_t** pp = &obj_table[h];
     while (*pp) {
-        if ((*pp)->addr == hdr) {
+        if ((*pp)->hdr == hdr) {
             obj_entry_t* tmp = *pp;
             *pp = tmp->next;
+            /* also remove from the containment list */
+            obj_entry_t** q = &obj_list;
+            while (*q) {
+                if ((*q)->hdr == hdr) {
+                    *q = (*q)->all;
+                    break;
+                }
+                q = &(*q)->all;
+            }
             free(tmp);
             return;
         }
@@ -184,10 +210,25 @@ static int obj_is_tracked(const void* hdr) {
     unsigned long h = hash_ptr(hdr);
     obj_entry_t* e = obj_table[h];
     while (e) {
-        if (e->addr == hdr) return 1;
+        if (e->hdr == hdr) return 1;
         e = e->next;
     }
     return 0;
+}
+
+/* Find the tracked block that contains a caller-visible (payload-interior)
+ * pointer. Conservative scans may produce pointers that land anywhere inside
+ * an allocation, so an exact header match is not enough. */
+static cpyte_obj_t* obj_find_containing(const void* user) {
+    const char* u = (const char*)user;
+    obj_entry_t* e;
+    for (e = obj_list; e; e = e->next) {
+        const char* payload = (const char*)e->hdr + sizeof(cpyte_obj_t);
+        if (e->size > 0 && u >= payload && u < payload + e->size) {
+            return e->hdr;
+        }
+    }
+    return NULL;
 }
 
 /* ── Conservative stack scanner ─────────────────────────────────── */
@@ -202,20 +243,35 @@ static void scan_stack_range(void* lo, void* hi) {
         /* quick alignment check */
         if ((unsigned long)candidate & (sizeof(void*) - 1)) continue;
 
-        /* check if candidate points to a tracked GC object */
-        cpyte_obj_t* hdr = TO_HDR(candidate);
-        if (obj_is_tracked(hdr)) {
-            ugc_visit(&gc, &hdr->base);
+        /* check if candidate points into a tracked GC object */
+        cpyte_obj_t* obj = obj_find_containing(candidate);
+        if (obj) {
+            ugc_visit(&gc, &obj->base);
         }
     }
 }
 
 static void scan_stack(void) {
 #if defined(_WIN32)
-    /* Windows: use GetCurrentThreadStackLimits (Win 8+) */
+    /* Windows: use GetCurrentThreadStackLimits (Win 8+). The reserved range
+     * also covers UNCOMMITTED pages and the guard page at the committed edge;
+     * reading those faults, so only walk MEM_COMMIT pages (skipping the
+     * PAGE_GUARD boundary) via VirtualQuery. */
     ULONG_PTR lo = 0, hi = 0;
     GetCurrentThreadStackLimits(&lo, &hi);
-    scan_stack_range((void*)lo, (void*)hi);
+    char* p = (char*)lo;
+    while (p < (char*)hi) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) break;
+        char* reg_end = (char*)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD)) {
+            char* begin = p > (char*)mbi.BaseAddress ? p : (char*)mbi.BaseAddress;
+            char* end = (char*)hi < reg_end ? (char*)hi : reg_end;
+            if (begin < end) scan_stack_range(begin, end);
+        }
+        if (reg_end <= p) break;  /* paranoia: no forward progress */
+        p = reg_end;
+    }
 #elif defined(__APPLE__)
     /* macOS: use pthread APIs */
     pthread_t self = pthread_self();
@@ -268,8 +324,8 @@ static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
         /* alignment check */
         if ((unsigned long)candidate & (sizeof(void*) - 1)) continue;
 
-        cpyte_obj_t* child = TO_HDR(candidate);
-        if (obj_is_tracked(child)) {
+        cpyte_obj_t* child = obj_find_containing(candidate);
+        if (child && obj_is_tracked(child)) {
             ugc_visit(g, &child->base);
         }
     }
@@ -291,6 +347,13 @@ void gc_init(void) {
     ugc_init(&gc, gc_scan_cb, gc_release_cb);
     gc_alloc_bytes = 0;
     gc_running = 1;
+    {
+        const char* t = getenv("CPYTE_GC_THRESHOLD");
+        if (t && *t) {
+            size_t v = (size_t)strtoul(t, NULL, 10);
+            if (v > 0) gc_threshold = v;
+        }
+    }
     
     /* Initialize TLAB for the current thread */
     tlab.start = NULL;
@@ -304,6 +367,10 @@ void* gc_malloc(size_t size) {
         void *ptr = tlab_alloc(size);
         if (ptr != NULL) {
             gc_alloc_bytes += size;
+            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
+                gc_trace("collect-trigger", gc_alloc_bytes);
+                gc_collect();
+            }
             return ptr;
         }
     }
@@ -331,6 +398,15 @@ void* gc_malloc(size_t size) {
     gc_alloc_bytes += size;
 
     CPY_MUTEX_UNLOCK(&gc_lock_);
+
+    if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
+        /* The object has not hit the mutator stack yet (it is about to be
+         * returned in a register), so grey it explicitly to survive the
+         * foreground collection. */
+        ugc_visit(&gc, &obj->base);
+        gc_collect();
+    }
+
     return TO_USER(obj);
 }
 
@@ -354,6 +430,15 @@ void gc_write_barrier(void* parent_ptr, void* child_ptr) {
 void gc_collect(void) {
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
+    /* Protect the current TLAB block: its interior objects are live because
+     * the mutator is executing; interior-pointer scan alone cannot see a block
+     * that is only referenced through a bump-pointer interior alias. */
+    if (tlab.start != NULL && tlab.current != tlab.start) {
+        cpyte_obj_t* hdr = (cpyte_obj_t*)((char*)tlab.start - sizeof(cpyte_obj_t));
+        if (obj_is_tracked(hdr)) {
+            ugc_visit(&gc, &hdr->base);
+        }
+    }
     ugc_collect(&gc);
     gc_alloc_bytes = 0;
     CPY_MUTEX_UNLOCK(&gc_lock_);
@@ -370,14 +455,14 @@ static void* gc_thread_fn(void* arg) {
 #endif
 
     while (gc_running) {
-        /* Step the GC if it has work to do */
+        /* Step the GC if it has work to do. Collection cycles are started
+         * synchronously on the mutator (in gc_malloc / gc_collect) so that the
+         * conservative root scan runs on the thread that actually owns the
+         * live JIT roots; the background thread must never begin a cycle,
+         * because its own stack holds none of the mutator's roots. */
         CPY_MUTEX_LOCK(&gc_lock_);
         if (gc.state != UGC_IDLE) {
             ugc_step(&gc);
-        } else if (gc_alloc_bytes >= gc_threshold) {
-            /* Start a new collection cycle */
-            ugc_step(&gc);  /* IDLE -> MARK, scans roots */
-            gc_alloc_bytes = 0;
         }
         CPY_MUTEX_UNLOCK(&gc_lock_);
 
@@ -395,6 +480,7 @@ static void* gc_thread_fn(void* arg) {
 void gc_start_thread(void) {
     gc_lock_init();
     if (gc_thread) return;  /* already started */
+    if (gc_threshold == 0) return;  /* auto-collect off: no background stepper */
     CPY_THREAD_START(&gc_thread, gc_thread_fn, NULL);
 }
 

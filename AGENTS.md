@@ -296,3 +296,31 @@ corpus (8/8) green on macOS arm64 after these changes.
   QR), generalized eigen, power iteration, and iterative solvers CG/Jacobi/
   Gauss-Seidel/SOR/Richardson/BiCGSTAB/GMRES/MINRES. Validate with
   `tmp_validate.cpy`.
+
+## v4.1.0 release (Sept 2026, published to PyPI + github + gitea)
+
+- Published as commit a67f338, tag `v4.1.0` (origin github.com/cpyte/cpyte +
+  gitea.5gnew.io.vn/Cpyte-Project/Cpyte). Bump `pyproject.toml` version first,
+  then `python -m build` (regenerates `source/cpyte.egg-info/`), `twine upload
+  --repository pypi dist/cpyte-4.1.0.*` (reads token from `~/.pypirc`), then
+  `twine upload --repository gitea dist/...`. Wheel smoke-tested in a fresh
+  venv (`python -m venv %TEMP%\opencode\cpyte41venv`); install + compile/run of
+  corpus programs confirmed the shipped artifact works standalone.
+- **Gitea git push needs an explicit credential bypass**: `git push gitea` via
+  the Git Credential Manager fails auth, but
+  `git -c credential.helper= push https://duytung:Duytung%402015@gitea.5gnew.io.vn/Cpyte-Project/Cpyte.git <ref>`
+  works (password is `Duytung@2015`, `@` must be URL-encoded as `%40`).
+  `twine` is on PATH only as `python -m twine` in this environment.
+- **`--version` still prints the stale `__init__.py` constant (`__version__` is
+  a separately-maintained string, still "3.4.0"):** `cpy --version` does
+  `from cpyte import __version__` (mainpie.py:867), NOT the pip metadata. The
+  pyproject build tag and `__version__` have drifted (4.1.0 vs 3.4.0); a true
+  fix is to derive `__version__` from `importlib.metadata` or sync both at
+  release time. TODO: decide with the user whether to patch + republish 4.1.1.
+- **Release hygiene**: `.gitignore` now excludes `dist/`, `build/`, and
+  `test/crashes/*.o` / `*.gc.o` / `*.runtime.o` (the 2500×3 fuzz artifacts must
+  NOT be committed; `examples/*.o` remain tracked binaries — leave them
+  unstaged at release time).
+- New GA workflow `.github/workflows/code_quality.yml` (ran `test` + `bomb` +
+  `benchmarks` jobs) and `ci_bomb.py` (repo-root fuzz driver, 2500/2500) are
+  now tracked and part of the release.

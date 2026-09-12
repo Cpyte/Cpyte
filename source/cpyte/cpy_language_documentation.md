@@ -300,13 +300,35 @@ uint64* uint64_ptr  # Pointer to unsigned 64-bit integer
 
 ### Array Types
 
-Arrays are dynamically allocated with explicit size:
+Arrays are dynamically allocated with explicit size; all array values are
+growable, and a `len()` builtin reports the current element count:
 
 ```cpy
 int[] numbers      # Array of integers
 str[] strings      # Array of strings
 Point[] points     # Array of Point structures
 ```
+
+#### Growth: `append(arr, x)` and `len(arr)`
+
+Every array produced by `new T[n]`, `range()`, a list literal or `str_split()`
+is backed by a registered heap buffer whose length can grow. `append(arr, x)`
+appends `x` to `arr` (returning the possibly-relocated array pointer), and
+`len(arr)` returns the current element count as `int64`:
+
+```cpy
+int[] a = new int[2]
+append(a, 10)
+append(a, 20)
+len(a)               # → 2
+print(a[0], a[1])    # 10 20
+```
+
+Both `append` and `len` may be shadowed by user-defined functions of the same
+name, exactly like `range` and `str_split`.
+
+Note: fixed-size array locals (`int[5]`) and raw C buffers are not
+registered and cannot be grown or queried with `append`/`len`.
 
 ### Type Annotations
 

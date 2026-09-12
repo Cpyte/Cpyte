@@ -793,6 +793,7 @@ dyn_str(const char *name) {
 
 typedef struct {
     size_t length;
+    size_t capacity;
     uint8_t data[]; // Flexible array member
 } CpyArrayHeader;
 
@@ -804,6 +805,7 @@ cpyte_array_alloc(size_t elem_size, size_t count) {
         return NULL;
     }
     header->length = count;
+    header->capacity = count;
     return header->data;
 }
 
@@ -815,14 +817,43 @@ cpyte_array_len(void *arr) {
 }
 
 void
+cpyte_array_set_len(void *arr, size_t new_len) {
+    if (arr == NULL) return;
+    CpyArrayHeader *header = (CpyArrayHeader*)((char*)arr - sizeof(CpyArrayHeader));
+    header->length = new_len;
+}
+
+void
 cpyte_array_unregister(void *arr) {
     // No-op with length-prefixed header: the header is freed with the array
     (void)arr;
 }
 
-// PERFORMANCE FIX: Legacy hash table implementation removed - no longer needed
-// Length-prefixed header implementation (above) provides better performance
-// without the hash table lookup overhead.
+/* Grow an array's capacity so that (length + increment) elements fit.
+ * Returns the (possibly moved) data pointer.  When growing is needed a new
+ * header + buffer is malloc'd, data is copied and the old block freed, which
+ * is safe because the caller holds the only pointer. */
+void*
+cpyte_array_reserve(void *arr, size_t elem_size, size_t increment) {
+    if (arr == NULL) return arr;
+    CpyArrayHeader *header = (CpyArrayHeader*)((char*)arr - sizeof(CpyArrayHeader));
+    size_t want = header->length + increment;
+    if (want <= header->capacity) {
+        return arr;  /* enough room – no realloc */
+    }
+    /* Double until we have room, minimum 4 */
+    size_t ncap = header->capacity;
+    if (ncap < 4) ncap = 4;
+    while (ncap < want) ncap *= 2;
+    size_t bytes = sizeof(CpyArrayHeader) + elem_size * ncap;
+    CpyArrayHeader *nu = (CpyArrayHeader*)malloc(bytes);
+    if (nu == NULL) return arr;  /* OOM – caller gets old pointer */
+    memcpy(nu->data, arr, header->length * elem_size);
+    nu->length = header->length;
+    nu->capacity = ncap;
+    free(header);
+    return nu->data;
+}
 
 // ---------------------------------------------------------------------------
 // Slot-indexed dynamic values + polymorphic runtime dispatch.
@@ -1311,6 +1342,59 @@ dyn_list_get(uint64_t list_bits, int64_t idx) {
         abort();
     }
     return &arr[idx];
+}
+
+/* dyn_list_repeat(list, n): return a new dynamic[] list that is `list`
+ * repeated `n` times (e.g. `[false] * 4`). Uses the same element semantics as
+ * a regular list literal (shared DynValue entries). Registered with the
+ * array-length header so for-in / cpyte_array_len work. */
+DynValue *
+dyn_list_repeat(uint64_t list_bits, int64_t n) {
+    DynValue *src = (DynValue *)(uintptr_t)list_bits;
+    if (src == NULL) {
+        fprintf(stderr, "repeating NULL dynamic list\n");
+        abort();
+    }
+    if (n < 0) {
+        fprintf(stderr, "cannot repeat a dynamic list a negative number of times\n");
+        abort();
+    }
+    int64_t len = cpyte_array_len(src);
+    int64_t total = len * n;
+    DynValue *arr = (DynValue *)cpyte_array_alloc(
+        sizeof(DynValue), total > 0 ? (size_t)total : 1);
+    if (arr == NULL) {
+        fprintf(stderr, "dynamic list repeat: allocation failed\n");
+        abort();
+    }
+    int64_t out_i = 0;
+    for (int64_t r = 0; r < n; r++) {
+        for (int64_t i = 0; i < len; i++) {
+            arr[out_i++] = src[i];
+        }
+    }
+    if (total == 0) {
+        cpyte_array_set_len(arr, 0);
+    }
+    return arr;
+}
+
+/* dyn_list_contains(list, kind, bits): Python-style `elem in list` for a
+ * dynamic[] list. Equality semantics match the dyn_op dispatcher, so ints,
+ * bools, doubles, strings and pointers compare the way == would. */
+int
+dyn_list_contains(uint64_t list_bits, int want_kind, uint64_t want_bits) {
+    DynValue *arr = (DynValue *)(uintptr_t)list_bits;
+    if (arr == NULL)
+        return 0;
+    int64_t n = cpyte_array_len(arr);
+    DynValue tmp;
+    for (int64_t i = 0; i < n; i++) {
+        dyn_op(&tmp, DYNOP_EQ, arr[i].kind, arr[i].data, want_kind, want_bits);
+        if (tmp.kind == DYN_BOOL && tmp.data != 0)
+            return 1;
+    }
+    return 0;
 }
 
 /* str_split(str, sep) — split a string by a separator into a DynValue list.

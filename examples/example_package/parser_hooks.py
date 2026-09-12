@@ -3,10 +3,11 @@ Example parser hooks for the example_package.
 
 This demonstrates how packages can extend the parser with custom syntax.
 """
+
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source"))
 from cpyte.extension_hooks import ParserHook
 
 
@@ -15,9 +16,9 @@ class AsyncParserHook(ParserHook):
 
     def should_handle_statement(self, tokens, pos):
         """Check if this is an async function definition."""
-        if pos < len(tokens) and tokens[pos].value == 'async':
+        if pos < len(tokens) and tokens[pos].value == "async":
             # Check if followed by 'def'
-            if pos + 1 < len(tokens) and tokens[pos + 1].value == 'def':
+            if pos + 1 < len(tokens) and tokens[pos + 1].value == "def":
                 return True
         return False
 

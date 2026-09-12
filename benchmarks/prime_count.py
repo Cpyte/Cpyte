@@ -1,4 +1,3 @@
-
 def is_prime(n):
     if n < 2:
         return 0
@@ -12,6 +11,7 @@ def is_prime(n):
             return 0
         i += 2
     return 1
+
 
 count = 0
 for n in range(2, 1000000):

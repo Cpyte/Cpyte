@@ -44,7 +44,7 @@ def _trunc_to_signed(value: int, width: int) -> int:
     mask = (1 << width) - 1
     value &= mask
     if value >= (1 << (width - 1)):
-        value -= (1 << width)
+        value -= 1 << width
     return value
 
 
@@ -86,7 +86,7 @@ def _fold_int_binop(op, left: int, right: int) -> Optional[int]:
         return left ^ right
     if op == TokenType.POW:
         try:
-            return left ** right
+            return left**right
         except (OverflowError, ValueError):
             return None
     return None
@@ -95,6 +95,7 @@ def _fold_int_binop(op, left: int, right: int) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Bit-manipulation helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_power_of_2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
@@ -114,16 +115,27 @@ def _log2_floor(n: int) -> int:
 # 1. Fibonacci / linear-recurrence detection + fast-doubling
 # ---------------------------------------------------------------------------
 
+
 def _detect_fibonacci_pattern(node: FuncDef):
     """Detect a standard recursive Fibonacci function.
 
-    Recognises::
+    Recognises the exact, semantics-preserving shape::
 
-        def fib(n: int) -> int:
-            if n <= 1: return n
+        def fib(n: int) -> int:            # or ``-> big`` / ``-> int64``
+            if n <= 1:                     # or ``n < 2``
+                return n                   # (optionally ``big nn = n; return nn``)
             return fib(n-1) + fib(n-2)
 
+    also when the recursion lives in the ``else`` branch of the base guard.
     Returns ``(param_name, param_type, ret_type)`` on success, else *None*.
+
+    The match is deliberately exact rather than a loose pattern: the base
+    block must return exactly ``n`` (identity on the parameter, via a chain of
+    plain alias ``VarDecl``s) and the recursion must be exactly
+    ``f(n-1) + f(n-2)`` (either operand order).  Anything else -- a different
+    base constant such as ``return 0``/``return 1``, ``f(n-3) + f(n-5)``, side
+    effects, extra statements -- yields *None* so the fast-doubling rewrite in
+    the backend can never change observable behaviour.
     """
     if not isinstance(node, FuncDef):
         return None
@@ -137,85 +149,118 @@ def _detect_fibonacci_pattern(node: FuncDef):
     if not body:
         return None
 
-    has_base = False
-    has_rec = False
+    # The base-case guard must be the first statement.
+    guard = body[0]
+    if not isinstance(guard, If):
+        return None
+    if not _is_fib_bound_cond(guard.cond, param_name):
+        return None
+    # The guard's then-branch must return exactly the parameter value.
+    if not _is_param_identity_return(guard.body, param_name):
+        return None
 
-    for stmt in body:
-        if isinstance(stmt, If):
-            cond = stmt.cond
-            if isinstance(cond, BinOp) and cond.op in (
-                TokenType.LESS_EQ, TokenType.LESS,
-            ):
-                # n <= 1 / n < 2  (or reversed)
-                if (
-                    isinstance(cond.left, Variable)
-                    and cond.left.name == param_name
-                    and isinstance(cond.right, Number)
-                    and cond.right.value in ("1", "2")
-                ) or (
-                    isinstance(cond.right, Variable)
-                    and cond.right.name == param_name
-                    and isinstance(cond.left, Number)
-                    and cond.left.value in ("1", "2")
-                ):
-                    # Base-case return: `return n` / `return <var>` / `return 0` / `return 1`
-                    def _is_base_return(s):
-                        return isinstance(s, Return) and isinstance(
-                            s.value, (Variable, Number)
-                        )
+    # The recursion is either the guard's else-branch or the statements that
+    # follow the guard; it must be exactly one ``return f(n-1) + f(n-2)`` and
+    # nothing else may be present in the function.
+    if guard.orelse:
+        recursion = guard.orelse
+        rest = body
+    else:
+        recursion = body[1:]
+        rest = body[:1]
+    if not _is_fib_pair_block(recursion, node.name, param_name):
+        return None
+    if len(rest) != 1:
+        return None
 
-                    for s in (stmt.body or []):
-                        if _is_base_return(s):
-                            has_base = True
-                    if stmt.orelse:
-                        # If the orelse carries the recursive call, mark it.
-                        if any(
-                            isinstance(s, Return)
-                            and _is_self_recursive_pair(
-                                s.value.left, s.value.right, node.name, param_name
-                            )
-                            if isinstance(s, Return) and isinstance(s.value, BinOp)
-                            and s.value.op == TokenType.PLUS
-                            else False
-                            for s in stmt.orelse
-                        ):
-                            has_rec = True
-                        for s in stmt.orelse:
-                            if _is_base_return(s):
-                                has_base = True
-        elif isinstance(stmt, Return):
-            if (
-                isinstance(stmt.value, BinOp)
-                and stmt.value.op == TokenType.PLUS
-                and _is_self_recursive_pair(stmt.value.left, stmt.value.right, node.name, param_name)
-            ):
-                has_rec = True
-
-    if has_base and has_rec:
-        return (param_name, param_type, ret_type)
-    return None
+    return (param_name, param_type, ret_type)
 
 
-def _is_self_recursive_pair(left, right, func_name: str, param_name: str) -> bool:
-    """Return True when *left* and *right* are ``func(param ± const)`` calls."""
-    if not (isinstance(left, Call) and isinstance(right, Call)):
+def _flip_compare(op) -> TokenType:
+    """Return the inverted comparison operator (``n < K`` <-> ``K > n``)."""
+    if op == TokenType.LESS:
+        return TokenType.GREATER
+    if op == TokenType.LESS_EQ:
+        return TokenType.GREATER_EQ
+    if op == TokenType.GREATER:
+        return TokenType.LESS
+    if op == TokenType.GREATER_EQ:
+        return TokenType.LESS_EQ
+    return op
+
+
+def _is_fib_bound_cond(cond, param_name: str) -> bool:
+    """True when *cond* is exactly ``n <= 1`` (or ``n < 2``), either operand
+    order.  These are the only bounds for which ``return n`` is valid on the
+    base domain ``n <= 1`` with the fast-doubling identity ``F(0)=0``,
+    ``F(1)=1`` and the ``n < 0 -> return n`` convention."""
+    if not isinstance(cond, BinOp):
         return False
-    if not (isinstance(left.callee, Variable) and left.callee.name == func_name):
+    op = cond.op
+    if op not in (TokenType.LESS, TokenType.LESS_EQ):
         return False
-    if not (isinstance(right.callee, Variable) and right.callee.name == func_name):
+    if isinstance(cond.left, Variable) and cond.left.name == param_name:
+        num = cond.right
+    elif isinstance(cond.right, Variable) and cond.right.name == param_name:
+        op = _flip_compare(op)
+        num = cond.left
+    else:
         return False
-    if len(left.args) != 1 or len(right.args) != 1:
+    v = _const_int_value(num)
+    if v is None:
         return False
-    for arg in (left.args[0], right.args[0]):
-        if not isinstance(arg, BinOp):
+    if op == TokenType.LESS_EQ:
+        return v == 1
+    return v == 2  # op == LESS
+
+
+def _is_param_identity_return(stmts, param_name: str) -> bool:
+    """True when a statement block returns exactly *param_name*, possibly by
+    first aliasing it through plain ``VarDecl``s (e.g. ``big nn = n``)."""
+    equal = {param_name}
+    for stmt in stmts:
+        if isinstance(stmt, VarDecl):
+            if isinstance(stmt.init, Variable) and stmt.init.name in equal:
+                equal.add(stmt.name)
+                continue
             return False
-        if arg.op != TokenType.MINUS:
-            return False
-        if not (isinstance(arg.left, Variable) and arg.left.name == param_name):
-            return False
-        if not isinstance(arg.right, Number):
-            return False
-    return True
+        if isinstance(stmt, Return):
+            return isinstance(stmt.value, Variable) and stmt.value.name in equal
+        return False
+    return False
+
+
+def _fib_call_delta(node, func_name: str, param_name: str) -> Optional[int]:
+    """Return the delta of a ``func(param - <delta>)`` call, else *None*."""
+    if not isinstance(node, Call):
+        return None
+    if not (isinstance(node.callee, Variable) and node.callee.name == func_name):
+        return None
+    if len(node.args) != 1:
+        return None
+    arg = node.args[0]
+    if not isinstance(arg, BinOp) or arg.op != TokenType.MINUS:
+        return None
+    if not (isinstance(arg.left, Variable) and arg.left.name == param_name):
+        return None
+    return _const_int_value(arg.right)
+
+
+def _is_fib_pair_block(stmts, func_name: str, param_name: str) -> bool:
+    """True when *stmts* is exactly one ``return f(n-1) + f(n-2)`` statement."""
+    if len(stmts) != 1:
+        return False
+    stmt = stmts[0]
+    if not isinstance(stmt, Return):
+        return False
+    value = stmt.value
+    if not isinstance(value, BinOp) or value.op != TokenType.PLUS:
+        return False
+    left = _fib_call_delta(value.left, func_name, param_name)
+    right = _fib_call_delta(value.right, func_name, param_name)
+    if left is None or right is None:
+        return False
+    return sorted((left, right)) == [1, 2]
 
 
 def _iterative_fib_indices(n_bits: int) -> list[bool]:
@@ -225,7 +270,7 @@ def _iterative_fib_indices(n_bits: int) -> list[bool]:
     if n_bits <= 0:
         return []
     bin_str = bin(n_bits)[3:]  # strip '0b1'
-    return [c == '1' for c in bin_str]
+    return [c == "1" for c in bin_str]
 
 
 def _fib_precomputed_table(max_n: int = 70) -> list[int]:
@@ -245,6 +290,7 @@ _FIB_SMALL_TABLE = _fib_precomputed_table(70)
 # ---------------------------------------------------------------------------
 # 3. Loop analysis helpers
 # ---------------------------------------------------------------------------
+
 
 def _loop_written_names(node) -> frozenset[str]:
     """Names of scalar variables the loop body may assign, collected by a
@@ -355,7 +401,12 @@ def _is_simple_counted_loop(node) -> tuple[str, int, int, bool] | None:
     cond = node.cond
     if not isinstance(cond, BinOp):
         return None
-    if cond.op not in (TokenType.LESS, TokenType.LESS_EQ, TokenType.GREATER, TokenType.GREATER_EQ):
+    if cond.op not in (
+        TokenType.LESS,
+        TokenType.LESS_EQ,
+        TokenType.GREATER,
+        TokenType.GREATER_EQ,
+    ):
         return None
     if not isinstance(cond.left, Variable):
         return None
@@ -377,7 +428,11 @@ def _is_simple_counted_loop(node) -> tuple[str, int, int, bool] | None:
         ):
             iv_assigns += 1
             b = stmt.value
-            if isinstance(b, BinOp) and isinstance(b.left, Variable) and b.left.name == iv_name:
+            if (
+                isinstance(b, BinOp)
+                and isinstance(b.left, Variable)
+                and b.left.name == iv_name
+            ):
                 n = _const_int_value(b.right)
                 if n is None:
                     return None
@@ -400,7 +455,9 @@ def _is_simple_counted_loop(node) -> tuple[str, int, int, bool] | None:
     return (iv_name, stop, step_val, inclusive)
 
 
-def _count_loop_iterations(start: int, stop: int, step: int, inclusive: bool = False) -> int:
+def _count_loop_iterations(
+    start: int, stop: int, step: int, inclusive: bool = False
+) -> int:
     """Return the number of iterations of a counted loop, or -1 if unknown.
 
     With *inclusive* set (``<=``/``>=`` conditions) the boundary value is
@@ -411,16 +468,25 @@ def _count_loop_iterations(start: int, stop: int, step: int, inclusive: bool = F
     if step > 0:
         if stop < start or (not inclusive and stop == start):
             return 0
-        return (stop - start + step) // step if inclusive else (stop - start + step - 1) // step
+        return (
+            (stop - start + step) // step
+            if inclusive
+            else (stop - start + step - 1) // step
+        )
     else:
         if stop > start or (not inclusive and stop == start):
             return 0
-        return (start - stop + (-step)) // (-step) if inclusive else (start - stop + (-step) - 1) // (-step)
+        return (
+            (start - stop + (-step)) // (-step)
+            if inclusive
+            else (start - stop + (-step) - 1) // (-step)
+        )
 
 
 # ---------------------------------------------------------------------------
 # 4. Algebraic-identity helpers
 # ---------------------------------------------------------------------------
+
 
 def _collect_assigned_names(stmts) -> set[str]:
     """Return the set of variable names assigned anywhere in *stmts*."""

@@ -114,12 +114,19 @@ returns a list (or tuple) of hook class instances.
 ```python
 from cpyte.extension_hooks import ParserHook
 
+
 class MyParserHook(ParserHook):
     def initialize(self, context):
         pass
 
+
 def get_hooks():
-    return [MyParserHook("my_package", metadata=HookMetadata(name="my_package.parser", description="..."))]
+    return [
+        MyParserHook(
+            "my_package",
+            metadata=HookMetadata(name="my_package.parser", description="..."),
+        )
+    ]
 ```
 
 The first positional argument is always the package name. CompilerHook's
@@ -260,6 +267,7 @@ declares, and can rewrite individual tokens.
 ```python
 from cpyte.extension_hooks import LexerHook
 
+
 class MyLexerHook(LexerHook):
     def get_additional_keywords(self) -> set[str]:
         return {"async", "await", "defer", "async_def"}
@@ -292,6 +300,7 @@ and the parser will defer to you at the matching position.
 ```python
 from cpyte.extension_hooks import ParserHook
 
+
 class DeferParserHook(ParserHook):
     def should_handle_statement(self, tokens, pos):
         return pos < len(tokens) and tokens[pos].value == "defer"
@@ -299,11 +308,13 @@ class DeferParserHook(ParserHook):
     def parse_statement(self, tokens, pos, context):
         pos += 1  # consume 'defer'
         from cpyte.astparse import parse_statement
+
         node, new_pos = parse_statement(tokens, pos)
         return {"type": "defer", "body": node}, new_pos
 
     def initialize(self, context):
         pass
+
 
 def get_hooks():
     return [DeferParserHook("my_package")]
@@ -328,6 +339,7 @@ list of `Diagnostic` objects — error-capable diagnostics fail the build.
 
 ```python
 from cpyte.extension_hooks import Diagnostic, SemanticHook
+
 
 class PromiseTypeHook(SemanticHook):
     def should_visit_node(self, node):
@@ -355,6 +367,7 @@ class PromiseTypeHook(SemanticHook):
 
     def initialize(self, context):
         pass
+
 
 def get_hooks():
     return [PromiseTypeHook("my_package")]
@@ -384,6 +397,7 @@ whole module.
 ```python
 from cpyte.extension_hooks import TransformHook
 
+
 class InlineTransformHook(TransformHook):
     def should_transform(self, node) -> bool:
         return getattr(node, "type", None) == "defer"
@@ -411,6 +425,7 @@ declarations, headers, foreign functions — without a `.cpy` file.
 
 ```python
 from cpyte.extension_hooks import SymbolResolverHook
+
 
 class SdkSymbolsHook(SymbolResolverHook):
     def can_resolve_symbol(self, name) -> bool:
@@ -444,14 +459,15 @@ the node, and `emit_node` returns the produced IR value. `before_codegen` /
 ```python
 from cpyte.extension_hooks import CodegenHook
 
+
 class AsyncCodegenHook(CodegenHook):
     def should_emit_node(self, node) -> bool:
         return hasattr(node, "is_async") and node.is_async
 
     def emit_node(self, node, builder, context):
-        llvm = context.data.get("llvm")       # LLVM bytecoding instance
-        module = context.data.get("module")   # llvmlite Module
-        builder = context.data.get("builder") # llvmlite IRBuilder
+        llvm = context.data.get("llvm")  # LLVM bytecoding instance
+        module = context.data.get("module")  # llvmlite Module
+        builder = context.data.get("builder")  # llvmlite IRBuilder
         return llvm.emit_funcdef(node)
 
     def before_codegen(self, module, context):
@@ -462,6 +478,7 @@ class AsyncCodegenHook(CodegenHook):
 
     def initialize(self, context):
         pass
+
 
 def get_hooks():
     return [AsyncCodegenHook("my_package")]
@@ -488,6 +505,7 @@ Return `True` from `should_add_passes` to have `add_module_passes` invoked.
 ```python
 from cpyte.extension_hooks import OptimizeHook
 
+
 class AsyncOptimizeHook(OptimizeHook):
     def should_add_passes(self, context) -> bool:
         return True
@@ -513,6 +531,7 @@ class AsyncOptimizeHook(OptimizeHook):
 
 ```python
 from cpyte.extension_hooks import BuildHook
+
 
 class SdkBuildHook(BuildHook):
     def get_include_paths(self, context) -> list[str]:
@@ -554,6 +573,7 @@ compiled with the program — include any headers your code needs.
 ```python
 from cpyte.extension_hooks import RuntimeHook
 
+
 class MyRuntimeHook(RuntimeHook):
     def get_runtime_code(self, context) -> str | None:
         return """
@@ -581,6 +601,7 @@ MyHandle* create_handle() {
     def initialize(self, context):
         pass
 
+
 def get_hooks():
     return [MyRuntimeHook("my_package")]
 ```
@@ -599,6 +620,7 @@ def get_hooks():
 
 ```python
 from cpyte.extension_hooks import LifecycleHook
+
 
 class ProfilingHook(LifecycleHook):
     def before_compile(self, context):

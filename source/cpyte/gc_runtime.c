@@ -110,18 +110,41 @@ typedef struct {
     char *current; /* Current bump pointer */
 } tlab_t;
 
-/* Thread-local storage for TLAB */
+/* Thread-local storage for TLAB.
+ *
+ * Windows and Linux use native TLS (`__declspec(thread)` / `__thread`).
+ * macOS must NOT: the JIT path compiles this file to LLVM IR and emits a
+ * Mach-O object via llvmlite's MCJIT, which cannot encode the TLVP
+ * relocation that `__thread` lowers to (ARM64_RELOC_TLVP_LOAD_PAGEOFF12).
+ * On Apple we back the per-thread TLAB with a pthread key instead, so the
+ * emitted object is TLS-free and each thread still gets its own buffer. */
 #ifdef _WIN32
 __declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
+#  define TLAB_GET() (&tlab)
+#elif defined(__APPLE__)
+static pthread_key_t  tlab_key;
+static pthread_once_t tlab_key_once = PTHREAD_ONCE_INIT;
+static void tlab_key_create(void) { pthread_key_create(&tlab_key, NULL); }
+static tlab_t* tlab_get(void) {
+    pthread_once(&tlab_key_once, tlab_key_create);
+    tlab_t* tl = (tlab_t*)pthread_getspecific(tlab_key);
+    if (tl == NULL) {
+        tl = (tlab_t*)calloc(1, sizeof(tlab_t));
+        pthread_setspecific(tlab_key, tl);
+    }
+    return tl;
+}
+#  define TLAB_GET() tlab_get()
 #else
 static __thread tlab_t tlab = {NULL, NULL, NULL};
+#  define TLAB_GET() (&tlab)
 #endif
 
 static void* tlab_alloc(size_t size) {
     /* Round up to pointer alignment */
     size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
     
-    if (tlab.start == NULL || tlab.current + size > tlab.end) {
+    if (TLAB_GET()->start == NULL || TLAB_GET()->current + size > TLAB_GET()->end) {
         /* TLAB exhausted or not initialized: allocate new block from global heap */
         size_t block_size = (size > TLAB_SIZE) ? size : TLAB_SIZE;
         
@@ -140,14 +163,14 @@ static void* tlab_alloc(size_t size) {
         
         CPY_MUTEX_UNLOCK(&gc_lock_);
         
-        tlab.start = PAYLOAD(hdr);
-        tlab.end = tlab.start + block_size;
-        tlab.current = tlab.start;
+        TLAB_GET()->start = PAYLOAD(hdr);
+        TLAB_GET()->end = TLAB_GET()->start + block_size;
+        TLAB_GET()->current = TLAB_GET()->start;
     }
     
     /* Bump-pointer allocation (lock-free) */
-    void *ptr = tlab.current;
-    tlab.current += size;
+    void *ptr = TLAB_GET()->current;
+    TLAB_GET()->current += size;
     return ptr;
 }
 
@@ -301,9 +324,15 @@ static void scan_stack(void) {
 
 /* ── ugc callbacks ──────────────────────────────────────────────── */
 
-/* Array length registry (defined in runtime.c): unregister arrays when their
- * object is collected so stale length entries can never be reused. */
+/* Array length registry (defined in runtime.c). */
 extern void cpyte_array_unregister(void* arr);
+extern void* cpyte_array_reserve(void *arr, size_t elem_size, size_t increment);
+
+/* GC wrapper: same logic as cpyte_array_reserve (malloc/free/memcpy).
+ * cpyte_array_alloc uses malloc, so realloc/free is safe for the header. */
+void* gc_array_reserve(void *arr, size_t elem_size, size_t increment) {
+    return cpyte_array_reserve(arr, elem_size, increment);
+}
 
 static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
     if (hdr == NULL) {
@@ -356,9 +385,9 @@ void gc_init(void) {
     }
     
     /* Initialize TLAB for the current thread */
-    tlab.start = NULL;
-    tlab.end = NULL;
-    tlab.current = NULL;
+    TLAB_GET()->start = NULL;
+    TLAB_GET()->end = NULL;
+    TLAB_GET()->current = NULL;
 }
 
 void* gc_malloc(size_t size) {
@@ -433,8 +462,8 @@ void gc_collect(void) {
     /* Protect the current TLAB block: its interior objects are live because
      * the mutator is executing; interior-pointer scan alone cannot see a block
      * that is only referenced through a bump-pointer interior alias. */
-    if (tlab.start != NULL && tlab.current != tlab.start) {
-        cpyte_obj_t* hdr = (cpyte_obj_t*)((char*)tlab.start - sizeof(cpyte_obj_t));
+    if (TLAB_GET()->start != NULL && TLAB_GET()->current != TLAB_GET()->start) {
+        cpyte_obj_t* hdr = (cpyte_obj_t*)((char*)TLAB_GET()->start - sizeof(cpyte_obj_t));
         if (obj_is_tracked(hdr)) {
             ugc_visit(&gc, &hdr->base);
         }
@@ -510,7 +539,7 @@ void gc_shutdown(void) {
     }
     
     /* Reset TLAB for current thread */
-    tlab.start = NULL;
-    tlab.end = NULL;
-    tlab.current = NULL;
+    TLAB_GET()->start = NULL;
+    TLAB_GET()->end = NULL;
+    TLAB_GET()->current = NULL;
 }

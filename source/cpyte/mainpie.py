@@ -200,7 +200,7 @@ def pretty_ast(node, indent=0):
         return f"{pad}({node.type_expr}){pretty_ast(node.expr, 0)}"
 
     if name == "StructDef":
-        gp = f'<{", ".join(node.generic_params)}>' if node.generic_params else ""
+        gp = f"<{', '.join(node.generic_params)}>" if node.generic_params else ""
         result = f"{pad}struct {node.name}{gp}:"
         for f in node.fields:
             result += f"\n{pad}  {f.type_expr} {f.name}"
@@ -257,13 +257,13 @@ def pretty_ast(node, indent=0):
     if isinstance(node, dict):
         t = node.get("type", "?")
         if t == "class":
-            result = f'{pad}class {node["name"]}:'
+            result = f"{pad}class {node['name']}:"
             for stmt in node.get("body", []):
                 result += f"\n{pretty_ast(stmt, indent + 1)}"
             return result
         if t == "for":
             result = (
-                f'{pad}for {node["var"]} in\n{pretty_ast(node["iter"], indent + 1)}'
+                f"{pad}for {node['var']} in\n{pretty_ast(node['iter'], indent + 1)}"
             )
             result += f"\n{pad}body:"
             for stmt in node.get("body", []):
@@ -546,6 +546,7 @@ def cmd_build(
         strict=strict,
         enable_extensions=not no_userspace,
         no_gc=no_gc,
+        filepath=os.path.abspath(src_file),
     )
 
     frameworks = _collect_frameworks(parsed)
@@ -570,30 +571,39 @@ def cmd_build(
     binding.initialize_native_asmprinter()
 
     mod = binding.parse_assembly(str(prog))
-    # Compile the bignum runtime from source for the host platform (instead
-    # of pre-built bitcode) so its libc symbol names match the target OS.
-    llvm_cc = _find_llvm_cc()
-    r = subprocess.run(
-        [
-            llvm_cc,
-            "-S",
-            "-emit-llvm",
-            "-O0",
-            "-target",
-            _host_target_triple(),
-            "-fno-stack-protector",
-            "-o",
-            "-",
-            _BIGNUM_C,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        ui.print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
-        sys.exit(1)
-    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
-    binding.link_modules(mod, bignum_mod)
+    # The bignum runtime is compiled from source for the host platform (instead
+    # of pre-built bitcode) so its libc symbol names match the target OS. Where
+    # a clang-compatible compiler with `-emit-llvm` is available we link its IR
+    # directly into the module; otherwise (AOT on systems with only gcc) it is
+    # compiled to a native object and linked by the system linker below.
+    bignum_mod = None
+    try:
+        llvm_cc = _find_llvm_cc()
+        r = subprocess.run(
+            [
+                llvm_cc,
+                "-S",
+                "-emit-llvm",
+                "-O0",
+                "-target",
+                _host_target_triple(),
+                "-fno-stack-protector",
+                "-o",
+                "-",
+                _BIGNUM_C,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            ui.print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+            sys.exit(1)
+        bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    except SystemExit:
+        # No clang/-emit-llvm compiler; fall back to native-object linking below.
+        bignum_mod = None
+    if bignum_mod is not None:
+        binding.link_modules(mod, bignum_mod)
     mod.verify()
 
     # Always run module optimization so the LLVM passes (SROA, inlining and the
@@ -608,6 +618,20 @@ def cmd_build(
         f.write(obj)
     linker = Linker(lto=lto)
     objs = [obj_file]
+
+    if bignum_mod is None:
+        # No clang/-emit-llvm compiler (AOT with plain gcc): the bignum runtime
+        # is compiled to a native object and linked by the system linker.
+        bignum_obj = out_base + ".bignum.o"
+        linker.compile_c(
+            _BIGNUM_C,
+            output=bignum_obj,
+            opt_level=opt,
+            opt_size=opt_size,
+            debug=debug,
+            pic=pic,
+        )
+        objs.append(bignum_obj)
 
     for src in src_files or []:
         src_obj = src.rsplit(".", 1)[0] + ".o"
@@ -833,6 +857,7 @@ def _main():
     lto = False
     no_gc = False
     exports = []
+    opt = None
     while args and args[0].startswith("--"):
         flag = args.pop(0)
         if flag == "--tab-size":
@@ -853,6 +878,8 @@ def _main():
             set_target_cpu(features=args.pop(0))
         elif flag == "--lto":
             lto = True
+        elif flag == "--opt" and args:
+            opt = int(args.pop(0))
         elif flag == "--ast":
             mode = "ast"
         elif flag == "--emit-llvm":
@@ -970,7 +997,13 @@ def _main():
         )
         ui.print_ok(f"Wrote {sef_file}")
     else:
-        run_jit(prog, src_files=src_files, no_userspace=no_userspace, pic=pic)
+        run_jit(
+            prog,
+            src_files=src_files,
+            no_userspace=no_userspace,
+            pic=pic,
+            opt_level=2 if opt is None else opt,
+        )
 
 
 if __name__ == "__main__":

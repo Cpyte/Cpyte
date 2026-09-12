@@ -11,6 +11,7 @@ rate-limited, malformed payload) are silent.
 Set ``CPYTE_NO_UPDATE_CHECK=1`` to disable the check entirely.
 """
 
+import datetime
 import json
 import os
 import re
@@ -23,16 +24,54 @@ try:
 except ImportError:  # running as a plain script (source/mainpie.py)
     from cpyte import ui
 
-_REPO = 'Cpyte/Cpyte'
-_API_URL = f'https://api.github.com/repos/{_REPO}/releases/latest'
+_REPO = "Cpyte/Cpyte"
+_API_URL = f"https://api.github.com/repos/{_REPO}/releases/latest"
 _RAW_VERSION_URL = (
-    f'https://raw.githubusercontent.com/{_REPO}/main/source/cpyte/__init__.py'
+    f"https://raw.githubusercontent.com/{_REPO}/main/source/cpyte/__init__.py"
 )
-_RELEASES_URL = f'https://github.com/{_REPO}/releases/latest'
+_RELEASES_URL = f"https://github.com/{_REPO}/releases/latest"
 
-_FETCH_TIMEOUT = 5.0
+# Keep the background check cheap so it never meaningfully delays a compile.
+_FETCH_TIMEOUT = 2.0
 
-_state = {'result': None, 'done': threading.Event()}
+_state = {"result": None, "done": threading.Event()}
+
+
+def _check_cache_path():
+    override = os.environ.get("CPYTE_CACHE_DIR")
+    if override:
+        base = override
+    elif os.name == "nt":
+        base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "cpyte", "cache")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "cpyte")
+    try:
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, "update_check.json")
+    except OSError:
+        return None
+
+
+def _load_cached_check():
+    path = _check_cache_path()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_cached_check(payload):
+    path = _check_cache_path()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError:
+        pass
 
 
 def parse_version(version):
@@ -41,7 +80,7 @@ def parse_version(version):
     ``v2.7.0``, ``2.7`` and ``2.7.0+1`` all reduce to their leading numeric
     segments; prerelease suffixes such as ``-dev`` are ignored.
     """
-    nums = re.findall(r'\d+', str(version).lstrip('vV'))
+    nums = re.findall(r"\d+", str(version).lstrip("vV"))
     return tuple(int(n) for n in nums) or (0,)
 
 
@@ -71,15 +110,15 @@ def _fetch_release_tag(timeout):
         req = urllib.request.Request(
             _API_URL,
             headers={
-                'User-Agent': 'cpyte-update-check',
-                'Accept': 'application/vnd.github+json',
+                "User-Agent": "cpyte-update-check",
+                "Accept": "application/vnd.github+json",
             },
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode('utf-8', 'replace'))
-        tag = data.get('tag_name')
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        tag = data.get("tag_name")
         if tag:
-            return str(tag).lstrip('vV')
+            return str(tag).lstrip("vV")
     except Exception:
         return None
     return None
@@ -88,25 +127,33 @@ def _fetch_release_tag(timeout):
 def _fetch_raw_version(timeout):
     try:
         req = urllib.request.Request(
-            _RAW_VERSION_URL, headers={'User-Agent': 'cpyte-update-check'}
+            _RAW_VERSION_URL, headers={"User-Agent": "cpyte-update-check"}
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            text = resp.read().decode('utf-8', 'replace')
+            text = resp.read().decode("utf-8", "replace")
         m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', text)
         if m:
-            return str(m.group(1)).lstrip('vV')
+            return str(m.group(1)).lstrip("vV")
     except Exception:
         return None
     return None
 
 
 def start_check(current_version):
-    """Begin fetching the latest release on a background daemon thread."""
-    if os.environ.get('CPYTE_NO_UPDATE_CHECK'):
+    """Begin fetching the latest release on a background daemon thread.
+
+    Rate-limited to one network check per day (cached in the user cache dir);
+    same-day runs reuse the cached result instantly so compiling stays fast.
+    """
+    if os.environ.get("CPYTE_NO_UPDATE_CHECK"):
         return
-    threading.Thread(
-        target=_runner, args=(str(current_version),), daemon=True
-    ).start()
+    today = datetime.date.today().isoformat()
+    cached = _load_cached_check()
+    if cached and cached.get("last_check") == today:
+        _state["result"] = (str(current_version), cached.get("latest"))
+        _state["done"].set()
+        return
+    threading.Thread(target=_runner, args=(str(current_version),), daemon=True).start()
 
 
 def _runner(current_version):
@@ -114,23 +161,26 @@ def _runner(current_version):
         latest = fetch_latest_version()
     except Exception:
         latest = None
-    _state['result'] = (current_version, latest)
-    _state['done'].set()
+    _save_cached_check(
+        {"last_check": datetime.date.today().isoformat(), "latest": latest}
+    )
+    _state["result"] = (current_version, latest)
+    _state["done"].set()
 
 
-def report_update(wait=1.0):
+def report_update(wait=0.2):
     """Print an update-available message when a newer release was found.
 
     Call after the main task completes. Waits up to ``wait`` seconds for the
     background check to finish; silently skips when it is still pending or
     nothing newer was found.
     """
-    if os.environ.get('CPYTE_NO_UPDATE_CHECK'):
+    if os.environ.get("CPYTE_NO_UPDATE_CHECK"):
         return
-    if not _state['done'].is_set() and not _state['done'].wait(wait):
+    if not _state["done"].is_set() and not _state["done"].wait(wait):
         return
-    current, latest = _state['result']
+    current, latest = _state["result"]
     if not latest or compare_versions(latest, current) <= 0:
         return
-    ui.print_warn(f'cpyte {latest} is available — you are on {current}.')
-    print(f'  {ui.dim("Update:")} {_RELEASES_URL}', file=sys.stderr)
+    ui.print_warn(f"cpyte {latest} is available — you are on {current}.")
+    print(f"  {ui.dim('Update:')} {_RELEASES_URL}", file=sys.stderr)

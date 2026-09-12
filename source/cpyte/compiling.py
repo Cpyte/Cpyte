@@ -5,6 +5,8 @@ import struct
 import subprocess
 import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from .generate_bc import _remove_probe_stack_ir
 from .linker import format_cc_diag, LinkerNotFoundError, Linker
@@ -38,9 +40,16 @@ else:
 
 _llvm_cc_cache = None
 
+# llvmlite's binding is not thread-safe: parse_assembly / link_modules /
+# create_pass_builder / optimize all touch the same global LLVM context.
+# The 3-way parallel C-runtime compilation keeps the (expensive, independent)
+# clang subprocesses on the worker threads, but every in-process binding call
+# is serialized behind this lock so cold-cache warm-up cannot race the JIT's
+# own parse/link while it links the user module.
+_llvm_binding_lock = threading.RLock()
+
 
 def _host_default_pic():
-
     """Return True when the host linker requires PIC (PIE) by default.
 
     Both macOS and Linux on AArch64 link position-independent executables by
@@ -219,7 +228,7 @@ def _map_windows_gnu_imp_globals(engine, mod):
         name = gv.name
         if not name.startswith("__imp_"):
             continue
-        sym = name[len("__imp_"):]
+        sym = name[len("__imp_") :]
         if sym not in imports:
             continue
         try:
@@ -323,7 +332,7 @@ def _map_windows_gnu_externals(engine, mod):
                 externs.add(f.name)
         for gv in mod.global_variables:
             if gv.name.startswith("__imp_"):
-                externs.add(gv.name[len("__imp_"):])
+                externs.add(gv.name[len("__imp_") :])
     except Exception:
         return
     if not externs:
@@ -352,7 +361,7 @@ def _map_windows_gnu_externals(engine, mod):
                 pass
     for gv in mod.global_variables:
         if gv.name.startswith("__imp_"):
-            sym = gv.name[len("__imp_"):]
+            sym = gv.name[len("__imp_") :]
             if sym in addrs:
                 try:
                     engine.add_global_mapping(gv, addrs[sym])
@@ -927,9 +936,7 @@ def optimize(mod, opt_level=3, opt_size=False):
                 if hook.should_add_passes(ctx):
                     hook.add_module_passes(npm, ctx)
             except Exception as e:
-                print_err(
-                    f"optimize hook {hook.__class__.__name__} failed: {e}"
-                )
+                print_err(f"optimize hook {hook.__class__.__name__} failed: {e}")
     except Exception:
         pass
 
@@ -946,11 +953,63 @@ def _maybe_compile(module, use_native_eh=False):
     return module, None
 
 
-def _cached_c_ir(llvm_cc, src_path, triple, opt="-O0", extra_flags=()):
+# Bignum symbols that must keep external linkage: the JIT resolves these by
+# name after finalize (bigint_from_str/bigint_print/bigint_to_str) and the
+# native AOT link of runtime.o needs bigint_from_int (runtime.c: bigint_input).
+_BIGNUM_KEEP = frozenset(
+    {"bigint_from_str", "bigint_from_int", "bigint_print", "bigint_to_str"}
+)
+
+
+def _mark_internal(mod, keep=frozenset()):
+    """Switch every defined function's linkage to internal (except names in
+    `keep`) before linking. The LLVM IR linker only carries internal globals
+    into the combined module when something references them, so marking the
+    runtime sources internal gives 'link only what's needed' semantics and lets
+    a later GlobalDCE prune runtimes the current program never touches."""
+    n = 0
+    for fn in mod.functions:
+        if fn.is_declaration or fn.name in keep:
+            continue
+        if str(fn.linkage) not in ("internal", "private", "linkonce_odr"):
+            fn.linkage = "internal"
+            n += 1
+    return n
+
+
+def _prune_module(mod):
+    """Cheap pre-optimization cleanup: drop unreferenced internal functions and
+    unused prototypes so the per-function pass phase and object emission never
+    see dead runtime code."""
+    from llvmlite import binding
+
+    pto = binding.create_pipeline_tuning_options(speed_level=0)
+    pb = binding.create_pass_builder(make_target_machine(), pto)
+    mpm = pb.getModulePassManager()
+    mpm.add_global_dead_code_eliminate_pass()
+    mpm.add_strip_dead_prototype_pass()
+    mpm.run(mod, pb)
+
+
+def _cached_c_ir(
+    llvm_cc,
+    src_path,
+    triple,
+    opt="-O0",
+    extra_flags=(),
+    jit_opt_level=None,
+    jit_opt_size=False,
+):
     """Compile a C runtime source to LLVM IR text, caching by content.
+
     The three runtime files (runtime.c/bignum.c/gc_runtime.c and the Windows
     GNU JIT stubs) are recompiled by clang on every JIT run, which dominates
     startup cost; content-addressed caching makes repeat runs skip clang.
+
+    When *jit_opt_level* is given (>0), a second cache entry is maintained
+    containing the module already run through :func:`optimize` at that level.
+    The JIT links these pre-optimized runtime modules so the expensive LLVM
+    pass pipeline runs once per runtime *content* instead of once per program.
     """
     import hashlib
     import tempfile
@@ -958,11 +1017,17 @@ def _cached_c_ir(llvm_cc, src_path, triple, opt="-O0", extra_flags=()):
     with open(src_path, "rb") as f:
         content = f.read()
     key = hashlib.sha1(
-        content + triple.encode() + opt.encode() + b"".join(map(str.encode, extra_flags))
+        content
+        + triple.encode()
+        + opt.encode()
+        + b"".join(map(str.encode, extra_flags))
     ).hexdigest()
 
     cache_dir = os.path.join(tempfile.gettempdir(), "cpyte_rtcache")
     cache_path = os.path.join(cache_dir, key + ".ll")
+    if jit_opt_level is not None and jit_opt_level > 0:
+        opt_suffix = "opt%do%d" % (jit_opt_level, 1 if jit_opt_size else 0)
+        cache_path = os.path.join(cache_dir, key + "." + opt_suffix + ".ll")
     try:
         os.makedirs(cache_dir, exist_ok=True)
         with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
@@ -993,6 +1058,28 @@ def _cached_c_ir(llvm_cc, src_path, triple, opt="-O0", extra_flags=()):
         return None, r
     ir_text = r.stdout
     if ir_text and ir_text.lstrip().startswith(";"):
+        if jit_opt_level is not None and jit_opt_level > 0:
+            # Warm the optimized cache entry in a background-safe way: optimize
+            # locally and atomically publish (tmp + os.replace). The llvmlite
+            # binding section is serialized (not thread-safe), while the clang
+            # subprocess above stays parallel across cores.
+            try:
+                from llvmlite import binding as _binding
+
+                with _llvm_binding_lock:
+                    _binding.initialize_native_target()
+                    _binding.initialize_native_asmprinter()
+                    opt_mod = _binding.parse_assembly(_remove_probe_stack_ir(ir_text))
+                    optimize(opt_mod, jit_opt_level, opt_size=jit_opt_size)
+                    opt_text = str(opt_mod)
+                if opt_text.lstrip().startswith(";"):
+                    tmp_path = cache_path + ".tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        f.write(opt_text)
+                    os.replace(tmp_path, cache_path)
+                return opt_text, None
+            except Exception:
+                pass
         try:
             tmp_path = cache_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1021,78 +1108,125 @@ def run_jit(
     binding.initialize_native_asmprinter()
 
     llvm_ir = str(module)
-    mod = binding.parse_assembly(llvm_ir)
+    with _llvm_binding_lock:
+        mod = binding.parse_assembly(llvm_ir)
     llvm_cc = _find_llvm_cc()
     if src_files:
+        # Compile every ccode module in parallel across all cores; the clang
+        # subprocesses dominate wall time and are independent, while the
+        # llvmlite parse_assembly/link_modules below stay serial on the main
+        # thread (the binding is not thread-safe).
         target = host_target()
-        for src in src_files:
+
+        def _compile_one(src):
             if src.endswith(".ll"):
                 with open(src) as f:
-                    src_ir = f.read()
-            else:
-                r = subprocess.run(
-                    [
-                        llvm_cc,
-                        "-S",
-                        "-emit-llvm",
-                        "-O0",
-                        "-target",
-                        target.triple,
-                        "-fno-stack-protector",
-                        "-o",
-                        "-",
-                        src,
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
+                    return src, f.read(), None
+            r = subprocess.run(
+                [
+                    llvm_cc,
+                    "-S",
+                    "-emit-llvm",
+                    "-O0",
+                    "-target",
+                    target.triple,
+                    "-fno-stack-protector",
+                    "-o",
+                    "-",
+                    src,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode != 0:
+                return src, None, r
+            return src, r.stdout, None
 
-                if r.returncode != 0:
-                    ccmap = getattr(module, "_ccode_src_map", None) or {}
-                    where = ccmap.get(src)
-                    if where:
-                        print_err(
-                            f"error compiling ccode block from {where}: "
-                            f"{format_cc_diag(r.stderr)}"
-                        )
-                    else:
-                        print_err(
-                            f"error compiling {src}: {format_cc_diag(r.stderr)}"
-                        )
-                    raise SystemExit(1)
-                src_ir = r.stdout
+        if len(src_files) > 1:
+            with ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 2)) as ex:
+                compiled = list(ex.map(_compile_one, src_files))
+        else:
+            compiled = [_compile_one(src_files[0])]
+        for src, src_ir, r in compiled:
+            if src_ir is None:
+                ccmap = getattr(module, "_ccode_src_map", None) or {}
+                where = ccmap.get(src)
+                if where:
+                    print_err(
+                        f"error compiling ccode block from {where}: "
+                        f"{format_cc_diag(r.stderr)}"
+                    )
+                else:
+                    print_err(f"error compiling {src}: {format_cc_diag(r.stderr)}")
+                raise SystemExit(1)
             src_ir = _remove_probe_stack_ir(src_ir)
-            src_mod = binding.parse_assembly(src_ir)
-            binding.link_modules(mod, src_mod)
+            with _llvm_binding_lock:
+                src_mod = binding.parse_assembly(src_ir)
+                binding.link_modules(mod, src_mod)
+
+    # Optimize the USER code now, before any runtime is linked. The C runtime
+    # modules below are pulled from a content-addressed cache already run
+    # through optimize() (see _cached_c_ir), so the heavy LLVM pass pipeline
+    # executes once per runtime content instead of once per program. Doing the
+    # user optimization here keeps every cpyte-specific pass (SROA, unrolling,
+    # GVN, vectorization) applied to exactly the functions the user wrote; the
+    # final whole-module re-optimization over the remaining runtime helpers is
+    # then skipped.
+    if opt_level > 0:
+        optimize(mod, opt_level)
 
     # Link the C runtime (print/assign/dynamic dispatch/array registry) so the
     # JIT can resolve native helpers that have no Python callback mirror.
     target = host_target()
-    runtime_ir, err = _cached_c_ir(llvm_cc, _RUNTIME_C, target.triple)
-    if runtime_ir is None:
-        print_err(f"error compiling {_RUNTIME_C}: {format_cc_diag(err.stderr)}")
-        raise SystemExit(1)
-    runtime_mod = binding.parse_assembly(_remove_probe_stack_ir(runtime_ir))
-    binding.link_modules(mod, runtime_mod)
 
-    # Compile the bignum runtime from source at JIT time so it matches the
-    # host platform (macOS/Linux/Windows) instead of relying on pre-built
-    # bitcode that bakes in a single platform's libc symbol names.
-    bignum_ir, err = _cached_c_ir(llvm_cc, _BIGNUM_C, target.triple)
-    if bignum_ir is None:
-        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
-        raise SystemExit(1)
-    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(bignum_ir))
-    binding.link_modules(mod, bignum_mod)
+    # Compile runtime/bignum/gc IR from source; the round-trips are cached
+    # per source-content/triple so repeat launches skip clang entirely, and the
+    # (cold) compiles run in parallel. bignum/gc functions are marked internal
+    # first so the IR linker only pulls in what this program references.
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            ex.submit(
+                _cached_c_ir, llvm_cc, src, target.triple, jit_opt_level=opt_level
+            ): src
+            for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C)
+        }
+        runtime_irs = {}
+        for fut, src in futures.items():
+            ir_text, err = fut.result()
+            if ir_text is None:
+                print_err(f"error compiling {src}: {format_cc_diag(err.stderr)}")
+                raise SystemExit(1)
+            runtime_irs[src] = ir_text
 
-    # Compile the GC runtime from source at JIT time so it matches the host
-    # platform (macOS/Linux/Windows) instead of relying on pre-built bitcode.
-    gc_ir, err = _cached_c_ir(llvm_cc, _GC_RUNTIME_C, target.triple)
-    if gc_ir is None:
-        print_err(f"error compiling {_GC_RUNTIME_C}: {format_cc_diag(err.stderr)}")
-        raise SystemExit(1)
-    gc_mod = binding.parse_assembly(_remove_probe_stack_ir(gc_ir))
-    binding.link_modules(mod, gc_mod)
+    internal_keep = {
+        _RUNTIME_C: "external",
+        _BIGNUM_C: _BIGNUM_KEEP,
+        _GC_RUNTIME_C: frozenset(),
+    }
+    for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C):
+        with _llvm_binding_lock:
+            m = binding.parse_assembly(_remove_probe_stack_ir(runtime_irs[src]))
+            keep = internal_keep[src]
+            if keep == "external":
+                binding.link_modules(mod, m)
+                continue
+            src_names = {f.name for f in m.functions if not f.is_declaration}
+            binding.link_modules(mod, m)
+        # Mark internal AFTER linking: the LLVM IR linker treats an internal
+        # source definition plus a same-named external declaration already in
+        # the destination as a conflict and DROPS the definition (leaving the
+        # user's call sites unresolved -> a NULL call in the JIT object).
+        # Linking first, then internalizing, keeps every needed definition in
+        # the combined module; the later _prune_module GlobalDCE removes the
+        # unreferenced leftover runtime code instead.
+        for fn in mod.functions:
+            if (
+                fn.name in src_names
+                and fn.name not in keep
+                and not fn.is_declaration
+                and str(fn.linkage) not in ("internal", "private", "linkonce_odr")
+            ):
+                fn.linkage = "internal"
 
     # The GNU/MinGW lowering sprinkles `call __main` / `call ___chkstk_ms`
     # into every compiled runtime function; without prior CG libraries the
@@ -1108,15 +1242,13 @@ def run_jit(
             llvm_cc, _WINJIT_STUB_C, target.triple, extra_flags=("-fno-builtin",)
         )
         if winjit_ir is None:
-            print_err(
-                f"error compiling {_WINJIT_STUB_C}: {format_cc_diag(err.stderr)}"
-            )
+            print_err(f"error compiling {_WINJIT_STUB_C}: {format_cc_diag(err.stderr)}")
             raise SystemExit(1)
         winjit_mod = binding.parse_assembly(_remove_probe_stack_ir(winjit_ir))
         binding.link_modules(mod, winjit_mod)
 
     mod.verify()
-    optimize(mod, opt_level)
+    _prune_module(mod)
     mod.verify()
 
     if _use_windows_gnu():
@@ -1125,9 +1257,10 @@ def run_jit(
 
     target_machine = make_target_machine()
 
-    backing_mod = binding.parse_assembly("")
-    engine = binding.create_mcjit_compiler(backing_mod, target_machine)
-    engine.add_module(mod)
+    with _llvm_binding_lock:
+        backing_mod = binding.parse_assembly("")
+        engine = binding.create_mcjit_compiler(backing_mod, target_machine)
+        engine.add_module(mod)
 
     # MinGW-compiled C runtime reaches DLL functions through absolute
     # large-model relocs (and __imp_* IAT thunks); hand the engine explicit
@@ -1326,37 +1459,8 @@ def run_jit(
         except NameError:
             pass
 
-        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_longlong)(
-            _runtime_array_register
-        )
-        _callbacks.append(cb)
-        try:
-            engine.add_global_mapping(
-                mod.get_function("cpyte_array_register"),
-                ctypes.cast(cb, ctypes.c_void_p).value,
-            )
-        except NameError:
-            pass
-
-        cb = ctypes.CFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p)(_runtime_array_len)
-        _callbacks.append(cb)
-        try:
-            engine.add_global_mapping(
-                mod.get_function("cpyte_array_len"),
-                ctypes.cast(cb, ctypes.c_void_p).value,
-            )
-        except NameError:
-            pass
-
-        cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(_runtime_array_unregister)
-        _callbacks.append(cb)
-        try:
-            engine.add_global_mapping(
-                mod.get_function("cpyte_array_unregister"),
-                ctypes.cast(cb, ctypes.c_void_p).value,
-            )
-        except NameError:
-            pass
+        # cpyte_array_alloc/len/unregister/reserve are provided by the C
+        # runtime (length-prefixed header); no Python-side overrides needed.
 
     _map_libc_fn(engine, mod, "malloc", ctypes.c_size_t, ctypes.c_void_p)
     _map_libc_fn(engine, mod, "free", None, None, argtypes=[ctypes.c_void_p])
@@ -1508,30 +1612,20 @@ def run_aot(
 
     mod = binding.parse_assembly(llvm_ir)
     # Compile the bignum runtime from source for the host platform (instead
-    # of pre-built bitcode) so its libc symbol names match the target OS.
+    # of pre-built bitcode) so its libc symbol names match the target OS. The
+    # clang round-trip is cached per source-content/triple, and the funcs are
+    # marked internal (minus the symbols runtime.o needs) so the IR linker and
+    # an early GlobalDCE only carry the bignum helpers this program uses.
     llvm_cc = _find_llvm_cc()
-    r = subprocess.run(
-        [
-            llvm_cc,
-            "-S",
-            "-emit-llvm",
-            "-O0",
-            "-target",
-            host_target().triple,
-            "-fno-stack-protector",
-            "-o",
-            "-",
-            _BIGNUM_C,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(r.stderr)}")
+    bignum_ir, err = _cached_c_ir(llvm_cc, _BIGNUM_C, host_target().triple)
+    if bignum_ir is None:
+        print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
-    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(r.stdout))
+    bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(bignum_ir))
+    _mark_internal(bignum_mod, keep=_BIGNUM_KEEP)
     binding.link_modules(mod, bignum_mod)
     mod.verify()
+    _prune_module(mod)
     optimize(mod, opt_level)
     mod.verify()
 
@@ -1549,21 +1643,29 @@ def run_aot(
         print_err(f"error: {e}")
         raise SystemExit(1)
 
+    compile_jobs = []
     for src in src_files or []:
-        src_obj = src.rsplit(".", 1)[0] + ".o"
-        linker.compile_c(src, output=src_obj, opt_level=3, pic=pic)
-        objs.append(src_obj)
-
+        compile_jobs.append((src, src.rsplit(".", 1)[0] + ".o"))
     if not no_userspace:
-        runtime_obj = output + ".runtime.o"
-        linker.compile_c(_RUNTIME_C, output=runtime_obj, opt_level=3, pic=pic, eh=True)
-        objs.append(runtime_obj)
+        compile_jobs.append((_RUNTIME_C, output + ".runtime.o"))
+    compile_jobs.append((_GC_RUNTIME_C, output + ".gc.o"))
 
-    # Compile the GC runtime from source for the host platform (instead of
-    # pre-built bitcode) — cross-platform on macOS/Linux/Windows.
-    gc_obj = output + ".gc.o"
-    linker.compile_c(_GC_RUNTIME_C, output=gc_obj, opt_level=3, pic=pic)
-    objs.append(gc_obj)
+    def _linker_compile(src, out):
+        linker.compile_c(
+            src,
+            output=out,
+            opt_level=3,
+            pic=pic,
+            eh=(not no_userspace and src == _RUNTIME_C),
+        )
+        return out
+
+    if len(compile_jobs) > 1:
+        with ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 2)) as ex:
+            compiled_objs = list(ex.map(lambda p: _linker_compile(*p), compile_jobs))
+    else:
+        compiled_objs = [_linker_compile(*compile_jobs[0])]
+    objs.extend(compiled_objs)
 
     out_name = output.rsplit(".", 1)[0] if "." in output else output
     linker.link(objs, out_name, opt_level=3, pic=pic, frameworks=frameworks)

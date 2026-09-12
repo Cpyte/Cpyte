@@ -79,12 +79,13 @@ class Node:
 
 class Number(Node):
     inferred_type: str | None
-    __slots__ = ("_token", "inferred_type", "value")
+    __slots__ = ("_token", "inferred_type", "value", "is_bool")
 
-    def __init__(self, value: str, token=None):
+    def __init__(self, value: str, token=None, is_bool: bool = False):
         self.value = value
         self._token = token
         self.inferred_type = None
+        self.is_bool = is_bool
 
     def __repr__(self):
         return f"Number({self.value})"
@@ -141,12 +142,14 @@ class ListLit(Node):
 
 
 class Call(Node):
-    __slots__ = ("_token", "args", "callee", "inferred_type")
+    __slots__ = ("_token", "args", "callee", "inferred_type", "param_types")
 
     def __init__(self, callee, args: list, token=None):
         self.callee = callee
         self.args = args
         self._token = token
+        self.inferred_type = None
+        self.param_types = None
 
     def __repr__(self):
         return f"Call({self.callee}, {self.args})"
@@ -292,6 +295,20 @@ _PREC = {
 
 _BINARY_OPS = set(_PREC.keys())
 
+# `in` is lexed as a generic KEYWORD (shared with if/while/for etc.), but as an
+# infix operator it denotes dynamic-list membership. It gets comparison-level
+# precedence (same as ==/!=) so `x in list` binds looser than arithmetic but
+# tighter than `and`/`or`. It is NOT added to _BINARY_OPS (which is keyed by
+# TokenType, and every KEYWORD shares TokenType.KEYWORD); instead both the
+# recursive and iterative binary parsers special-case it via _is_in_infix below.
+IN_PREC = 40
+
+
+def _is_in_infix(tokens: list[Token], pos: int) -> bool:
+    tok = tokens[pos] if pos < len(tokens) else None
+    return bool(tok is not None and tok.type == TokenType.KEYWORD and tok.value == "in")
+
+
 # Maximum nesting depth for recursive expression parsing. Past this limit the
 # parser switches to a fully-iterative Pratt fallback (_parse_expr_iterative)
 # so that pathologically deep expressions can never overflow the interpreter
@@ -366,10 +383,9 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
 
         left, pos = _parse_unary(tokens, pos)
 
-        while (
-            pos < len(tokens)
-            and tokens[pos].type in _BINARY_OPS
-            and _prec(tokens[pos]) >= min_prec
+        while pos < len(tokens) and (
+            (tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= min_prec)
+            or (_is_in_infix(tokens, pos) and IN_PREC >= min_prec)
         ):
             op = tokens[pos]
             pos += 1
@@ -379,7 +395,9 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
                 TokenType.DEDENT,
             ):
                 pos += 1
-            next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
+            next_prec = _prec(op) if op.type != TokenType.KEYWORD else IN_PREC + 1
+            if op.type == TokenType.POW:
+                next_prec = _prec(op)
             right, pos = _parse_binary(tokens, pos, next_prec)
             left = BinOp(left, op.type, right, token=op)
 
@@ -539,7 +557,11 @@ def _parse_atom(tokens: list[Token], pos: int):
             val = "0"
         else:
             val = "0"
-        return Number(val, token=tok), pos + 1
+        return Number(
+            val,
+            token=tok,
+            is_bool=tok.value in ("true", "True", "false", "False"),
+        ), pos + 1
 
     if tok.type == TokenType.KEYWORD and tok.value == "input":
         pos += 1
@@ -863,7 +885,13 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
             ):
                 val = "1" if tok.value in ("true", "True") else "0"
                 pos += 1
-                vals.append(Number(val, token=tok))
+                vals.append(
+                    Number(
+                        val,
+                        token=tok,
+                        is_bool=tok.value in ("true", "True", "false", "False"),
+                    )
+                )
                 continue
             if tok.type == TokenType.KEYWORD and tok.value == "input":
                 pos += 1
@@ -1033,15 +1061,20 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
 
         elif kind == "binary_loop":
             mp = frame[1]
-            if (
-                pos < len(tokens)
-                and tokens[pos].type in _BINARY_OPS
-                and _prec(tokens[pos]) >= mp
+            in_here = _is_in_infix(tokens, pos)
+            if pos < len(tokens) and (
+                (tokens[pos].type in _BINARY_OPS and _prec(tokens[pos]) >= mp)
+                or (in_here and IN_PREC >= mp)
             ):
                 op = tokens[pos]
                 pos += 1
                 pos = _skip_expr_newlines(tokens, pos)
-                next_prec = _prec(op) if op.type == TokenType.POW else _prec(op) + 1
+                if op.type == TokenType.KEYWORD:
+                    next_prec = IN_PREC + 1
+                elif op.type == TokenType.POW:
+                    next_prec = _prec(op)
+                else:
+                    next_prec = _prec(op) + 1
                 frames.append(("binary_combine", mp, op))
                 frames.append(("binary", next_prec))
 
@@ -2350,7 +2383,7 @@ def _looks_like_type(tokens, pos):
 def _type_to_str(t: str | tuple) -> str:
     if isinstance(t, tuple):
         name, params = t
-        return f'{name}<{", ".join(_type_to_str(p) if isinstance(p, tuple) else p for p in params)}>'
+        return f"{name}<{', '.join(_type_to_str(p) if isinstance(p, tuple) else p for p in params)}>"
     return t
 
 

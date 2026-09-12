@@ -154,7 +154,7 @@ from .extension_hooks import (
     SemanticHook,
     get_global_hook_registry,
 )
-from .lexar import Lexer, LexerError, register_keywords
+from .lexar import Lexer, LexerError, TokenType, register_keywords
 from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
 
 _ARRAY_SUFFIX_RE = re.compile(r"^(.*)\[\d*\]$")
@@ -965,6 +965,9 @@ class SemanticAnalyzer:
 
     def _infer_type_recursive(self, node):
         if isinstance(node, Number):
+            if getattr(node, "is_bool", False):
+                node.inferred_type = "bool"
+                return "bool"
             # Check for hexadecimal literals (0x prefix) BEFORE float 'e' check,
             # since hex values legitimately contain the letter 'e' as a digit (0-9a-f)
             if node.value.startswith("0x") or node.value.startswith("0X"):
@@ -1091,6 +1094,21 @@ class SemanticAnalyzer:
                 return "bool"
 
             right_t = self._infer_type(node.right)
+
+            if node.op == TokenType.KEYWORD:
+                # `in` — dynamic-list membership. `node.op` is TokenType.KEYWORD
+                # only for the `in` infix operator (all other binops use a
+                # dedicated TokenType). Right side must be a list/iterable.
+                if right_t == "dynamic[]":
+                    node.inferred_type = "bool"
+                    return "bool"
+                self.error(
+                    f"operator `in` requires a list on the right-hand side",
+                    node,
+                    note=f"got `{right_t}`; the right operand of `in` must be a list",
+                )
+                node.inferred_type = "bool"
+                return "bool"
 
             if left_t == "dynamic" or right_t == "dynamic":
                 # One side is runtime-typed: defer the whole operation to the
@@ -1247,6 +1265,12 @@ class SemanticAnalyzer:
                     result = left_t if left_t is not None else right_t
                     node.inferred_type = result
                     return result
+                if node.op.name == "STAR" and left_t == "dynamic[]":
+                    # List repetition: `list * int` -> a new list with the same
+                    # elements repeated `right` times (e.g. `[false] * n`).
+                    self._infer_type(node.right)
+                    node.inferred_type = "dynamic[]"
+                    return "dynamic[]"
                 if node.op.name == "SLASH":
                     int_types = ("int", "int64", "uint64")
                     if (
@@ -1408,6 +1432,12 @@ class SemanticAnalyzer:
                             return None
                         node.inferred_type = "dynamic[]"
                         return "dynamic[]"
+                if node.callee.name in ("append", "len"):
+                    user_sym = self.current_scope.lookup(node.callee.name)
+                    if user_sym is None or user_sym.kind != "function":
+                        if node.callee.name == "append":
+                            return self._infer_append(node)
+                        return self._infer_len(node)
                 if self._in_decorator and node.callee.name == "code":
                     for arg in node.args:
                         self._infer_type(arg)
@@ -1664,10 +1694,12 @@ class SemanticAnalyzer:
             return
         if sym.node and isinstance(sym.node, FuncDef):
             expected_count = len(sym.node.params)
+            call.param_types = list(sym.node.params.values())
         elif sym.node and isinstance(sym.node, (Import, CCode, Llvm)):
             for fname, (_, params, vararg) in sym.node.symbols:
                 if fname == call.callee.name:
                     expected_count = len(params)
+                    call.param_types = [pt for _, pt in params]
                     if vararg:
                         return
                     break
@@ -2095,7 +2127,7 @@ class SemanticAnalyzer:
                         entry["loaded"] = True
                         if self._lazy_load_error is None:
                             self._lazy_load_error = (
-                                f'could not load imported header `{entry["path"]}`: {e}'
+                                f"could not load imported header `{entry['path']}`: {e}"
                             )
                         continue
                     symbols, _kind, constants, frameworks, var_names = result
@@ -2367,6 +2399,11 @@ class SemanticAnalyzer:
                 params = [(name, ptype) for name, ptype in ast_node.params.items()]
                 ret_type = ast_node.rettype or "int"
                 symbols[ast_node.name] = (ret_type, params, False)
+                sub_ast.append(ast_node)
+            elif isinstance(ast_node, FuncDef):
+                # Module-private functions: not exported as symbols, but kept in
+                # sub_ast so codegen still emits their bodies — public functions
+                # of the imported module may call them.
                 sub_ast.append(ast_node)
             elif isinstance(ast_node, StructDef):
                 sub_ast.append(ast_node)
@@ -3111,6 +3148,140 @@ class SemanticAnalyzer:
                 f"or non-negative value instead ({ctx})",
             )
 
+    _ARRAY_APPEND_CONVERSIONS = [
+        ("int", "int64"),
+        ("int", "uint64"),
+        ("int", "size_t"),
+        ("int64", "int"),
+        ("uint64", "int"),
+        ("int64", "uint64"),
+        ("uint64", "int64"),
+        ("int64", "size_t"),
+        ("uint64", "size_t"),
+        ("size_t", "int"),
+        ("size_t", "int64"),
+        ("size_t", "uint64"),
+        ("float", "double"),
+        ("double", "float"),
+        ("str", "char"),
+        ("char", "str"),
+        ("int", "big"),
+        ("int64", "big"),
+        ("uint64", "big"),
+        ("size_t", "big"),
+        ("big", "big"),
+        ("int", "ubig"),
+        ("int64", "ubig"),
+        ("uint64", "ubig"),
+        ("size_t", "ubig"),
+        ("big", "ubig"),
+        ("ubig", "ubig"),
+        ("ubig", "big"),
+    ]
+
+    def _append_value_compatible(self, val_type, elem_type):
+        """Same convertibility rules as `_visit_assign`: an int can be appended
+        to an int64[] (etc.) and pointers/str/char interchange as they do in
+        plain assignment."""
+        if val_type is None or elem_type is None:
+            return False
+        if val_type == elem_type:
+            return True
+        if (val_type, elem_type) in self._ARRAY_APPEND_CONVERSIONS:
+            return True
+        if val_type == "int" and elem_type.endswith("*"):
+            return True
+        if val_type == "str" and (elem_type.endswith("*") or elem_type == "char"):
+            return True
+        if elem_type == "str" and (val_type.endswith("*") or val_type == "char"):
+            return True
+        return False
+
+    def _infer_len(self, node):
+        for arg in node.args:
+            self._infer_type(arg)
+        if len(node.args) != 1:
+            self.error(
+                "len() expects exactly 1 argument (an array)",
+                node,
+                note=f"got {len(node.args)}",
+            )
+            return None
+        arg_t = getattr(node.args[0], "inferred_type", None)
+        if arg_t is None or not arg_t.endswith("[]"):
+            self.error(
+                f"len() requires an array argument, got "
+                f"`{arg_t if arg_t is not None else 'unknown'}`",
+                node,
+                note="len() returns the registered element count of an array "
+                "(`new T[n]`, `range()`, a list literal or `str_split()` result); "
+                "fixed-size and raw C buffers have no registered length",
+            )
+            return None
+        node.inferred_type = "int64"
+        return "int64"
+
+    def _infer_append(self, node):
+        for arg in node.args:
+            self._infer_type(arg)
+        if len(node.args) != 2:
+            self.error(
+                "append() expects exactly 2 arguments (array, value)",
+                node,
+                note=f"got {len(node.args)}",
+            )
+            return None
+        target = node.args[0]
+        value = node.args[1]
+        if not isinstance(target, (Variable, Index, Attr)):
+            self.error(
+                "append() target must be an lvalue (a variable, array element "
+                "or struct field), not an arbitrary expression",
+                node,
+            )
+            return None
+        target_t = getattr(target, "inferred_type", None)
+        if target_t is None or not target_t.endswith("[]"):
+            # A `dynamic[]` element (`dynarr[i]`) or a dynamic struct field can
+            # hold a list at runtime; only bare scalar `dynamic` values are
+            # rejected (they have no underlying registered buffer).
+            if target_t == "dynamic" and isinstance(target, (Index, Attr)):
+                node.inferred_type = "dynamic"
+                return "dynamic"
+            self.error(
+                f"append() target must be an array, got "
+                f"`{target_t if target_t is not None else 'unknown'}`",
+                node,
+                note="append() grows `T[]` / `dynamic[]` values created by "
+                "`new T[n]`, `range()`, a list literal or `str_split()`; it "
+                "cannot grow fixed-size or raw C buffers",
+            )
+            return None
+        if isinstance(target, Variable):
+            sym = self.current_scope.lookup(target.name)
+            if sym is not None and sym.kind in ("const", "const_view"):
+                self.error(
+                    f"cannot append to constant{'-view' if sym.kind == 'const_view' else ''} `{target.name}`",
+                    node,
+                    note="append() mutates the array; declare it as a variable",
+                )
+                return None
+        elem_t = target_t[:-2]
+        if elem_t != "dynamic":
+            value_t = getattr(value, "inferred_type", None)
+            if value_t != "dynamic" and not self._append_value_compatible(
+                value_t, elem_t
+            ):
+                self.error(
+                    f"cannot append value of type "
+                    f"`{value_t if value_t is not None else 'unknown'}` to an "
+                    f"array of `{elem_t}`",
+                    node,
+                )
+                return None
+        node.inferred_type = target_t
+        return target_t
+
     def _visit_assign(self, node: Assign, scope: Scope | None = None):
         val_type = self._infer_type(node.value)
         if val_type == "void":
@@ -3134,7 +3305,9 @@ class SemanticAnalyzer:
             if self._in_decorator and name in ("args", "func_name", "skip"):
                 if isinstance(node.target, Variable):
                     if name == "args":
-                        node.target.inferred_type = "dynamic[]"  # Array of dynamic values
+                        node.target.inferred_type = (
+                            "dynamic[]"  # Array of dynamic values
+                        )
                     elif name == "func_name":
                         node.target.inferred_type = "str"
                     elif name == "skip":
@@ -3595,7 +3768,7 @@ class SemanticAnalyzer:
                     next_val += 1
                 sym = Symbol("enum_member", node.name, node)
                 sym.const_value = member["_const_value"]
-                s.define(f'{node.name}.{member["name"]}', sym)
+                s.define(f"{node.name}.{member['name']}", sym)
         finally:
             self._enum_context_name = prev_ctx
 

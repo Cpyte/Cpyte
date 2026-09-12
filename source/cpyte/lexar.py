@@ -59,26 +59,59 @@ class TokenType(Enum):
 
 # Base keywords - core language keywords that cannot be overridden
 _BASE_KEYWORDS = {
-    'def', 'class', 'return', 'if', 'else', 'elif',
-    'while', 'for', 'in', 'break', 'continue',
-    'public', 'private', 'static', 'virtual', 'override',
-    'import', 'true', 'false', 'null', 'True', 'False',
-    'and', 'or', 'not',
-    'print',
-    'input', 'input_str', 'input_big',
-    'switch', 'case', 'default',
-    'new', 'struct', 'sizeof', 'ref',
-    'int64', 'uint64',
-    'assert',
-    'let',
-    'try', 'except', 'raise',
-    'asm',
-    'ccode',
-    'llvm',
-    'enum', 'type',
-    'unsafe',
-    'defer',
-    'borrow', 'move', 'mut',
+    "def",
+    "class",
+    "return",
+    "if",
+    "else",
+    "elif",
+    "while",
+    "for",
+    "in",
+    "break",
+    "continue",
+    "public",
+    "private",
+    "static",
+    "virtual",
+    "override",
+    "import",
+    "true",
+    "false",
+    "null",
+    "True",
+    "False",
+    "and",
+    "or",
+    "not",
+    "print",
+    "input",
+    "input_str",
+    "input_big",
+    "switch",
+    "case",
+    "default",
+    "new",
+    "struct",
+    "sizeof",
+    "ref",
+    "int64",
+    "uint64",
+    "assert",
+    "let",
+    "try",
+    "except",
+    "raise",
+    "asm",
+    "ccode",
+    "llvm",
+    "enum",
+    "type",
+    "unsafe",
+    "defer",
+    "borrow",
+    "move",
+    "mut",
 }
 
 # Additional keywords registered by packages
@@ -115,9 +148,16 @@ KEYWORDS = get_keywords()
 
 
 class Token:
-    __slots__ = ('column', 'line', 'raw', 'type', 'value')
+    __slots__ = ("column", "line", "raw", "type", "value")
 
-    def __init__(self, type_: TokenType, value: str | None = None, line: int = 0, column: int = 0, raw: bool = False):
+    def __init__(
+        self,
+        type_: TokenType,
+        value: str | None = None,
+        line: int = 0,
+        column: int = 0,
+        raw: bool = False,
+    ):
         self.type = type_
         self.value = value
         self.line = line
@@ -125,43 +165,51 @@ class Token:
         self.raw = raw
 
     def __repr__(self):
-        return f'Token({self.type.name}, {self.value!r}, L{self.line}:{self.column})'
+        return f"Token({self.type.name}, {self.value!r}, L{self.line}:{self.column})"
 
 
 class LexerError(Exception):
     def __init__(self, message: str, line: int = 0, column: int = 0):
         self.line = line
         self.column = column
-        super().__init__(f'LexerError at {line}:{column}: {message}')
+        super().__init__(f"LexerError at {line}:{column}: {message}")
 
 
 _ESCAPE_MAP = {
-    'n': '\n',
-    't': '\t',
-    'r': '\r',
-    '\\': '\\',
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "\\": "\\",
     '"': '"',
     "'": "'",
-    '0': '\0',
+    "0": "\0",
 }
 
 
-def _unescape_char(esc: str, lexer: '_LineLexer') -> str:
+def _unescape_char(esc: str, lexer: "_LineLexer") -> str:
     """Decode a single escape sequence after the backslash."""
-    if esc == 'x':
-        digits = ''
-        while len(digits) < 2 and not lexer.at_end() and (lexer.peek().isdigit() or lexer.peek().lower() in 'abcdef'):
+    if esc == "x":
+        digits = ""
+        while (
+            len(digits) < 2
+            and not lexer.at_end()
+            and (lexer.peek().isdigit() or lexer.peek().lower() in "abcdef")
+        ):
             digits += lexer.advance()
         if digits:
             return chr(int(digits, 16))
-        return '\\x'
-    if esc == 'u':
-        digits = ''
-        while len(digits) < 4 and not lexer.at_end() and (lexer.peek().isdigit() or lexer.peek().lower() in 'abcdef'):
+        return "\\x"
+    if esc == "u":
+        digits = ""
+        while (
+            len(digits) < 4
+            and not lexer.at_end()
+            and (lexer.peek().isdigit() or lexer.peek().lower() in "abcdef")
+        ):
             digits += lexer.advance()
         if len(digits) == 4:
             return chr(int(digits, 16))
-        return '\\u'
+        return "\\u"
     return _ESCAPE_MAP.get(esc, esc)
 
 
@@ -172,40 +220,48 @@ def _unescape_run(text: str) -> str:
     n = len(text)
     while i < n:
         ch = text[i]
-        if ch == '\\' and i + 1 < n:
+        if ch == "\\" and i + 1 < n:
             esc = text[i + 1]
-            if esc == 'x':
-                digits = ''
+            if esc == "x":
+                digits = ""
                 j = i + 2
-                while len(digits) < 2 and j < n and (text[j].isdigit() or text[j].lower() in 'abcdef'):
+                while (
+                    len(digits) < 2
+                    and j < n
+                    and (text[j].isdigit() or text[j].lower() in "abcdef")
+                ):
                     digits += text[j]
                     j += 1
                 if digits:
                     out.append(chr(int(digits, 16)))
                     i = j
                     continue
-                out.append('\\x')
+                out.append("\\x")
                 i += 2
                 continue
-            if esc == 'u':
-                digits = ''
+            if esc == "u":
+                digits = ""
                 j = i + 2
-                while len(digits) < 4 and j < n and (text[j].isdigit() or text[j].lower() in 'abcdef'):
+                while (
+                    len(digits) < 4
+                    and j < n
+                    and (text[j].isdigit() or text[j].lower() in "abcdef")
+                ):
                     digits += text[j]
                     j += 1
                 if len(digits) == 4:
                     out.append(chr(int(digits, 16)))
                     i = j
                     continue
-                out.append('\\u')
+                out.append("\\u")
                 i += 2
                 continue
-            out.append(_ESCAPE_MAP.get(esc, '\\' + esc))
+            out.append(_ESCAPE_MAP.get(esc, "\\" + esc))
             i += 2
             continue
         out.append(ch)
         i += 1
-    return ''.join(out)
+    return "".join(out)
 
 
 class _LineLexer:
@@ -217,7 +273,7 @@ class _LineLexer:
 
     def peek(self, offset: int = 0) -> str:
         idx = self.pos + offset
-        return self.line[idx] if idx < len(self.line) else '\0'
+        return self.line[idx] if idx < len(self.line) else "\0"
 
     def advance(self) -> str:
         ch = self.line[self.pos]
@@ -233,19 +289,29 @@ class _LineLexer:
         start = self.pos
 
         # Check for hexadecimal literal (0x or 0X)
-        if self.peek() == '0' and self.pos + 1 < len(self.line) and self.peek(1).lower() == 'x':
+        if (
+            self.peek() == "0"
+            and self.pos + 1 < len(self.line)
+            and self.peek(1).lower() == "x"
+        ):
             self.advance()  # consume '0'
             self.advance()  # consume 'x'
-            while self.pos < len(self.line) and (self.peek().isdigit() or self.peek().lower() in 'abcdef'):
+            while self.pos < len(self.line) and (
+                self.peek().isdigit() or self.peek().lower() in "abcdef"
+            ):
                 self.advance()
-            value = self.line[start:self.pos]
+            value = self.line[start : self.pos]
             return Token(TokenType.NUMBER, value, self.line_number, start_col)
 
         # Regular decimal number
         while self.pos < len(self.line) and self.peek().isdigit():
             self.advance()
 
-        if self.peek() == '.' and self.pos + 1 < len(self.line) and self.peek(1).isdigit():
+        if (
+            self.peek() == "."
+            and self.pos + 1 < len(self.line)
+            and self.peek(1).isdigit()
+        ):
             self.advance()
             while self.pos < len(self.line) and self.peek().isdigit():
                 self.advance()
@@ -253,10 +319,10 @@ class _LineLexer:
         # Scientific notation exponent (e/E [+/-]digits). Only consume it when
         # at least one digit follows the exponent marker, so `1e5` lexes as a
         # single NUMBER while an identifier-friendly `e` isn't swallowed.
-        if self.pos < len(self.line) and self.peek().lower() == 'e':
+        if self.pos < len(self.line) and self.peek().lower() == "e":
             save = self.pos
             self.advance()  # consume 'e'/'E'
-            if self.pos < len(self.line) and self.peek() in ('+', '-'):
+            if self.pos < len(self.line) and self.peek() in ("+", "-"):
                 self.advance()
             exp_start = self.pos
             while self.pos < len(self.line) and self.peek().isdigit():
@@ -265,7 +331,7 @@ class _LineLexer:
                 # no exponent digits — not scientific notation; rewind
                 self.pos = save
 
-        value = self.line[start:self.pos]
+        value = self.line[start : self.pos]
         return Token(TokenType.NUMBER, value, self.line_number, start_col)
 
     def scan_string(self, quote: str, raw: bool = False) -> Token:
@@ -276,21 +342,23 @@ class _LineLexer:
 
         while self.pos < len(self.line):
             ch = self.advance()
-            if ch == '\\':
+            if ch == "\\":
                 if self.pos >= len(self.line):
-                    raise LexerError('Unterminated string escape', start_line, start_col)
+                    raise LexerError(
+                        "Unterminated string escape", start_line, start_col
+                    )
                 esc = self.advance()
                 if raw:
-                    chars.append('\\')
+                    chars.append("\\")
                     chars.append(esc)
                 else:
                     chars.append(_unescape_char(esc, self))
             elif ch == quote:
-                return Token(TokenType.STRING, ''.join(chars), start_line, start_col)
+                return Token(TokenType.STRING, "".join(chars), start_line, start_col)
             else:
                 chars.append(ch)
 
-        raise LexerError('Unterminated string literal', start_line, start_col)
+        raise LexerError("Unterminated string literal", start_line, start_col)
 
     def scan_fstring(self, quote: str) -> Token:
         start_col = self.column
@@ -304,9 +372,11 @@ class _LineLexer:
             ch = self.advance()
             if expr_quote is not None:
                 chars.append(ch)
-                if ch == '\\':
+                if ch == "\\":
                     if self.pos >= len(self.line):
-                        raise LexerError('Unterminated string escape', start_line, start_col)
+                        raise LexerError(
+                            "Unterminated string escape", start_line, start_col
+                        )
                     chars.append(self.advance())
                 elif ch == expr_quote:
                     expr_quote = None
@@ -315,49 +385,53 @@ class _LineLexer:
                 chars.append(ch)
                 if ch in ('"', "'"):
                     expr_quote = ch
-                elif ch == '{':
+                elif ch == "{":
                     depth += 1
-                elif ch == '}':
+                elif ch == "}":
                     depth -= 1
                 continue
-            if ch == '\\':
+            if ch == "\\":
                 if self.pos >= len(self.line):
-                    raise LexerError('Unterminated string escape', start_line, start_col)
-                chars.append('\\')
+                    raise LexerError(
+                        "Unterminated string escape", start_line, start_col
+                    )
+                chars.append("\\")
                 chars.append(self.advance())
             elif ch == quote:
-                return Token(TokenType.FSTRING, ''.join(chars), start_line, start_col)
-            elif ch == '{':
+                return Token(TokenType.FSTRING, "".join(chars), start_line, start_col)
+            elif ch == "{":
                 chars.append(ch)
-                if self.pos < len(self.line) and self.peek() == '{':
+                if self.pos < len(self.line) and self.peek() == "{":
                     chars.append(self.advance())
                 else:
                     depth += 1
-            elif ch == '}':
+            elif ch == "}":
                 chars.append(ch)
-                if self.pos < len(self.line) and self.peek() == '}':
+                if self.pos < len(self.line) and self.peek() == "}":
                     chars.append(self.advance())
             else:
                 chars.append(ch)
 
-        raise LexerError('Unterminated string literal', start_line, start_col)
+        raise LexerError("Unterminated string literal", start_line, start_col)
 
     def scan_identifier(self) -> Token:
         start_col = self.column
         start = self.pos
-        while self.pos < len(self.line) and (self.peek().isalnum() or self.peek() == '_'):
+        while self.pos < len(self.line) and (
+            self.peek().isalnum() or self.peek() == "_"
+        ):
             self.advance()
 
-        value = self.line[start:self.pos]
+        value = self.line[start : self.pos]
         if value in get_keywords():
-            if value == 'and':
+            if value == "and":
                 return Token(TokenType.AND, value, self.line_number, start_col)
-            if value == 'or':
+            if value == "or":
                 return Token(TokenType.OR, value, self.line_number, start_col)
-            if value == 'not':
+            if value == "not":
                 return Token(TokenType.NOT, value, self.line_number, start_col)
             # int64 and uint64 are treated as keywords but should be identifiers for type parsing
-            if value in ('int64', 'uint64'):
+            if value in ("int64", "uint64"):
                 return Token(TokenType.IDENTIFIER, value, self.line_number, start_col)
             return Token(TokenType.KEYWORD, value, self.line_number, start_col)
         return Token(TokenType.IDENTIFIER, value, self.line_number, start_col)
@@ -366,29 +440,31 @@ class _LineLexer:
         ch = self.advance()
         col = self.column - 1
 
-        three_char = ch + self.peek() + self.peek(1) if self.pos + 1 < len(self.line) else ''
-        two_char = ch + self.peek() if not self.at_end() else ''
+        three_char = (
+            ch + self.peek() + self.peek(1) if self.pos + 1 < len(self.line) else ""
+        )
+        two_char = ch + self.peek() if not self.at_end() else ""
 
         op_map_3 = {
-            '//=': TokenType.SLASH_SLASH_EQ,
+            "//=": TokenType.SLASH_SLASH_EQ,
         }
 
         op_map_2 = {
-            '**': TokenType.POW,
-            '->': TokenType.RETURNTYPE,
-            '//': TokenType.SLASH_SLASH,
-            '<<': TokenType.SHL,
-            '>>': TokenType.SHR,
-            '==': TokenType.EQ_EQ,
-            '!=': TokenType.NOT_EQ,
-            '<=': TokenType.LESS_EQ,
-            '>=': TokenType.GREATER_EQ,
-            '+=': TokenType.PLUS_EQ,
-            '-=': TokenType.MINUS_EQ,
-            '*=': TokenType.STAR_EQ,
-            '/=': TokenType.SLASH_EQ,
-            ':=': TokenType.COLON_EQ,
-            '--': TokenType.MINUS_MINUS,
+            "**": TokenType.POW,
+            "->": TokenType.RETURNTYPE,
+            "//": TokenType.SLASH_SLASH,
+            "<<": TokenType.SHL,
+            ">>": TokenType.SHR,
+            "==": TokenType.EQ_EQ,
+            "!=": TokenType.NOT_EQ,
+            "<=": TokenType.LESS_EQ,
+            ">=": TokenType.GREATER_EQ,
+            "+=": TokenType.PLUS_EQ,
+            "-=": TokenType.MINUS_EQ,
+            "*=": TokenType.STAR_EQ,
+            "/=": TokenType.SLASH_EQ,
+            ":=": TokenType.COLON_EQ,
+            "--": TokenType.MINUS_MINUS,
         }
 
         if three_char in op_map_3:
@@ -396,42 +472,46 @@ class _LineLexer:
             self.advance()
             return Token(op_map_3[three_char], three_char, self.line_number, col)
 
-        if two_char == '--' and self.pos + 1 < len(self.line) and self.peek(1).isdigit():
-            return Token(TokenType.MINUS, '-', self.line_number, col)
+        if (
+            two_char == "--"
+            and self.pos + 1 < len(self.line)
+            and self.peek(1).isdigit()
+        ):
+            return Token(TokenType.MINUS, "-", self.line_number, col)
 
         if two_char in op_map_2:
             self.advance()
             return Token(op_map_2[two_char], two_char, self.line_number, col)
 
         single_map = {
-            '+': TokenType.PLUS,
-            '-': TokenType.MINUS,
-            '*': TokenType.STAR,
-            '/': TokenType.SLASH,
-            '%': TokenType.PERCENT,
-            '=': TokenType.EQUAL,
-            '<': TokenType.LESS,
-            '>': TokenType.GREATER,
-            '&': TokenType.AMPERSAND,
-            '|': TokenType.PIPE,
-            '^': TokenType.CARET,
-            '~': TokenType.TILDE,
+            "+": TokenType.PLUS,
+            "-": TokenType.MINUS,
+            "*": TokenType.STAR,
+            "/": TokenType.SLASH,
+            "%": TokenType.PERCENT,
+            "=": TokenType.EQUAL,
+            "<": TokenType.LESS,
+            ">": TokenType.GREATER,
+            "&": TokenType.AMPERSAND,
+            "|": TokenType.PIPE,
+            "^": TokenType.CARET,
+            "~": TokenType.TILDE,
         }
 
         if ch in single_map:
             return Token(single_map[ch], ch, self.line_number, col)
 
         punct_map = {
-            '(': TokenType.LPAREN,
-            ')': TokenType.RPAREN,
-            '[': TokenType.LBRACKET,
-            ']': TokenType.RBRACKET,
-            '{': TokenType.LBRACE,
-            '}': TokenType.RBRACE,
-            ',': TokenType.COMMA,
-            ':': TokenType.COLON,
-            '.': TokenType.DOT,
-            '@': TokenType.AT_SIGN,
+            "(": TokenType.LPAREN,
+            ")": TokenType.RPAREN,
+            "[": TokenType.LBRACKET,
+            "]": TokenType.RBRACKET,
+            "{": TokenType.LBRACE,
+            "}": TokenType.RBRACE,
+            ",": TokenType.COMMA,
+            ":": TokenType.COLON,
+            ".": TokenType.DOT,
+            "@": TokenType.AT_SIGN,
         }
 
         if ch in punct_map:
@@ -444,16 +524,16 @@ class _LineLexer:
         while not self.at_end():
             ch = self.peek()
 
-            if ch in ' \t\r':
+            if ch in " \t\r":
                 self.advance()
                 continue
 
-            if ch == '#':
+            if ch == "#":
                 break
 
-            if ch == '\\':
+            if ch == "\\":
                 self.advance()
-                while not self.at_end() and self.peek() in ' \t\r':
+                while not self.at_end() and self.peek() in " \t\r":
                     self.advance()
                 break
 
@@ -461,27 +541,27 @@ class _LineLexer:
                 tokens.append(self.scan_number())
                 continue
 
-            if ch in '"\'':
+            if ch in "\"'":
                 tokens.append(self.scan_string(ch))
                 continue
 
-            if ch in 'fr' and self.pos + 1 < len(self.line) and self.peek(1) in '"\'':
+            if ch in "fr" and self.pos + 1 < len(self.line) and self.peek(1) in "\"'":
                 prefix = self.advance()
                 quote = self.peek()
-                if prefix == 'f':
+                if prefix == "f":
                     tokens.append(self.scan_fstring(quote))
                 else:
                     tokens.append(self.scan_string(quote, raw=True))
                 continue
 
             if (
-                ch in 'fr'
+                ch in "fr"
                 and self.pos + 1 < len(self.line)
-                and self.peek(1) in 'fr'
+                and self.peek(1) in "fr"
                 and self.pos + 2 < len(self.line)
-                and self.peek(2) in '"\'' 
+                and self.peek(2) in "\"'"
             ):
-                is_f = ch == 'f' or self.peek(1) == 'f'
+                is_f = ch == "f" or self.peek(1) == "f"
                 self.advance()
                 self.advance()
                 quote = self.peek()
@@ -493,7 +573,7 @@ class _LineLexer:
                     tokens.append(self.scan_string(quote, raw=True))
                 continue
 
-            if ch.isalpha() or ch == '_':
+            if ch.isalpha() or ch == "_":
                 tokens.append(self.scan_identifier())
                 continue
 
@@ -503,20 +583,26 @@ class _LineLexer:
 
 
 class Lexer:
-    def __init__(self, source: str, filename: str = '<string>', tab_size: int = 4, enable_extensions: bool = True):
+    def __init__(
+        self,
+        source: str,
+        filename: str = "<string>",
+        tab_size: int = 4,
+        enable_extensions: bool = True,
+    ):
         self.source = source
         self.filename = filename
         self.tab_size = tab_size
         self.tokens: list[Token] = []
         self.enable_extensions = enable_extensions
         self._tokenize()
-    
+
     @staticmethod
     def register_package_keywords(keywords: set[str]) -> None:
         """Register keywords from a package."""
         register_keywords(keywords)
-    
-    @staticmethod  
+
+    @staticmethod
     def unregister_package_keywords(keywords: set[str]) -> None:
         """Unregister keywords from a package."""
         unregister_keywords(keywords)
@@ -524,48 +610,46 @@ class Lexer:
     def _validate_indentation(self, raw_lines: list[str]):
         for i, line in enumerate(raw_lines):
             stripped = line.lstrip()
-            if not stripped or stripped.startswith('#'):
+            if not stripped or stripped.startswith("#"):
                 continue
 
-            leading = line[:len(line) - len(stripped)]
-            has_tabs = '\t' in leading
-            has_spaces = ' ' in leading
+            leading = line[: len(line) - len(stripped)]
+            has_tabs = "\t" in leading
+            has_spaces = " " in leading
 
             if has_tabs and has_spaces:
                 ln = i + 1
-                tab_col = leading.index('\t') + 1
+                tab_col = leading.index("\t") + 1
                 raise LexerError(
-                    f'Mixing tabs and spaces in indentation (tab at column {tab_col})',
-                    ln, tab_col
+                    f"Mixing tabs and spaces in indentation (tab at column {tab_col})",
+                    ln,
+                    tab_col,
                 )
 
             if has_tabs and self.tab_size == 0:
-                raise LexerError(
-                    'Tabs are not allowed for indentation',
-                    i + 1, 1
-                )
+                raise LexerError("Tabs are not allowed for indentation", i + 1, 1)
 
     def _normalize_leading(self, line: str) -> str:
-        if self.tab_size == 0 or '\t' not in line:
+        if self.tab_size == 0 or "\t" not in line:
             return line
 
         stripped = line.lstrip()
-        leading = line[:len(line) - len(stripped)]
+        leading = line[: len(line) - len(stripped)]
 
-        if '\t' not in leading:
+        if "\t" not in leading:
             return line
 
-        result = ''
+        result = ""
         for ch in leading:
-            if ch == '\t':
-                result += ' ' * (self.tab_size - (len(result) % self.tab_size))
+            if ch == "\t":
+                result += " " * (self.tab_size - (len(result) % self.tab_size))
             else:
                 result += ch
 
         return result + stripped
 
     def _tokenize(self):
-        raw_lines = self.source.split('\n')
+        raw_lines = self.source.split("\n")
 
         self._validate_indentation(raw_lines)
 
@@ -580,14 +664,14 @@ class Lexer:
         while i < len(norm_lines):
             norm_line = norm_lines[i]
             line_number = i + 1
-            stripped = norm_line.lstrip(' \t')
+            stripped = norm_line.lstrip(" \t")
 
-            if not stripped or stripped.startswith('#'):
+            if not stripped or stripped.startswith("#"):
                 i += 1
                 continue
 
             trimmed = stripped.rstrip()
-            ends_with_bs = trimmed.endswith('\\')
+            ends_with_bs = trimmed.endswith("\\")
 
             indent = len(norm_line) - len(stripped)
 
@@ -601,15 +685,19 @@ class Lexer:
                     indent_stack.append(indent)
                     self.tokens.append(Token(TokenType.INDENT, None, line_number, 1))
 
-            if not is_continuation and trimmed in ('ccode:', 'llvm:', 'unsafe llvm:'):
-                if trimmed == 'unsafe llvm:':
-                    header_parts = ['unsafe', 'llvm']
-                elif trimmed == 'llvm:':
-                    header_parts = ['llvm']
+            if not is_continuation and trimmed in ("ccode:", "llvm:", "unsafe llvm:"):
+                if trimmed == "unsafe llvm:":
+                    header_parts = ["unsafe", "llvm"]
+                elif trimmed == "llvm:":
+                    header_parts = ["llvm"]
                 else:
-                    header_parts = ['ccode']
+                    header_parts = ["ccode"]
                 i, last_non_blank = self._emit_raw_block(
-                    norm_lines, i, indent, line_number, header_parts,
+                    norm_lines,
+                    i,
+                    indent,
+                    line_number,
+                    header_parts,
                 )
                 continuation = False
                 continue
@@ -626,7 +714,9 @@ class Lexer:
             self.tokens.extend(line_tokens)
 
             if not (ends_with_bs or bracket_depth > 0):
-                self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_line) + 1))
+                self.tokens.append(
+                    Token(TokenType.NEWLINE, None, line_number, len(norm_line) + 1)
+                )
                 last_non_blank = line_number
 
             continuation = ends_with_bs
@@ -647,18 +737,22 @@ class Lexer:
         with indentation <= the header's ends the block. Returns (new_i,
         last_non_blank).
         """
-        hdr = ' '.join(header_parts)
+        hdr = " ".join(header_parts)
         for value in header_parts:
             self.tokens.append(Token(TokenType.KEYWORD, value, line_number, indent + 1))
-        self.tokens.append(Token(TokenType.COLON, ':', line_number, indent + len(hdr) + 1))
-        self.tokens.append(Token(TokenType.NEWLINE, None, line_number, len(norm_lines[i]) + 1))
+        self.tokens.append(
+            Token(TokenType.COLON, ":", line_number, indent + len(hdr) + 1)
+        )
+        self.tokens.append(
+            Token(TokenType.NEWLINE, None, line_number, len(norm_lines[i]) + 1)
+        )
 
         c_lines = []
         block_indent = None
         i += 1
         while i < len(norm_lines):
             raw = norm_lines[i]
-            ls = raw.lstrip(' \t')
+            ls = raw.lstrip(" \t")
             if not ls:
                 c_lines.append(raw)
                 i += 1
@@ -672,7 +766,7 @@ class Lexer:
 
         if block_indent:
             out = []
-            pad = ' ' * block_indent
+            pad = " " * block_indent
             for raw_line in c_lines:
                 if raw_line.startswith(pad):
                     out.append(raw_line[block_indent:])
@@ -681,7 +775,7 @@ class Lexer:
             c_lines = out
 
         self.tokens.append(Token(TokenType.INDENT, None, i + 1, 1))
-        self.tokens.append(Token(TokenType.STRING, '\n'.join(c_lines), i + 1, 1))
+        self.tokens.append(Token(TokenType.STRING, "\n".join(c_lines), i + 1, 1))
         self.tokens.append(Token(TokenType.NEWLINE, None, i + 1, 1))
         self.tokens.append(Token(TokenType.DEDENT, None, i + 1, 1))
         return i, i + 1

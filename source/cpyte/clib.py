@@ -15,20 +15,20 @@ import tempfile
 # ── libclang setup (cross-platform) ─────────────────────────────
 _LIBCLANG_PATHS = [
     # macOS: Xcode Command Line Tools / Xcode toolchains
-    '/Library/Developer/CommandLineTools/usr/lib/libclang.dylib',
-    '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib',
+    "/Library/Developer/CommandLineTools/usr/lib/libclang.dylib",
+    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib",
     # Linux: distro LLVM installs (Debian/Ubuntu/Fedora/Arch, x86-64 + arm64)
-    '/usr/lib/llvm-*/lib/libclang.so',
-    '/usr/lib/llvm-*/lib/libclang.so.*',
-    '/usr/lib/x86_64-linux-gnu/libclang-*.so.*',
-    '/usr/lib/aarch64-linux-gnu/libclang-*.so.*',
-    '/usr/lib/libclang.so',
-    '/usr/lib64/libclang.so',
-    '/usr/local/lib/libclang.so',
+    "/usr/lib/llvm-*/lib/libclang.so",
+    "/usr/lib/llvm-*/lib/libclang.so.*",
+    "/usr/lib/x86_64-linux-gnu/libclang-*.so.*",
+    "/usr/lib/aarch64-linux-gnu/libclang-*.so.*",
+    "/usr/lib/libclang.so",
+    "/usr/lib64/libclang.so",
+    "/usr/local/lib/libclang.so",
     # Windows / generic (also tried by name on PATH, then clang.cindex defaults)
-    'libclang.dll',
-    'libclang.so',
-    'libclang.dylib',
+    "libclang.dll",
+    "libclang.so",
+    "libclang.dylib",
 ]
 _libclang_loaded = False
 
@@ -37,16 +37,19 @@ def _find_libclang():
     """Locate a libclang shared library on any platform, or None."""
     try:
         import ctypes.util as _cutil
-        found = _cutil.find_library('clang')
+
+        found = _cutil.find_library("clang")
         if found:
             return found
     except Exception:
         pass
     import shutil
+
     for p in _LIBCLANG_PATHS:
         expanded = os.path.expanduser(p)
-        if os.path.isabs(expanded) and '*' in expanded:
+        if os.path.isabs(expanded) and "*" in expanded:
             from glob import glob
+
             matches = sorted(glob(expanded))
             if not matches:
                 continue
@@ -65,6 +68,7 @@ def _init_libclang():
     library_file = _find_libclang()
     try:
         import clang.cindex  # type: ignore[reportMissingImports]
+
         if library_file:
             clang.cindex.Config.set_library_file(library_file)
         _libclang_loaded = True
@@ -72,118 +76,124 @@ def _init_libclang():
     except Exception:
         return False
 
+
 # Hand-written fallback libraries. Types here are C source-level types (e.g.
 # 'char*', 'size_t', 'double') — they are converted to cpyte types through the
 # strict C→cpyte mapper (see `_hardcoded_symbols`), so a curated entry can
 # never disagree with what parsing the real header with libclang would produce.
 C_LIBRARIES = {
-    'stdio': {
-        'printf':   ('int', [('fmt', 'char*')], True),
-        'putchar':  ('int', [('c', 'int')]),
-        'getchar':  ('int', []),
-        'puts':     ('int', [('s', 'char*')]),
-        'sprintf':  ('int', [('buf', 'char*'), ('fmt', 'char*')], True),
-        'snprintf': ('int', [('buf', 'char*'), ('n', 'size_t'), ('fmt', 'char*')], True),
-        'fprintf':  ('int', [('stream', 'FILE*'), ('fmt', 'char*')], True),
-        'scanf':    ('int', [('fmt', 'char*')], True),
-        'sscanf':   ('int', [('s', 'char*'), ('fmt', 'char*')], True),
+    "stdio": {
+        "printf": ("int", [("fmt", "char*")], True),
+        "putchar": ("int", [("c", "int")]),
+        "getchar": ("int", []),
+        "puts": ("int", [("s", "char*")]),
+        "sprintf": ("int", [("buf", "char*"), ("fmt", "char*")], True),
+        "snprintf": (
+            "int",
+            [("buf", "char*"), ("n", "size_t"), ("fmt", "char*")],
+            True,
+        ),
+        "fprintf": ("int", [("stream", "FILE*"), ("fmt", "char*")], True),
+        "scanf": ("int", [("fmt", "char*")], True),
+        "sscanf": ("int", [("s", "char*"), ("fmt", "char*")], True),
     },
-    'stdlib': {
-        'abs':     ('int', [('x', 'int')]),
-        'labs':    ('long', [('x', 'long')]),
-        'rand':    ('int', []),
-        'srand':   ('void', [('seed', 'unsigned')]),
-        'malloc':  ('void*', [('size', 'size_t')]),
-        'calloc':  ('void*', [('nmemb', 'size_t'), ('size', 'size_t')]),
-        'realloc': ('void*', [('ptr', 'void*'), ('size', 'size_t')]),
-        'free':    ('void', [('ptr', 'void*')]),
-        'atoi':    ('int', [('s', 'char*')]),
-        'atol':    ('long', [('s', 'char*')]),
-        'atof':    ('double', [('s', 'char*')]),
-        'exit':    ('void', [('status', 'int')]),
-        'system':  ('int', [('cmd', 'char*')]),
+    "stdlib": {
+        "abs": ("int", [("x", "int")]),
+        "labs": ("long", [("x", "long")]),
+        "rand": ("int", []),
+        "srand": ("void", [("seed", "unsigned")]),
+        "malloc": ("void*", [("size", "size_t")]),
+        "calloc": ("void*", [("nmemb", "size_t"), ("size", "size_t")]),
+        "realloc": ("void*", [("ptr", "void*"), ("size", "size_t")]),
+        "free": ("void", [("ptr", "void*")]),
+        "atoi": ("int", [("s", "char*")]),
+        "atol": ("long", [("s", "char*")]),
+        "atof": ("double", [("s", "char*")]),
+        "exit": ("void", [("status", "int")]),
+        "system": ("int", [("cmd", "char*")]),
     },
-    'math': {
-        'sqrt':   ('double', [('x', 'double')]),
-        'sin':    ('double', [('x', 'double')]),
-        'cos':    ('double', [('x', 'double')]),
-        'tan':    ('double', [('x', 'double')]),
-        'asin':   ('double', [('x', 'double')]),
-        'acos':   ('double', [('x', 'double')]),
-        'atan':   ('double', [('x', 'double')]),
-        'atan2':  ('double', [('y', 'double'), ('x', 'double')]),
-        'pow':    ('double', [('x', 'double'), ('y', 'double')]),
-        'exp':    ('double', [('x', 'double')]),
-        'log':    ('double', [('x', 'double')]),
-        'log10':  ('double', [('x', 'double')]),
-        'floor':  ('double', [('x', 'double')]),
-        'ceil':   ('double', [('x', 'double')]),
-        'fabs':   ('double', [('x', 'double')]),
-        'fmod':   ('double', [('x', 'double'), ('y', 'double')]),
+    "math": {
+        "sqrt": ("double", [("x", "double")]),
+        "sin": ("double", [("x", "double")]),
+        "cos": ("double", [("x", "double")]),
+        "tan": ("double", [("x", "double")]),
+        "asin": ("double", [("x", "double")]),
+        "acos": ("double", [("x", "double")]),
+        "atan": ("double", [("x", "double")]),
+        "atan2": ("double", [("y", "double"), ("x", "double")]),
+        "pow": ("double", [("x", "double"), ("y", "double")]),
+        "exp": ("double", [("x", "double")]),
+        "log": ("double", [("x", "double")]),
+        "log10": ("double", [("x", "double")]),
+        "floor": ("double", [("x", "double")]),
+        "ceil": ("double", [("x", "double")]),
+        "round": ("double", [("x", "double")]),
+        "fabs": ("double", [("x", "double")]),
+        "fmod": ("double", [("x", "double"), ("y", "double")]),
     },
-    'string': {
-        'strlen':   ('size_t', [('s', 'char*')]),
-        'strcmp':   ('int', [('s1', 'char*'), ('s2', 'char*')]),
-        'strncmp':  ('int', [('s1', 'char*'), ('s2', 'char*'), ('n', 'size_t')]),
-        'strcpy':   ('char*', [('dst', 'char*'), ('src', 'char*')]),
-        'strncpy':  ('char*', [('dst', 'char*'), ('src', 'char*'), ('n', 'size_t')]),
-        'strcat':   ('char*', [('dst', 'char*'), ('src', 'char*')]),
-        'strncat':  ('char*', [('dst', 'char*'), ('src', 'char*'), ('n', 'size_t')]),
-        'strchr':   ('char*', [('s', 'char*'), ('c', 'int')]),
-        'strstr':   ('char*', [('haystack', 'char*'), ('needle', 'char*')]),
-        'strdup':   ('char*', [('s', 'char*')]),
-        'memset':   ('void*', [('s', 'void*'), ('c', 'int'), ('n', 'size_t')]),
-        'memcpy':   ('void*', [('dst', 'void*'), ('src', 'void*'), ('n', 'size_t')]),
-        'memcmp':   ('int', [('s1', 'void*'), ('s2', 'void*'), ('n', 'size_t')]),
+    "string": {
+        "strlen": ("size_t", [("s", "char*")]),
+        "strcmp": ("int", [("s1", "char*"), ("s2", "char*")]),
+        "strncmp": ("int", [("s1", "char*"), ("s2", "char*"), ("n", "size_t")]),
+        "strcpy": ("char*", [("dst", "char*"), ("src", "char*")]),
+        "strncpy": ("char*", [("dst", "char*"), ("src", "char*"), ("n", "size_t")]),
+        "strcat": ("char*", [("dst", "char*"), ("src", "char*")]),
+        "strncat": ("char*", [("dst", "char*"), ("src", "char*"), ("n", "size_t")]),
+        "strchr": ("char*", [("s", "char*"), ("c", "int")]),
+        "strstr": ("char*", [("haystack", "char*"), ("needle", "char*")]),
+        "strdup": ("char*", [("s", "char*")]),
+        "memset": ("void*", [("s", "void*"), ("c", "int"), ("n", "size_t")]),
+        "memcpy": ("void*", [("dst", "void*"), ("src", "void*"), ("n", "size_t")]),
+        "memcmp": ("int", [("s1", "void*"), ("s2", "void*"), ("n", "size_t")]),
     },
-    'time': {
-        'time':      ('time_t', [('t', 'time_t*')]),
-        'clock':     ('time_t', []),
-        'difftime':  ('double', [('t1', 'time_t'), ('t2', 'time_t')]),
-        'ctime':     ('char*', [('t', 'time_t*')]),
+    "time": {
+        "time": ("time_t", [("t", "time_t*")]),
+        "clock": ("time_t", []),
+        "difftime": ("double", [("t1", "time_t"), ("t2", "time_t")]),
+        "ctime": ("char*", [("t", "time_t*")]),
     },
 }
 
 # Maps bare import names to their C header files for system header parsing
 _BUILTIN_LIB_HEADERS = {
-    'stdio': 'stdio.h',
-    'stdlib': 'stdlib.h',
-    'math': 'math.h',
-    'string': 'string.h',
-    'time': 'time.h',
-    'fcntl': 'fcntl.h',
-    'unistd': 'unistd.h',
-    'sys/stat': 'sys/stat.h',
-    'sys/types': 'sys/types.h',
-    'sys/socket': 'sys/socket.h',
-    'sys/mman': 'sys/mman.h',
-    'signal': 'signal.h',
-    'errno': 'errno.h',
-    'assert': 'assert.h',
-    'ctype': 'ctype.h',
-    'dirent': 'dirent.h',
-    'dlfcn': 'dlfcn.h',
-    'glob': 'glob.h',
-    'pthread': 'pthread.h',
-    'pwd': 'pwd.h',
-    'setjmp': 'setjmp.h',
-    'stdarg': 'stdarg.h',
-    'stdint': 'stdint.h',
-    'stddef': 'stddef.h',
-    'limits': 'limits.h',
-    'float': 'float.h',
-    'locale': 'locale.h',
-    'tar': 'tar.h',
-    'zlib': 'zlib.h',
-    'sys/time': 'sys/time.h',
-    'sys/wait': 'sys/wait.h',
-    'sys/resource': 'sys/resource.h',
-    'sys/ioctl': 'sys/ioctl.h',
-    'sys/un': 'sys/un.h',
-    'netdb': 'netdb.h',
-    'netinet/in': 'netinet/in.h',
-    'netinet/tcp': 'netinet/tcp.h',
-    'arpa/inet': 'arpa/inet.h',
+    "stdio": "stdio.h",
+    "stdlib": "stdlib.h",
+    "math": "math.h",
+    "string": "string.h",
+    "time": "time.h",
+    "fcntl": "fcntl.h",
+    "unistd": "unistd.h",
+    "sys/stat": "sys/stat.h",
+    "sys/types": "sys/types.h",
+    "sys/socket": "sys/socket.h",
+    "sys/mman": "sys/mman.h",
+    "signal": "signal.h",
+    "errno": "errno.h",
+    "assert": "assert.h",
+    "ctype": "ctype.h",
+    "dirent": "dirent.h",
+    "dlfcn": "dlfcn.h",
+    "glob": "glob.h",
+    "pthread": "pthread.h",
+    "pwd": "pwd.h",
+    "setjmp": "setjmp.h",
+    "stdarg": "stdarg.h",
+    "stdint": "stdint.h",
+    "stddef": "stddef.h",
+    "limits": "limits.h",
+    "float": "float.h",
+    "locale": "locale.h",
+    "tar": "tar.h",
+    "zlib": "zlib.h",
+    "sys/time": "sys/time.h",
+    "sys/wait": "sys/wait.h",
+    "sys/resource": "sys/resource.h",
+    "sys/ioctl": "sys/ioctl.h",
+    "sys/un": "sys/un.h",
+    "netdb": "netdb.h",
+    "netinet/in": "netinet/in.h",
+    "netinet/tcp": "netinet/tcp.h",
+    "arpa/inet": "arpa/inet.h",
 }
 
 # Cache for parsed system headers (header_name -> symbols dict)
@@ -207,7 +217,9 @@ def _sdk_roots():
     try:
         r = subprocess.run(
             ["xcrun", "--show-sdk-path"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if r.returncode == 0 and r.stdout.strip():
             roots.append(r.stdout.strip())
@@ -242,7 +254,9 @@ def _probe_cc_include_dirs():
             r = subprocess.run(
                 [cc, "-E", "-x", "c", "-v", "-"],
                 input="",
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -250,8 +264,9 @@ def _probe_cc_include_dirs():
         if not output:
             output = r.stdout
         m = re.search(
-            r'#include <\.\.\.> search starts here:(.*?)\nEnd of search list\.',
-            output, re.DOTALL,
+            r"#include <\.\.\.> search starts here:(.*?)\nEnd of search list\.",
+            output,
+            re.DOTALL,
         )
         if not m:
             continue
@@ -259,8 +274,8 @@ def _probe_cc_include_dirs():
             line = line.strip()
             if not line:
                 continue
-            line = re.sub(r'\s*\((framework|library) directory\)$', '', line)
-            if not line.startswith('/') or not os.path.isdir(line):
+            line = re.sub(r"\s*\((framework|library) directory\)$", "", line)
+            if not line.startswith("/") or not os.path.isdir(line):
                 continue
             if line not in dirs:
                 dirs.append(line)
@@ -379,7 +394,7 @@ def _parse_system_header(header_name):
                 if ptype is None:
                     params = None
                     break
-                pname = p.spelling or f'p{len(params)}'
+                pname = p.spelling or f"p{len(params)}"
                 params.append((pname, ptype))
             if params is None:
                 continue
@@ -398,39 +413,37 @@ def _parse_system_header(header_name):
         except OSError:
             pass
 
+
 _HEADER_PATTERN = re.compile(
-    r'(?:CG_EXTERN|CF_EXPORT|EXTERN_C|extern)\s+'
-    r'([\w\s\*]+?)\s+'          # return type (lazy)
-    r'(?:__nullable|__nonnull|__null_unspecified|__kindof)\s+'
-    r'(\w+)\s*'                 # function name
-    r'\(([^)]*)\)'              # parameters
-    r'\s*;',
-    re.DOTALL
+    r"(?:CG_EXTERN|CF_EXPORT|EXTERN_C|extern)\s+"
+    r"([\w\s\*]+?)\s+"  # return type (lazy)
+    r"(?:__nullable|__nonnull|__null_unspecified|__kindof)\s+"
+    r"(\w+)\s*"  # function name
+    r"\(([^)]*)\)"  # parameters
+    r"\s*;",
+    re.DOTALL,
 )
 
 _HEADER_PATTERN_CF = re.compile(
-    r'(?:CF_EXPORT)\s+'
-    r'([\w\s\*]+)\s+'          # return type
-    r'(\w+)\s*'                # function name
-    r'\(([^)]*)\)'             # parameters
-    r'\s*;',
-    re.DOTALL
+    r"(?:CF_EXPORT)\s+"
+    r"([\w\s\*]+)\s+"  # return type
+    r"(\w+)\s*"  # function name
+    r"\(([^)]*)\)"  # parameters
+    r"\s*;",
+    re.DOTALL,
 )
 
 _HEADER_PATTERN_CG = re.compile(
-    r'(?:CG_EXTERN)\s+'
-    r'([\w\s\*]+?)\s+'          # return type (lazy)
-    r'(?:__nullable|__nonnull|__null_unspecified|__kindof)?\s*'
-    r'(\w+)\s*'                # function name
-    r'\(([^)]*)\)'             # parameters
-    r'\s*;',
-    re.DOTALL
+    r"(?:CG_EXTERN)\s+"
+    r"([\w\s\*]+?)\s+"  # return type (lazy)
+    r"(?:__nullable|__nonnull|__null_unspecified|__kindof)?\s*"
+    r"(\w+)\s*"  # function name
+    r"\(([^)]*)\)"  # parameters
+    r"\s*;",
+    re.DOTALL,
 )
 
-_HEADER_PATTERN_ALT = re.compile(
-    r'(\w[\w\s\*]*)\s+(\w+)\s*\(([^)]*)\)\s*;',
-    re.DOTALL
-)
+_HEADER_PATTERN_ALT = re.compile(r"(\w[\w\s\*]*)\s+(\w+)\s*\(([^)]*)\)\s*;", re.DOTALL)
 
 
 def _add_symbol(symbols, m):
@@ -444,7 +457,7 @@ def _add_symbol(symbols, m):
     if ret_type is None:
         return
 
-    if not raw_params or raw_params.strip() == 'void':
+    if not raw_params or raw_params.strip() == "void":
         params = []
         vararg = False
     else:
@@ -452,7 +465,7 @@ def _add_symbol(symbols, m):
         vararg = False
         for part in _split_params(raw_params):
             part = part.strip()
-            if part == '...':
+            if part == "...":
                 vararg = True
                 continue
             pname, ptype = _parse_decl(part)
@@ -460,14 +473,13 @@ def _add_symbol(symbols, m):
             # wrong; drop the symbol rather than emit a broken extern.
             if ptype is None:
                 return
-            params.append((pname or f'p{len(params)}', ptype))
+            params.append((pname or f"p{len(params)}", ptype))
     symbols[fname] = (ret_type, params, vararg)
 
 
 # Pattern for CF_EXPORT const variable declarations (e.g., kCFRunLoopCommonModes)
 _CONST_VAR_PATTERN = re.compile(
-    r'(?:CF_EXPORT|CG_EXTERN|extern)\s+const\s+(\w+)\s+(\w+)\s*;',
-    re.DOTALL
+    r"(?:CF_EXPORT|CG_EXTERN|extern)\s+const\s+(\w+)\s+(\w+)\s*;", re.DOTALL
 )
 
 
@@ -532,10 +544,10 @@ def resolve_library(name):
                 if fname not in parsed:
                     parsed[fname] = desc
             if parsed:
-                return parsed, 'c'
+                return parsed, "c"
 
     if hard is not None:
-        return hard, 'c'
+        return hard, "c"
     return None
 
 
@@ -545,7 +557,7 @@ _INCLUDE_PATTERN = re.compile(r'#\s*include\s+[<"](\S+)[>"]')
 def _resolve_include(include_path, current_file, search_paths):
     """Resolve a #include to an absolute file path."""
     # Quote includes: search relative to current file first
-    if not include_path.startswith('<'):
+    if not include_path.startswith("<"):
         dirpath = os.path.dirname(current_file)
         candidate = os.path.normpath(os.path.join(dirpath, include_path))
         if os.path.exists(candidate):
@@ -554,16 +566,16 @@ def _resolve_include(include_path, current_file, search_paths):
     # Try framework paths (e.g., <CoreGraphics/CGEventTypes.h>). Framework
     # roots are searched generically (System/Library/Frameworks, Frameworks,
     # or the SDK root itself) so any SDK layout works.
-    parts = include_path.split('/')
+    parts = include_path.split("/")
     if len(parts) >= 2:
         framework_name = parts[0]
-        header_rel = '/'.join(parts[1:])
+        header_rel = "/".join(parts[1:])
         for sdk in search_paths:
-            for fw_root in ('System/Library/Frameworks', 'Frameworks', ''):
+            for fw_root in ("System/Library/Frameworks", "Frameworks", ""):
                 for fw_subdir in (
-                    f'{framework_name}.framework/Headers',
-                    f'{framework_name}.framework/Versions/Current/Headers',
-                    f'{framework_name}.framework/Versions/A/Headers',
+                    f"{framework_name}.framework/Headers",
+                    f"{framework_name}.framework/Versions/Current/Headers",
+                    f"{framework_name}.framework/Versions/A/Headers",
                 ):
                     candidate = os.path.join(sdk, fw_root, fw_subdir, header_rel)
                     if os.path.exists(candidate):
@@ -571,7 +583,7 @@ def _resolve_include(include_path, current_file, search_paths):
 
     # Search standard SDK include paths
     for sdk in search_paths:
-        for subdir in ('usr/include', ''):
+        for subdir in ("usr/include", ""):
             candidate = os.path.join(sdk, subdir, include_path)
             if os.path.exists(candidate):
                 return candidate
@@ -579,11 +591,14 @@ def _resolve_include(include_path, current_file, search_paths):
     # Search framework private headers
     if len(parts) >= 2:
         framework_name = parts[0]
-        header_rel = '/'.join(parts[1:])
+        header_rel = "/".join(parts[1:])
         for sdk in search_paths:
-            for fw_root in ('System/Library/Frameworks', 'Frameworks', ''):
+            for fw_root in ("System/Library/Frameworks", "Frameworks", ""):
                 candidate = os.path.join(
-                    sdk, fw_root, f'{framework_name}.framework/PrivateHeaders', header_rel
+                    sdk,
+                    fw_root,
+                    f"{framework_name}.framework/PrivateHeaders",
+                    header_rel,
                 )
                 if os.path.exists(candidate):
                     return candidate
@@ -593,18 +608,24 @@ def _resolve_include(include_path, current_file, search_paths):
 
 def _normalize_header_content(content):
     """Strip attributes and flatten multi-line declarations for easier parsing."""
-    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
     # Remove known attribute macros with balanced parens
     attr_prefixes = [
-        'API_AVAILABLE', 'API_UNAVAILABLE', 'API_DEPRECATED',
-        'CF_AVAILABLE', 'CG_AVAILABLE_STARTING',
-        'NS_AVAILABLE', 'NS_DEPRECATED',
-        '__OSX_AVAILABLE_STARTING', '__TVOS_AVAILABLE_STARTING', '__IOS_AVAILABLE_STARTING',
-        'SWIFT_UNAVAILABLE',
-        'CF_BRIDGED_TYPE',
+        "API_AVAILABLE",
+        "API_UNAVAILABLE",
+        "API_DEPRECATED",
+        "CF_AVAILABLE",
+        "CG_AVAILABLE_STARTING",
+        "NS_AVAILABLE",
+        "NS_DEPRECATED",
+        "__OSX_AVAILABLE_STARTING",
+        "__TVOS_AVAILABLE_STARTING",
+        "__IOS_AVAILABLE_STARTING",
+        "SWIFT_UNAVAILABLE",
+        "CF_BRIDGED_TYPE",
     ]
     for prefix in attr_prefixes:
-        pattern = re.compile(re.escape(prefix) + r'\s*\(')
+        pattern = re.compile(re.escape(prefix) + r"\s*\(")
         while True:
             m = pattern.search(content)
             if not m:
@@ -613,40 +634,49 @@ def _normalize_header_content(content):
             depth = 1
             i = m.end()
             while i < len(content) and depth > 0:
-                if content[i] == '(':
+                if content[i] == "(":
                     depth += 1
-                elif content[i] == ')':
+                elif content[i] == ")":
                     depth -= 1
                 i += 1
             content = content[:start] + content[i:]
     # Remove __attribute__((...))
-    content = re.sub(r'__attribute__\s*\(\([^)]*\)\)', '', content)
+    content = re.sub(r"__attribute__\s*\(\([^)]*\)\)", "", content)
     # Remove single keywords
-    for kw in ['nullable', 'nonnull', '__nullable', '__nonnull', '__null_unspecified',
-               '__kindof', 'CF_RETURNS_RETAINED', 'CF_RETURNS_NOT_RETAINED',
-               'NS_REQUIRES_NIL_TERMINATION', 'CF_BRIDGED_TRANSFER']:
-        content = re.sub(r'\b' + kw + r'\b', '', content)
+    for kw in [
+        "nullable",
+        "nonnull",
+        "__nullable",
+        "__nonnull",
+        "__null_unspecified",
+        "__kindof",
+        "CF_RETURNS_RETAINED",
+        "CF_RETURNS_NOT_RETAINED",
+        "NS_REQUIRES_NIL_TERMINATION",
+        "CF_BRIDGED_TRANSFER",
+    ]:
+        content = re.sub(r"\b" + kw + r"\b", "", content)
     # Remove remaining stray parens (from partially removed attributes): ) followed by )
-    content = re.sub(r'\)\s*\)', ')', content)
+    content = re.sub(r"\)\s*\)", ")", content)
     # Flatten continuation lines
-    lines = content.split('\n')
+    lines = content.split("\n")
     result = []
     for line in lines:
         if result and not line.strip():
             result.append(line)
             continue
-        if result and (line.startswith('    ') or line.startswith('\t')):
-            result[-1] = result[-1] + ' ' + line.strip()
+        if result and (line.startswith("    ") or line.startswith("\t")):
+            result[-1] = result[-1] + " " + line.strip()
         else:
             result.append(line)
-    return '\n'.join(result)
+    return "\n".join(result)
 
 
 def parse_header_file(filepath, search_paths=None, _processed=None):
     if _processed is None:
         _processed = set()
     if filepath in _processed:
-        return {}, 'h', {}, set(), set()
+        return {}, "h", {}, set(), set()
     _processed.add(filepath)
 
     with open(filepath) as f:
@@ -690,7 +720,9 @@ def parse_header_file(filepath, search_paths=None, _processed=None):
             inc_path = m.group(1)
             inc_file = _resolve_include(inc_path, filepath, search_paths)
             if inc_file:
-                sub_sym, _, sub_const, sub_fw, sub_vars = parse_header_file(inc_file, search_paths, _processed)
+                sub_sym, _, sub_const, sub_fw, sub_vars = parse_header_file(
+                    inc_file, search_paths, _processed
+                )
                 for k, v in sub_sym.items():
                     symbols.setdefault(k, v)
                 var_names.update(sub_vars)
@@ -701,25 +733,25 @@ def parse_header_file(filepath, search_paths=None, _processed=None):
     enum_consts = _extract_enum_constants(content, constants)
     constants.update(enum_consts)
 
-    return symbols, 'h', constants, frameworks, var_names
+    return symbols, "h", constants, frameworks, var_names
 
 
 def _extract_defines(content):
     """Extract #define integer constants and function-like macros."""
     constants = {}
     macros = {}
-    for m in re.finditer(r'#\s*define\s+(\w+)\s+(0[xX][0-9a-fA-F]+|\d+)', content):
+    for m in re.finditer(r"#\s*define\s+(\w+)\s+(0[xX][0-9a-fA-F]+|\d+)", content):
         name, val = m.group(1), m.group(2)
         try:
             constants[name] = int(val, 0)
         except ValueError:
             pass
     # Function-like macros: #define NAME(params) body
-    for m in re.finditer(r'#\s*define\s+(\w+)\s*\(([^)]*)\)\s*(.*?)(?:\n|$)', content):
+    for m in re.finditer(r"#\s*define\s+(\w+)\s*\(([^)]*)\)\s*(.*?)(?:\n|$)", content):
         name, params, _body = m.group(1), m.group(2), m.group(3)
-        param_list = [p.strip() for p in params.split(',') if p.strip()]
+        param_list = [p.strip() for p in params.split(",") if p.strip()]
         if param_list:
-            macros[name] = ('int', [(p, 'int') for p in param_list], False)
+            macros[name] = ("int", [(p, "int") for p in param_list], False)
     return constants, macros
 
 
@@ -730,10 +762,10 @@ def _extract_enum_constants(content, known_constants=None):
     constants = {}
 
     enum_block_re = re.compile(
-        r'(?:typedef\s+)?'
-        r'(?:CF_ENUM\s*\([^)]+\)|enum\s+(?:\w+\s*)?(?::\s*\w+\s*)?)'
-        r'\s*(\{)',
-        re.DOTALL
+        r"(?:typedef\s+)?"
+        r"(?:CF_ENUM\s*\([^)]+\)|enum\s+(?:\w+\s*)?(?::\s*\w+\s*)?)"
+        r"\s*(\{)",
+        re.DOTALL,
     )
 
     pos = 0
@@ -745,17 +777,17 @@ def _extract_enum_constants(content, known_constants=None):
         depth = 1
         i = brace_start + 1
         while i < len(content) and depth > 0:
-            if content[i] == '{':
+            if content[i] == "{":
                 depth += 1
-            elif content[i] == '}':
+            elif content[i] == "}":
                 depth -= 1
-            elif content[i] == '/' and i + 1 < len(content):
-                if content[i+1] == '/':
-                    nl = content.find('\n', i)
+            elif content[i] == "/" and i + 1 < len(content):
+                if content[i + 1] == "/":
+                    nl = content.find("\n", i)
                     i = nl if nl != -1 else len(content)
                     continue
-                elif content[i+1] == '*':
-                    end = content.find('*/', i + 2)
+                elif content[i + 1] == "*":
+                    end = content.find("*/", i + 2)
                     i = end + 1 if end != -1 else len(content)
                     continue
             i += 1
@@ -764,12 +796,12 @@ def _extract_enum_constants(content, known_constants=None):
             items = _split_enum_body(body)
             auto_val = 0
             for item in items:
-                parts = item.split('=', 1)
+                parts = item.split("=", 1)
                 name = parts[0].strip()
                 if not name or not name.isidentifier():
                     continue
                 if len(parts) > 1:
-                    val = parts[1].strip().rstrip(',')
+                    val = parts[1].strip().rstrip(",")
                     const_val = _resolve_int(val, known_constants)
                     if const_val is not None:
                         constants[name] = const_val
@@ -788,9 +820,9 @@ def _resolve_int(val, known_constants):
     """Try to resolve an integer value, following references to other constants."""
     val = val.strip()
     try:
-        if val.startswith('0x') or val.startswith('0X'):
+        if val.startswith("0x") or val.startswith("0X"):
             return int(val, 16)
-        if val.startswith('-') and val[1:].isdigit():
+        if val.startswith("-") and val[1:].isdigit():
             return int(val)
         if val.isdigit():
             return int(val)
@@ -816,19 +848,19 @@ def _split_enum_body(body):
     i = 0
     while i < len(body):
         ch = body[i]
-        if ch == '(' or ch == '<':
+        if ch == "(" or ch == "<":
             depth += 1
-        elif ch == ')' or ch == '>':
+        elif ch == ")" or ch == ">":
             depth -= 1
-        elif ch == ',' and depth == 0:
+        elif ch == "," and depth == 0:
             items.append(body[start:i])
             start = i + 1
-        elif ch == '/' and i + 1 < len(body):
-            if body[i+1] == '/':
-                nl = body.find('\n', i)
+        elif ch == "/" and i + 1 < len(body):
+            if body[i + 1] == "/":
+                nl = body.find("\n", i)
                 i = nl if nl != -1 else len(body)
-            elif body[i+1] == '*':
-                end = body.find('*/', i + 2)
+            elif body[i + 1] == "*":
+                end = body.find("*/", i + 2)
                 i = end + 1 if end != -1 else len(body)
         i += 1
     remaining = body[start:i].strip()
@@ -837,8 +869,8 @@ def _split_enum_body(body):
     # Strip comments from each item
     result = []
     for item in items:
-        item = re.sub(r'/\*.*?\*/', '', item, flags=re.DOTALL)
-        item = re.sub(r'//.*', '', item)
+        item = re.sub(r"/\*.*?\*/", "", item, flags=re.DOTALL)
+        item = re.sub(r"//.*", "", item)
         item = item.strip()
         if item:
             result.append(item)
@@ -846,10 +878,10 @@ def _split_enum_body(body):
 
 
 def _framework_name_from_path(filepath):
-    parts = filepath.replace('\\', '/').split('/')
+    parts = filepath.replace("\\", "/").split("/")
     for i, p in enumerate(parts):
-        if p.endswith('.framework'):
-            return p[:-len('.framework')]
+        if p.endswith(".framework"):
+            return p[: -len(".framework")]
     return None
 
 
@@ -862,9 +894,9 @@ def _framework_names_from_path(filepath):
     resolve the symbols the program actually uses.
     """
     names = set()
-    for p in filepath.replace('\\', '/').split('/'):
-        if p.endswith('.framework'):
-            names.add(p[:-len('.framework')])
+    for p in filepath.replace("\\", "/").split("/"):
+        if p.endswith(".framework"):
+            names.add(p[: -len(".framework")])
     return names
 
 
@@ -881,23 +913,60 @@ def _framework_names_from_path(filepath):
 # running (LP64: mac/linux, LLP64: windows) rather than guessed.
 
 # qualifiers with no ABI effect
-_C_QUALIFIERS = frozenset({
-    'const', 'volatile', 'restrict', '__restrict', '__restrict__',
-    '_Nonnull', '_Nullable', '_Null_unspecified', '__nonnull', '__nullable',
-    'inline', '__inline', '__inline__', 'static', 'extern', 'register',
-    'auto', 'typedef', '_Noreturn', '_Atomic', '_Alignas', '_Thread_local',
-    '__thread', '__signed__', '__extension__', '__asm__', 'asm',
-})
+_C_QUALIFIERS = frozenset(
+    {
+        "const",
+        "volatile",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "_Nonnull",
+        "_Nullable",
+        "_Null_unspecified",
+        "__nonnull",
+        "__nullable",
+        "inline",
+        "__inline",
+        "__inline__",
+        "static",
+        "extern",
+        "register",
+        "auto",
+        "typedef",
+        "_Noreturn",
+        "_Atomic",
+        "_Alignas",
+        "_Thread_local",
+        "__thread",
+        "__signed__",
+        "__extension__",
+        "__asm__",
+        "asm",
+    }
+)
 
 # base-type keywords that start a C type
-_C_BASE_KEYWORDS = frozenset({
-    'void', 'char', 'short', 'int', 'long', 'float', 'double',
-    'signed', 'unsigned', '_Bool', 'bool',
-    'struct', 'union', 'enum',
-})
+_C_BASE_KEYWORDS = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "_Bool",
+        "bool",
+        "struct",
+        "union",
+        "enum",
+    }
+)
 
 # Platform integer widths, derived from the running interpreter (ctypes).
-_LONG_WIDTH = ctypes.sizeof(ctypes.c_long)   # 8 on mac/linux, 4 on windows (LLP64)
+_LONG_WIDTH = ctypes.sizeof(ctypes.c_long)  # 8 on mac/linux, 4 on windows (LLP64)
 _SSIZE_T_SIZE = ctypes.sizeof(ctypes.c_ssize_t)
 _SIZE_T_SIZE = ctypes.sizeof(ctypes.c_size_t)
 
@@ -905,69 +974,131 @@ _SIZE_T_SIZE = ctypes.sizeof(ctypes.c_size_t)
 # needs to name explicitly). Mapping them through ctypes keeps these correct
 # on both LP64 and LLP64 hosts.
 _STD_INT_TYPES = {
-    'size_t':     (_SIZE_T_SIZE, True),
-    'ssize_t':    (_SSIZE_T_SIZE, False),
-    'ptrdiff_t':  (_SSIZE_T_SIZE, False),
-    'intptr_t':   (_SSIZE_T_SIZE, False),
-    'uintptr_t':  (_SIZE_T_SIZE, True),
-    'time_t':     (8, False),      # 8 everywhere cpyte targets
+    "size_t": (_SIZE_T_SIZE, True),
+    "ssize_t": (_SSIZE_T_SIZE, False),
+    "ptrdiff_t": (_SSIZE_T_SIZE, False),
+    "intptr_t": (_SSIZE_T_SIZE, False),
+    "uintptr_t": (_SIZE_T_SIZE, True),
+    "time_t": (8, False),  # 8 everywhere cpyte targets
     # <stdint.h> fixed-width types
-    'int8_t':   (1, False),
-    'uint8_t':  (1, True),
-    'int16_t':  (2, False),
-    'uint16_t': (2, True),
-    'int32_t':  (4, False),
-    'uint32_t': (4, True),
-    'int64_t':  (8, False),
-    'uint64_t': (8, True),
-    'intmax_t':  (8, False),
-    'uintmax_t': (8, True),
+    "int8_t": (1, False),
+    "uint8_t": (1, True),
+    "int16_t": (2, False),
+    "uint16_t": (2, True),
+    "int32_t": (4, False),
+    "uint32_t": (4, True),
+    "int64_t": (8, False),
+    "uint64_t": (8, True),
+    "intmax_t": (8, False),
+    "uintmax_t": (8, True),
     # Apple / POSIX aliases (64-bit dev targets: macOS, Linux)
-    'CFIndex':    (_LONG_WIDTH, False),
-    'NSInteger':  (_LONG_WIDTH, False),
-    'NSUInteger': (_LONG_WIDTH, True),
-    'pid_t':      (4, False),      # int on mac/linux
+    "CFIndex": (_LONG_WIDTH, False),
+    "NSInteger": (_LONG_WIDTH, False),
+    "NSUInteger": (_LONG_WIDTH, True),
+    "pid_t": (4, False),  # int on mac/linux
     # Apple _types.h short names
-    'int32':    (4, False),
-    'uint32':   (4, True),
-    'int64':    (8, False),
-    'uint64':   (8, True),
+    "int32": (4, False),
+    "uint32": (4, True),
+    "int64": (8, False),
+    "uint64": (8, True),
 }
 
 # Opaque pointer typedefs (libc + Apple frameworks). These deliberately
 # degrade to cpyte `void*`: pointer-typed, ABI-safe, and the only way to use
 # framework APIs from cpyte. Used by the regex fallback path; with libclang the
 # canonical spelling already resolves them to plain pointers.
-_OPAQUE_POINTER_TYPES = frozenset({
-    'FILE',
-    'CGColorRef', 'CGColorSpaceRef', 'CGEventTapCallBack', 'CGContextRef',
-    'CGDataProviderRef', 'CGDisplayStreamRef', 'CGEventRef', 'CGEventSourceRef',
-    'CGImageRef', 'CGPathRef', 'CGPatternRef', 'CGPDFDocumentRef', 'CGPDFPageRef',
-    'CGFontRef', 'CGLayerRef', 'CGPSConverterRef', 'CGWindowRef',
-    'CFAllocatorRef', 'CFArrayRef', 'CFAttributedStringRef', 'CFBooleanRef',
-    'CFCalendarRef', 'CFCharacterSetRef', 'CFDataRef', 'CFDateRef',
-    'CFDictionaryRef', 'CFErrorRef', 'CFLocaleRef', 'CFMachPortRef',
-    'CFMutableArrayRef', 'CFMutableDataRef', 'CFMutableDictionaryRef',
-    'CFMutableSetRef', 'CFMutableStringRef', 'CFNotificationCenterRef',
-    'CFNullRef', 'CFNumberRef', 'CFPropertyListRef', 'CFReadStreamRef',
-    'CFRunLoopRef', 'CFRunLoopSourceRef', 'CFRunLoopTimerRef',
-    'CFRunLoopObserverRef', 'CFSetRef', 'CFStringRef', 'CFTimeZoneRef',
-    'CFTypeRef', 'CFURLRef', 'CFUUIDRef', 'CFWriteStreamRef',
-    'SecIdentityRef', 'SecCertificateRef', 'SecKeyRef', 'SecTrustRef',
-    'SecPolicyRef', 'SecAccessRef', 'SecKeychainRef', 'SecKeychainItemRef',
-    'SecTrustedApplicationRef', 'SecAccessControlRef', 'SecItemRef',
-    'IOSurfaceRef', 'CVPixelBufferRef', 'CVBufferRef', 'CVImageBufferRef',
-    'CVOpenGLBufferRef', 'CVOpenGLTextureRef', 'CVDisplayLinkRef',
-    'MIDIEndpointRef', 'MIDIClientRef', 'MIDIPortRef',
-    'AudioQueueRef', 'AudioUnit', 'AudioComponentInstance',
-})
+_OPAQUE_POINTER_TYPES = frozenset(
+    {
+        "FILE",
+        "CGColorRef",
+        "CGColorSpaceRef",
+        "CGEventTapCallBack",
+        "CGContextRef",
+        "CGDataProviderRef",
+        "CGDisplayStreamRef",
+        "CGEventRef",
+        "CGEventSourceRef",
+        "CGImageRef",
+        "CGPathRef",
+        "CGPatternRef",
+        "CGPDFDocumentRef",
+        "CGPDFPageRef",
+        "CGFontRef",
+        "CGLayerRef",
+        "CGPSConverterRef",
+        "CGWindowRef",
+        "CFAllocatorRef",
+        "CFArrayRef",
+        "CFAttributedStringRef",
+        "CFBooleanRef",
+        "CFCalendarRef",
+        "CFCharacterSetRef",
+        "CFDataRef",
+        "CFDateRef",
+        "CFDictionaryRef",
+        "CFErrorRef",
+        "CFLocaleRef",
+        "CFMachPortRef",
+        "CFMutableArrayRef",
+        "CFMutableDataRef",
+        "CFMutableDictionaryRef",
+        "CFMutableSetRef",
+        "CFMutableStringRef",
+        "CFNotificationCenterRef",
+        "CFNullRef",
+        "CFNumberRef",
+        "CFPropertyListRef",
+        "CFReadStreamRef",
+        "CFRunLoopRef",
+        "CFRunLoopSourceRef",
+        "CFRunLoopTimerRef",
+        "CFRunLoopObserverRef",
+        "CFSetRef",
+        "CFStringRef",
+        "CFTimeZoneRef",
+        "CFTypeRef",
+        "CFURLRef",
+        "CFUUIDRef",
+        "CFWriteStreamRef",
+        "SecIdentityRef",
+        "SecCertificateRef",
+        "SecKeyRef",
+        "SecTrustRef",
+        "SecPolicyRef",
+        "SecAccessRef",
+        "SecKeychainRef",
+        "SecKeychainItemRef",
+        "SecTrustedApplicationRef",
+        "SecAccessControlRef",
+        "SecItemRef",
+        "IOSurfaceRef",
+        "CVPixelBufferRef",
+        "CVBufferRef",
+        "CVImageBufferRef",
+        "CVOpenGLBufferRef",
+        "CVOpenGLTextureRef",
+        "CVDisplayLinkRef",
+        "MIDIEndpointRef",
+        "MIDIClientRef",
+        "MIDIPortRef",
+        "AudioQueueRef",
+        "AudioUnit",
+        "AudioComponentInstance",
+    }
+)
 
 # 8-bit scalars (macOS), ABI-safe as cpyte `char` (i8). Not pointers.
-_8BIT_SCALAR_TYPES = frozenset({
-    'BOOL', 'Boolean', 'DarwinBoolean', 'SInt8', 'UInt8',
-})
+_8BIT_SCALAR_TYPES = frozenset(
+    {
+        "BOOL",
+        "Boolean",
+        "DarwinBoolean",
+        "SInt8",
+        "UInt8",
+    }
+)
 
-_C_TOKEN_RE = re.compile(r'\w+|\*+|\[+|\]+|\(|\)|\.\.\.|,')
+_C_TOKEN_RE = re.compile(r"\w+|\*+|\[+|\]+|\(|\)|\.\.\.|,")
 
 
 def _tokenize_type(raw):
@@ -982,30 +1113,44 @@ def _consume_int_spec(words, i):
     'char'/'short'/'int'/'long'/'longlong', or (None, i) when words[i:] does
     not begin with an integer-type word.
     """
-    if i >= len(words) or words[i] not in ('signed', 'unsigned', 'char', 'short', 'int', 'long'):
+    if i >= len(words) or words[i] not in (
+        "signed",
+        "unsigned",
+        "char",
+        "short",
+        "int",
+        "long",
+    ):
         return None, i
     unsigned = False
     has_long = 0
     kind = None
     j = i
-    while j < len(words) and words[j] in ('signed', 'unsigned', 'char', 'short', 'int', 'long'):
+    while j < len(words) and words[j] in (
+        "signed",
+        "unsigned",
+        "char",
+        "short",
+        "int",
+        "long",
+    ):
         w = words[j]
-        if w == 'unsigned':
+        if w == "unsigned":
             unsigned = True
-        elif w == 'long':
+        elif w == "long":
             has_long += 1
-        elif w == 'char':
-            kind = 'char'
-        elif w == 'short':
-            kind = 'short'
-        elif w == 'int':
+        elif w == "char":
+            kind = "char"
+        elif w == "short":
+            kind = "short"
+        elif w == "int":
             if kind is None:
-                kind = 'int'
+                kind = "int"
         j += 1
     if kind is None:
-        kind = 'int'
+        kind = "int"
     if has_long:
-        kind = 'longlong' if has_long >= 2 else 'long'
+        kind = "longlong" if has_long >= 2 else "long"
     else:
         # 'char *' -> the char op on 'const char *' is handled by caller
         pass
@@ -1016,13 +1161,13 @@ def _int_width_lang(width, unsigned):
     """Exact-width integer → cpyte scalar type, or None when cpyte has no type
     of that width (16-bit)."""
     if width == 1:
-        return 'char'
+        return "char"
     if width == 2:
         return None
     if width == 4:
-        return 'int'
+        return "int"
     if width == 8:
-        return 'uint64' if unsigned else 'int64'
+        return "uint64" if unsigned else "int64"
     return None
 
 
@@ -1031,23 +1176,23 @@ def _int_width_ptr(width, unsigned):
     if width == 1:
         # char* is the cpyte string contract; byte-happy `unsigned char*` stays
         # generic so it is not mistaken for a NUL-terminated string.
-        return 'str' if not unsigned else None
+        return "str" if not unsigned else None
     if width == 2:
         return None
     if width == 4:
-        return 'int*'
+        return "int*"
     if width == 8:
-        return 'uint64*' if unsigned else 'int64*'
+        return "uint64*" if unsigned else "int64*"
     return None
 
 
 def _int_spec_lang(kind, unsigned):
-    widths = {'char': 1, 'short': 2, 'int': 4, 'long': _LONG_WIDTH, 'longlong': 8}
+    widths = {"char": 1, "short": 2, "int": 4, "long": _LONG_WIDTH, "longlong": 8}
     return _int_width_lang(widths[kind], unsigned)
 
 
 def _int_spec_ptr(kind, unsigned):
-    widths = {'char': 1, 'short': 2, 'int': 4, 'long': _LONG_WIDTH, 'longlong': 8}
+    widths = {"char": 1, "short": 2, "int": 4, "long": _LONG_WIDTH, "longlong": 8}
     return _int_width_ptr(widths[kind], unsigned)
 
 
@@ -1059,7 +1204,7 @@ def _canonical_spelling(ctype):
         try:
             return ctype.spelling
         except Exception:
-            return ''
+            return ""
 
 
 def _parse_decl(raw):
@@ -1070,17 +1215,17 @@ def _parse_decl(raw):
     fallback). Returns (None, None) when the type cannot be represented
     exactly in cpyte, so callers skip the symbol entirely.
     """
-    raw = (raw or '').strip()
+    raw = (raw or "").strip()
     if not raw:
         return None, None
 
     # Function pointers have no cpyte type, but as a parameter or return value
     # they are plain pointers under every relevant calling convention, so they
     # degrade ABI-safely to void*.
-    if '(' in raw:
-        m = re.search(r'\(\s*\*\s*(\w+)\s*\)', raw)
-        name = m.group(1) if m else ''
-        return name, 'void*'
+    if "(" in raw:
+        m = re.search(r"\(\s*\*\s*(\w+)\s*\)", raw)
+        name = m.group(1) if m else ""
+        return name, "void*"
 
     words = []
     stars = 0
@@ -1088,9 +1233,9 @@ def _parse_decl(raw):
     for t in _tokenize_type(raw):
         if t in _C_QUALIFIERS:
             continue
-        if t.startswith('*'):
-            stars += t.count('*')
-        elif t in ('[', ']'):
+        if t.startswith("*"):
+            stars += t.count("*")
+        elif t in ("[", "]"):
             array = True
         elif t.isdigit():
             continue
@@ -1101,21 +1246,21 @@ def _parse_decl(raw):
         return None, None
 
     first = words[0]
-    base_lang = None          # scalar cpyte type
-    base_ptr_lang = None      # single-pointer cpyte type
+    base_lang = None  # scalar cpyte type
+    base_ptr_lang = None  # single-pointer cpyte type
     consumed = 1
 
-    if first in ('void', 'float', 'double', '_Bool', 'bool', 'struct', 'union', 'enum'):
-        if first in ('_Bool', 'bool'):
-            base_lang, base_ptr_lang = 'bool', None
-        elif first == 'void':
-            base_lang, base_ptr_lang = 'void', 'void*'
-        elif first == 'float':
-            base_lang, base_ptr_lang = 'float', 'float*'
-        elif first == 'double':
-            base_lang, base_ptr_lang = 'double', 'double*'
+    if first in ("void", "float", "double", "_Bool", "bool", "struct", "union", "enum"):
+        if first in ("_Bool", "bool"):
+            base_lang, base_ptr_lang = "bool", None
+        elif first == "void":
+            base_lang, base_ptr_lang = "void", "void*"
+        elif first == "float":
+            base_lang, base_ptr_lang = "float", "float*"
+        elif first == "double":
+            base_lang, base_ptr_lang = "double", "double*"
         else:  # struct/union/enum: representable only by pointer
-            base_lang, base_ptr_lang = None, 'void*'
+            base_lang, base_ptr_lang = None, "void*"
             if len(words) > 1 and words[1] not in _C_BASE_KEYWORDS:
                 consumed = 2
     else:
@@ -1126,7 +1271,7 @@ def _parse_decl(raw):
             base_lang = _int_spec_lang(kind, unsigned)
             base_ptr_lang = _int_spec_ptr(kind, unsigned)
         elif first in _OPAQUE_POINTER_TYPES:
-            base_lang, base_ptr_lang = 'void*', 'void*'
+            base_lang, base_ptr_lang = "void*", "void*"
         elif first in _STD_INT_TYPES:
             width, unsigned = _STD_INT_TYPES[first]
             base_lang = _int_width_lang(width, unsigned)
@@ -1134,7 +1279,7 @@ def _parse_decl(raw):
             if base_lang is None and base_ptr_lang is None:
                 return None, None
         elif first in _8BIT_SCALAR_TYPES:
-            base_lang = 'char'
+            base_lang = "char"
         else:
             # Unknown typedef: cannot know width or pointerness. A bare
             # unrepresentable scalar must be skipped, not guessed.
@@ -1148,14 +1293,14 @@ def _parse_decl(raw):
             return None, None
     if len(rest) > 1:
         return None, None
-    name = rest[0] if rest else ''
+    name = rest[0] if rest else ""
 
     if stars or array:
         if base_ptr_lang is None:
-            return name, 'void*'
+            return name, "void*"
         if stars + (1 if array else 0) == 1:
             return name, base_ptr_lang
-        return name, 'void*'
+        return name, "void*"
     if base_lang is None:
         return None, None
     return name, base_lang
@@ -1172,19 +1317,19 @@ def _split_params(s):
     parts = []
     cur = []
     for ch in s:
-        if ch in '({[':
+        if ch in "({[":
             depth += 1
             cur.append(ch)
-        elif ch in ')}]':
+        elif ch in ")}]":
             depth -= 1
             cur.append(ch)
-        elif ch == ',' and depth == 0:
-            parts.append(''.join(cur).strip())
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
             cur = []
         else:
             cur.append(ch)
     if cur:
-        parts.append(''.join(cur).strip())
+        parts.append("".join(cur).strip())
     return parts
 
 
@@ -1193,6 +1338,7 @@ def parse_c_source(filepath):
         return _parse_c_source_regex(filepath)
 
     import clang.cindex as ci  # type: ignore[reportMissingImports]
+
     try:
         idx = ci.Index.create()
         tu = idx.parse(filepath)
@@ -1206,7 +1352,7 @@ def parse_c_source(filepath):
 
         if c.storage_class == ci.StorageClass.STATIC:
             continue
-        if c.spelling == 'main':
+        if c.spelling == "main":
             continue
         if c.spelling in _C_KEYWORDS:
             continue
@@ -1229,13 +1375,13 @@ def parse_c_source(filepath):
             if ptype is None:
                 params = None
                 break
-            params.append((p.spelling or f'p{len(params)}', ptype))
+            params.append((p.spelling or f"p{len(params)}", ptype))
         if params is None:
             continue
 
         symbols[c.spelling] = (ret_type, params, vararg)
 
-    return symbols, 'c'
+    return symbols, "c"
 
 
 def _parse_c_source_regex(filepath):
@@ -1247,14 +1393,14 @@ def _parse_c_source_regex(filepath):
         fname = m.group(2).strip()
         raw_params = m.group(3).strip()
 
-        if fname in _C_KEYWORDS or fname == 'main':
+        if fname in _C_KEYWORDS or fname == "main":
             continue
 
         _, ret_type = _parse_decl(raw_ret)
         if ret_type is None:
             continue
 
-        if not raw_params or raw_params == 'void':
+        if not raw_params or raw_params == "void":
             params = []
             vararg = False
         else:
@@ -1263,7 +1409,7 @@ def _parse_c_source_regex(filepath):
             vararg = False
             for p in parts:
                 p = p.strip()
-                if p == '...':
+                if p == "...":
                     vararg = True
                     continue
                 pname, ptype = _parse_decl(p)
@@ -1271,33 +1417,69 @@ def _parse_c_source_regex(filepath):
                 if ptype is None:
                     params = None
                     break
-                params.append((pname or f'p{len(params)}', ptype))
+                params.append((pname or f"p{len(params)}", ptype))
             if params is None:
                 continue
         symbols[fname] = (ret_type, params, vararg)
-    return symbols, 'c'
+    return symbols, "c"
+
 
 _C_KEYWORDS = {
-    'if', 'while', 'for', 'switch', 'return', 'sizeof',
-    'typedef', 'struct', 'union', 'enum', 'case', 'default',
-    'break', 'continue', 'goto', 'do', 'else',
+    "if",
+    "while",
+    "for",
+    "switch",
+    "return",
+    "sizeof",
+    "typedef",
+    "struct",
+    "union",
+    "enum",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "goto",
+    "do",
+    "else",
 }
 
 _C_SRC_RE = re.compile(
-    r'(?:(?:static|inline|extern)\s+)*'
-    r'([\w\s\*]+?)\s+'
-    r'(\w+)\s*\(([^)]*)\)\s*(?:\[[^\]]*\])?\s*\{'
+    r"(?:(?:static|inline|extern)\s+)*"
+    r"([\w\s\*]+?)\s+"
+    r"(\w+)\s*\(([^)]*)\)\s*(?:\[[^\]]*\])?\s*\{"
 )
 
-_LLVM_DEF_RE = re.compile(r'define\s+(.*?)\s@(\w+)\s*\(([^)]*)\)')
+_LLVM_DEF_RE = re.compile(r"define\s+(.*?)\s@(\w+)\s*\(([^)]*)\)")
 
-_LLVM_RET_PREFIX_KEYWORDS = frozenset({
-    'dso_local', 'dso_preemptable', 'external', 'private', 'internal',
-    'available_externally', 'linkonce', 'linkonce_odr', 'weak', 'weak_odr',
-    'common', 'appending', 'extern_weak', 'global', 'hidden', 'protected',
-    'default', 'dllimport', 'dllexport', 'thread_local', 'local_unnamed_addr',
-    'unnamed_addr', 'nocomdat', 'preemptable',
-})
+_LLVM_RET_PREFIX_KEYWORDS = frozenset(
+    {
+        "dso_local",
+        "dso_preemptable",
+        "external",
+        "private",
+        "internal",
+        "available_externally",
+        "linkonce",
+        "linkonce_odr",
+        "weak",
+        "weak_odr",
+        "common",
+        "appending",
+        "extern_weak",
+        "global",
+        "hidden",
+        "protected",
+        "default",
+        "dllimport",
+        "dllexport",
+        "thread_local",
+        "local_unnamed_addr",
+        "unnamed_addr",
+        "nocomdat",
+        "preemptable",
+    }
+)
 
 
 def parse_llvm_ir_text(text):
@@ -1313,7 +1495,7 @@ def parse_llvm_ir_text(text):
         ret_tokens = m.group(1).strip().split()
         while ret_tokens and ret_tokens[0] in _LLVM_RET_PREFIX_KEYWORDS:
             ret_tokens.pop(0)
-        raw_ret = ' '.join(ret_tokens)
+        raw_ret = " ".join(ret_tokens)
         fname = m.group(2).strip()
         raw_params = m.group(3).strip()
 
@@ -1324,21 +1506,21 @@ def parse_llvm_ir_text(text):
         params = []
         vararg = False
         ok = True
-        if raw_params and raw_params != '...':
+        if raw_params and raw_params != "...":
             for p in _split_ir_params(raw_params):
                 p = p.strip()
-                if p == '...':
+                if p == "...":
                     vararg = True
                     continue
                 ptype = _ir_param_type_to_lang(p)
                 if ptype is None:
                     ok = False
                     break
-                params.append((f'p{len(params)}', ptype))
+                params.append((f"p{len(params)}", ptype))
         if not ok:
             continue
         symbols[fname] = (ret_type, params, vararg)
-    return symbols, 'llvm'
+    return symbols, "llvm"
 
 
 def _split_ir_params(raw):
@@ -1346,17 +1528,17 @@ def _split_ir_params(raw):
     depth = 0
     cur = []
     for ch in raw:
-        if ch in '([{':
+        if ch in "([{":
             depth += 1
-        elif ch in ')]}':
+        elif ch in ")]}":
             depth -= 1
-        if ch == ',' and depth == 0:
-            parts.append(''.join(cur))
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
             cur = []
         else:
             cur.append(ch)
     if cur or raw:
-        parts.append(''.join(cur))
+        parts.append("".join(cur))
     return parts
 
 
@@ -1364,13 +1546,13 @@ def _ir_param_type_to_lang(param):
     parts = param.split()
     idx = None
     for i, t in enumerate(parts):
-        if t.startswith('%'):
+        if t.startswith("%"):
             idx = i
             break
     if idx is None:
         raw = param
     else:
-        raw = ' '.join(parts[:idx])
+        raw = " ".join(parts[:idx])
     return _ir_type_to_lang(raw)
 
 
@@ -1383,34 +1565,34 @@ def _ir_type_to_lang(t):
     yields None and the enclosing function is skipped.
     """
     t = t.strip()
-    if t == 'void':
-        return 'void'
-    if t == 'i1':
-        return 'bool'
-    if t == 'i8':
-        return 'char'
-    if t == 'i32':
-        return 'int'
-    if t == 'i64':
-        return 'int64'
-    if t == 'float':
-        return 'float'
-    if t == 'double':
-        return 'double'
-    if t == 'i8*':
-        return 'str'
-    if t == 'i32*':
-        return 'int*'
-    if t == 'i64*':
-        return 'int64*'
-    if t == 'float*':
-        return 'float*'
-    if t == 'double*':
-        return 'double*'
-    if t == 'ptr':
-        return 'void*'
-    if t == 'i1*':
-        return 'void*'
-    if t.endswith('*'):
-        return 'void*'
+    if t == "void":
+        return "void"
+    if t == "i1":
+        return "bool"
+    if t == "i8":
+        return "char"
+    if t == "i32":
+        return "int"
+    if t == "i64":
+        return "int64"
+    if t == "float":
+        return "float"
+    if t == "double":
+        return "double"
+    if t == "i8*":
+        return "str"
+    if t == "i32*":
+        return "int*"
+    if t == "i64*":
+        return "int64*"
+    if t == "float*":
+        return "float*"
+    if t == "double*":
+        return "double*"
+    if t == "ptr":
+        return "void*"
+    if t == "i1*":
+        return "void*"
+    if t.endswith("*"):
+        return "void*"
     return None

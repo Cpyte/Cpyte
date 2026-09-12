@@ -11,18 +11,22 @@ RUNTIME_C = os.path.join(HERE, "runtime.c")
 
 C_CC = "clang"
 C_CFLAGS = ["-O3", "-lm"]
-CPY_COMPILE = [sys.executable, os.path.join(PROJECT, "source", "cpyte", "mainpie.py"), "--aot"]
+CPY_COMPILE = [
+    sys.executable,
+    os.path.join(PROJECT, "source", "cpyte", "mainpie.py"),
+    "--aot",
+]
 
 
 ALL_BENCHMARKS = [
-    {"name": "fib_recursive",  "has_cpy": True},
-    {"name": "fib_iterative",  "has_cpy": True},
-    {"name": "prime_count",    "has_cpy": True},
-    {"name": "matrix_mult",    "has_cpy": True},
-    {"name": "call_overhead",  "has_cpy": True},
-    {"name": "quicksort",      "has_cpy": True},
-    {"name": "string_concat",  "has_cpy": True},
-    {"name": "mem_alloc",      "has_cpy": True},
+    {"name": "fib_recursive", "has_cpy": True},
+    {"name": "fib_iterative", "has_cpy": True},
+    {"name": "prime_count", "has_cpy": True},
+    {"name": "matrix_mult", "has_cpy": True},
+    {"name": "call_overhead", "has_cpy": True},
+    {"name": "quicksort", "has_cpy": True},
+    {"name": "string_concat", "has_cpy": True},
+    {"name": "mem_alloc", "has_cpy": True},
 ]
 
 
@@ -35,7 +39,8 @@ def compile_c(name):
     out = os.path.join(HERE, f"{name}_c")
     subprocess.run(
         [C_CC, *C_CFLAGS, "-o", out, src],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -43,7 +48,9 @@ def compile_cpy(name):
     cpy_src = os.path.join(HERE, f"{name}.cpy")
     r = subprocess.run(
         [*CPY_COMPILE, cpy_src],
-        capture_output=True, text=True, cwd=HERE,
+        capture_output=True,
+        text=True,
+        cwd=HERE,
     )
     if r.returncode != 0:
         print(f"    cpy compile failed: {r.stderr.strip()}")
@@ -51,7 +58,9 @@ def compile_cpy(name):
     exe = os.path.join(HERE, f"{name}_cpy")
     r2 = subprocess.run(
         [C_CC, "program.o", RUNTIME_C, "-o", exe, "-lm"],
-        capture_output=True, text=True, cwd=HERE,
+        capture_output=True,
+        text=True,
+        cwd=HERE,
     )
     if r2.returncode != 0:
         print(f"    cpy link failed: {r2.stderr.strip()}")
@@ -74,10 +83,10 @@ def fmt_ns(ns):
     if ns < 1000:
         return f"{ns}ns"
     if ns < 1_000_000:
-        return f"{ns/1_000:.3f}us"
+        return f"{ns / 1_000:.3f}us"
     if ns < 1_000_000_000:
-        return f"{ns/1_000_000:.3f}ms"
-    return f"{ns/1_000_000_000:.6f}s"
+        return f"{ns / 1_000_000:.3f}ms"
+    return f"{ns / 1_000_000_000:.6f}s"
 
 
 def main():
@@ -87,9 +96,9 @@ def main():
     if os.path.exists(src_runtime):
         shutil.copy2(src_runtime, RUNTIME_C)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("  Compiling benchmarks...")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     for bm in ALL_BENCHMARKS:
         name = bm["name"]
@@ -108,9 +117,9 @@ def main():
         log("Python OK")
         print()
 
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print("  Running benchmarks (3 trials, no averaging)...")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     results = {}
 
@@ -119,7 +128,7 @@ def main():
         print(f"  [{name}]")
 
         for lang, cmd, key in [
-            ("C",     [os.path.join(HERE, f"{name}_c")], "C"),
+            ("C", [os.path.join(HERE, f"{name}_c")], "C"),
             ("Python", [sys.executable, os.path.join(HERE, f"{name}.py")], "Python"),
         ]:
             trials = []
@@ -159,9 +168,9 @@ def main():
 
         print()
 
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print("  Results (raw ns per trial, no averaging)")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     rows = []
     for bm in ALL_BENCHMARKS:
@@ -184,16 +193,20 @@ def main():
 
         c_s = fmt(c_trials)
         py_s = fmt(py_trials)
-        cpy_s = fmt(cpy_trials) if bm.get("cpy_ok") and cpy_trials and cpy_trials[0] is not None else "N/A"
+        cpy_s = (
+            fmt(cpy_trials)
+            if bm.get("cpy_ok") and cpy_trials and cpy_trials[0] is not None
+            else "N/A"
+        )
 
         r = ""
         c_best = best(c_trials)
         py_best = best(py_trials)
         cpy_best = best(cpy_trials)
         if c_best and py_best:
-            r += f"py/c={py_best/c_best:.1f}x"
+            r += f"py/c={py_best / c_best:.1f}x"
             if cpy_best:
-                r += f" cpy/c={cpy_best/c_best:.1f}x"
+                r += f" cpy/c={cpy_best / c_best:.1f}x"
         rows.append((name, c_s, py_s, cpy_s, r))
 
     w = max(len(r[0]) for r in rows) + 2

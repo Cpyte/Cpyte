@@ -1,4 +1,3 @@
-
 n = 200
 a = [[1.0] * n for _ in range(n)]
 b = [[2.0] * n for _ in range(n)]

@@ -11,6 +11,7 @@ def fib(n):
         n -= 1
     return a.value
 
+
 total = 0
 n = 0
 while n < 10000:

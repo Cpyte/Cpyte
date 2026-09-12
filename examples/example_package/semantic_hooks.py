@@ -6,10 +6,11 @@ checking. The new API returns a list of :class:`Diagnostic` objects instead of
 plain error strings, so package authors get the same rich reporting (level
 colors, location, error codes) as the built-in analyzer.
 """
+
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'source'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source"))
 from cpyte.extension_hooks import Diagnostic, DiagnosticSeverity, SemanticHook
 
 
@@ -18,7 +19,7 @@ class AsyncSemanticHook(SemanticHook):
 
     def should_visit_node(self, node):
         """Check if this is an async function."""
-        return hasattr(node, 'is_async') and node.is_async
+        return hasattr(node, "is_async") and node.is_async
 
     def visit_node(self, node, context):
         """Validate async function semantics.
@@ -29,8 +30,10 @@ class AsyncSemanticHook(SemanticHook):
         diagnostics = []
 
         # Check that async functions return Promise types
-        if hasattr(node, 'rettype') and node.rettype:
-            if not node.rettype.endswith('Promise') and not node.rettype.endswith('Future'):
+        if hasattr(node, "rettype") and node.rettype:
+            if not node.rettype.endswith("Promise") and not node.rettype.endswith(
+                "Future"
+            ):
                 diagnostics.append(
                     Diagnostic.error(
                         f"Async function '{node.name}' should return Promise or Future "
@@ -45,8 +48,8 @@ class AsyncSemanticHook(SemanticHook):
     def get_custom_type_rules(self):
         """Return custom type checking rules."""
         return {
-            'Promise': self._check_promise_type,
-            'Future': self._check_future_type,
+            "Promise": self._check_promise_type,
+            "Future": self._check_future_type,
         }
 
     def _check_promise_type(self, type_expr):

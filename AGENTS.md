@@ -2,6 +2,19 @@
 
 ## Sept 2026 emitter optimization work (FP math, pow, unroll breadth)
 
+- **int64/uint64 const-prop fold truncation bug (fixed).** When an
+  `int64`/`uint64` variable was const-propagated into `_try_algebraic_simplify`,
+  the substituted `Number` literal emitted at i32 width, and the integer
+  constant-fold (`_fold_int_binop` + `_trunc_to_signed`) truncated the result to
+  32 bits. Example: `int64 a = 104729; print(a * a)` produced `-1916738447`
+  (i32 overflow) instead of `10968163441`. The POW strength-reduction lane
+  (`**{0,1,2,3}`) had the same issue. Fix: track the declared local type width
+  (`left_width`/`right_width`) at substitution time and use
+  `max(emitted_width, left_width, right_width)` for the fold result width; widen
+  the POW operand via `_extend_to_i64`. Plain `int` (i32) constants are
+  unaffected (width 32 max). Regression test: `test/test_int64_fold.cpy` (added
+  to CI corpus).
+
 - **FP identity/strength-reduction + double const-prop now fire at every
   `--opt` level** (`_try_algebraic_simplify` in `bytecoding.py`). New
   double/float lane runs alongside the integer lane: literal const folding on

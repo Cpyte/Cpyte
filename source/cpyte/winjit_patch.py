@@ -170,8 +170,8 @@ def patch_windows_gnu_relocs(
     symbols: List[Tuple[str, int, int]] = []
     for i in range(symtab["size"] // 24):
         o = symtab["offset"] + i * 24
-        st_name, st_info, st_other, st_shndx, st_value, st_size = (
-            struct.unpack_from("<IBBHQQ", d, o)
+        st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from(
+            "<IBBHQQ", d, o
         )
         j = strsyms.find(b"\x00", st_name)
         symbols.append(
@@ -343,7 +343,10 @@ def patch_windows_gnu_relocs(
         ctypes.memmove(ctypes.c_void_p(tgt), b, size)
         # Restore original protections
         k32.VirtualProtect(
-            ctypes.c_void_p(start_page), prot_len, old_prot.value, ctypes.byref(old_prot)
+            ctypes.c_void_p(start_page),
+            prot_len,
+            old_prot.value,
+            ctypes.byref(old_prot),
         )
 
     patched = 0

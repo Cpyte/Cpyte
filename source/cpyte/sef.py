@@ -53,6 +53,7 @@ USER_STACK_SIZE = 4096
 class SefError(Exception):
     """Raised for malformed SEF data."""
 
+
 def read_segments(data):
     """Decode a SEF blob into (header, [segments]).
 
@@ -60,16 +61,15 @@ def read_segments(data):
     offset.  Raises SefError on structural problems.
     """
     if len(data) < HEADER_SIZE:
-        raise SefError("file too small: %d bytes, need at least %d"
-                       % (len(data), HEADER_SIZE))
+        raise SefError(
+            "file too small: %d bytes, need at least %d" % (len(data), HEADER_SIZE)
+        )
 
     magic, entry, num, flags = struct.unpack_from("<IIHH", data, 0)
     if magic != SEF_MAGIC:
-        raise SefError("bad magic 0x%08X (expected 0x%08X)"
-                       % (magic, SEF_MAGIC))
+        raise SefError("bad magic 0x%08X (expected 0x%08X)" % (magic, SEF_MAGIC))
     if num > SEF_MAX_SEGMENTS:
-        raise SefError("too many segments: %d (max %d)"
-                       % (num, SEF_MAX_SEGMENTS))
+        raise SefError("too many segments: %d (max %d)" % (num, SEF_MAX_SEGMENTS))
 
     need = HEADER_SIZE + num * SEGMENT_SIZE
     if len(data) < need:
@@ -78,13 +78,16 @@ def read_segments(data):
     segments = []
     for i in range(num):
         stype, vaddr, size, offset = struct.unpack_from(
-            "<IIII", data, HEADER_SIZE + i * SEGMENT_SIZE)
-        segments.append({
-            "type": stype,
-            "vaddr": vaddr,
-            "size": size,
-            "offset": offset,
-        })
+            "<IIII", data, HEADER_SIZE + i * SEGMENT_SIZE
+        )
+        segments.append(
+            {
+                "type": stype,
+                "vaddr": vaddr,
+                "size": size,
+                "offset": offset,
+            }
+        )
 
     header = {
         "entry": entry,
@@ -120,8 +123,11 @@ def check(data):
         return findings
 
     record("pass", "magic 0x%08X" % SEF_MAGIC)
-    record("pass", "header %d bytes (header+descriptors)"
-           % (HEADER_SIZE + header["num_segments"] * SEGMENT_SIZE))
+    record(
+        "pass",
+        "header %d bytes (header+descriptors)"
+        % (HEADER_SIZE + header["num_segments"] * SEGMENT_SIZE),
+    )
 
     total = total_mem(segments)
     if total == 0:
@@ -138,22 +144,30 @@ def check(data):
             ok = False
 
         if seg["vaddr"] + seg["size"] > total:
-            record("fail",
-                   "seg %d (%s): vaddr 0x%X + size %d exceeds total %d"
-                   % (i, tname, seg["vaddr"], seg["size"], total))
+            record(
+                "fail",
+                "seg %d (%s): vaddr 0x%X + size %d exceeds total %d"
+                % (i, tname, seg["vaddr"], seg["size"], total),
+            )
             ok = False
 
         if seg["type"] in (SEG_TEXT, SEG_DATA):
             end = seg["offset"] + seg["size"]
             if end > len(data):
-                record("fail",
-                       "seg %d (%s): data [0x%X,0x%X) exceeds file size %d"
-                       % (i, tname, seg["offset"], end, len(data)))
+                record(
+                    "fail",
+                    "seg %d (%s): data [0x%X,0x%X) exceeds file size %d"
+                    % (i, tname, seg["offset"], end, len(data)),
+                )
                 ok = False
 
         if ok:
-            desc = "seg %d (%s) vaddr=0x%X size=%d" \
-                   % (i, tname, seg["vaddr"], seg["size"])
+            desc = "seg %d (%s) vaddr=0x%X size=%d" % (
+                i,
+                tname,
+                seg["vaddr"],
+                seg["size"],
+            )
             if seg["type"] == SEG_BSS:
                 desc += " (zero-filled)"
             else:
@@ -161,13 +175,12 @@ def check(data):
             record("pass", desc)
 
     # Overlap detection between segment vaddr ranges.
-    ranges = sorted((seg["vaddr"], seg["vaddr"] + seg["size"], i)
-                    for i, seg in enumerate(segments))
+    ranges = sorted(
+        (seg["vaddr"], seg["vaddr"] + seg["size"], i) for i, seg in enumerate(segments)
+    )
     for (a_start, a_end, a_i), (b_start, b_end, b_i) in zip(ranges, ranges[1:]):
         if b_start < a_end:
-            record("fail",
-                   "seg %d and seg %d overlap in vaddr"
-                   % (a_i, b_i))
+            record("fail", "seg %d and seg %d overlap in vaddr" % (a_i, b_i))
 
     entry = header["entry"]
     if entry >= total:
@@ -175,16 +188,19 @@ def check(data):
     else:
         in_text = False
         for seg in segments:
-            if (seg["type"] == SEG_TEXT and
-                    seg["vaddr"] <= entry < seg["vaddr"] + seg["size"]):
+            if (
+                seg["type"] == SEG_TEXT
+                and seg["vaddr"] <= entry < seg["vaddr"] + seg["size"]
+            ):
                 in_text = True
                 break
         if in_text:
             record("pass", "entry 0x%X inside TEXT" % entry)
         else:
-            record("warn",
-                   "entry 0x%X is outside every TEXT segment (may crash on jump)"
-                   % entry)
+            record(
+                "warn",
+                "entry 0x%X is outside every TEXT segment (may crash on jump)" % entry,
+            )
 
     if header["flags"] & SEF_FLAG_PRIV_CONTROLLER:
         record("pass", "flags 0x%04X -> controller privilege" % header["flags"])
@@ -199,8 +215,9 @@ def layout(header, segments):
     total = total_mem(segments)
     stack_top = (total + USER_STACK_SIZE) & ~0xF
     return {
-        "file_size": HEADER_SIZE + header["num_segments"] * SEGMENT_SIZE + sum(
-            seg["size"] for seg in segments if seg["type"] != SEG_BSS),
+        "file_size": HEADER_SIZE
+        + header["num_segments"] * SEGMENT_SIZE
+        + sum(seg["size"] for seg in segments if seg["type"] != SEG_BSS),
         "total_mem": total,
         "entry": header["entry"],
         "flags": header["flags"],
@@ -223,12 +240,13 @@ def dump(data):
     out.append("  flags       0x%04X (%s)" % (header["flags"], priv))
     out.append("")
 
-    out.append("  %-3s %-9s %-10s %-8s %-9s" %
-               ("#", "type", "vaddr", "size", "offset"))
+    out.append("  %-3s %-9s %-10s %-8s %-9s" % ("#", "type", "vaddr", "size", "offset"))
     for i, seg in enumerate(segments):
         off = "-" if seg["type"] == SEG_BSS else "0x%X" % seg["offset"]
-        out.append("  %-3d %-9s 0x%-8X %-8d %-9s"
-                   % (i, type_name(seg["type"]), seg["vaddr"], seg["size"], off))
+        out.append(
+            "  %-3d %-9s 0x%-8X %-8d %-9s"
+            % (i, type_name(seg["type"]), seg["vaddr"], seg["size"], off)
+        )
 
     total = total_mem(segments)
     stack_top = (total + USER_STACK_SIZE) & ~0xF
@@ -279,12 +297,14 @@ def pack_segments(segments, entry, flags=0):
         if vaddr is None:
             vaddr = running
         running = max(running, vaddr + size)
-        descs.append({"type": stype, "vaddr": vaddr, "size": size,
-                      "data": seg.get("data", b"")})
+        descs.append(
+            {"type": stype, "vaddr": vaddr, "size": size, "data": seg.get("data", b"")}
+        )
 
     if len(descs) > SEF_MAX_SEGMENTS:
-        raise SefError("too many segments: %d (max %d)"
-                       % (len(descs), SEF_MAX_SEGMENTS))
+        raise SefError(
+            "too many segments: %d (max %d)" % (len(descs), SEF_MAX_SEGMENTS)
+        )
 
     total = running
     if total == 0:
@@ -300,8 +320,7 @@ def pack_segments(segments, entry, flags=0):
     out = bytearray()
     out += struct.pack("<IIHH", SEF_MAGIC, entry, len(descs), flags)
     for desc, off in zip(descs, offsets):
-        out += struct.pack("<IIII", desc["type"], desc["vaddr"],
-                           desc["size"], off)
+        out += struct.pack("<IIII", desc["type"], desc["vaddr"], desc["size"], off)
     for desc in descs:
         out += desc["data"]
 
@@ -338,7 +357,8 @@ def pack(entry=0, flags=0, text=None, data=None, bss=None, spec=None):
                 if size != len(data_bytes):
                     raise SefError(
                         "%s segment size %d != file size %d (%s)"
-                        % (stype, size, len(data_bytes), seg["file"]))
+                        % (stype, size, len(data_bytes), seg["file"])
+                    )
             entry_seg = {
                 "type": stype,
                 "size": size,
@@ -376,15 +396,17 @@ def print_findings(findings):
             marker = "FAIL"
         print("  %s  %s" % (marker, msg))
 
+
 def cmd_pack(output, entry=0, flags=0, text=None, data=None, bss=None, spec=None):
     blob = pack(entry=entry, flags=flags, text=text, data=data, bss=bss, spec=spec)
     with open(output, "wb") as f:
         f.write(blob)
     header, segments = read_segments(blob)
     info = layout(header, segments)
-    print("Wrote %s: %d bytes, %d segments, entry=0x%X, flags=0x%X"
-          % (output, len(blob), info["num_segments"],
-             info["entry"], info["flags"]))
+    print(
+        "Wrote %s: %d bytes, %d segments, entry=0x%X, flags=0x%X"
+        % (output, len(blob), info["num_segments"], info["entry"], info["flags"])
+    )
     return 0
 
 

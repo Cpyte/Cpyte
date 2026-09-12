@@ -41,6 +41,7 @@ from typing import Any, Generic, TypeVar
 # Diagnostics
 # ============================================================================
 
+
 class DiagnosticSeverity(IntEnum):
     NOTE = 0
     WARNING = 1
@@ -104,6 +105,7 @@ class Diagnostic:
 # ============================================================================
 # Compiler Context
 # ============================================================================
+
 
 @dataclass
 class CompilerContext:
@@ -171,6 +173,7 @@ class CompilerContext:
 # Hook Metadata
 # ============================================================================
 
+
 @dataclass(frozen=True, slots=True)
 class HookMetadata:
     """
@@ -191,6 +194,7 @@ class HookMetadata:
 # Compiler Stages
 # ============================================================================
 
+
 class HookStage(Enum):
     LIFECYCLE = "lifecycle"
     LEXER = "lexer"
@@ -207,8 +211,8 @@ class HookStage(Enum):
 # Base Hook
 # ============================================================================
 
-class CompilerHook(ABC):
 
+class CompilerHook(ABC):
     stage: HookStage | None = None
 
     def __init__(
@@ -248,8 +252,8 @@ class CompilerHook(ABC):
 # Lexer
 # ============================================================================
 
-class LexerHook(CompilerHook):
 
+class LexerHook(CompilerHook):
     stage = HookStage.LEXER
 
     def get_additional_keywords(self) -> set[str]:
@@ -279,8 +283,8 @@ class LexerHook(CompilerHook):
 # Parser
 # ============================================================================
 
-class ParserHook(CompilerHook):
 
+class ParserHook(CompilerHook):
     stage = HookStage.PARSER
 
     def should_handle_expression(
@@ -318,8 +322,8 @@ class ParserHook(CompilerHook):
 # Semantic Analysis
 # ============================================================================
 
-class SemanticHook(CompilerHook):
 
+class SemanticHook(CompilerHook):
     stage = HookStage.SEMANTIC
 
     def should_visit_node(self, node: Any) -> bool:
@@ -362,8 +366,8 @@ class SemanticHook(CompilerHook):
 # AST Transformation
 # ============================================================================
 
-class TransformHook(CompilerHook):
 
+class TransformHook(CompilerHook):
     stage = HookStage.TRANSFORM
 
     def should_transform(self, node: Any) -> bool:
@@ -388,8 +392,8 @@ class TransformHook(CompilerHook):
 # Symbol / Import Resolution
 # ============================================================================
 
-class SymbolResolverHook(CompilerHook):
 
+class SymbolResolverHook(CompilerHook):
     """
     Allows packages to provide external symbols, imports, SDKs, headers,
     generated declarations, etc.
@@ -422,8 +426,8 @@ class SymbolResolverHook(CompilerHook):
 # Code Generation
 # ============================================================================
 
-class CodegenHook(CompilerHook):
 
+class CodegenHook(CompilerHook):
     stage = HookStage.CODEGEN
 
     def should_emit_node(self, node: Any) -> bool:
@@ -456,8 +460,8 @@ class CodegenHook(CompilerHook):
 # Optimization
 # ============================================================================
 
-class OptimizeHook(CompilerHook):
 
+class OptimizeHook(CompilerHook):
     stage = HookStage.OPTIMIZE
 
     def should_add_passes(self, context: CompilerContext) -> bool:
@@ -482,8 +486,8 @@ class OptimizeHook(CompilerHook):
 # Build / Linking
 # ============================================================================
 
-class BuildHook(CompilerHook):
 
+class BuildHook(CompilerHook):
     stage = HookStage.LINK
 
     def get_include_paths(
@@ -527,8 +531,8 @@ class BuildHook(CompilerHook):
 # Runtime
 # ============================================================================
 
-class RuntimeHook(CompilerHook):
 
+class RuntimeHook(CompilerHook):
     stage = HookStage.RUNTIME
 
     def get_runtime_code(
@@ -554,8 +558,8 @@ class RuntimeHook(CompilerHook):
 # Lifecycle
 # ============================================================================
 
-class LifecycleHook(CompilerHook):
 
+class LifecycleHook(CompilerHook):
     stage = HookStage.LIFECYCLE
 
     def before_compile(self, context: CompilerContext) -> None:
@@ -577,7 +581,6 @@ H = TypeVar("H", bound=CompilerHook)
 
 @dataclass(slots=True)
 class HookRegistration(Generic[H]):
-
     hook: H
     package_name: str
     priority: int
@@ -591,12 +594,11 @@ class HookRegistration(Generic[H]):
 # Registry
 # ============================================================================
 
-class HookRegistry:
 
+class HookRegistry:
     def __init__(self) -> None:
         self._hooks: dict[HookStage, list[HookRegistration]] = {
-            stage: []
-            for stage in HookStage
+            stage: [] for stage in HookStage
         }
 
         self._by_name: dict[str, CompilerHook] = {}
@@ -624,26 +626,16 @@ class HookRegistry:
     ) -> None:
 
         if hook.stage is None:
-            raise ValueError(
-                f"Hook {hook.name!r} does not define a compiler stage"
-            )
+            raise ValueError(f"Hook {hook.name!r} does not define a compiler stage")
 
         if hook.name in self._by_name:
-            raise ValueError(
-                f"Hook {hook.name!r} is already registered"
-            )
+            raise ValueError(f"Hook {hook.name!r} is already registered")
 
-        priority = (
-            hook.priority
-            if priority is None
-            else priority
-        )
+        priority = hook.priority if priority is None else priority
 
         for conflict in hook.metadata.conflicts:
             if conflict in self._by_name:
-                raise ValueError(
-                    f"Hook {hook.name!r} conflicts with {conflict!r}"
-                )
+                raise ValueError(f"Hook {hook.name!r} conflicts with {conflict!r}")
 
         registration = HookRegistration(
             hook=hook,
@@ -727,10 +719,7 @@ class HookRegistry:
             registration.hook
             for registrations in self._hooks.values()
             for registration in registrations
-            if (
-                registration.hook.enabled
-                and isinstance(registration.hook, hook_type)
-            )
+            if (registration.hook.enabled and isinstance(registration.hook, hook_type))
         ]
 
     def find(self, name: str) -> CompilerHook | None:
@@ -767,10 +756,7 @@ class HookRegistry:
             hook.shutdown(context)
 
     def clear(self) -> None:
-        self._hooks = {
-            stage: []
-            for stage in HookStage
-        }
+        self._hooks = {stage: [] for stage in HookStage}
         self._by_name.clear()
         self._context = None
 
@@ -779,12 +765,12 @@ class HookRegistry:
 # Hook Loading
 # ============================================================================
 
+
 class HookLoadError(Exception):
     pass
 
 
 class HookLoader:
-
     @staticmethod
     def load_hooks_from_package(
         package_name: str,
@@ -797,15 +783,10 @@ class HookLoader:
         loaded = 0
 
         for relative_path in hook_files:
-
-            hook_path = os.path.abspath(
-                os.path.join(package_dir, relative_path)
-            )
+            hook_path = os.path.abspath(os.path.join(package_dir, relative_path))
 
             if not os.path.isfile(hook_path):
-                raise HookLoadError(
-                    f"Hook file does not exist: {hook_path}"
-                )
+                raise HookLoadError(f"Hook file does not exist: {hook_path}")
 
             try:
                 hooks = HookLoader._load_hook_file(
@@ -823,8 +804,7 @@ class HookLoader:
 
             except Exception as exc:
                 raise HookLoadError(
-                    f"Failed loading hooks from "
-                    f"{hook_path}: {exc}"
+                    f"Failed loading hooks from {hook_path}: {exc}"
                 ) from exc
 
         return loaded
@@ -835,10 +815,7 @@ class HookLoader:
         package_name: str,
     ) -> list[CompilerHook]:
 
-        module_name = (
-            f"_cpyte_extension_"
-            f"{abs(hash((package_name, hook_path)))}"
-        )
+        module_name = f"_cpyte_extension_{abs(hash((package_name, hook_path)))}"
 
         spec = importlib.util.spec_from_file_location(
             module_name,
@@ -846,53 +823,38 @@ class HookLoader:
         )
 
         if spec is None or spec.loader is None:
-            raise HookLoadError(
-                f"Cannot create module loader for {hook_path}"
-            )
+            raise HookLoadError(f"Cannot create module loader for {hook_path}")
 
         module = importlib.util.module_from_spec(spec)
 
         try:
             spec.loader.exec_module(module)
         except Exception as exc:
-            raise HookLoadError(
-                f"Failed to execute {hook_path}: {exc}"
-            ) from exc
+            raise HookLoadError(f"Failed to execute {hook_path}: {exc}") from exc
 
         get_hooks = getattr(module, "get_hooks", None)
 
         if get_hooks is None:
-            raise HookLoadError(
-                f"{hook_path} must define get_hooks()"
-            )
+            raise HookLoadError(f"{hook_path} must define get_hooks()")
 
         if not callable(get_hooks):
-            raise HookLoadError(
-                f"get_hooks in {hook_path} is not callable"
-            )
+            raise HookLoadError(f"get_hooks in {hook_path} is not callable")
 
         try:
             hooks = get_hooks()
         except Exception as exc:
-            raise HookLoadError(
-                f"get_hooks() failed in {hook_path}: {exc}"
-            ) from exc
+            raise HookLoadError(f"get_hooks() failed in {hook_path}: {exc}") from exc
 
         if not isinstance(hooks, (list, tuple)):
             raise HookLoadError(
-                f"get_hooks() in {hook_path} must return "
-                f"a list or tuple"
+                f"get_hooks() in {hook_path} must return a list or tuple"
             )
 
         result: list[CompilerHook] = []
 
         for hook in hooks:
-
             if not isinstance(hook, CompilerHook):
-                raise HookLoadError(
-                    f"Invalid hook returned by {hook_path}: "
-                    f"{hook!r}"
-                )
+                raise HookLoadError(f"Invalid hook returned by {hook_path}: {hook!r}")
 
             hook.package_name = package_name
             hook.hook_path = hook_path
@@ -902,14 +864,9 @@ class HookLoader:
             # by metadata name and rejects duplicates, so give such hooks a
             # unique name derived from the package, defining file and class.
             if hook.name == package_name:
-                module_name = os.path.splitext(
-                    os.path.basename(hook_path)
-                )[0]
+                module_name = os.path.splitext(os.path.basename(hook_path))[0]
                 hook.metadata = HookMetadata(
-                    name=(
-                        f"{package_name}:{module_name}:"
-                        f"{type(hook).__name__}"
-                    ),
+                    name=(f"{package_name}:{module_name}:{type(hook).__name__}"),
                     version=hook.metadata.version,
                     priority=hook.metadata.priority,
                     requires=hook.metadata.requires,
@@ -926,8 +883,8 @@ class HookLoader:
 # Hook Dispatcher
 # ============================================================================
 
-class HookDispatcher:
 
+class HookDispatcher:
     """
     High-level interface used by the compiler itself.
 
@@ -947,9 +904,7 @@ class HookDispatcher:
 
         for hook in self.registry.get(HookStage.LEXER):
             if isinstance(hook, LexerHook):
-                result.update(
-                    hook.get_additional_keywords()
-                )
+                result.update(hook.get_additional_keywords())
 
         return result
 
@@ -958,9 +913,7 @@ class HookDispatcher:
 
         for hook in self.registry.get(HookStage.LEXER):
             if isinstance(hook, LexerHook):
-                result.update(
-                    hook.get_additional_operators()
-                )
+                result.update(hook.get_additional_operators())
 
         return result
 
@@ -975,7 +928,6 @@ class HookDispatcher:
     ) -> Any:
 
         for hook in self.registry.get(HookStage.TRANSFORM):
-
             if not isinstance(hook, TransformHook):
                 continue
 
@@ -1000,7 +952,6 @@ class HookDispatcher:
         diagnostics: list[Diagnostic] = []
 
         for hook in self.registry.get(HookStage.SEMANTIC):
-
             if isinstance(hook, SemanticHook):
                 if hook.should_visit_node(node):
                     diagnostics.extend(
@@ -1024,7 +975,6 @@ class HookDispatcher:
     ) -> Any | None:
 
         for hook in self.registry.get(HookStage.CODEGEN):
-
             if not isinstance(hook, CodegenHook):
                 continue
 
@@ -1047,33 +997,20 @@ class HookDispatcher:
     ) -> None:
 
         for hook in self.registry.get(HookStage.LINK):
-
             if not isinstance(hook, BuildHook):
                 continue
 
-            context.include_paths.extend(
-                hook.get_include_paths(context)
-            )
+            context.include_paths.extend(hook.get_include_paths(context))
 
-            context.library_paths.extend(
-                hook.get_library_paths(context)
-            )
+            context.library_paths.extend(hook.get_library_paths(context))
 
-            context.libraries.extend(
-                hook.get_libraries(context)
-            )
+            context.libraries.extend(hook.get_libraries(context))
 
-            context.defines.update(
-                hook.get_defines(context)
-            )
+            context.defines.update(hook.get_defines(context))
 
-            context.compiler_flags.extend(
-                hook.get_compiler_flags(context)
-            )
+            context.compiler_flags.extend(hook.get_compiler_flags(context))
 
-            context.linker_flags.extend(
-                hook.get_linker_flags(context)
-            )
+            context.linker_flags.extend(hook.get_linker_flags(context))
 
     # ------------------------------------------------------------------
     # Runtime
@@ -1087,7 +1024,6 @@ class HookDispatcher:
         result: list[str] = []
 
         for hook in self.registry.get(HookStage.RUNTIME):
-
             if not isinstance(hook, RuntimeHook):
                 continue
 

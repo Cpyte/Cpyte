@@ -324,12 +324,18 @@ corpus (8/8) green on macOS arm64 after these changes.
   `git -c credential.helper= push https://duytung:Duytung%402015@gitea.5gnew.io.vn/Cpyte-Project/Cpyte.git <ref>`
   works (password is `Duytung@2015`, `@` must be URL-encoded as `%40`).
   `twine` is on PATH only as `python -m twine` in this environment.
-- **`--version` still prints the stale `__init__.py` constant (`__version__` is
-  a separately-maintained string, still "3.4.0"):** `cpy --version` does
-  `from cpyte import __version__` (mainpie.py:867), NOT the pip metadata. The
-  pyproject build tag and `__version__` have drifted (4.1.0 vs 3.4.0); a true
-  fix is to derive `__version__` from `importlib.metadata` or sync both at
-  release time. TODO: decide with the user whether to patch + republish 4.1.1.
+- **Version is single-sourced from `__init__.py` now (fixed in v4.2.1).**
+  `cpy --version` does `from cpyte import __version__` (mainpie.py:894), so the
+  string in `source/cpyte/__init__.py` is the ONLY version you bump at release
+  time. `pyproject.toml` carries `dynamic = ["version"]` +
+  `[tool.setuptools.dynamic] version = {attr = "cpyte.__version__"}` to derive
+  the wheel/egg-info version from that one string — never write a literal
+  `version =` in pyproject again. The pre-4.2.1 drift (pyproject 4.1.0/4.2.0 vs
+  `__init__.py` "3.4.0") shipped a broken 4.2.0 wheel whose `--version` reported
+  3.4.0 and whose update-checker nagged users; verify the rebuilt wheel with
+  `python -m build` then `unzip -p dist/*.whl cpyte/__init__.py` and
+  `unzip -p dist/*.whl */METADATA | grep Version` and confirm both say the same
+  version before `twine upload`.
 - **Release hygiene**: `.gitignore` now excludes `dist/`, `build/`, and
   `test/crashes/*.o` / `*.gc.o` / `*.runtime.o` (the 2500×3 fuzz artifacts must
   NOT be committed; `examples/*.o` remain tracked binaries — leave them

@@ -343,3 +343,38 @@ corpus (8/8) green on macOS arm64 after these changes.
 - New GA workflow `.github/workflows/code_quality.yml` (ran `test` + `bomb` +
   `benchmarks` jobs) and `ci_bomb.py` (repo-root fuzz driver, 2500/2500) are
   now tracked and part of the release.
+
+## v4.2.2 release (Sept 2026, bugfix)
+
+- **AOT bigint link broke in `run_aot` (compiling.py).** The AOT path marked
+  every bignum function `internal` (`_mark_internal`) BEFORE
+  `binding.link_modules`. The program module pre-declares every `bigint_*`
+  helper as external, and the LLVM IR linker treats an internal source
+  definition plus a same-named external destination declaration as a conflict
+  and DROPS the body. So every bignum function outside `_BIGNUM_KEEP`
+  (e.g. `bigint_add`, `bigint_sub`, `bigint_pow`) emitted `define`-less in
+  `program.o` → `link error: Undefined symbols ... _bigint_add`. The JIT path
+  already had the fix (link first, then internalize, comment at compiling.py
+  ~1215); `run_aot` did not. Fix mirrors the JIT: link bignum IR while
+  external, record `src_names`, internalize survivors after linking, then
+  `_prune_module`. Regression: `test_big_return_coerce.cpy` (AOT) was added to
+  the CI corpus — `nm program.o | grep bigint` must show `_bigint_add` defined.
+- **`return <int>` from a `big`/`ubig` function emitted `inttoptr` (SIGSEGV).**
+  `emit_return` only had LLVM types: an int value and an `i8*` return type fell
+  into the generic `inttoptr` branch, so `return n` treated the integer as a
+  bignum pointer and crashed at runtime (JIT and AOT alike). The workaround
+  (`big nn = n; return nn`) is why `test_basic_fib.cpy` never exposed it. Fix:
+  track the current function's semantic return type in `self._func_rettype`
+  (set + save/restore alongside `_in_decorator` in `emit_funcdef`), and in the
+  return-coercion `IntType -> PointerType` branch promote via
+  `_promote_to_big(value, inferred_type)` / `_promote_to_ubig` instead of
+  `inttoptr`. Regression: `test/test_big_return_coerce.cpy` (direct
+  `return n` int64/uint64 → big, + recursive big fib) — JIT and AOT both print
+  `7 -7 18446744073709551615 1346269`.
+- Release: v4.2.0 (45 files) → v4.2.1 (version single-source fix) → v4.2.2
+  (the two fixes above). Published to PyPI + gitea (both whl+sdist, verified
+  via pypi.org JSON `latest` and gitea `simple/cpyte/` HTML), tagged `v4.2.2`,
+  pushed to `github` + `origin` (gitea, credential bypass). All remotes at
+  `4eae54b`.
+
+## v4.2.0/v4.2.1 release process recap (all stashes applied + published)

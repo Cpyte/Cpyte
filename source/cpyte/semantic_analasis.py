@@ -105,6 +105,7 @@ from .astparse import (
     ClassDef,
     Continue,
     DeferStmt,
+    DelStmt,
     Deref,
     EnumDef,
     ExprStmt,
@@ -486,6 +487,42 @@ def _is_literal_zero(node) -> bool:
         return False
 
 
+_HEAP_ALLOC_FNS = ("malloc", "calloc", "realloc")
+
+
+def _is_heap_alloc_expr(v):
+    """True for `new` allocations and raw C heap allocs (`malloc`, `calloc`,
+    `realloc`), so `del` and the ownership checker agree about what is
+    reclaimed with manual `free`."""
+    if isinstance(v, NewExpr):
+        return True
+    if isinstance(v, CastExpr):
+        return _is_heap_alloc_expr(v.expr)
+    if (
+        isinstance(v, Call)
+        and isinstance(v.callee, Variable)
+        and v.callee.name in _HEAP_ALLOC_FNS
+        and len(v.args) >= 1
+    ):
+        return True
+    return False
+
+
+def _is_gc_managed_expr(v):
+    """True when `v` allocates through the GC (`new` under a GC-enabled build).
+
+    Under GC, `new T` lowers to `gc_malloc`, whose returned pointer is interior
+    to a collector header block and is reclaimed by the collector, so a manual
+    `free()` of it is an invalid free (runtime abort). Raw `malloc`/`calloc`/
+    `realloc` calls are NOT GC-managed — they lower to plain libc alloc even
+    with the GC on — so they are still freed with `del`."""
+    if isinstance(v, NewExpr):
+        return True
+    if isinstance(v, CastExpr):
+        return _is_gc_managed_expr(v.expr)
+    return False
+
+
 def _is_compile_time_false(node) -> bool:
     if isinstance(node, Number):
         try:
@@ -554,6 +591,8 @@ class SemanticAnalyzer:
         self._promoted_vars: set[str] = set()
         self._forward_names: set[str] = set()
         self._imported_clibs: set[str] = set()
+        self._heap_names: set[str] = set()
+        self._gc_new_names: set[str] = set()
 
     def _hook_context(self) -> CompilerContext:
         """Build a cached CompilerContext exposing this analyzer to hooks."""
@@ -1432,6 +1471,10 @@ class SemanticAnalyzer:
                             return None
                         node.inferred_type = "dynamic[]"
                         return "dynamic[]"
+                if node.callee.name in ("has", "get_attr"):
+                    user_sym = self.current_scope.lookup(node.callee.name)
+                    if user_sym is None or user_sym.kind != "function":
+                        return self._infer_has_get_attr(node, node.callee.name)
                 if node.callee.name in ("append", "len"):
                     user_sym = self.current_scope.lookup(node.callee.name)
                     if user_sym is None or user_sym.kind != "function":
@@ -1601,6 +1644,16 @@ class SemanticAnalyzer:
         if isinstance(node, UnaryOp):
             return [node.operand]
         if isinstance(node, Call):
+            # `has`/`get_attr` are builtins handled entirely in
+            # `_infer_has_get_attr`; the name argument must not be resolved as a
+            # normal expression (an undeclared name is a *valid* has() arg and
+            # must read as false, not error).
+            if (
+                isinstance(node.callee, Variable)
+                and node.callee.name in ("has", "get_attr")
+                and not self._user_has_builtin(node.callee.name)
+            ):
+                return []
             return list(node.args)
         if isinstance(node, Index):
             return [node.obj, node.index]
@@ -1761,6 +1814,8 @@ class SemanticAnalyzer:
             self._infer_type(node.expr)
         elif isinstance(node, DeferStmt):
             self._visit(node.body, scope)
+        elif isinstance(node, DelStmt):
+            self._visit_del(node, scope)
         elif isinstance(node, Import):
             self._visit_import(node)
         elif isinstance(node, StructDef):
@@ -2572,6 +2627,14 @@ class SemanticAnalyzer:
                 _collect(stmt.expr, names)
                 reads.update(names)
                 return False
+            if isinstance(stmt, DelStmt):
+                if isinstance(stmt.target, Variable):
+                    reads.add(stmt.target.name)
+                else:
+                    names = set()
+                    _collect(stmt.target, names)
+                    reads.update(names)
+                return False
             if isinstance(stmt, DeferStmt):
                 names = set()
                 _collect(stmt.body, names)
@@ -2612,12 +2675,21 @@ class SemanticAnalyzer:
                 walk(child, False)
             return False
 
-        def _collect(node, acc):
+        def _collect(node, acc: set):
             if node is None:
                 return
             if isinstance(node, Variable):
                 acc.add(node.name)
                 return
+            if isinstance(node, Call):
+                if (
+                    isinstance(node.callee, Variable)
+                    and node.callee.name in ("has", "get_attr")
+                    and getattr(node, "meta", None)
+                ):
+                    for child in node.args:
+                        _collect(child, acc)
+                    return
             for child in self._infer_children(node):
                 _collect(child, acc)
             # Some expression nodes aren't covered by _infer_children (e.g.
@@ -2727,24 +2799,11 @@ class SemanticAnalyzer:
                 return False
             return False
 
-        _HEAP_ALLOC_FNS = ("malloc", "calloc", "realloc")
-
         def is_heap_alloc_expr(v):
             """True for `new` allocations and raw C heap allocs (`malloc`,
             `calloc`, `realloc`), so ownership tracking matches how these are
             actually reclaimed (manual `free`)."""
-            if isinstance(v, NewExpr):
-                return True
-            if isinstance(v, CastExpr):
-                return is_heap_alloc_expr(v.expr)
-            if (
-                isinstance(v, Call)
-                and isinstance(v.callee, Variable)
-                and v.callee.name in _HEAP_ALLOC_FNS
-                and len(v.args) >= 1
-            ):
-                return True
-            return False
+            return _is_heap_alloc_expr(v)
 
         def free_target(v):
             """If expression is a free()/deferring-free call over a variable,
@@ -2923,6 +2982,28 @@ class SemanticAnalyzer:
                 for s in getattr(stmt, "orelse", None) or []:
                     walk_stmt(s, frame)
                 return
+            if isinstance(stmt, DelStmt):
+                tgt = stmt.target
+                if isinstance(tgt, Variable) and stmt.del_kind == "heap":
+                    name = tgt.name
+                    if state.get(name) == "freed":
+                        self.warning(
+                            f"`{name}` is already freed",
+                            stmt,
+                            note="double-free of a heap allocation",
+                        )
+                    elif state.get(name) == "moved":
+                        self.warning(
+                            f"`del {name}` called on a value that was already moved",
+                            stmt,
+                        )
+                    elif state.get(name) == "owned":
+                        state[name] = "freed"
+                    return
+                if isinstance(tgt, Variable):
+                    state.pop(tgt.name, None)
+                    return
+                return
             if isinstance(stmt, DeferStmt):
                 ft = free_target(stmt)
                 if ft is not None:
@@ -3028,13 +3109,34 @@ class SemanticAnalyzer:
             for child in getattr(stmt, "body", None) or []:
                 if isinstance(
                     child,
-                    (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print),
+                    (
+                        ExprStmt,
+                        VarDecl,
+                        Assign,
+                        If,
+                        While,
+                        DelStmt,
+                        DeferStmt,
+                        Return,
+                        Print,
+                    ),
                 ):
                     walk_stmt(child, frame)
 
         for stmt in body:
             if not isinstance(
-                stmt, (ExprStmt, VarDecl, Assign, If, While, DeferStmt, Return, Print)
+                stmt,
+                (
+                    ExprStmt,
+                    VarDecl,
+                    Assign,
+                    If,
+                    While,
+                    DelStmt,
+                    DeferStmt,
+                    Return,
+                    Print,
+                ),
             ):
                 continue
             walk_stmt(stmt, fn)
@@ -3282,6 +3384,204 @@ class SemanticAnalyzer:
         node.inferred_type = target_t
         return target_t
 
+    def _user_has_builtin(self, name: str) -> bool:
+        sym = self.current_scope.lookup(name)
+        return sym is not None and sym.kind == "function"
+
+    def _infer_has_get_attr(self, node: Call, name: str):
+        """Semantic analysis for the `has` / `get_attr` builtins.
+
+        `has(x)`            — does a variable named `x` exist? (compile-time if
+                              the name is declared/undeclared; runtime if `x`
+                              is a promoted dynamic var and the value may have
+                              been erased by `del`)
+        `has(x)` (expr)     — is a pointer non-null / a dynamic value set?
+        `has(obj, "f")`     — does `obj` (a struct/class, or ptr to one) have
+                              field `f`? (const when the name is a literal)
+        `has(obj, fname)`   — runtime strcmp dispatch when the name is a
+                              runtime `str` expression.
+        `get_attr(o, "f")`  — read field `f` of `o` (static GEP when literal).
+        `get_attr(o, fname)`— runtime dispatch when the name is a `str` expr;
+                              requires all fields to share one type.
+        """
+        if name == "has":
+            if len(node.args) == 1:
+                return self._infer_has_one(node)
+            if len(node.args) == 2:
+                return self._infer_has_field(node)
+            self.error(
+                "has() expects 1 or 2 arguments",
+                node,
+                note="has(name) -> does the variable exist?; "
+                "has(obj, \"field\") -> does the field exist?",
+            )
+            return None
+        # get_attr
+        if len(node.args) != 2:
+            self.error(
+                "get_attr() expects 2 arguments",
+                node,
+                note="get_attr(obj, \"field\") reads a struct/class field "
+                "by name",
+            )
+            return None
+        obj, name_arg = node.args[:2]
+        obj_t = self._infer_type(obj)
+        is_lit = isinstance(name_arg, String)
+        if is_lit:
+            name_arg.inferred_type = "str"
+        else:
+            name_t = self._infer_type(name_arg)
+            if name_t != "str":
+                self.error(
+                    "get_attr() field argument must be a string literal or a "
+                    "`str` expression",
+                    name_arg,
+                    note=f"got `{name_t}`",
+                )
+                return None
+        field_name = name_arg.value if is_lit else None
+        lookup_t = (obj_t or "").removesuffix("*").removesuffix("[]")
+        struct_sym = self.current_scope.lookup(lookup_t) if lookup_t else None
+        fields = []
+        if struct_sym and struct_sym.kind in ("struct", "class") and struct_sym.node:
+            fields = list(struct_sym.node.fields)
+        elif not (obj_t and obj_t.endswith("*")) and obj_t != "dynamic":
+            if obj_t != "dynamic":
+                self.error(
+                    f"get_attr() requires a struct/class object, got `{obj_t}`",
+                    obj,
+                )
+                return None
+        if obj_t == "dynamic":
+            self.error(
+                "get_attr() requires a statically-typed struct/class object; "
+                "the field set of a `dynamic` value cannot be resolved",
+                obj,
+            )
+            return None
+        if not fields:
+            self.error(
+                f"get_attr() target `{obj_t}` has no resolvable fields",
+                obj,
+            )
+            return None
+        if is_lit:
+            for f in fields:
+                if f.name == field_name:
+                    node.inferred_type = f.type_expr
+                    node.meta = {
+                        "kind": "get_attr_lit",
+                        "field": field_name,
+                        "obj": obj,
+                    }
+                    return f.type_expr
+            self.error(
+                f"type `{obj_t}` has no field `{field_name}`",
+                node,
+                note="get_attr() field names are resolved against the struct "
+                "definition",
+            )
+            return None
+        types = {f.type_expr for f in fields}
+        if len(types) != 1:
+            self.error(
+                f"runtime get_attr() on `{obj_t}` requires all fields to share "
+                "one type",
+                node,
+                note=f"fields resolve to {sorted(types)}; use a string-literal "
+                "field name for mixed-type structs",
+            )
+            return None
+        uniform = next(iter(types))
+        node.inferred_type = uniform
+        node.meta = {
+            "kind": "get_attr_dyn",
+            "struct": lookup_t,
+            "obj": obj,
+            "uniform_type": uniform,
+        }
+        return uniform
+
+    def _infer_has_one(self, node: Call):
+        arg = node.args[0]
+        if isinstance(arg, Variable):
+            sym = self.current_scope.lookup(arg.name)
+            if sym is None:
+                node.inferred_type = "bool"
+                node.meta = {"kind": "has_const", "value": False}
+            elif sym.dynamic or sym.type == "dynamic":
+                node.inferred_type = "bool"
+                node.meta = {"kind": "has_dyn_var", "target": arg}
+            else:
+                node.inferred_type = "bool"
+                node.meta = {"kind": "has_const", "value": True}
+            return "bool"
+        arg_t = self._infer_type(arg)
+        if arg_t and arg_t.endswith("*"):
+            node.inferred_type = "bool"
+            node.meta = {"kind": "has_ptr", "target": arg}
+            return "bool"
+        if arg_t == "dynamic":
+            node.inferred_type = "bool"
+            node.meta = {"kind": "has_dyn_val", "target": arg}
+            return "bool"
+        self.error(
+            "has() expects a variable name, a pointer, or a `dynamic` value",
+            arg,
+            note=f"got `{arg_t}`",
+        )
+        return None
+
+    def _infer_has_field(self, node: Call):
+        obj, name_arg = node.args[:2]
+        obj_t = self._infer_type(obj)
+        is_lit = isinstance(name_arg, String)
+        if is_lit:
+            name_arg.inferred_type = "str"
+        else:
+            name_t = self._infer_type(name_arg)
+            if name_t != "str":
+                self.error(
+                    "has() field argument must be a string literal or a `str` "
+                    "expression",
+                    name_arg,
+                    note=f"got `{name_t}`",
+                )
+                return None
+        field_name = name_arg.value if is_lit else None
+        lookup_t = (obj_t or "").removesuffix("*").removesuffix("[]")
+        struct_sym = self.current_scope.lookup(lookup_t) if lookup_t else None
+        if not (struct_sym and struct_sym.kind in ("struct", "class")):
+            if obj_t == "dynamic":
+                self.error(
+                    "has(obj, \"field\") requires a statically-typed struct "
+                    "/class object",
+                    obj,
+                )
+                return None
+            self.error(
+                f"has(obj, \"field\") requires a struct/class object, got "
+                f"`{obj_t}`",
+                obj,
+            )
+            return None
+        fields = list(struct_sym.node.fields)
+        if is_lit:
+            node.inferred_type = "bool"
+            node.meta = {
+                "kind": "has_field_const",
+                "value": any(f.name == field_name for f in fields),
+            }
+            return "bool"
+        node.inferred_type = "bool"
+        node.meta = {
+            "kind": "has_field_dyn",
+            "struct": lookup_t,
+            "obj": obj,
+        }
+        return "bool"
+
     def _visit_assign(self, node: Assign, scope: Scope | None = None):
         val_type = self._infer_type(node.value)
         if val_type == "void":
@@ -3437,6 +3737,14 @@ class SemanticAnalyzer:
                         )
             elif existing.kind == "variable":
                 existing.initialized = True
+            if _is_heap_alloc_expr(node.value):
+                self._heap_names.add(name)
+            else:
+                self._heap_names.discard(name)
+            if _is_gc_managed_expr(node.value):
+                self._gc_new_names.add(name)
+            else:
+                self._gc_new_names.discard(name)
         elif isinstance(node.target, Attr):
             obj = node.target.obj
             if isinstance(obj, Variable):
@@ -3629,6 +3937,76 @@ class SemanticAnalyzer:
         if val_type == "dynamic":
             sym.dynamic = True
         s.define(node.name, sym)
+        if _is_heap_alloc_expr(node.init):
+            self._heap_names.add(node.name)
+        else:
+            self._heap_names.discard(node.name)
+        if _is_gc_managed_expr(node.init):
+            self._gc_new_names.add(node.name)
+        else:
+            self._gc_new_names.discard(node.name)
+
+    def _visit_del(self, node: DelStmt, scope: Scope | None = None):
+        """`del <target>` — unbind a variable or clear an addressable slot.
+
+        Classification (mirrors the ownership checker's view of heap):
+          * dynamic symbol            -> "dynamic": runtime DYN_NONE mark
+          * static heap pointer (new/malloc) -> "heap":  emit free()
+          * any other declared symbol -> "static": drop from compiler scope
+          * Index/Attr/Deref targets  -> "slot":   clear the addressed slot
+        The name is then removed from the scope chain so later uses are
+        compile errors (Python-style `del`).
+        """
+        target = node.target
+        if isinstance(target, Variable):
+            name = target.name
+            s = scope or self.current_scope
+            sym = s.lookup(name)
+            if sym is None:
+                self.error(
+                    f"use of undeclared identifier `{name}`",
+                    target,
+                    note="`del` can only remove a variable that exists in scope",
+                )
+                return
+            if sym.kind == "const":
+                self.error(
+                    f"cannot delete constant `{name}`",
+                    target,
+                    note="constants are immutable once declared; "
+                    "only variables can be deleted",
+                )
+                return
+            if sym.dynamic or sym.type == "dynamic":
+                node.del_kind = "dynamic"
+            elif sym.type and sym.type.endswith("*") and name in self._heap_names:
+                if self.no_gc or name not in self._gc_new_names:
+                    node.del_kind = "heap"
+                else:
+                    # GC-managed `new` allocation: the collector owns the block
+                    # (a manual free() of a gc_malloc interior pointer would
+                    # abort), so `del` only unbinds the name.
+                    node.del_kind = "static"
+            else:
+                node.del_kind = "static"
+            # Unbind from the whole scope chain (the nearest scope that binds
+            # it, then every enclosing scope) so later uses fail loudly.
+            cur: Scope | None = s
+            while cur is not None:
+                cur.undefine(name)
+                cur = cur.parent
+            self._heap_names.discard(name)
+            self._gc_new_names.discard(name)
+        elif isinstance(target, (Index, Attr, Deref)):
+            self._infer_type(target)
+            node.del_kind = "slot"
+        else:
+            self.error(
+                "`del` requires a variable or an addressable slot",
+                node,
+                note="supported targets: `del name`, `del arr[i]`, "
+                "`del obj.field`, `del *ptr`",
+            )
 
     def _visit_break(self, node: Break):
         if self._loop_depth == 0:

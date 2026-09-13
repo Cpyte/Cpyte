@@ -95,7 +95,7 @@ def emit_program(
 
 
 # -- low-level re-exports (the whole compiler usable from one package) ------
-from .astparse import (  # noqa: E402, F401
+from .astparse import (  # noqa: F401
     Assert,
     Assign,
     Break,
@@ -103,6 +103,7 @@ from .astparse import (  # noqa: E402, F401
     ClassDef,
     Continue,
     DeferStmt,
+    DelStmt,
     EnumDef,
     ExprStmt,
     FuncDef,
@@ -116,21 +117,27 @@ from .astparse import (  # noqa: E402, F401
     Switch,
     Try,
     TypeAlias,
+    VarDecl,
     While,
+    parse_file,
 )
-from .lexar import Lexer, LexerError  # noqa: E402, F401
-from .semantic_analasis import analyze  # noqa: E402, F401
-from .bytecoding import LLVM  # noqa: E402, F401
-from .compiling import (  # noqa: E402, F401
+from .bytecoding import LLVM  # noqa: F401
+from .compiling import (  # noqa: F401
     Linker,
     LinkerNotFoundError,
     host_target,
     run_aot,
     run_jit,
 )
-from .compiling import _host_default_pic as host_default_pic  # noqa: E402
-from .mainpie import (  # noqa: E402, F401
+from .compiling import _host_default_pic as host_default_pic
+from .lexar import Lexer, LexerError  # noqa: F401
+from .mainpie import (  # noqa: F401
     _collect_frameworks as collect_frameworks,
+)
+from .mainpie import (
     _detect_nogc as detect_nogc,
+)
+from .mainpie import (
     _find_workspace_root as find_workspace_root,
 )
+from .semantic_analasis import analyze  # noqa: F401

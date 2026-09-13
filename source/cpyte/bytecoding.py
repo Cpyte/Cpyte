@@ -25,7 +25,6 @@ from .optimizations import (
     _count_loop_iterations,
     _detect_fibonacci_pattern,
     _detect_shift_amount_from_mul,
-    _find_loop_invariants,
     _fold_int_binop,
     _is_const_one,
     _is_const_zero,
@@ -203,6 +202,12 @@ def _emit_children(node) -> list:
     if isinstance(node, NewExpr):
         return [node.size] if node.size is not None else []
     if isinstance(node, Call):
+        if (
+            isinstance(node.callee, Variable)
+            and node.callee.name in ("has", "get_attr")
+            and getattr(node, "meta", None)
+        ):
+            return []
         children = []
         if isinstance(node.callee, Attr):
             children.append(node.callee.obj)
@@ -963,6 +968,43 @@ class LLVM:
         self._code_skip.initializer = ir.Constant(ir.IntType(1), 0)  # type: ignore[attr-defined]
 
     # CRITICAL CONSTANT FOLDING BUG
+    def _isolate_const_prop_branch(self, body):
+        """Run one control-flow branch with isolated constant propagation.
+
+        A branch cannot inherit constants invalidated or established by a
+        sibling branch, and none of its assignments are known after the merge.
+        Keep the outer tables intact while emitting the branch, then return the
+        names that must be invalidated at the merge point.
+        """
+
+        class _BranchBody:
+            __slots__ = ("body",)
+
+            def __init__(self, branch_body):
+                self.body = branch_body
+
+        written = _loop_written_names(_BranchBody(body))
+        saved_const_prop = self._const_prop
+        active_const_prop = dict(saved_const_prop)
+        for name in written:
+            active_const_prop.pop(name, None)
+        saved_const_prop_f = self._const_prop_f
+        active_const_prop_f = dict(saved_const_prop_f)
+        for name in written:
+            active_const_prop_f.pop(name, None)
+        self._const_prop = active_const_prop
+        self._const_prop_f = active_const_prop_f
+        return saved_const_prop, saved_const_prop_f, written
+
+    def _restore_const_prop_after_branch(self, saved_const_prop, saved_const_prop_f):
+        self._const_prop = saved_const_prop
+        self._const_prop_f = saved_const_prop_f
+
+    def _invalidate_const_prop_names(self, names):
+        for name in names:
+            self._const_prop.pop(name, None)
+            self._const_prop_f.pop(name, None)
+
     @register_emitter(Switch)
     def emit_switch(self, node):
         val_ty = getattr(node.value, "inferred_type", None)
@@ -1002,6 +1044,7 @@ class LLVM:
         # Step 2: Handle Dynamic/Non-Constant Expressions via Branch Cascade
         if any(c is not None and not isinstance(c, ir.Constant) for c in case_irs):
             default_blk = end_blk
+            merged_written = set()
 
             for i, (case_val, body) in enumerate(node.cases):
                 if case_val is None:
@@ -1009,10 +1052,13 @@ class LLVM:
                     default_blk = self.builder.append_basic_block(name="sw_default")
                     curr_pos = self.builder.block
                     self.builder.position_at_end(default_blk)
+                    saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+                    merged_written.update(written)
                     self._push_scope()
                     for stmt in body:
                         self.emit(stmt)
                     self._pop_scope()
+                    self._restore_const_prop_after_branch(saved_cp, saved_cpf)
                     if not self._block_terminated():
                         self.builder.branch(end_blk)
                     self.builder.position_at_end(curr_pos)
@@ -1026,10 +1072,13 @@ class LLVM:
 
                     # Populate matching case body
                     self.builder.position_at_end(then_blk)
+                    saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+                    merged_written.update(written)
                     self._push_scope()
                     for stmt in body:
                         self.emit(stmt)
                     self._pop_scope()
+                    self._restore_const_prop_after_branch(saved_cp, saved_cpf)
                     if not self._block_terminated():
                         self.builder.branch(end_blk)
 
@@ -1039,6 +1088,7 @@ class LLVM:
             # Fall through remaining condition to default/end
             self.builder.branch(default_blk)
             self.builder.position_at_end(end_blk)
+            self._invalidate_const_prop_names(merged_written)
             return
 
         # Step 3: Handle Constant Expressions via Native LLVM Switch Instruction
@@ -1058,22 +1108,28 @@ class LLVM:
                 sw.add_case(case_irs[i], case_blks[i])
 
         # Emit code for each case block
+        merged_written = set()
         for i, (_, body) in enumerate(node.cases):
             self.builder.position_at_end(case_blks[i])
+            saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+            merged_written.update(written)
             self._push_scope()
             for stmt in body:
                 self.emit(stmt)
             self._pop_scope()
+            self._restore_const_prop_after_branch(saved_cp, saved_cpf)
             if not self._block_terminated():
                 self.builder.branch(end_blk)
 
         self.builder.position_at_end(end_blk)
+        self._invalidate_const_prop_names(merged_written)
 
     def _emit_switch_glob(self, node):
         """String switch: each case value is a shell-style glob pattern."""
         value = self.emit(node.value)
         end_blk = self.builder.append_basic_block(name="sw_end")
         default_bodies = []
+        merged_written = set()
         for i, (case_val, body) in enumerate(node.cases):
             if case_val is None:
                 default_bodies.append(body)
@@ -1085,10 +1141,13 @@ class LLVM:
             nxt_blk = self.builder.append_basic_block(name="sw_next")
             self.builder.cbranch(is_match, case_blk, nxt_blk)
             self.builder.position_at_start(case_blk)
+            saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+            merged_written.update(written)
             self._push_scope()
             for stmt in body:
                 self.emit(stmt)
             self._pop_scope()
+            self._restore_const_prop_after_branch(saved_cp, saved_cpf)
             if not self._block_terminated():
                 self.builder.branch(end_blk)
             self.builder.position_at_start(nxt_blk)
@@ -1097,15 +1156,19 @@ class LLVM:
             self.builder.branch(default_blk)
             self.builder.position_at_start(default_blk)
             for body in default_bodies:
+                saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+                merged_written.update(written)
                 self._push_scope()
                 for stmt in body:
                     self.emit(stmt)
                 self._pop_scope()
+                self._restore_const_prop_after_branch(saved_cp, saved_cpf)
                 if not self._block_terminated():
                     self.builder.branch(end_blk)
         else:
             self.builder.branch(end_blk)
         self.builder.position_at_start(end_blk)
+        self._invalidate_const_prop_names(merged_written)
 
     def _emit_switch_dynamic(self, node):
         """Dynamic switch: string case patterns use glob matching, other case
@@ -1113,6 +1176,7 @@ class LLVM:
         k, b = self._dyn_pair(node.value)
         end_blk = self.builder.append_basic_block(name="sw_end")
         default_bodies = []
+        merged_written = set()
         for case_val, body in node.cases:
             if case_val is None:
                 default_bodies.append(body)
@@ -1147,10 +1211,13 @@ class LLVM:
             nxt_blk = self.builder.append_basic_block(name="sw_next")
             self.builder.cbranch(is_match, case_blk, nxt_blk)
             self.builder.position_at_start(case_blk)
+            saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+            merged_written.update(written)
             self._push_scope()
             for stmt in body:
                 self.emit(stmt)
             self._pop_scope()
+            self._restore_const_prop_after_branch(saved_cp, saved_cpf)
             if not self._block_terminated():
                 self.builder.branch(end_blk)
             self.builder.position_at_start(nxt_blk)
@@ -1159,15 +1226,19 @@ class LLVM:
             self.builder.branch(default_blk)
             self.builder.position_at_start(default_blk)
             for body in default_bodies:
+                saved_cp, saved_cpf, written = self._isolate_const_prop_branch(body)
+                merged_written.update(written)
                 self._push_scope()
                 for stmt in body:
                     self.emit(stmt)
                 self._pop_scope()
+                self._restore_const_prop_after_branch(saved_cp, saved_cpf)
                 if not self._block_terminated():
                     self.builder.branch(end_blk)
         else:
             self.builder.branch(end_blk)
         self.builder.position_at_start(end_blk)
+        self._invalidate_const_prop_names(merged_written)
 
     _JMP_BUF_SIZE = 200
 
@@ -1520,6 +1591,69 @@ class LLVM:
         # Collect the deferred statement; it is emitted (in reverse order) at
         # the function's exit points, both explicit `return` and implicit end.
         self._deferred.append(node.body)
+
+    @register_emitter(DelStmt)
+    def emit_delstmt(self, node: DelStmt):
+        """`del <target>` — unbind a variable or clear an addressable slot.
+
+        Matches the semantic `del_kind` classification:
+          * static  -> drop the name from every codegen local table (later
+                       uses raise "Undefined variable").
+          * dynamic -> write DYN_NONE into the variable's DynValue slot (or
+                       the arena slot via `assign`).
+          * heap    -> free() the pointed-to allocation.
+          * slot    -> store a typed zero/null into the addressable slot.
+        """
+        kind = node.del_kind
+        target = node.target
+        if kind == "static":
+            name = target.name
+            if name in self.locals:
+                ptr = self.locals[name]
+                if not isinstance(
+                    getattr(ptr.type, "pointee", None), ir.PointerType
+                ):
+                    self.builder.store(
+                        ir.Constant(ptr.type.pointee, None), ptr
+                    )
+            for table in (self.locals, self.local_types, self.ssa_values):
+                table.pop(name, None)
+            self.const_vars.pop(name, None)
+            return None
+        if kind == "dynamic":
+            name = target.name
+            if name in self.locals and getattr(
+                self.locals[name].type, "pointee", None
+            ) == _DynValue:
+                zero = ir.Constant(_DynValue, ir.Undefined)
+                zero = self.builder.insert_value(
+                    zero, ir.Constant(_i32, _DYN_NONE), 0
+                )
+                zero = self.builder.insert_value(zero, ir.Constant(_i64, 0), 1)
+                self.builder.store(zero, self.locals[name])
+            else:
+                assign_fn = self.functions.get("assign")
+                if assign_fn is not None:
+                    self.builder.call(
+                        assign_fn,
+                        [
+                            self._string_const(name),
+                            ir.Constant(_i32, _DYN_NONE),
+                            ir.Constant(_i64, 0),
+                        ],
+                    )
+            return None
+        if kind == "heap":
+            self._emit_builtin_free(target)
+            return None
+        if kind == "slot":
+            slot = self._emit_lvalue(target)
+            if isinstance(slot.type, ir.PointerType) and slot.type.pointee is not None:
+                self.builder.store(ir.Constant(slot.type.pointee, None), slot)
+            return None
+        raise Exception(
+            f"unhandled del_kind {kind!r} at L{node._token.line}:{node._token.column}"
+        )
 
     def emit(self, node: Node | dict) -> _IRValue:
         key = id(node)
@@ -3347,25 +3481,36 @@ class LLVM:
             self.builder.cbranch(cond, then_bb, end_bb)
 
         self.builder.position_at_end(then_bb)
+        then_saved_cp, then_saved_cpf, then_written = self._isolate_const_prop_branch(
+            node.body
+        )
         self._push_scope()
         for stmt in node.body:
             if not self._block_terminated():
                 self.emit(stmt)
         self._pop_scope()
+        self._restore_const_prop_after_branch(then_saved_cp, then_saved_cpf)
         if not self._block_terminated():
             self.builder.branch(end_bb)
 
+        merged_written = set(then_written)
         if node.orelse:
             self.builder.position_at_end(else_bb)
+            else_saved_cp, else_saved_cpf, else_written = (
+                self._isolate_const_prop_branch(node.orelse)
+            )
+            merged_written.update(else_written)
             self._push_scope()
             for stmt in node.orelse:
                 if not self._block_terminated():
                     self.emit(stmt)
             self._pop_scope()
+            self._restore_const_prop_after_branch(else_saved_cp, else_saved_cpf)
             if not self._block_terminated():
                 self.builder.branch(end_bb)
 
         self.builder.position_at_end(end_bb)
+        self._invalidate_const_prop_names(merged_written)
 
     def _promote(self, left, right):
         if isinstance(left.type, ir.DoubleType) and not isinstance(
@@ -3457,6 +3602,11 @@ class LLVM:
             return self.builder.icmp_unsigned("!=", val, ir.Constant(val.type, None))
         if isinstance(val.type, (ir.FloatType, ir.DoubleType)):
             return self.builder.fcmp_unordered("!=", val, ir.Constant(val.type, 0.0))
+        if isinstance(val.type, (ir.IdentifiedStructType, ir.LiteralStructType)):
+            raise RuntimeError(
+                f"cannot evaluate struct type `{getattr(val, 'name', val.type)}` as a "
+                f"boolean (struct values are not truthy in cpy)"
+            )
         return self.builder.icmp_signed("!=", val, ir.Constant(val.type, 0))
 
     # ------------------------------------------------------------------
@@ -4742,6 +4892,13 @@ class LLVM:
                 return self.builder.xor(value, all_ones)
             case TokenType.NOT:
                 value = self.emit(node.operand)
+                if isinstance(
+                    value.type, (ir.IdentifiedStructType, ir.LiteralStructType)
+                ):
+                    raise RuntimeError(
+                        f"cannot apply `not` to a value of struct type "
+                        f"`{getattr(node.operand, 'inferred_type', value.type)}`"
+                    )
                 if isinstance(value.type, ir.PointerType):
                     zero = ir.Constant(value.type, None)
                     return self.builder.icmp_unsigned("==", value, zero)
@@ -5151,6 +5308,15 @@ class LLVM:
         ):
             return self._emit_builtin_len(node)
 
+        # Builtin has()/get_attr() — Python-style existence/field access.
+        # Shadowable by a user `def has(...)` / `def get_attr(...)`.
+        if (
+            isinstance(node.callee, Variable)
+            and node.callee.name in ("has", "get_attr")
+            and node.callee.name not in self.functions
+        ):
+            return self._emit_builtin_has_get_attr(node)
+
         # Builtin code() — call the original function through __code_fn pointer.
         if (
             self._is_decorator_factory
@@ -5473,6 +5639,93 @@ class LLVM:
             )
             self.functions["cpyte_array_len"] = fn
         return self.builder.call(fn, [arg])
+
+    def _emit_builtin_has_get_attr(self, node):
+        """has()/get_attr() — existence checks and runtime field access.
+
+        `node.meta` (set by semantic analysis) selects the shape:
+          * has_const     -> compile-time bool for `has(name)` on a declared /
+                             undeclared static name.
+          * has_dyn_var   -> `has(promoted_dynamic_var)`: live slot kind != NONE.
+          * has_dyn_val   -> `has(<dynamic expr>)`: live kind != NONE.
+          * has_ptr       -> `has(ptr_value)`: non-null pointer.
+          * has_field_const -> compile-time bool for `has(obj, "field")`.
+          * has_field_dyn -> runtime strcmp dispatch over the struct fields.
+          * get_attr_lit  -> static GEP + load (same as `obj.field`).
+          * get_attr_dyn  -> strcmp dispatch -> uniform-typed field load.
+        """
+        meta = getattr(node, "meta", None) or {}
+        kind = meta.get("kind")
+
+        if kind == "has_const":
+            return ir.Constant(_i1, 1 if meta.get("value") else 0)
+        if kind == "has_dyn_var":
+            target = meta["target"]
+            k, _ = self._dyn_pair(target)
+            return self.builder.icmp_signed("!=", k, ir.Constant(_i32, _DYN_NONE))
+        if kind == "has_dyn_val":
+            k, _ = self._dyn_pair(meta["target"])
+            return self.builder.icmp_signed("!=", k, ir.Constant(_i32, _DYN_NONE))
+        if kind == "has_ptr":
+            val = self.emit(meta["target"])
+            if isinstance(val.type, ir.PointerType):
+                return self.builder.icmp_unsigned(
+                    "!=", val, ir.Constant(val.type, None)
+                )
+            raise Exception(
+                f"has() pointer target is not a pointer at "
+                f"L{node._token.line}:{node._token.column}"
+            )
+        if kind == "has_field_const":
+            return ir.Constant(_i1, 1 if meta.get("value") else 0)
+        if kind == "has_field_dyn":
+            struct_name = meta["struct"]
+            fields = self.struct_fields.get(struct_name) or []
+            name_val = self.emit(node.args[1])
+            if name_val.type != _i8ptr:
+                name_val = self.builder.bitcast(name_val, _i8ptr)
+            result = ir.Constant(_i1, 0)
+            for f in fields:
+                fname = self._string_const(f.name)
+                cmp_res = self.builder.call(self._strcmp_fn, [name_val, fname])
+                match = self.builder.icmp_signed(
+                    "==", cmp_res, ir.Constant(_i32, 0)
+                )
+                result = self.builder.or_(result, match)
+            return result
+        if kind == "get_attr_lit":
+            attr_node = Attr(meta["obj"], meta["field"], token=node._token)
+            return self.emit_attr(attr_node)
+        if kind == "get_attr_dyn":
+            struct_name = meta["struct"]
+            fields = self.struct_fields.get(struct_name) or []
+            obj_ptr = self._emit_lvalue(meta["obj"])
+            if isinstance(getattr(obj_ptr.type, "pointee", None), ir.PointerType):
+                obj_ptr = self.builder.load(obj_ptr)
+            name_val = self.emit(node.args[1])
+            if name_val.type != _i8ptr:
+                name_val = self.builder.bitcast(name_val, _i8ptr)
+            idx = ir.Constant(_i32, -1)
+            for i, f in enumerate(fields):
+                fname = self._string_const(f.name)
+                cmp_res = self.builder.call(self._strcmp_fn, [name_val, fname])
+                match = self.builder.icmp_signed(
+                    "==", cmp_res, ir.Constant(_i32, 0)
+                )
+                idx = self.builder.select(
+                    match, ir.Constant(_i32, i), idx
+                )
+            struct_start = self.builder.gep(
+                obj_ptr,
+                [ir.Constant(_i32, 0), ir.Constant(_i32, 0)],
+                inbounds=True,
+            )
+            field_ptr = self.builder.gep(struct_start, [idx], inbounds=True)
+            return self.builder.load(field_ptr)
+        raise Exception(
+            f"unknown has()/get_attr() meta kind {kind!r} at "
+            f"L{node._token.line}:{node._token.column}"
+        )
 
     def _emit_builtin_append(self, node):
         """append(arr, x) — grow a registered array by one element.
@@ -5819,13 +6072,12 @@ class LLVM:
             active_f.pop(name, None)
         self._const_prop_f = active_f
 
-        # ---- Loop-invariant code motion: hoist provably-invariant assigns ----
-        invariants = _find_loop_invariants(node)
-        hoisted_ids = set()
-        for inv in invariants:
-            if not self._block_terminated():
-                self.emit(inv)
-                hoisted_ids.add(id(inv))
+        # ---- Loop-invariant code motion is intentionally OFF ----
+        # The previous name-based analysis (`_find_loop_invariants`) could
+        # miscompile: hoisting a `x = f(n)` assign out of a loop changed how
+        # many times a side-effecting `f` ran, and memory/pointer effects were
+        # invisible to the name-based read/write sets.  Hoisting was removed;
+        # only the conservative const-prop invalidation above applies.
 
         cond_bb = self.builder.append_basic_block("while.cond")
         body_bb = self.builder.append_basic_block("while.body")
@@ -5842,8 +6094,6 @@ class LLVM:
         self.loop_stack.append((cond_bb, end_bb))
         self._push_scope()
         for stmt in node.body:
-            if id(stmt) in hoisted_ids:
-                continue
             if not self._block_terminated():
                 self.emit(stmt)
         self._pop_scope()

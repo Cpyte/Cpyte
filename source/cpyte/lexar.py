@@ -112,6 +112,7 @@ _BASE_KEYWORDS = {
     "borrow",
     "move",
     "mut",
+    "del",
 }
 
 # Additional keywords registered by packages

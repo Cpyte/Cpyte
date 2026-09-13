@@ -337,6 +337,9 @@ class _Formatter:
     def _emit_continue(self, node, level: int):
         self._emit_simple(node, "continue", level)
 
+    def _emit_del(self, node, level: int):
+        self._emit_simple(node, f"del {self._expr(node.target)}", level)
+
     def _emit_assert(self, node, level: int):
         pad = "    " * level
         cond_str = self._expr(node.cond)
@@ -536,6 +539,7 @@ _STATEMENT_HANDLERS = {
     "Print": _Formatter._emit_print,
     "Break": _Formatter._emit_break,
     "Continue": _Formatter._emit_continue,
+    "DelStmt": _Formatter._emit_del,
     "Assert": _Formatter._emit_assert,
     "ExprStmt": _Formatter._emit_exprstmt,
     "Import": _Formatter._emit_import,

@@ -10,8 +10,6 @@ Provides:
 
 from __future__ import annotations
 
-from typing import Optional
-
 from .astparse import (
     AddrOf,
     Assign,
@@ -48,7 +46,7 @@ def _trunc_to_signed(value: int, width: int) -> int:
     return value
 
 
-def _fold_int_binop(op, left: int, right: int) -> Optional[int]:
+def _fold_int_binop(op, left: int, right: int) -> int | None:
     """Fold an integer BinOp at compile time, honouring cpyte's semantics:
     ``+ - * // % << >> & | ^ **``.  Division/remainder use C semantics
     (truncation toward zero); returns *None* for signed-div-by-zero and for
@@ -73,6 +71,12 @@ def _fold_int_binop(op, left: int, right: int) -> Optional[int]:
     if op == TokenType.SHL:
         if right < 0:
             return None
+        # Const-prop'd shift amounts can be astronomically large (e.g. a
+        # uint64 constant lane). Shifting by >= 64 bits is 0 after
+        # truncation to any emitted width (<= 64 bits), and computing
+        # `left << right` for a 1.6e19-bit shift would exhaust memory.
+        if right >= 64:
+            return 0
         return left << right
     if op == TokenType.SHR:
         if right < 0:
@@ -188,17 +192,16 @@ def _flip_compare(op) -> TokenType:
         return TokenType.LESS_EQ
     return op
 
-
+#fix fibbonaci optimization bug
 def _is_fib_bound_cond(cond, param_name: str) -> bool:
     """True when *cond* is exactly ``n <= 1`` (or ``n < 2``), either operand
-    order.  These are the only bounds for which ``return n`` is valid on the
-    base domain ``n <= 1`` with the fast-doubling identity ``F(0)=0``,
-    ``F(1)=1`` and the ``n < 0 -> return n`` convention."""
+    order.
+    """
     if not isinstance(cond, BinOp):
         return False
+
     op = cond.op
-    if op not in (TokenType.LESS, TokenType.LESS_EQ):
-        return False
+
     if isinstance(cond.left, Variable) and cond.left.name == param_name:
         num = cond.right
     elif isinstance(cond.right, Variable) and cond.right.name == param_name:
@@ -206,12 +209,17 @@ def _is_fib_bound_cond(cond, param_name: str) -> bool:
         num = cond.left
     else:
         return False
+
+    if op not in (TokenType.LESS, TokenType.LESS_EQ):
+        return False
+
     v = _const_int_value(num)
     if v is None:
         return False
+
     if op == TokenType.LESS_EQ:
         return v == 1
-    return v == 2  # op == LESS
+    return v == 2
 
 
 def _is_param_identity_return(stmts, param_name: str) -> bool:
@@ -230,7 +238,7 @@ def _is_param_identity_return(stmts, param_name: str) -> bool:
     return False
 
 
-def _fib_call_delta(node, func_name: str, param_name: str) -> Optional[int]:
+def _fib_call_delta(node, func_name: str, param_name: str) -> int | None:
     """Return the delta of a ``func(param - <delta>)`` call, else *None*."""
     if not isinstance(node, Call):
         return None
@@ -518,8 +526,12 @@ def _get_used_variables(entity) -> set[str]:
             continue
         if isinstance(obj, Variable):
             names.add(obj.name)
+        #Missing semantic information during annalysis
         elif isinstance(obj, Assign):
             stack.append(obj.value)
+
+            if not isinstance(obj.target, Variable):
+                stack.append(obj.target)
         elif isinstance(obj, (list, tuple)):
             stack.extend(obj)
         elif isinstance(obj, dict):
@@ -540,51 +552,6 @@ def _get_used_variables(entity) -> set[str]:
                 except TypeError:
                     pass
     return names
-
-
-def _find_loop_invariants(loop: While) -> list[Assign]:
-    """Identify assign statements inside *loop* that can be hoisted before
-    the loop and *removed* from its body (store-once LICM).
-
-    ``Variable = <expr>`` is hoistable when:
-    * ``<expr>`` reads no variable the loop writes anywhere (deep, including
-      nested branches; ``y = y + 1`` is excluded by its self-read), and
-    * the target is never *read* in the loop body (a read preceding the
-      hoisted store in the original ordering would observe a different
-      value), and
-    * the target does not appear in the loop condition (moving the store out
-      could change how many times the loop runs), and
-    * the RHS performs no function call and no memory dereference (calls may
-      have side effects, and pointer/field reads might alias writes the loop
-      makes through a different name that our name-based analysis cannot
-      see).
-
-    Writes to the target *elsewhere* in the loop are fine: the hoisted store
-    simply establishes a value that those later stores overwrite, which
-    preserves every read and the post-loop value."""
-    mutated = _loop_written_names(loop)
-    cond_names = _get_used_variables(loop.cond)
-    all_read: set[str] = set()
-    for stmt in loop.body:
-        all_read |= _get_used_variables(stmt)
-    invariants: list[Assign] = []
-    for stmt in loop.body:
-        if not isinstance(stmt, Assign):
-            continue
-        target = stmt.target
-        if not isinstance(target, Variable):
-            continue
-        rhs_vars = _get_used_variables(stmt.value)
-        if not rhs_vars.isdisjoint(mutated):
-            continue
-        if target.name in all_read:
-            continue
-        if target.name in cond_names:
-            continue
-        if _expr_may_violate_invariance(stmt.value):
-            continue
-        invariants.append(stmt)
-    return invariants
 
 
 def _expr_may_violate_invariance(node) -> bool:
@@ -640,7 +607,7 @@ def _is_const_one(node) -> bool:
     return False
 
 
-def _const_int_value(node) -> Optional[int]:
+def _const_int_value(node) -> int | None:
     if isinstance(node, Number):
         try:
             return int(node.value, 0)
@@ -649,7 +616,7 @@ def _const_int_value(node) -> Optional[int]:
     return None
 
 
-def _const_fp_value(node) -> Optional[float]:
+def _const_fp_value(node) -> float | None:
     """Return the floating-point value of a numeric literal *node* that is
     NOT integer-parseable (``2.0``, ``1e3``), else *None*.  Integral literals
     (``2``) are left to ``_const_int_value`` -- a double-typed context is
@@ -667,7 +634,7 @@ def _const_fp_value(node) -> Optional[float]:
         return None
 
 
-def _detect_shift_amount_from_mul(node) -> Optional[int]:
+def _detect_shift_amount_from_mul(node) -> int | None:
     """If *node* is ``x * 2**k`` or ``2**k * x`` return *k*, else *None*."""
     if not isinstance(node, BinOp) or node.op != TokenType.STAR:
         return None

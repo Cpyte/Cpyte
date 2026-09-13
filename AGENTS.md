@@ -1,5 +1,110 @@
 # Notes
 
+## Sept 2026 `del` / `has` / `get_attr` language features
+
+Three Python-flavored features shipped together (parser `DelStmt`, semantic
+`_visit_del` + `_infer_has_get_attr`, codegen `emit_delstmt` +
+`_emit_builtin_has_get_attr`, formatter `_emit_del`). CI corpus grew to 21/21;
+`ci_bomb.py` stays 2500/2500.
+
+- **`del` unbinds a variable or clears an addressable slot.**
+  - `del name` on a **static** (non-heap) variable removes it from the whole
+    scope chain (`_undefine_from_scope` in `_visit_del`, semantic) — later uses
+    are clean `use of undeclared identifier` compile errors, and codegen pops
+    it from `locals`/`local_types`/`ssa_values`/`const_vars`.
+  - `del name` on a **promoted/`dynamic`** variable marks kind DYN_NONE at
+    runtime (writes `{DYN_NONE,0}` into the `_DynValue` slot; falls back to
+    the arena `assign(name, 0, 0)`).
+  - `del name` on a **heap pointer** (name tracked in `self._heap_names`, from
+    the module-level `_is_heap_alloc_expr` helper that gates `malloc/calloc/
+    realloc` — the same helper the ownership checker uses) emits `free()` and
+    also unbinds the name.
+  - `del arr[i]` / `del obj.field` / `del *pp` **clear the slot**: typed
+    zero/null store through `_emit_lvalue`. `del_kind` is stamped on the AST
+    node by semantic ("static"/"dynamic"/"heap"/"slot") and consumed by
+    `emit_delstmt` in `bytecoding.py`. `del` on a `const` or an undeclared
+    name is a compile error; a deleted name can be re-declared later.
+  - Ownership checker treats `del p` on an owned heap pointer like `free(p)`
+    (no false leak/double-free warnings).
+- **`has(...)` — Python-style existence checks.**
+  - `has(x)` (bare name): compile-time bool when `x` is statically in/out of
+    scope (const 1/0); runtime kind!=DYN_NONE check for promoted/`dynamic`
+    vars. **An undeclared name is legal** and means false (this is the whole
+    point) — so builtin `has` is intercepted in `_infer_type` BEFORE it can
+    emit `use of undeclared identifier`, and `_infer_children` (semantic +
+    bytecoding's `_emit_children`) returns `[]` for builtin has/get_attr args
+    so the iterative deep-mode paths don't pre-visit the arg. Arg may also be a
+    pointer (non-null test) or a `dynamic` value (set test).
+  - `has(obj, "f")`: compile-time literal field-exists on any struct/class;
+    `has(obj, name_expr)` with a runtime `str` is a strcmp dispatch over the
+    known fields (i1 OR-chain, inline — no control flow).
+- **`get_attr(obj, "f")` — read any field by name.**
+  - Literal name on a known struct/class: static GEP + load (codegen builds a
+    synthetic `Attr(meta["obj"], field)` and calls `emit_attr`), returns the
+    field's real type. Works on struct values and `Struct*` pointers.
+  - Runtime `str` name: strcmp dispatch selects the field index, then a
+    two-stage GEP (`[0,0]` to the first field element pointer, then a runtime
+    `gep(ptr, [idx])`) + load — llvmlite struct GEP cannot take a non-constant
+    index, so the first index must be split out. **Requires all fields to
+    share one type** (else a clean compile error with the conflicting types
+    listed); a pointer target is loaded once via `_emit_lvalue` so `Vec3*`
+    objects work.
+- **Shadowable** like `range`/`len`: `def has(...)` / `def get_attr(...)`
+  preempts the builtin (checked via scope lookup in semantic and
+  `self.functions` in codegen). Both semantics and codegen gate on it.
+- **Sharp edges.** `has`/`get_attr` 1-arg+2-arg shape and runtime-name type
+  are validated in semantic with helpful notes. `(int)has(...)` prints `-1`
+  for true (i1 sext cast quirk — pre-existing, unrelated). All older syntax
+  is untouched; `del` is a new lexer keyword but no existing program used it.
+
+## Sept 2026 `del`/`has`/`get_attr` bug-hunt round 2 (GC-new del, LICM removal, guards)
+
+Adversarial fuzzing (`test/test_fuzz_del_has.py`, del/has/get_attr generators on
+the base `fuzzer.py` engine, opt0 vs opt3 differential JIT, 7-way parallel)
+hunted the feature; **every classified bug was fixed, `ci_bomb.py` stays
+2500/2500 and CI corpus grew to 22/22 via `test/test_del_gc_new.cpy`.**
+
+- **`del p` on a GC-managed `new` pointer must NOT `free()` (was a runtime
+  SIGABRT).** Under the default GC build, `new T` lowers to `gc_malloc`
+  (`_get_malloc_fn`), whose returned pointer is *interior* to the collector's
+  `cpyte_obj_t` header — plain libc `free()` of it is an invalid free and
+  aborts. User `malloc`/`calloc`/`realloc` calls are NOT affected (they lower
+  to plain libc alloc even with the GC on). Fix in semantic: the new module
+  helper `_is_gc_managed_expr` (NewExpr, unwrapping CastExpr) feeds the new
+  `self._gc_new_names` set alongside `_heap_names` (both VarDecl and Assign
+  sites). `_visit_del` stamps `del_kind="static"` (unbind-only, collector
+  reclaims) when `not no_gc and name in _gc_new_names`; "heap" → `free()` is
+  reserved for raw-malloc-origin pointers. Randomized reproducer:
+  `test/crashes_del_has/crash_25420_0001.cpy`.
+- **LICM hoisting removed entirely (bytecoding).** `_find_loop_invariants`
+  (optimizations.py) was deleted — it was wrong: its name-based read/write sets
+  missed memory effects and a hoisted `x = g(k)` moved a side-effecting `g`
+  call out of a loop (output change). `emit_while` now imports it no more, no
+  longer calls it, and the `hoisted_ids` skip-list in the body loop is gone.
+  Only the conservative straight-line const-prop invalidation across the
+  backedge remains (correct and regression-tested in `test_opt_alg.cpy`).
+- **Struct values in boolean contexts are now clean compile errors.** The
+  `not <struct>` / `<struct> and ...` / `<struct> or ...` / `while <struct>:`
+  paths crashed codegen with `TypeError: 'int' object is not iterable` (an
+  `ir.Constant(struct_type, 0)` construction). `_is_true` (bytecoding) and the
+  `emit_unaryop` NOT branch now raise a clear `RuntimeError: cannot evaluate
+  struct type ... as a boolean` — the CLI rejects, the fuzz harness classifies
+  as a clean reject. Repro: `test/crashes_del_has/crash_25421_0001.cpy`.
+- **`test_fuzz_del_has.py` classifier treats a trapped process as UB noise.**
+  A negative exit code (SIGTRAP/SIGFPE from an LLVM div-by-zero guard or a
+  poison shift) is the program's *own* undefined behavior — opt0 vs opt3 may
+  legally place/fold the trap differently, so one-side-trap-with-output is NOT
+  a miscompile. Only unequal outputs from two *surviving* runs are a bug; the
+  leftover "bugs" in earlier blasts were these UB programs. Also: never count
+  a multiprocessing-spawn import failure as a test failure — the worker must
+  be importable under `spawn` (a missing symbol in `bytecoding`'s
+  `optimizations` import once made every result "UB noise rc=1").
+- **Files**: feature codegen `bytecoding.py` (`emit_delstmt`,
+  `_emit_builtin_has_get_attr`, `_truthy_expr`/`_is_true` guards),
+  `semantic_analasis.py` (`_visit_del` + GC-aware classification), plus the
+  regression corpus additions under `test/test_del_has_*.cpy` and
+  `test/test_del_gc_new.cpy`.
+
 ## Sept 2026 emitter optimization work (FP math, pow, unroll breadth)
 
 - **int64/uint64 const-prop fold truncation bug (fixed).** When an
@@ -49,6 +154,13 @@
 
 ## Sept 2026 bug-hunt findings (structural hazards in optimizations.py / bytecoding.py)
 
+- **`_fold_int_binop` shift-overflow (fixed).** `left << right` on a
+  const-prop'd `uint64` lane could shift by an astronomically large constant
+  (e.g. `g1 << (g1 * g2)` with `uint64` operands), computing a 1.6e19-bit
+  Python int and dying with `OverflowError: too many digits in integer`
+  (crash reproducers in the fuzz corpus). Fix: `right >= 64` folds to `0`
+  (any shift by >= 64 is 0 after truncation to the ≤ 64-bit emitted width);
+  negative shifts already returned None. Bomb test back to 2500/2500.
 - **LICM was silent dead code; now it runs.** `_find_loop_invariants` used
   `_collect_assigned_names` (top-level targets only), so every hoist candidate's
   own target was always in `mutated` -> `[]` forever. Additionally

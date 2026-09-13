@@ -142,7 +142,14 @@ class ListLit(Node):
 
 
 class Call(Node):
-    __slots__ = ("_token", "args", "callee", "inferred_type", "param_types")
+    __slots__ = (
+        "_token",
+        "args",
+        "callee",
+        "inferred_type",
+        "param_types",
+        "meta",
+    )
 
     def __init__(self, callee, args: list, token=None):
         self.callee = callee
@@ -150,6 +157,7 @@ class Call(Node):
         self._token = token
         self.inferred_type = None
         self.param_types = None
+        self.meta = None
 
     def __repr__(self):
         return f"Call({self.callee}, {self.args})"
@@ -1185,6 +1193,8 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
         node, pos = parse_break(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "continue":
         node, pos = parse_continue(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == "del":
+        node, pos = parse_del(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "assert":
         node, pos = parse_assert(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "asm":
@@ -1987,6 +1997,26 @@ class DeferStmt(Node):
         return f"DeferStmt({self.body!r})"
 
 
+class DelStmt(Node):
+    """`del <target>` — unbind a variable or clear a runtime slot.
+
+    Static locals are removed from the compiler scope (later uses become
+    compile errors); dynamic/arena variables are marked deleted at runtime
+    (kind DYN_NONE); heap pointers from `new`/`malloc` are freed; and
+    `del obj.field` / `del arr[i]` / `del *p` clear the addressed slot.
+    """
+
+    __slots__ = ("_token", "target", "del_kind")
+
+    def __init__(self, target, token=None):
+        self.target = target
+        self._token = token
+        self.del_kind = None  # "static" | "dynamic" | "heap" | "slot", set by semantic
+
+    def __repr__(self):
+        return f"DelStmt({self.target!r})"
+
+
 class StructDef(Node):
     __slots__ = ("_token", "fields", "generic_params", "name")
 
@@ -2502,11 +2532,24 @@ def parse_defer(tokens: list[Token], pos: int):
     return DeferStmt(stmt, token=tok), pos
 
 
+def parse_del(tokens: list[Token], pos: int):
+    tok = tokens[pos]  # 'del'
+    pos += 1
+    if pos >= len(tokens):
+        raise ParseError("Expected an expression after `del`", tok)
+    target, pos = parse_expression(tokens, pos)
+    _expect_newline(tokens, pos, tok)
+    return DelStmt(target, token=tok), pos
+
+
 def parse_statement(tokens: list[Token], pos: int):
     if pos >= len(tokens):
         return None, pos
 
     tok = tokens[pos]
+
+    if tok.type == TokenType.KEYWORD and tok.value == "del":
+        return parse_del(tokens, pos)
 
     if tok.type == TokenType.KEYWORD and tok.value == "return":
         return parse_return(tokens, pos)

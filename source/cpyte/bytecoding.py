@@ -677,6 +677,7 @@ class LLVM:
         self._dbg_tracer_fns = {}
         self._dbg_boxes = {}
         self._dbg_box_slots = {}
+        self._dbg_box_types = {}
         self._dbg_cur_fn = ""
         self._dbg_emitted = set()
         self._dbg_collect = {}
@@ -746,6 +747,7 @@ class LLVM:
         self._in_emit_iterative = False
         self._in_decorator = False
         self._is_decorator_factory = False
+        self._func_rettype = None  # semantic return type of the current FuncDef
         self._const_prop: dict = {}
         self._const_prop_f: dict = {}
 
@@ -2541,10 +2543,12 @@ class LLVM:
         old_deferred = self._deferred
         old_in_decorator = self._in_decorator
         old_decorator_factory = self._is_decorator_factory
+        old_func_rettype = self._func_rettype
         old_const_prop = self._const_prop
         old_const_prop_f = self._const_prop_f
         self._in_decorator = node.rettype == "decorated"
         self._is_decorator_factory = node.rettype == "decorated"
+        self._func_rettype = node.rettype
         self.locals = {}
         self.local_types = {}
         self.ssa_values = {}
@@ -2627,6 +2631,7 @@ class LLVM:
         self._deferred = old_deferred
         self._in_decorator = old_in_decorator
         self._is_decorator_factory = old_decorator_factory
+        self._func_rettype = old_func_rettype
         self._const_prop = old_const_prop
         self._const_prop_f = old_const_prop_f
 
@@ -3226,7 +3231,14 @@ class LLVM:
                 elif isinstance(value.type, ir.IntType) and isinstance(
                     ret_ty, ir.PointerType
                 ):
-                    value = self.builder.inttoptr(value, ret_ty)
+                    if self._func_rettype == "big":
+                        value = self._promote_to_big(
+                            value, getattr(node.value, "inferred_type", None)
+                        )
+                    elif self._func_rettype == "ubig":
+                        value = self._promote_to_ubig(value)
+                    else:
+                        value = self.builder.inttoptr(value, ret_ty)
             self.builder.ret(value)
         else:
             ret_ty = self.builder.function.ftype.return_type
@@ -3770,6 +3782,9 @@ class LLVM:
                 ptr = self.locals.get(var)
                 if ptr is None:
                     continue
+                ty = self.local_types.get(var)
+                if ty:
+                    self._dbg_box_types.setdefault(name, {})[var] = ty
                 gep = self.builder.gep(
                     box, [ir.Constant(_i32, 0), ir.Constant(_i32, slot)]
                 )

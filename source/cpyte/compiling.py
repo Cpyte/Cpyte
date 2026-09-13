@@ -1613,17 +1613,30 @@ def run_aot(
     mod = binding.parse_assembly(llvm_ir)
     # Compile the bignum runtime from source for the host platform (instead
     # of pre-built bitcode) so its libc symbol names match the target OS. The
-    # clang round-trip is cached per source-content/triple, and the funcs are
-    # marked internal (minus the symbols runtime.o needs) so the IR linker and
-    # an early GlobalDCE only carry the bignum helpers this program uses.
+    # clang round-trip is cached per source-content/triple. The IR linker
+    # treats an internal source definition plus a same-named external
+    # declaration already in the destination (the program declares every
+    # bigint_*/ubigint_* helper) as a conflict and DROPS the definition, so we
+    # link FIRST (external definitions) and only then mark the survivors
+    # internal; the later _prune_module GlobalDCE removes the unreferenced
+    # runtime code, keeping only the helpers this program uses and everything
+    # _BIGNUM_KEEP lists for the native AOT link of runtime.o.
     llvm_cc = _find_llvm_cc()
     bignum_ir, err = _cached_c_ir(llvm_cc, _BIGNUM_C, host_target().triple)
     if bignum_ir is None:
         print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
     bignum_mod = binding.parse_assembly(_remove_probe_stack_ir(bignum_ir))
-    _mark_internal(bignum_mod, keep=_BIGNUM_KEEP)
+    src_names = {f.name for f in bignum_mod.functions if not f.is_declaration}
     binding.link_modules(mod, bignum_mod)
+    for fn in mod.functions:
+        if (
+            fn.name in src_names
+            and fn.name not in _BIGNUM_KEEP
+            and not fn.is_declaration
+            and str(fn.linkage) not in ("internal", "private", "linkonce_odr")
+        ):
+            fn.linkage = "internal"
     mod.verify()
     _prune_module(mod)
     optimize(mod, opt_level)

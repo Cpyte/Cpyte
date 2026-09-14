@@ -187,9 +187,14 @@ class Linker:
             cmd.extend(["-framework", fw])
         if not shared:
             cmd.append("-lm")
-        # On Linux with -fPIC, use -no-pie to avoid "relocation R_X86_64_32 against .rodata" errors
-        # This occurs when mixing PIC objects with PIE linkers on modern Linux distributions
-        if sys.platform != "darwin" and sys.platform != "win32" and pic and not shared:
+        # Modern Linux distributions default the linker to building PIE
+        # executables, but the compiler emits non-PIC objects on x86_64
+        # (pic=False is the historical default there). A non-PIC object carries
+        # absolute relocations (e.g. R_X86_64_32 against .rodata.str1.1) that
+        # cannot be resolved in a PIE binary -> "can not be used when making a
+        # PIE object". Disable PIE on every executable link; it is a harmless
+        # no-op when the objects are already PIC (arm64/--cpu PIC builds).
+        if sys.platform not in ("darwin", "win32") and not shared:
             cmd.append("-no-pie")
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:

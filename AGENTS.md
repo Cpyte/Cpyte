@@ -490,3 +490,30 @@ corpus (8/8) green on macOS arm64 after these changes.
   `4eae54b`.
 
 ## v4.2.0/v4.2.1 release process recap (all stashes applied + published)
+
+## v4.2.4 release (Sept 2026, Ubuntu build bugfixes)
+
+- **`gc_runtime.c` missing `_GNU_SOURCE` broke Ubuntu builds.** The Linux
+  stack-scan path calls `pthread_getattr_np` (gc_runtime.c ~310), a GNU
+  extension that glibc only declares when `_GNU_SOURCE` is defined. Under a
+  strict ISO C mode (or a `cc` that does not default to `-std=gnu*`), the
+  declaration is hidden -> implicit-declaration error / build failure. Fix:
+  guarded `#if !defined(_WIN32) && !defined(_GNU_SOURCE)` `#define _GNU_SOURCE 1`
+  at the very top of `gc_runtime.c`, BEFORE any `#include`. The wheel ships
+  `gc_runtime.c` verbatim so the fix reaches users on install.
+- **JIT compiler probe did not validate the clang-only `-target` flag.**
+  `_find_llvm_cc` (compiling.py) probed candidates with only
+  `-S -emit-llvm -O0`, but every downstream runtime/bignum compile also passes
+  `-target <host triple>` (compiling.py:1047/1131, mainpie.py:588). A
+  gcc-family `cc` that squeaked past the `-emit-llvm` probe then died at the
+  real invocation with `cc: error: unrecognized command-line option '-target'`.
+  Fix: the probe now includes `-target host_target().triple`, so the selected
+  compiler is guaranteed to accept the exact flag set actually used; on
+  gcc-only Ubuntu the clean "install clang / use --aot" message is shown
+  instead of a cryptic mid-compile failure.
+- Release: v4.2.4. CI corpus 22/22; wheel verified in a fresh venv (JIT opt3 +
+  AOT of `test/test_del_gc_new.cpy` both print `99 0 7 0 5`). Published to
+  PyPI + gitea registry, tagged `v4.2.4`, pushed to `github` + `origin` (gitea,
+  credential bypass).
+
+## v4.2.0/v4.2.1 release process recap (all stashes applied + published)

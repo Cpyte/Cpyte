@@ -853,7 +853,7 @@ def _main():
 
     strict = False
     no_userspace = False
-    pic = None
+    pic : bool = False
     lto = False
     no_gc = False
     exports = []

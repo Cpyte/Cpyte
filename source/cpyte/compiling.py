@@ -4,12 +4,12 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-import threading
 
 from .generate_bc import _remove_probe_stack_ir
-from .linker import format_cc_diag, LinkerNotFoundError, Linker
+from .linker import Linker, LinkerNotFoundError, format_cc_diag
 from .ui import print_err, print_ok
 from .winjit_patch import link_jit_anchors, patch_windows_gnu_relocs
 
@@ -463,12 +463,13 @@ def _find_llvm_cc():
         return _llvm_cc_cache
     import shutil
 
+    triple = host_target().triple
     for name in ("clang", "cc", "gcc"):
         exe = shutil.which(name)
         if exe:
             try:
                 r = subprocess.run(
-                    [exe, "-S", "-emit-llvm", "-O0", "-o", "-", "-xc", "-"],
+                    [exe, "-S", "-emit-llvm", "-O0", "-target", triple, "-o", "-", "-xc", "-"],
                     input="int __x = 0;",
                     capture_output=True,
                     text=True,

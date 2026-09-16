@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # Undefined-symbol relocation types in the MinGW GNU large-model ELF objects
 # emitted by the ``*windows-gnu-elf`` JIT triple on this machine.
@@ -32,8 +32,8 @@ _WINDOWS_EXPORT_DLLS = (
     "ntdll",
 )
 
-_export_cache: Dict[str, int] = {}
-_extra_cache: Dict[str, int] = {}
+_export_cache: dict[str, int] = {}
+_extra_cache: dict[str, int] = {}
 _k32_gpa_cache: Any = None
 k32: Any = None
 
@@ -109,7 +109,7 @@ def _scavenge_export(name: str) -> int:
 
 
 def patch_windows_gnu_relocs(
-    engine: Any, tm: Any, mod: Any, res: Dict[str, int]
+    engine: Any, tm: Any, mod: Any, res: dict[str, int]
 ) -> int:
     """Fix relocation immediates MCJIT left unresolved in the merged JIT module."""
     _init_k32()
@@ -134,24 +134,24 @@ def patch_windows_gnu_relocs(
     e_shnum = struct.unpack_from("<H", d, 0x3C)[0]
     e_shstrndx = struct.unpack_from("<H", d, 0x3E)[0]
 
-    shdrs: Dict[int, Dict[str, int]] = {}
+    shdrs: dict[int, dict[str, int]] = {}
     for i in range(e_shnum):
         o = e_shoff + i * e_shentsize
         sh = struct.unpack_from("<IIQQQQIIQQ", d, o)
-        shdrs[i] = dict(
-            name_idx=sh[0],
-            sh_type=sh[1],
-            offset=sh[4],
-            size=sh[5],
-            link=sh[6],
-            info=sh[7],
-        )
+        shdrs[i] = {
+            "name_idx": sh[0],
+            "sh_type": sh[1],
+            "offset": sh[4],
+            "size": sh[5],
+            "link": sh[6],
+            "info": sh[7],
+        }
 
     shstr = shdrs[e_shstrndx]
     shstr_data = d[shstr["offset"] : shstr["offset"] + shstr["size"]]
 
     # Pre-decode section names once to optimize string processing inside loops
-    secname_by_idx: Dict[int, str] = {}
+    secname_by_idx: dict[int, str] = {}
     for i, sh_info in shdrs.items():
         off = sh_info["name_idx"]
         j = shstr_data.find(b"\x00", off)
@@ -167,7 +167,7 @@ def patch_windows_gnu_relocs(
         return 0
 
     strsyms = d[symlink["offset"] : symlink["offset"] + symlink["size"]]
-    symbols: List[Tuple[str, int, int]] = []
+    symbols: list[tuple[str, int, int]] = []
     for i in range(symtab["size"] // 24):
         o = symtab["offset"] + i * 24
         st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from(
@@ -178,7 +178,7 @@ def patch_windows_gnu_relocs(
             (strsyms[st_name:j].decode("utf-8", errors="replace"), st_value, st_shndx)
         )
 
-    bases: Dict[str, int] = {}
+    bases: dict[str, int] = {}
     try:
         main_addr = engine.get_function_address("main")
     except Exception:
@@ -203,9 +203,9 @@ def patch_windows_gnu_relocs(
             print("[winjit] no .ltext base", flush=True)
         return 0
 
-    sites2: List[str] = []
+    sites2: list[str] = []
 
-    symaddrs: Dict[str, Optional[int]] = {}
+    symaddrs: dict[str, int | None] = {}
     defined_names = {n for n, v, sh in symbols if n and sh != 0}
     for name, st_value, st_shndx in symbols:
         if st_shndx == 0:
@@ -226,7 +226,7 @@ def patch_windows_gnu_relocs(
             if b is not None:
                 symaddrs[name] = (b + st_value) & 0xFFFFFFFFFFFFFFFF
 
-    all_relocs: List[Tuple[str, int, int, str, int, int]] = []
+    all_relocs: list[tuple[str, int, int, str, int, int]] = []
     for sh in shdrs.values():
         if sh["sh_type"] != 4:  # SHT_RELA
             continue
@@ -240,7 +240,7 @@ def patch_windows_gnu_relocs(
             symname, _, st_shndx = symbols[r_info >> 32]
             all_relocs.append((tsec, r_off, r_type, symname, r_addend, st_shndx))
 
-    funcs: List[List[Any]] = sorted(
+    funcs: list[list[Any]] = sorted(
         [
             [s[0], s[1], 0]
             for s in symbols
@@ -255,7 +255,7 @@ def patch_windows_gnu_relocs(
     if funcs:
         funcs[-1][2] = 0x7FFFFFFF
 
-    def owning(r_off: int) -> Optional[List[Any]]:
+    def owning(r_off: int) -> list[Any] | None:
         lo, hi = 0, len(funcs)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -269,7 +269,7 @@ def patch_windows_gnu_relocs(
                 return f
         return None
 
-    univ_got: List[int] = []
+    univ_got: list[int] = []
     for tsec, r_off, r_type, symname, add, shndx in all_relocs:
         if tsec == ".ltext" and r_type == _R_X86_64_GOTPC64:
             imm64 = struct.unpack_from(
@@ -286,7 +286,7 @@ def patch_windows_gnu_relocs(
 
     first_univ = univ_got[0] if univ_got else None
 
-    def decode_gotbase(faddr: int, func_size: int) -> Optional[int]:
+    def decode_gotbase(faddr: int, func_size: int) -> int | None:
         if not faddr:
             return None
         n = min(func_size, 160)
@@ -308,7 +308,7 @@ def patch_windows_gnu_relocs(
             i += 1
         return None
 
-    func_got: Dict[str, int] = {}
+    func_got: dict[str, int] = {}
     for f in funcs:
         g = decode_gotbase(
             (ltext_base + f[1]) & 0xFFFFFFFFFFFFFFFF,
@@ -317,7 +317,7 @@ def patch_windows_gnu_relocs(
         if g is not None:
             func_got[f[0]] = g
 
-    gotoff_fix: Dict[int, int] = {}
+    gotoff_fix: dict[int, int] = {}
     for tsec, r_off, r_type, symname, add, shndx in all_relocs:
         if not (tsec == ".ltext" and r_type == _R_X86_64_GOTOFF64 and shndx == 0):
             continue

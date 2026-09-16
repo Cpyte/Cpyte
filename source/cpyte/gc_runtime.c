@@ -14,6 +14,9 @@
  * License: BSD-2-Clause (ugc) + project license
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #define UGC_IMPLEMENTATION
 #define UGC_USE_TAGGED_POINTER 0
 #include <stddef.h>

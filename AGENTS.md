@@ -517,3 +517,30 @@ corpus (8/8) green on macOS arm64 after these changes.
   credential bypass).
 
 ## v4.2.0/v4.2.1 release process recap (all stashes applied + published)
+
+## v4.2.5 release (Sept 2026, Linux JIT TLS-lowering bugfix)
+
+- **`LLVM ERROR: allocation of TLS not implemented` (SIGABRT) on Linux JIT —
+  every program.** The GC runtime's TLAB used native TLS
+  (`static __thread tlab_t tlab` in the Linux branch of `gc_runtime.c`).
+  clang lowers `__thread` to a `thread_local` LLVM global, and RuntimeDyld
+  (llvmlite MCJIT) refuses to allocate one. Since the JIT links
+  `gc_runtime.c` into EVERY program (compiling.py ~1192), every Linux JIT run
+  aborted with exit -6 at module emission — the fuzzer's A/B run against
+  v4.2.4 (the first version that compiled on Ubuntu, after the v4.2.4
+  `_GNU_SOURCE` fix) surfaced all 6 seeds identically. macOS never hit it: the
+  `__APPLE__` branch already backed the TLAB with a pthread key
+  (`pthread_getspecific`/`setspecific`) to dodge the TLVP relocation. Fix:
+  drop the `__thread` branch and use the pthread-key approach for ALL POSIX
+  platforms (`#ifdef _WIN32` keeps `__declspec(thread)`). The emitted IR is
+  now TLS-free on Linux/macOS/BSD; `grep -c thread_local <gc_runtime.ll>` == 0.
+  The AOT path is unaffected (pthread keys work natively). Parallel compile of
+  the forced-Linux branch (`clang -fsyntax-only -U__APPLE__
+  -D_GNU_SOURCE gc_runtime.c`) is clean, and macro `-U__APPLE__` runs the same
+  `#else` code as macOS. Window: consistent with the JIT-protocol comment —
+  Windows native TLS is kept (no POSIX threads); its winjit path was already
+  TLS-avoiding elsewhere.
+- Release: v4.2.5. CI corpus 22/22; wheel verified (version 4.2.5 + the
+  packaged `gc_runtime.c` has no `__thread`); fresh-venv JIT PUSH
+  `test/test_del_gc_new.cpy` prints `99 0 7 0 5`. Tagged `v4.2.5`, pushed to
+  `github` + `origin` (gitea), published to PyPI + gitea registry.

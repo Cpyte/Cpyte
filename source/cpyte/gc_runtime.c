@@ -115,16 +115,19 @@ typedef struct {
 
 /* Thread-local storage for TLAB.
  *
- * Windows and Linux use native TLS (`__declspec(thread)` / `__thread`).
- * macOS must NOT: the JIT path compiles this file to LLVM IR and emits a
- * Mach-O object via llvmlite's MCJIT, which cannot encode the TLVP
- * relocation that `__thread` lowers to (ARM64_RELOC_TLVP_LOAD_PAGEOFF12).
- * On Apple we back the per-thread TLAB with a pthread key instead, so the
- * emitted object is TLS-free and each thread still gets its own buffer. */
+ * Native TLS (`__declspec(thread)` / `__thread`) is avoided on every POSIX
+ * platform: the JIT path compiles this file to LLVM IR and emits a native
+ * object via llvmlite's MCJIT, and the compiler lowers native TLS to a
+ * `thread_local` LLVM global, which RuntimeDyld refuses to allocate
+ * (`LLVM ERROR: allocation of TLS not implemented`; on macOS arm64 it would
+ * also require the TLVP relocation ARM64_RELOC_TLVP_LOAD_PAGEOFF12). We back
+ * the per-thread TLAB with a pthread key instead, so the emitted object is
+ * TLS-free and each thread still gets its own buffer. Windows keeps native
+ * TLS (no POSIX threads available). */
 #ifdef _WIN32
 __declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
 #  define TLAB_GET() (&tlab)
-#elif defined(__APPLE__)
+#else
 static pthread_key_t  tlab_key;
 static pthread_once_t tlab_key_once = PTHREAD_ONCE_INIT;
 static void tlab_key_create(void) { pthread_key_create(&tlab_key, NULL); }
@@ -138,22 +141,19 @@ static tlab_t* tlab_get(void) {
     return tl;
 }
 #  define TLAB_GET() tlab_get()
-#else
-static __thread tlab_t tlab = {NULL, NULL, NULL};
-#  define TLAB_GET() (&tlab)
 #endif
 
 static void* tlab_alloc(size_t size) {
     /* Round up to pointer alignment */
     size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
-    
+
     if (TLAB_GET()->start == NULL || TLAB_GET()->current + size > TLAB_GET()->end) {
         /* TLAB exhausted or not initialized: allocate new block from global heap */
         size_t block_size = (size > TLAB_SIZE) ? size : TLAB_SIZE;
-        
+
         gc_lock_init();
         CPY_MUTEX_LOCK(&gc_lock_);
-        
+
         /* Allocate the TLAB block through the normal GC path */
         cpyte_obj_t* hdr = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + block_size);
         if (hdr == NULL) {
@@ -163,14 +163,14 @@ static void* tlab_alloc(size_t size) {
         hdr->size = block_size;
         ugc_register(&gc, &hdr->base);
         obj_track(hdr);
-        
+
         CPY_MUTEX_UNLOCK(&gc_lock_);
-        
+
         TLAB_GET()->start = PAYLOAD(hdr);
         TLAB_GET()->end = TLAB_GET()->start + block_size;
         TLAB_GET()->current = TLAB_GET()->start;
     }
-    
+
     /* Bump-pointer allocation (lock-free) */
     void *ptr = TLAB_GET()->current;
     TLAB_GET()->current += size;
@@ -386,7 +386,7 @@ void gc_init(void) {
             if (v > 0) gc_threshold = v;
         }
     }
-    
+
     /* Initialize TLAB for the current thread */
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
@@ -406,7 +406,7 @@ void* gc_malloc(size_t size) {
             return ptr;
         }
     }
-    
+
     /* Fallback to global allocation for large objects or TLAB failure */
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
@@ -540,7 +540,7 @@ void gc_shutdown(void) {
         }
         obj_table[i] = NULL;
     }
-    
+
     /* Reset TLAB for current thread */
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;

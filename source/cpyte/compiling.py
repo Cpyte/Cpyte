@@ -545,6 +545,26 @@ def _load_libc():
 
 
 _libc = _load_libc()
+
+
+def _load_optional_lib(*names):
+    for _n in names:
+        if not _n:
+            continue
+        try:
+            return ctypes.CDLL(_n)
+        except OSError:
+            continue
+    return None
+
+
+_libm = _load_optional_lib(
+    ctypes.util.find_library("m"), "libm.so.6", "/usr/lib/libm.so", "libm.dylib"
+)
+_libgcc = _load_optional_lib(
+    ctypes.util.find_library("gcc_s"), "libgcc_s.so.1", "/usr/lib/libgcc_s.so.1"
+)
+_process_libs = tuple(lib for lib in (_libc, _libm, _libgcc) if lib is not None)
 _libc.strlen.argtypes = [ctypes.c_char_p]
 _libc.strlen.restype = ctypes.c_int
 _libc.memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
@@ -1496,8 +1516,11 @@ def run_jit(
     try:
         fn = mod.get_function("strcmp")
         engine.add_global_mapping(fn, _libc_addr("strcmp"))
+        _explicit_mapped.add("strcmp")
     except NameError:
         pass
+
+    _map_process_libc(engine, mod)
 
     engine.finalize_object()
     if _use_windows_gnu():
@@ -1579,6 +1602,9 @@ def _libc_addr(name):
     return ctypes.cast(getattr(_libc, name), ctypes.c_void_p).value
 
 
+_explicit_mapped = set()
+
+
 def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
     """Map an external libc symbol in the JIT module to its raw native address.
 
@@ -1591,6 +1617,49 @@ def _map_libc_fn(engine, mod, name, argtype, restype, argtypes=None):
     except NameError:
         return
     engine.add_global_mapping(fn, _libc_addr(name))
+    _explicit_mapped.add(name)
+
+
+def _map_process_libc(engine, mod):
+    """Resolve every external C symbol the runtime/bignum helpers reference.
+
+    RuntimeDyld's in-process symbol lookup is unreliable on Linux: llvmlite
+    returns a NULL address for libc functions (printf, fputs, putchar, ...),
+    and MCJIT leaves an unresolved external at address 0. A runtime helper
+    such as print_int (whose C body calls printf) then jumps to NULL and the
+    process SIGSEGVs before producing any output. Map each external
+    declaration we can find in the loaded C runtime / libm / process image to
+    its real address. LLVM intrinsics (``llvm.*``) are lowered by the backend
+    and are deliberately skipped.
+    """
+    libs = list(_process_libs)
+    try:
+        libs.append(ctypes.CDLL(None))
+    except OSError:
+        pass
+    mapped = set()
+    for fn in mod.functions:
+        if not fn.is_declaration:
+            continue
+        name = fn.name
+        if name.startswith("llvm.") or name in mapped or name in _explicit_mapped:
+            continue
+        for lib in libs:
+            try:
+                sym = getattr(lib, name)
+            except AttributeError:
+                continue
+            try:
+                addr = ctypes.cast(sym, ctypes.c_void_p).value
+            except (TypeError, ValueError):
+                continue
+            if addr:
+                mapped.add(name)
+                try:
+                    engine.add_global_mapping(fn, addr)
+                except Exception:
+                    pass
+                break
 
 
 def run_aot(

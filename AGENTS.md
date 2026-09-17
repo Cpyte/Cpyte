@@ -1,5 +1,32 @@
 # Notes
 
+## v4.2.6 release (Sept 2026, Linux JIT NULL-symbol fix)
+
+- **The v4.2.5 wheel was stale: shipped with the gc_runtime pthread-key TLS fix
+  but WITHOUT the `_map_process_libc` Linux symbol-mapping fix** (an uncommitted
+  change in `compiling.py` at wheel-build time). On Linux/BSD JIT the result was
+  a silent `SIGSEGV` (RIP=0, call through NULL): RuntimeDyld's in-process lookup
+  returns address 0 for libc externals (`printf`, `fputs`, `putchar`, ...), so
+  `print_int` (whose C body calls `printf`) jumped to NULL before producing any
+  output. Bare llvmlite JIT tests passed; every program failed; `--nogc` did not
+  help (runtime.c is still linked).
+- **Fix (committed in v4.2.6, `compiling.py`): `_map_process_libc` maps EVERY
+  external C declaration in the JIT module to its real address**
+  (`ctypes.CDLL(None)` + libc/libm/libgcc_s) via `engine.add_global_mapping`
+  BEFORE `finalize_object()`. `_process_libs` collects libc/libm/libgcc_s at
+  import (`_libm`/`_libgcc` added); `_explicit_mapped` records the few libc
+  symbols `_map_libc_fn` already handles (malloc/free/realloc/calloc/strlen/
+  memcpy/atoi/atof/strcmp) so they are not double-mapped. LLVM `llvm.*`
+  intrinsics are skipped (lowered by the backend).
+- **Verified in a fresh `linux/amd64` container** (the fuzzer's target, Rosetta
+  under Docker Desktop): hello prints `42` exit 0; `--opt 3` + GC prints
+  `4950`/`10968163441`; native arm64-Linux JIT remains unsupported by MCJIT
+  (deterministic SIGSEGV, out of scope). Wheel verified standalone in the
+  container venv before publish.
+- Release: v4.2.6 tagged `v4.2.6`, pushed to `github` + `origin` (gitea route
+  needs the credential-bypass push), published to PyPI + gitea registry.
+  CI corpus 22/22.
+
 ## Sept 2026 `del` / `has` / `get_attr` language features
 
 Three Python-flavored features shipped together (parser `DelStmt`, semantic

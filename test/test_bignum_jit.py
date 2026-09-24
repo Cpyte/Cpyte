@@ -60,5 +60,33 @@ import ctypes
 
 fn = ctypes.CFUNCTYPE(ctypes.c_int)(engine.get_function_address("main"))
 print("Running main...", flush=True)
-result = fn()
+# bigint_print writes through libc printf/putchar (fd 1), not sys.stdout, so
+# capture at the descriptor level with dup2 rather than Python stream objects.
+import os
+import tempfile
+
+with tempfile.NamedTemporaryFile(delete=False) as cap:
+    cap_name = cap.name
+cap_fd = os.open(cap_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+saved = os.dup(1)
+os.dup2(cap_fd, 1)
+try:
+    result = fn()
+    ctypes.CDLL(None).fflush(
+        None
+    )  # flush libc stdout while fd 1 points at the capture file
+finally:
+    os.dup2(saved, 1)
+    os.close(cap_fd)
+    os.close(saved)
+with open(cap_name, "r") as cap:
+    out = cap.read()
+os.unlink(cap_name)
 print("Result:", result)
+# Regression: bignum.c bigint_print used to omit the trailing \n, fusing runs
+# together while print_int/print_str emit a newline. Every bigint_print call
+# must end with a newline.
+if not out.endswith("\n"):
+    print(f"FAIL: bigint_print output missing trailing newline: {out!r}")
+    sys.exit(1)
+print("Newline check OK:", repr(out))

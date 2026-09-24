@@ -305,7 +305,7 @@ void* bigint_div(void* a, void* b) {
         }
         v->limbs[y->used] = carry;
         v->used = y->used + (carry ? 1 : 0);
-        
+
         carry = 0;
         u->limbs[0] = 0; // leading zero for Knuth-D
         for (size_t i = 0; i < x->used; i++) {
@@ -331,7 +331,7 @@ void* bigint_div(void* a, void* b) {
     r->used = q_len;
 
     uint64_t v_top = v->limbs[v->used - 1];
-    
+
     for (size_t j = q_len; j > 0; j--) {
         size_t idx = j - 1;
         size_t u_idx = idx + v->used;
@@ -514,10 +514,11 @@ int bigint_cmp(void* a, void* b) {
 
 void bigint_print(void* p) {
     BigNum* b = (BigNum*)p;
-    if (!b) { printf("(null)"); return; }
+    if (!b) { printf("(null)\n"); return; }
     if (b->negative) putchar('-');
     if (b->used == 1 && b->limbs[0] == 0) {
         putchar('0');
+        printf("\n");
         return;
     }
     size_t max_digits = b->used * 20 + 1;
@@ -544,7 +545,7 @@ void bigint_print(void* p) {
         _bn_trim(&tmp);
     }
     free(tmp.limbs);
-    printf("%s", buf + pos);
+    printf("%s\n", buf + pos);
     free(buf);
 }
 

@@ -1,96 +1,195 @@
 struct S1:
-    uint64 data
-    int64 x
-    uint64 key
-    int64 value
-    str left
+    str next
+    big x
+    int64 name
+    double head
 
-char g2 = "a"
-int g3 = (62821118 // (13928853483667239305 ^ (42 * -803577150)))
-big g4 = 623328414074251618045229299862
+struct S2:
+    char key
+    uint64 name
+    uint64 left
+    char value
+    big x
+    int tail
+
+uint64 g3 = 14328958268677676706
+uint64 g4 = g3
+int g5 = (g3 << 1807633257)
+int g6 = (g3 / 627721149)
 
 def main() -> int:
-    int w5 = 1
-    while (((((358286710 - ~(g3 // g3)) + g3) >= 340282366920938463463374607431768211456)) and (w5 > 0)):
-        w5 = w5 - 1
-        int w6 = 1
-        while (((3.14159 > 42169.013343)) and (w6 > 0)):
-            w6 = w6 - 1
-            int w7 = 3
-            while (((g3 or (g4 and g4))) and (w7 > 0)):
-                w7 = w7 - 1
-                g3 = 5
-                int w8 = 3
-                while (((g4 < 354583259999935616048225858260)) and (w8 > 0)):
-                    w8 = w8 - 1
-                    print(0)
-                for v9 in '12345':
-                    g4 = g4
-                g2 = g2
-            int64 v10 = -(2147483648 ^ g3)
-            for v11 in '\\t':
-                int w12 = 1
-                while (((v10 <= 10000000000000000000)) and (w12 > 0)):
-                    w12 = w12 - 1
-                    uint64 v13 = g3
-                    char v14 = g2
-                    print((750196961 >> v10))
-                char* v15 = (new char)
-                return 0
-            g2 = g2
-        if (905184566471333601 ^ 1624693287):
-            17987335051318189998
-            return 0
+    if (new int[8]):
+        return 0
+    for v7 in 'abc':
+        if ((g6 != g6) and g3):
+            9999999999999999.0
         else:
-            if ((not g4 < g4) or (9223372036854775808 and 3.14159)):
-                g2 = "a"
-                float v16 = (-1.0 / -46830.658952)
-                for v17 in 'abc':
-                    str v18 = "nQMCM"
-                    float v19 = (v16 - v16)
-                    v17 = "c"
-                    if g2:
-                        return 0
-                    else:
-                        str v20 = v18
-                        v17 = g2
-                    for v21 in 'x':
-                        for v22 in '12345':
-                            uint64 v23 = g3
-                        int v24 = g2
-                        v21 = v21
-                        for v25 in '':
-                            for v26 in 'abc':
-                                print(0)
-                            int w27 = 4
-                            while ((v21) and (w27 > 0)):
-                                w27 = w27 - 1
-                                print(0)
-                            for v28 in 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa':
-                                print(0)
-                    v16 *= v16
-            if (82624.461347 < 3.14159):
-                print(0)
+            char* v8 = (new char)
+        if ("frUS" <= ""):
+            if (-42 >= 42):
+                g5 //= (1768252413975103627 % (g3 % g3))
+                print(("Jgqo R" + "H"))
+                v7 = v7
             else:
-                g4 = 706578800818773261232534183426
-                print((g3 // g3))
-                for v29 in 'hello world':
-                    str* v30 = (new str)
-                    for v31 in 'hello world':
-                        g4 += g4
-                        for v32 in 'hello world':
+                g3 = (13293782378847247686 << (g5 + g4))
+            g6 = g5
+            int64 v9 = g4
+            double v10 = (1.0 + (61569.058634 * (123.456 + -47148.988200)))
+        else:
+            int w11 = 3
+            while (((g6 != 1137466235)) and (w11 > 0)):
+                w11 = w11 - 1
+                double v12 = ((9999999999999999.0 + 1857.799971) + -61843.160860)
+                if (9223372036854775808 >> (g6 >> g6)):
+                    int64 v13 = -g3
+                    if -v13:
+                        for v14 in '12345':
+                            print(v12)
+                            g6 -= g3
+                        uint64 v15 = v13
+                    print(123.456)
+                    g5
+                else:
+                    sizeof(g6)
+                    g4
+                double v16 = v12
+                float v17 = (v16 - v16)
+                return 0
+            g6 = ((g3 * g5) / g3)
+            if ((~g3 / 280483276) != 5):
+                g4 += not 2
+                if (60711.825859 <= (2.71828 - 1.5)):
+                    g6 = g3
+                    int64 v18 = (g3 + g3)
+                    int64 v19 = (g6 % g3)
+                int w20 = 4
+                while ((g5) and (w20 > 0)):
+                    w20 = w20 - 1
+                    uint64 v21 = g3
+                    int w22 = 3
+                    while ((g5) and (w22 > 0)):
+                        w22 = w22 - 1
+                        int w23 = 3
+                        while ((g6) and (w23 > 0)):
+                            w23 = w23 - 1
+                            print(g3)
+                            char v24 = v7
+                            int w25 = 2
+                            while ((v21) and (w25 > 0)):
+                                w25 = w25 - 1
+                                print(0)
+                            str v26 = v7
+                        v21 -= g6
+            print(g6)
+        g5 = g4
+        if ((g4 % g6) == 18446744073709551615):
+            if (4294967296 and g5):
+                int64 v27 = g5
+                (g4 << 1591543620)
+                v7 = "x"
+                if (new str[1]):
+                    uint64 v28 = (g5 >> g4)
+                    return 0
+            for v29 in 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa':
+                g5 = g3
+                if v29:
+                    uint64 v30 = 10330590589573270285
+                    int64 v31 = 885851047552152997
+                    if (g3 // v30):
+                        int w32 = 4
+                        while ((g5) and (w32 > 0)):
+                            w32 = w32 - 1
+                            if g4:
+                                print(0)
+                            else:
+                                print(0)
+                            char v33 = v29
+                            v30 = g3
+                        g5 = g3
+                    for v34 in 'x':
+                        big v35 = v30
+                        return 0
+            g4 = 11508010946442311837
+            if g6:
+                g6 = g6
+                if ((g4 / g4) and -78849.803696):
+                    g6
+                    g5 = g3
+                    if 0.0:
+                        print(g3)
+                        if g6:
+                            char v36 = v7
+                            for v37 in 'x':
+                                print(0)
+                            print(g6)
+                        else:
+                            for v38 in 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa':
+                                print(0)
+                            g5 = g5
+                            print(g5)
+                        v7
+                        g6
+                    else:
+                        int64** v39 = (new int64*)
+                        if g6:
+                            g4 = g5
+                        g6
+                        g5
+                        print(g5)
+                        double v40 = 41476.226280
+                        int64 v41 = g3
+                    if g6:
+                        v7 = v7
+                        double v42 = 0.0
+                    (g4 % g4)
+                g5 = not (100 << g6)
+                int w43 = 2
+                while ((((g3 % g6) or g3)) and (w43 > 0)):
+                    w43 = w43 - 1
+                    ("b8JZwA+" + "cTd=zr")
+                    v7 = "c"
+            print((-51540.403807 / ((2.71828 * 123.456) * (0.5 * 14349.155966))))
+            g6 = ((g3 - g6) - g6)
+        else:
+            if (((-9641.454955 - -5878.110503) < -71204.883367) and not -g3):
+                g6 //= g4
+                int w44 = 2
+                while (((-18035.167651 <= -76977.583021)) and (w44 > 0)):
+                    w44 = w44 - 1
+                    if (2.71828 - 9999999999999999.0):
+                        v7
+                        g6
+                        big v45 = g3
+                    else:
+                        g5 = g3
+                        uint64 v46 = g3
+                    if -g3:
+                        v7 = v7
+                    else:
+                        for v47 in '!@#$%^&*()':
                             print(g4)
-                            g4 = g3
-                            g2 = g2
-                    char v33 = g2
-                print(-g4)
-                if (736289122235763292388954747073 < (g4 // g3)):
-                    g2 = "a"
-                    print((1.0 * 0.5))
+                            print(g5)
+                            int v48 = g6
+                        print(g4)
                     print(g4)
-            print(g3)
-        print(11758079004579087967)
-        if ((g4 and (g4 or sizeof(char))) and g2):
-            big v34 = g4
-            g2 = "a"
+            float v49 = 42616.234070
+        for v50 in 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa':
+            g4
+            big v51 = g3
+            int w52 = 4
+            while (((g3 >> 2)) and (w52 > 0)):
+                w52 = w52 - 1
+                int v53 = v7
+                g5 = g6
+                g4
+                double v54 = (24326.074759 - -(-1.0))
+                v53 = 1063134375
+            float v55 = (-2.71828 * 0.5)
+            v50 = v50
+            g3 = g5
+            if ((-g3 >= 569236804) and g3):
+                str v56 = "q5djPsSFzV"
+            else:
+                if (v55 >= 0.5):
+                    int64 v57 = (g6 + g6)
     return 0

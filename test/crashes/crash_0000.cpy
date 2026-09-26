@@ -1,13 +1,16 @@
-big* g1 = (new big)
-big g2 = ((((9223372036854775807 | 16580181462776082358) + (17179850520605114899 >> -42)) // 3717972343879128598) + (-(((11354402974245751 // 6604403564394189884) + not g1) / (9223372036854775808 >> -0)) * (15819310897189086200 & (4294967296 % (~1 // 1519938463)))))
+struct S1:
+    float x
+    str prev
+    float value
+
+float g2 = (-90728.718579 * (-58847.817606 * -(((-36751.948830 - 1.5) / 71919.867702) - -6597.292403)))
+int g3 = sizeof(g2)
 
 def main() -> int:
-    int w3 = 4
-    while ((((10238373542742509812 <= 14925633614627394926) or ("" != "bZz5NZ68"))) and (w3 > 0)):
-        w3 = w3 - 1
+    for v4 in 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa':
         print(0)
-    for v4 in '!@#$%^&*()':
-        v4 = v4
-        uint64 v5 = 10000000000000000000
-        return 0
+    g3 = 1000000
+    g2 = g2
+    char v5 = "a"
+    g3 = -g3
     return 0

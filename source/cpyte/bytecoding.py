@@ -200,7 +200,9 @@ def _emit_children(node) -> list:
     if isinstance(node, Attr):
         return [node.obj]
     if isinstance(node, NewExpr):
-        return [node.size] if node.size is not None else []
+        children = [node.size] if node.size is not None else []
+        children.extend(node.args or [])
+        return children
     if isinstance(node, Call):
         if (
             isinstance(node.callee, Variable)
@@ -208,6 +210,22 @@ def _emit_children(node) -> list:
             and getattr(node, "meta", None)
         ):
             return []
+        if (
+            isinstance(node.callee, Variable)
+            and node.callee.name == "isinstance"
+            and getattr(node, "meta", None)
+        ):
+            # The class-name argument is not an expression; only the object
+            # expression is emitted.
+            return [node.args[0]] if node.args else []
+        if (
+            isinstance(node.callee, Attr)
+            and isinstance(node.callee.obj, Variable)
+            and node.callee.obj.name == "super"
+        ):
+            # `super.method(...)` is a static base-class call; the `super`
+            # receiver is not a real expression to emit.
+            return list(node.args)
         children = []
         if isinstance(node.callee, Attr):
             children.append(node.callee.obj)
@@ -218,6 +236,8 @@ def _emit_children(node) -> list:
     if isinstance(node, ExprStmt):
         return [node.expr]
     if isinstance(node, CastExpr):
+        return [node.expr]
+    if isinstance(node, AsExpr):
         return [node.expr]
     if isinstance(node, ListLit):
         return list(node.items)
@@ -747,6 +767,14 @@ class LLVM:
         self._decorator_skip = False  # Flag to skip original function
         self.generic_instantiations = {}  # name -> [(type_args_tuple, ...)]
         self._struct_nodes = {}  # name -> StructDef AST node (for generic resolution)
+        # Class-vtable machinery (Stage 1 OOP): virtualness, flattened method
+        # slots, vtable struct types/globals and per-class type ids.
+        self._class_virtual = {}  # name -> bool (hierarchy has a vtable)
+        self._class_slot_cache = {}  # name -> [(method_name, defining_class)]
+        self._vt_types = {}  # name -> ir.LiteralStructType of the vtable
+        self._vt_globals = {}  # name -> ir.GlobalVariable of the vtable
+        self._vt_slots = {}  # name -> {method_name: (slot_index, fnty)}
+        self._class_ids = {}  # name -> int (O(1) RTTI for isinstance, stage 3)
         self._emit_depth = 0
         self._emit_memo = {}
         self._in_emit_iterative = False
@@ -1430,6 +1458,11 @@ class LLVM:
                 except Exception:
                     pass
 
+        if os.environ.get("CPYTE_JIT_DEBUG"):
+            import sys as _sys
+            print("[bytecoding] runtime hooks:", [h.name for h in self._hook_registry.get(HookStage.RUNTIME)], file=_sys.stderr)
+            print("[bytecoding] import_src_files:", self.import_src_files, file=_sys.stderr)
+
         for node in structs:
             if isinstance(node, ClassDef):
                 continue
@@ -1445,6 +1478,10 @@ class LLVM:
 
         for node in imports:
             self.emit(node)
+
+        # All classdefs (local + imported) are registered now: their vtable
+        # class ids are final, so the RTTI ancestor grid can be materialized.
+        self._emit_ancestor_grid()
 
         # Emit all ccode/llvm blocks before function definitions so that
         # ccode-declared and llvm-declared functions are available to every
@@ -2014,40 +2051,84 @@ class LLVM:
 
     @register_emitter(ClassDef)
     def emit_classdef(self, node: ClassDef):
-        """Emit a class as a struct with methods as functions having a hidden 'this' pointer."""
+        """Emit a class as a struct with methods as functions having a hidden
+        'this' pointer.
+
+        A *non-sealed* class hierarchy carries a vtable: an `i8*` type-pointer
+        stored at field 0 (the synthetic `@vptr` sentinel in `struct_fields`)
+        that points to a per-class vtable global whose field 0 is the class id
+        (RTTI for `isinstance`) and whose remaining slave slots are the virtual
+        method pointers. Method calls then dispatch through the receiver's own
+        vtable, so a `Base*` holding a `Child` calls `Child`'s override.
+        `sealed` classes keep the old zero-cost static dispatch (no vptr)."""
         self._struct_nodes[node.name] = node
-        # Collect all fields (including inherited)
+        # Virtualness is a hierarchy property: the (sealed) root decides. A
+        # sealed class may only sit in a fully sealed chain (validated in
+        # semantic), so re-deriving it here is safe.
+        if node.base and node.base in self._class_virtual:
+            virtual = self._class_virtual[node.base]
+        else:
+            virtual = not node.sealed
+        self._class_virtual[node.name] = virtual
+        # Collect all fields (including inherited). The synthetic `@vptr` slot
+        # lives at index 0 of `struct_fields` for the root of a virtual
+        # hierarchy, so every index-based field lookup / GEP below stays
+        # correct against the shifted offsets. Its type resolves through
+        # `llvm_type("void*")` == _i8ptr.
         all_fields = []
         if node.base and node.base in self.struct_fields:
             all_fields.extend(self.struct_fields[node.base])
         all_fields.extend(node.fields)
-        # Generate struct type
-        field_tys = [self.llvm_type(f.type_expr) for f in all_fields]
-        if field_tys or all_fields:
-            llvm_struct = self.structs.get(node.name)
-            if llvm_struct is None or not isinstance(
-                llvm_struct, ir.IdentifiedStructType
-            ):
-                # Pre-register an opaque identified struct BEFORE resolving field
-                # types so self-referential fields resolve to a pointer to this
-                # type instead of silently degrading to `i32`. get_identified_type
-                # registers into the module's context so the definition is
-                # serialized into the IR.
-                llvm_struct = self.module.context.get_identified_type(
-                    f"class.{node.name}"
-                )
-                self.structs[node.name] = llvm_struct
+        index_fields = all_fields
+        if virtual and not node.base:
+            index_fields = [Field("@vptr", "void*", token=node._token)] + all_fields
+        field_tys = [self.llvm_type(f.type_expr) for f in index_fields]
+        llvm_struct = self.structs.get(node.name)
+        if llvm_struct is None or not isinstance(
+            llvm_struct, ir.IdentifiedStructType
+        ):
+            # Pre-register an opaque identified struct BEFORE resolving field
+            # types so self-referential fields resolve to a pointer to this
+            # type instead of silently degrading to `i32`. get_identified_type
+            # registers into the module's context so the definition is
+            # serialized into the IR. Fieldless sealed classes still register
+            # (as an empty struct) so `new T` can allocate them.
+            llvm_struct = self.module.context.get_identified_type(
+                f"class.{node.name}"
+            )
+            self.structs[node.name] = llvm_struct
+        if field_tys or index_fields:
             if llvm_struct.is_opaque:
                 llvm_struct.set_body(*field_tys)
-            self.struct_fields[node.name] = all_fields
-        # Emit methods — each gets a hidden 'this' pointer as first parameter
+            self.struct_fields[node.name] = index_fields
+        # Phase 1: declare method headers (so the vtable can reference their
+        # addresses before any method body is emitted — `new X` inside a
+        # method of X needs the vtable global to exist).
         for m in node.methods:
-            self._emit_class_method(node, m, all_fields)
-            # Emit inherited methods (call through to base class implementation)
+            self._declare_class_method(node, m)
+        # Phase 2: build the vtable (needs the header functions only).
+        if virtual:
+            self._emit_class_vtable(node)
+        # Phase 3: emit method bodies.
+        for m in node.methods:
+            self._emit_class_method(node, m, index_fields)
+        # Phase 4: property accessors (static `Class.prop.get`/`Class.prop.set`).
+        # Navigated by name from the defining class, so redefinitions in a
+        # child (which ship their own PropertyDef) resolve to the child's own.
+        for p in getattr(node, "properties", None) or ():
+            for acc in (p.get, p.set):
+                if acc is None:
+                    continue
+                self._declare_class_method(node, acc)
+                self._emit_class_method(node, acc, index_fields)
+        # Emit inherited methods (static-dispatch wrappers that bitcast the
+        # child pointer to the base type and forward to the base body).
         if node.base:
             for fname, fobj in list(self.functions.items()):
                 if fname.startswith(node.base + "."):
                     method_name = fname[len(node.base) + 1 :]
+                    if "." in method_name:
+                        continue
                     child_name = f"{node.name}.{method_name}"
                     if child_name not in self.functions:
                         # Create a wrapper that bitcasts the child pointer to base type
@@ -2068,6 +2149,81 @@ class LLVM:
                         else:
                             wb.ret(ret)
                         self.functions[child_name] = wrapper
+
+    def _declare_class_method(
+        self, class_node: ClassDef, method: FuncDef
+    ):
+        """Create the `Class.method` header function if it doesn't exist yet."""
+        class_ty = self.structs.get(class_node.name)
+        if class_ty is None:
+            return
+        this_ty = ir.PointerType(class_ty)
+        non_this_params = {k: v for k, v in method.params.items() if k != "this"}
+        param_tys = [this_ty] + [self.llvm_type(t) for t in non_this_params.values()]
+        ret_ty = self.llvm_type(method.rettype or "void")
+        func_name = f"{class_node.name}.{method.name}"
+        if func_name in self.functions:
+            return
+        fnty = ir.FunctionType(ret_ty, param_tys)
+        self.functions[func_name] = ir.Function(self.module, fnty, func_name)
+
+    def _class_slot_list(self, cls: str) -> list:
+        """Flattened virtual method list for a class: base slots first (stable
+        index = slot position), own methods override in place or append."""
+        cached = self._class_slot_cache.get(cls)
+        if cached is not None:
+            return cached
+        node = self._struct_nodes.get(cls)
+        if node is None:
+            return []
+        result = []
+        if node.base:
+            result = list(self._class_slot_list(node.base))
+        for m in node.methods:
+            if m.name == "__init__":
+                continue
+            found = None
+            for i, (n, _d) in enumerate(result):
+                if n == m.name:
+                    found = i
+                    break
+            if found is not None:
+                result[found] = (m.name, cls)
+            else:
+                result.append((m.name, cls))
+        self._class_slot_cache[cls] = result
+        return result
+
+    def _emit_class_vtable(self, node: ClassDef):
+        """Emit the per-class vtable global: `{i64 classid, (method ptrs)...}`.
+
+        Field 0 holds the O(1) class id (used by `isinstance` in stage 3); slot
+        i dispatches through field i+1. Every slot element type is the *base*
+        method signature (overrides are signature-checked in semantic), so no
+        constant function bitcast is ever needed.
+        """
+        cls = node.name
+        slots = self._class_slot_list(cls)
+        vt_ty = ir.LiteralStructType(
+            [_i64]
+            + [
+                self.functions[f"{d}.{n}"].function_type.as_pointer()
+                for n, d in slots
+            ]
+        )
+        cid = self._class_ids.setdefault(cls, len(self._class_ids))
+        cv = ir.GlobalVariable(self.module, vt_ty, name=f"vt.{cls}")
+        cv.initializer = ir.Constant(
+            vt_ty,
+            [ir.Constant(_i64, cid)]
+            + [self.functions[f"{d}.{n}"] for n, d in slots],
+        )
+        self._vt_types[cls] = vt_ty
+        self._vt_globals[cls] = cv
+        self._vt_slots[cls] = {
+            n: (i, self.functions[f"{d}.{n}"].function_type)
+            for i, (n, d) in enumerate(slots)
+        }
 
     def _emit_class_method(
         self, class_node: ClassDef, method: FuncDef, all_fields: list
@@ -2189,6 +2345,31 @@ class LLVM:
         malloc_fn = self._get_malloc_fn()
         ptr = self.builder.call(malloc_fn, [total_size])
         ptr = self.builder.bitcast(ptr, malloc_ty)
+        # Class instantiation: install the vtable pointer and run the
+        # constructor. `new X` (no parens) is a deliberate bare alloc that
+        # installs the vptr but skips `__init__`; `new X(...)` always calls it.
+        cls_node = self._struct_nodes.get(node.type_expr)
+        if isinstance(cls_node, ClassDef):
+            if self._class_virtual.get(node.type_expr):
+                vtp = self.builder.gep(
+                    ptr, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)], inbounds=True
+                )
+                self.builder.store(
+                    self.builder.bitcast(self._vt_globals[node.type_expr], _i8ptr),
+                    vtp,
+                )
+            init_fn = self.functions.get(f"{node.type_expr}.__init__")
+            if init_fn is not None:
+                init_args = [ptr]
+                ptypes = init_fn.function_type.args
+                for i, arg in enumerate(node.args or []):
+                    init_args.append(
+                        self._coerce_call_arg(
+                            self.emit(arg), ptypes[i + 1], getattr(arg, "inferred_type", None)
+                        )
+                    )
+                self.builder.call(init_fn, init_args)
+            return ptr
         # No registration needed - fallback path doesn't support iteration
         return ptr
 
@@ -2415,6 +2596,59 @@ class LLVM:
             )
         return self.builder.bitcast(val, target)
 
+    @register_emitter(AsExpr)
+    def emit_as(self, node: AsExpr):
+        """`x as T` — safe runtime downcast through the Stage-3 RTTI grid.
+
+        `node.meta` selects the shape:
+          * as_const  -> compile-time success (T at/above the static type) or
+                         null (sealed/monomorphic or unrelated hierarchies).
+          * as_runtime -> load the receiver's class id (vtable field 0) and
+                         compare against `anc.grid[rid][depth(T)]`, then select
+                         between the (re-typed) receiver and a typed null.
+        The receiver is computed with the same 3-way pushdown as
+        `_emit_isinstance`: a pointer value, a pointer-to-pointer variable
+        (load), or a class VALUE (address-of via `_emit_lvalue`).
+        """
+        meta = getattr(node, "meta", None) or {}
+        kind = meta.get("kind")
+        recv = self.emit(node.expr)
+        if isinstance(recv.type, ir.PointerType):
+            if isinstance(recv.type.pointee, ir.PointerType):
+                recv = self.builder.load(recv)
+        else:
+            recv = self._emit_lvalue(node.expr)
+        tptr = self.llvm_type(node.type_expr + "*")
+        null_t = ir.Constant(tptr, None)
+        if kind == "as_const":
+            if meta.get("value"):
+                return self.builder.bitcast(recv, tptr) if recv.type != tptr else recv
+            return null_t
+        if kind == "as_runtime":
+            self._emit_ancestor_grid()
+            grid = self._ancestor_grid
+            vptrp = self.builder.gep(
+                recv, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)], inbounds=True
+            )
+            vptr = self.builder.load(vptrp)
+            cidp = self.builder.bitcast(vptr, ir.PointerType(_i64))
+            rcid = self.builder.load(
+                self.builder.gep(cidp, [ir.Constant(_i32, 0)], inbounds=True)
+            )
+            id_t = self._class_ids.get(node.type_expr, -1)
+            depth_t = self._class_chain_depth.get(node.type_expr, 0)
+            stride = self._ancestor_stride
+            off = self.builder.add(
+                self.builder.mul(rcid, ir.Constant(_i64, stride)),
+                ir.Constant(_i64, depth_t),
+            )
+            row = self.builder.gep(grid, [ir.Constant(_i32, 0), off], inbounds=True)
+            anc = self.builder.load(row)
+            cond = self.builder.icmp_signed("==", anc, ir.Constant(_i64, id_t))
+            cast_recv = self.builder.bitcast(recv, tptr)
+            return self.builder.select(cond, cast_recv, null_t)
+        return recv
+
     @register_emitter(InlineAsm)
     def emit_inlineasm(self, node: InlineAsm):
         arg_tys = []
@@ -2461,6 +2695,19 @@ class LLVM:
                 or self._is_dynamic_expr(node.obj)
             ):
                 return self._emit_dyn_index(node)
+        cls = self._static_obj_class(node.obj)
+        if cls and self._dunder_fn_name(cls, "__getitem__") is not None:
+            obj_decl = None
+            if isinstance(node.obj, Variable):
+                obj_decl = self.local_types.get(node.obj.name)
+            obj_decl = obj_decl or getattr(node.obj, "inferred_type", None)
+            if not (obj_decl and str(obj_decl).endswith("[]")):
+                call = Call(
+                    Attr(node.obj, "__getitem__", token=getattr(node.obj, "_token", None)),
+                    [node.index],
+                    token=node._token,
+                )
+                return self.emit(call)
         ptr = self._emit_lvalue(node)
         return self.builder.load(ptr)
 
@@ -2521,6 +2768,9 @@ class LLVM:
 
     @register_emitter(Attr)
     def emit_attr(self, node: Attr):
+        meta = getattr(node, "meta", None) or {}
+        if meta.get("kind") == "prop_get":
+            return self._emit_prop_get(node)
         enum_val = getattr(node, "_enum_member_value", None)
         if enum_val is not None:
             return ir.Constant(ir.IntType(32), enum_val)
@@ -2593,6 +2843,9 @@ class LLVM:
             if base:
                 return self._base_type_name(base)
             return None
+        if isinstance(node, CastExpr):
+            # A cast names its target type explicitly (`(Animal*)dog` -> Animal).
+            return self._base_type_name(node.type_expr)
         return None
 
     def _emit_lvalue_attr(self, node: Attr):
@@ -2638,6 +2891,12 @@ class LLVM:
             return self._emit_lvalue_attr(node)
         if isinstance(node, Deref):
             return self.emit(node.operand)
+        if isinstance(node, CastExpr):
+            # A cast that yields a pointer IS the object address (e.g.
+            # `(Animal*)dog` in get_attr/field access).
+            val = self.emit(node)
+            if isinstance(val.type, ir.PointerType):
+                return val
         raise Exception("Cannot take address of expression")
 
     @register_emitter(FuncDef)
@@ -4330,8 +4589,118 @@ class LLVM:
         s1 = self.builder.shl(val, ir.Constant(t, 1))
         return self.builder.add(s3, s1)
 
+    _DUNDER_BINOPS = {
+        TokenType.PLUS: "__add__",
+        TokenType.MINUS: "__sub__",
+        TokenType.STAR: "__mul__",
+        TokenType.SLASH: "__truediv__",
+        TokenType.SLASH_SLASH: "__floordiv__",
+        TokenType.PERCENT: "__mod__",
+        TokenType.POW: "__pow__",
+        TokenType.LESS: "__lt__",
+        TokenType.LESS_EQ: "__le__",
+        TokenType.GREATER: "__gt__",
+        TokenType.GREATER_EQ: "__ge__",
+        TokenType.EQ_EQ: "__eq__",
+        TokenType.NOT_EQ: "__ne__",
+    }
+
+    def _static_obj_class(self, expr):
+        """Return the stripped class/struct base name of an expression's
+        compile-time type, or None when the type carries no class identity.
+        Mirrors the receiver-type probe of emit_call's method-dispatch path."""
+        if isinstance(expr, Variable):
+            t = self.local_types.get(expr.name) or getattr(expr, "inferred_type", None)
+        else:
+            t = getattr(expr, "inferred_type", None)
+            if t is None and hasattr(expr, "_inferred_type"):
+                t = expr._inferred_type
+        if not t:
+            return None
+        base = str(t).removesuffix("*").removesuffix("[]")
+        return base or None
+
+    def _dunder_fn_name(self, cls, dunder):
+        """Return the callable key for `cls.dunder`, or None when the class does
+        not define the dunder. Virtual classes answer from the vtable slot map,
+        sealed/monomorphic classes from the static function table."""
+        if dunder in self._vt_slots.get(cls, {}):
+            return dunder
+        mname = f"{cls}.{dunder}"
+        if mname in self.functions:
+            return mname
+        return None
+
+    def _coerce_call_arg(self, val, expected, inferred_type=None):
+        """Numeric/pointer coercion for a value about to be passed to a call.
+        Mirrors the essential coercions of the generic call path so synthesized
+        dunder method calls (which reuse method-dispatch) accept differently-
+        typed class pointers and integer/fp literals."""
+        if isinstance(expected, ir.PointerType):
+            if isinstance(val.type, ir.PointerType):
+                return self.builder.bitcast(val, expected) if val.type != expected else val
+            if isinstance(val.type, ir.IntType):
+                return self.builder.inttoptr(val, expected)
+            return val
+        if isinstance(expected, ir.IntType):
+            if isinstance(val.type, ir.IntType):
+                if val.type.width != expected.width:
+                    if val.type.width < expected.width:
+                        return self.builder.sext(val, expected)
+                    return self.builder.trunc(val, expected)
+                return val
+            if isinstance(val.type, ir.DoubleType) or isinstance(val.type, ir.FloatType):
+                return self.builder.fptosi(val, expected)
+            if isinstance(val.type, ir.PointerType) and expected.width >= 32:
+                return self.builder.ptrtoint(val, expected)
+            return val
+        if isinstance(expected, (ir.DoubleType, ir.FloatType)):
+            if isinstance(val.type, (ir.DoubleType, ir.FloatType)):
+                if val.type == expected:
+                    return val
+                if isinstance(expected, ir.DoubleType):
+                    return self.builder.fpext(val, expected)
+                return self.builder.fptrunc(val, expected)
+            if isinstance(val.type, ir.IntType):
+                return self.builder.sitofp(val, expected)
+            return val
+        if isinstance(expected, ir.IdentifiedStructType) and isinstance(
+            val.type, ir.PointerType
+        ):
+            # Class-VALUE method parameter: the signature holds the struct by
+            # value, but the caller passes a Class* pointer. Bitcast the pointer
+            # to the parameter's base struct, then load it (Python-style object
+            # argument). Sub-hierarchy pointers get a base cast first.
+            base_ptr = ir.PointerType(expected)
+            if val.type != base_ptr:
+                val = self.builder.bitcast(val, base_ptr)
+            return self.builder.load(val)
+        return val
+
+    def _try_dunder_binop(self, node):
+        """`left OP right` -> `left.__op__(right)` when the left operand's class
+        defines the operator dunder. Returns the emitted value, or None so the
+        caller falls through to the numeric/string/dynamic paths."""
+        dunder = self._DUNDER_BINOPS.get(node.op)
+        if dunder is None:
+            return None
+        cls = self._static_obj_class(node.left)
+        if not cls or self._dunder_fn_name(cls, dunder) is None:
+            return None
+        call = Call(
+            Attr(node.left, dunder, token=getattr(node.left, "_token", None)),
+            [node.right],
+            token=node._token,
+        )
+        return self.emit(call)
+
     @register_emitter(BinOp)
     def emit_binop(self, node):
+        # ---- 0. Dunder operator overloading (`left.__op__(right)`) ----
+        dunder_val = self._try_dunder_binop(node)
+        if dunder_val is not None:
+            return dunder_val
+
         # ---- 4. Algebraic-identity folding ----
         simplified = self._try_algebraic_simplify(node)
         if simplified is not None:
@@ -5072,6 +5441,11 @@ class LLVM:
     @register_emitter(Assign)
     def emit_assign(self, node):
         if (
+            isinstance(node.target, Attr)
+            and (getattr(node.target, "meta", None) or {}).get("kind") == "prop_set"
+        ):
+            return self._emit_prop_set(node)
+        if (
             self._is_decorator_factory
             and isinstance(node.target, Variable)
             and node.target.name == "result"
@@ -5233,18 +5607,91 @@ class LLVM:
             self._emit_write_barrier(target_ptr, value)
         return None
 
+    def _method_receiver(self, obj_node, slot_this):
+        """Resolve a class-method receiver (value / pointer / pointer-to-pointer)
+        and bitcast it to the method's `this` type. Mirrors the emit_call static
+        path so property accessors reuse the same 3-way pushdown."""
+        obj_val = self.emit(obj_node)
+        if isinstance(obj_val.type, ir.PointerType):
+            return (
+                self.builder.bitcast(obj_val, slot_this)
+                if obj_val.type != slot_this
+                else obj_val
+            )
+        return self.builder.bitcast(self._emit_lvalue(obj_node), slot_this)
+
+    def _emit_super_call(self, node):
+        meta = getattr(node, "meta", None) or {}
+        base = meta.get("base")
+        mname = meta.get("name")
+        func = self.functions.get(f"{base}.{mname}") if base else None
+        if func is None:
+            raise Exception(f"super: method `{base}.{mname}` not compiled")
+        this_slot = self.locals.get("this")
+        if this_slot is None:
+            raise Exception("super used outside a method body")
+        recv = self.builder.load(this_slot)
+        base_struct = self.structs.get(base) if base else None
+        if base_struct is not None:
+            bt = ir.PointerType(base_struct)
+            if recv.type != bt:
+                recv = self.builder.bitcast(recv, bt)
+        args = [recv]
+        ptypes = func.function_type.args
+        for i, arg in enumerate(node.args):
+            av = self.emit(arg)
+            av = self._coerce_call_arg(
+                av, ptypes[i + 1], getattr(arg, "inferred_type", None)
+            )
+            args.append(av)
+        return self.builder.call(func, args)
+
+    def _emit_prop_get(self, node: Attr):
+        meta = getattr(node, "meta", None) or {}
+        cls = meta.get("cls")
+        fname = f"{cls}.{node.name}.get" if cls else None
+        func = self.functions.get(fname)
+        if func is None:
+            raise Exception(f"property getter `{fname}` not compiled")
+        return self.builder.call(
+            func, [self._method_receiver(node.obj, func.function_type.args[0])]
+        )
+
+    def _emit_prop_set(self, node):
+        target = node.target
+        meta = getattr(target, "meta", None) or {}
+        cls = meta.get("cls")
+        fname = f"{cls}.{target.name}.set" if cls else None
+        func = self.functions.get(fname)
+        if func is None:
+            raise Exception(f"property setter `{fname}` not compiled")
+        recv = self._method_receiver(target.obj, func.function_type.args[0])
+        value = self.emit(node.value)
+        ptypes = func.function_type.args
+        value = self._coerce_call_arg(
+            value, ptypes[1], getattr(node.value, "inferred_type", None)
+        )
+        return self.builder.call(func, [recv, value])
+
     @register_emitter(Call)
     def emit_call(self, node):
         # Handle method calls: obj.method(args) -> ClassName.method(obj, args)
+        if (
+            isinstance(node.callee, Attr)
+            and isinstance(node.callee.obj, Variable)
+            and node.callee.obj.name == "super"
+        ):
+            return self._emit_super_call(node)
         if isinstance(node.callee, Attr):
             callee_name = node.callee.name
-            obj_val = self.emit(node.callee.obj)
             # Look up the method by finding the class type of the object
             obj_type_name = None
             if isinstance(node.callee.obj, Variable):
                 obj_type_name = self.local_types.get(node.callee.obj.name)
             elif hasattr(node.callee.obj, "_inferred_type"):
                 obj_type_name = node.callee.obj._inferred_type
+            if not obj_type_name:
+                obj_type_name = getattr(node.callee.obj, "inferred_type", None)
             if obj_type_name:
                 # Strip pointer
                 obj_type_name = obj_type_name.removesuffix("*")
@@ -5252,12 +5699,80 @@ class LLVM:
                 resolved = self._resolve_generic_type(obj_type_name)
                 if resolved is not None:
                     obj_type_name = resolved
+                slots = self._vt_slots.get(obj_type_name)
+                if slots is not None and callee_name in slots:
+                    # Virtual dispatch: the receiver's own vtable decides which
+                    # implementation runs, so a Base* holding a Child calls the
+                    # Child's override. Slot signatures are fixed at the base
+                    # (override signature is checked in semantic), so the loaded
+                    # pointer needs no constant bitcast beyond the receiver.
+                    slot_idx, slot_fnty = slots[callee_name]
+                    obj_val = self.emit(node.callee.obj)
+                    recv = obj_val
+                    if isinstance(recv.type, ir.PointerType):
+                        if isinstance(recv.type.pointee, ir.PointerType):
+                            recv = self.builder.load(recv)
+                    else:
+                        recv = self._emit_lvalue(node.callee.obj)
+                    vptrp = self.builder.gep(
+                        recv,
+                        [ir.Constant(_i32, 0), ir.Constant(_i32, 0)],
+                        inbounds=True,
+                    )
+                    vt_val = self.builder.load(vptrp)
+                    vts = self.builder.bitcast(
+                        vt_val, ir.PointerType(self._vt_types[obj_type_name])
+                    )
+                    fnptr = self.builder.load(
+                        self.builder.gep(
+                            vts,
+                            [ir.Constant(_i32, 0), ir.Constant(_i32, slot_idx + 1)],
+                            inbounds=True,
+                        )
+                    )
+                    this_ty = slot_fnty.args[0]
+                    this_arg = (
+                        self.builder.bitcast(recv, this_ty)
+                        if recv.type != this_ty
+                        else recv
+                    )
+                    args = [this_arg]
+                    for arg in node.args:
+                        arg_val = self.emit(arg)
+                        arg_val = self._coerce_call_arg(
+                            arg_val, slot_fnty.args[len(args)],
+                            getattr(arg, "inferred_type", None),
+                        )
+                        args.append(arg_val)
+                    return self.builder.call(fnptr, args)
+                obj_val = self.emit(node.callee.obj)
                 method_name = f"{obj_type_name}.{callee_name}"
                 func = self.functions.get(method_name)
                 if func:
+                    # Static (monomorphic) method call. Methods always take the
+                    # receiver as `ClassName*`; a VALUE receiver (a class-scoped
+                    # local/field) must be address-of'd, and a differently-typed
+                    # class pointer (e.g. a Dog value behind an Animal* local in
+                    # a sealed-static-call context) must be bitcast.
+                    slot_this = func.function_type.args[0]
                     args = [obj_val]
+                    if isinstance(obj_val.type, ir.PointerType):
+                        args[0] = (
+                            self.builder.bitcast(obj_val, slot_this)
+                            if obj_val.type != slot_this
+                            else obj_val
+                        )
+                    else:
+                        args[0] = self.builder.bitcast(
+                            self._emit_lvalue(node.callee.obj), slot_this
+                        )
                     for arg in node.args:
-                        args.append(self.emit(arg))
+                        arg_val = self.emit(arg)
+                        arg_val = self._coerce_call_arg(
+                            arg_val, func.function_type.args[len(args)],
+                            getattr(arg, "inferred_type", None),
+                        )
+                        args.append(arg_val)
                     return self.builder.call(func, args)
 
         # Builtin conversion functions (Python-style): str()/int()/float()/double()
@@ -5317,6 +5832,15 @@ class LLVM:
         ):
             return self._emit_builtin_has_get_attr(node)
 
+        # Builtin isinstance() — O(1) class-id RTTI. Shadowable by a user
+        # `def isinstance(...)`.
+        if (
+            isinstance(node.callee, Variable)
+            and node.callee.name == "isinstance"
+            and "isinstance" not in self.functions
+        ):
+            return self._emit_isinstance(node)
+
         # Builtin code() — call the original function through __code_fn pointer.
         if (
             self._is_decorator_factory
@@ -5336,6 +5860,24 @@ class LLVM:
                     shifted = self.builder.zext(shifted, ir.IntType(64))
                 return shifted
             return ir.Constant(ir.IntType(64), 0)
+
+        # `obj(...)` -> `obj.__call__(...)` when the callee is a class-typed
+        # variable whose class defines the callable dunder. Semantic stamps
+        # `_dunder_via` with the class name; fall back to the static type.
+        if isinstance(node.callee, Variable):
+            dunder_cls = node.callee._dunder_via
+            if dunder_cls is None:
+                dunder_cls = self._static_obj_class(node.callee)
+            if (
+                dunder_cls
+                and self._dunder_fn_name(dunder_cls, "__call__") is not None
+            ):
+                call = Call(
+                    Attr(node.callee, "__call__", token=node.callee._token),
+                    node.args,
+                    token=node._token,
+                )
+                return self.emit(call)
 
         func = self.functions.get(node.callee.name)
         if func is None:
@@ -5433,6 +5975,14 @@ class LLVM:
         if not self.no_userspace and self._is_dynamic_expr(arg):
             k, b = self._dyn_pair(arg)
             return self.builder.call(self.functions["dyn_str_v"], [k, b])
+        cls = self._static_obj_class(arg)
+        if cls and self._dunder_fn_name(cls, "__str__") is not None:
+            call = Call(
+                Attr(arg, "__str__", token=getattr(arg, "_token", None)),
+                [],
+                token=getattr(arg, "_token", None),
+            )
+            return self.emit(call)
         val = self.emit(arg)
         return self._stringify_value(arg, val)
 
@@ -5627,6 +6177,15 @@ class LLVM:
         `new T[n]`, `range()`, list literals and `str_split()` results. Not
         supported (semantically rejected) on fixed-size local arrays or
         raw/C buffers that were never length-registered."""
+        arg = node.args[0]
+        cls = self._static_obj_class(arg)
+        if cls and self._dunder_fn_name(cls, "__len__") is not None:
+            call = Call(
+                Attr(arg, "__len__", token=getattr(arg, "_token", None)),
+                [],
+                token=node._token,
+            )
+            return self.emit(call)
         arg = self.emit(node.args[0])
         if arg.type != _i8ptr:
             arg = self.builder.bitcast(arg, _i8ptr)
@@ -5725,6 +6284,96 @@ class LLVM:
         raise Exception(
             f"unknown has()/get_attr() meta kind {kind!r} at "
             f"L{node._token.line}:{node._token.column}"
+        )
+
+    def _emit_ancestor_grid(self):
+        """Build the RTTI ancestor table: `anc.grid[class_id][depth]` = the
+        ancestor class id at that depth (depth 0 is the hierarchy root).
+
+        A virtual object's vtable field 0 holds its O(1) class id; reading
+        `grid[rid][depth(T)]` then answering `== id(T)` is "is the runtime
+        class a descendant-or-equal of `T`" in one table read. Classes with
+        shorter chains leave trailing slots at -1 (never matches an id).
+        """
+        if getattr(self, "_ancestor_grid_emitted", False):
+            return
+        self._ancestor_grid_emitted = True
+        classes = [
+            c for c, n in self._struct_nodes.items() if isinstance(n, ClassDef)
+        ]
+        chains = {}
+        for c in classes:
+            cur = self._struct_nodes.get(c)
+            ch = []
+            seen = set()
+            while cur is not None and cur.name not in seen:
+                seen.add(cur.name)
+                ch.append(cur.name)
+                cur = self._struct_nodes.get(cur.base) if cur.base else None
+            chains[c] = ch
+        maxd = max((len(ch) - 1 for ch in chains.values()), default=0)
+        self._class_chain_depth = {c: len(ch) - 1 for c, ch in chains.items()}
+        self._ancestor_stride = maxd + 1
+        if not classes:
+            return
+        rows = []
+        for c in classes:
+            row = [-1] * self._ancestor_stride
+            ch = chains[c]
+            for i, anc in enumerate(ch):
+                row[len(ch) - 1 - i] = self._class_ids.get(anc, -1)
+            rows.append(row)
+        flat = [v for r in rows for v in r]
+        ty = ir.ArrayType(_i64, len(flat))
+        g = ir.GlobalVariable(self.module, ty, name="anc.grid")
+        g.initializer = ir.Constant(ty, flat)
+        self._ancestor_grid = g
+
+    def _emit_isinstance(self, node):
+        """isinstance(obj, Class) — O(1) class-id RTTI.
+
+        `node.meta` selects the shape:
+          * is_const  -> compile-time truth (sealed chains are monomorphic, or
+                         the static type already proves/disproves the check).
+          * is_runtime -> load the receiver's class id (vtable field 0) and
+                         compare against `anc.grid[rid][depth(T)]`.
+        """
+        meta = getattr(node, "meta", None) or {}
+        kind = meta.get("kind")
+        if kind == "is_const":
+            return ir.Constant(_i1, 1 if meta.get("value") else 0)
+        cls_name = meta.get("cls")
+        self._emit_ancestor_grid()
+        grid = self._ancestor_grid
+        obj = node.args[0]
+        obj_val = self.emit(obj)
+        recv = obj_val
+        if isinstance(recv.type, ir.PointerType):
+            if isinstance(recv.type.pointee, ir.PointerType):
+                recv = self.builder.load(recv)
+        else:
+            recv = self._emit_lvalue(obj)
+        vptrp = self.builder.gep(
+            recv, [ir.Constant(_i32, 0), ir.Constant(_i32, 0)], inbounds=True
+        )
+        vptr = self.builder.load(vptrp)
+        cidp = self.builder.bitcast(vptr, ir.PointerType(_i64))
+        rcid = self.builder.load(
+            self.builder.gep(cidp, [ir.Constant(_i32, 0)], inbounds=True)
+        )
+        id_t = self._class_ids.get(cls_name, -1)
+        depth_t = self._class_chain_depth.get(cls_name, 0)
+        stride = self._ancestor_stride
+        off = self.builder.add(
+            self.builder.mul(rcid, ir.Constant(_i64, stride)),
+            ir.Constant(_i64, depth_t),
+        )
+        row = self.builder.gep(
+            grid, [ir.Constant(_i32, 0), off], inbounds=True
+        )
+        anc = self.builder.load(row)
+        return self.builder.icmp_signed(
+            "==", anc, ir.Constant(_i64, id_t)
         )
 
     def _emit_builtin_append(self, node):

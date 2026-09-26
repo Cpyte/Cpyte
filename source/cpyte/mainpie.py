@@ -21,7 +21,12 @@ if __package__:
         run_scorpion,
         set_target_cpu,
     )
-    from .extension_hooks import HookStage, get_global_hook_registry
+    from .extension_hooks import (
+        CompilerContext,
+        HookLoader,
+        HookStage,
+        get_global_hook_registry,
+    )
     from .lexar import Lexer, LexerError, register_keywords
     from .linker import Linker, format_cc_diag
     from .package_manifest import (
@@ -52,7 +57,12 @@ else:
         run_scorpion,
         set_target_cpu,
     )
-    from cpyte.extension_hooks import HookStage, get_global_hook_registry
+    from cpyte.extension_hooks import (
+        CompilerContext,
+        HookLoader,
+        HookStage,
+        get_global_hook_registry,
+    )
     from cpyte.lexar import Lexer, LexerError, register_keywords
     from cpyte.linker import Linker, format_cc_diag
     from cpyte.package_manifest import (
@@ -185,7 +195,10 @@ def pretty_ast(node, indent=0):
 
     if name == "NewExpr":
         size = f"[{pretty_ast(node.size, 0)}]" if node.size else ""
-        return f"{pad}new {node.type_expr}{size}"
+        text = f"{pad}new {node.type_expr}{size}"
+        if getattr(node, "args", None) is not None:
+            text += "(" + ", ".join(pretty_ast(a, 0) for a in node.args) + ")"
+        return text
 
     if name == "Deref":
         return f"{pad}*\n{pretty_ast(node.operand, indent + 1)}"
@@ -306,6 +319,16 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
 
             # Register manifest
             manifest_registry.register(manifest)
+
+            # Parser hooks must be loaded before parsing the source file.
+            if manifest.extensions.parser_hooks:
+                HookLoader.load_hooks_from_package(
+                    package_name,
+                    version_dir,
+                    manifest.extensions.parser_hooks,
+                    get_global_hook_registry(),
+                    CompilerContext(data={"package_dir": version_dir}),
+                )
 
             # Note: hooks are NOT loaded here. Per the "hooks only when
             # imported" rule, a package's extension hooks are introduced by the

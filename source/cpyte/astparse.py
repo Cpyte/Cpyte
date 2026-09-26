@@ -114,12 +114,20 @@ class FString(Node):
 
 
 class Variable(Node):
-    __slots__ = ("_token", "const_value", "dynamic", "inferred_type", "name")
+    __slots__ = (
+        "_token",
+        "const_value",
+        "dynamic",
+        "inferred_type",
+        "name",
+        "_dunder_via",
+    )
 
     def __init__(self, name: str, token=None):
         self.name = name
         self._token = token
         self.const_value = None
+        self._dunder_via = None
 
     def __repr__(self):
         return f"Variable({self.name})"
@@ -179,7 +187,14 @@ class Index(Node):
 
 class Attr(Node):
     inferred_type: str | None
-    __slots__ = ("_enum_member_value", "_token", "inferred_type", "name", "obj")
+    __slots__ = (
+        "_enum_member_value",
+        "_token",
+        "inferred_type",
+        "meta",
+        "name",
+        "obj",
+    )
 
     def __init__(self, obj, name: str, token=None):
         self.obj = obj
@@ -187,6 +202,7 @@ class Attr(Node):
         self._token = token
         self._enum_member_value = None
         self.inferred_type = None
+        self.meta = None
 
     def __repr__(self):
         return f"Attr({self.obj}, {self.name})"
@@ -489,6 +505,17 @@ def _try_parse_cast_type(tokens, pos):
 def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
 
+    for hook in _get_all_parser_hooks(True):
+        if (
+            hasattr(hook, "should_handle_expression")
+            and hook.should_handle_expression(tokens, pos)
+        ):
+            return hook.parse_expression(
+                tokens,
+                pos,
+                _make_parser_ctx(tokens, pos),
+            )
+
     if tok.type == TokenType.KEYWORD and tok.value == "borrow":
         pos += 1
         mutable = False
@@ -618,7 +645,23 @@ def _parse_atom(tokens: list[Token], pos: int):
             if m is not None:
                 type_str = m.group(1)
                 size = Number(m.group(2), token=tok)
-        return NewExpr(type_str, size, token=tok), pos
+        args = None
+        if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+            # `new X(a, b, ...)` — constructor arguments for a class type.
+            pos += 1
+            args = []
+            if pos < len(tokens) and tokens[pos].type != TokenType.RPAREN:
+                while True:
+                    arg, pos = parse_expression(tokens, pos)
+                    args.append(arg)
+                    if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
+                        pos += 1
+                        continue
+                    break
+            if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+                raise ParseError("Expected ')' after constructor arguments", tok)
+            pos += 1
+        return NewExpr(type_str, size, token=tok, args=args), pos
 
     if tok.type == TokenType.KEYWORD and tok.value == "asm":
         return parse_inline_asm(tokens, pos)
@@ -793,13 +836,27 @@ def _parse_call_args(tokens: list[Token], pos: int, callee):
 
 
 def _parse_postfix(tokens: list[Token], pos: int, node):
-    while pos < len(tokens) and tokens[pos].type in (
-        TokenType.LPAREN,
-        TokenType.LBRACKET,
-        TokenType.DOT,
+    while pos < len(tokens) and (
+        tokens[pos].type in (
+            TokenType.LPAREN,
+            TokenType.LBRACKET,
+            TokenType.DOT,
+        )
+        or (tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "as")
     ):
         tok = tokens[pos]
-        if tok.type == TokenType.LPAREN:
+        if tok.type == TokenType.KEYWORD and tok.value == "as":
+            pos += 1
+            if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+                raise ParseError(
+                    "Expected a class name after 'as'",
+                    tokens[pos] if pos < len(tokens) else None,
+                )
+            name = tokens[pos].value
+            assert name is not None
+            pos += 1
+            node = AsExpr(name, node, token=tok)
+        elif tok.type == TokenType.LPAREN:
             node, pos = _parse_call_args(tokens, pos, node)
         elif tok.type == TokenType.LBRACKET:
             pos += 1
@@ -1004,13 +1061,27 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
         elif kind == "postfix":
             prefixes = frame[1]
             node = vals.pop()
-            while pos < len(tokens) and tokens[pos].type in (
-                TokenType.LPAREN,
-                TokenType.LBRACKET,
-                TokenType.DOT,
+            while pos < len(tokens) and (
+                tokens[pos].type in (
+                    TokenType.LPAREN,
+                    TokenType.LBRACKET,
+                    TokenType.DOT,
+                )
+                or (tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "as")
             ):
                 ptok = tokens[pos]
-                if ptok.type == TokenType.LPAREN:
+                if ptok.type == TokenType.KEYWORD and ptok.value == "as":
+                    pos += 1
+                    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+                        raise ParseError(
+                            "Expected a class name after 'as'",
+                            tokens[pos] if pos < len(tokens) else None,
+                        )
+                    name = tokens[pos].value
+                    assert name is not None
+                    pos += 1
+                    node = AsExpr(name, node, token=ptok)
+                elif ptok.type == TokenType.LPAREN:
                     pos += 1
                     frames.append(("call_done", prefixes))
                     frames.append(("callargs", node, [], ptok))
@@ -1173,6 +1244,12 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
         "override",
     ):
         node, pos = parse_decorated_def(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == "sealed":
+        # `sealed class X:` — a closed, monomorphic class (no vtable).
+        node, pos = parse_sealed_class(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value == "dataclass":
+        # `dataclass class X:` — auto-synthesized `__init__`/`__eq__`/`__str__`.
+        node, pos = parse_dataclass_class(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "class":
         node, pos = parse_class(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "struct":
@@ -1338,7 +1415,7 @@ def parse_decorated_def(tokens: list[Token], pos: int):
     return _parse_func_with_visibility(tokens, pos, visibility, tok)
 
 
-def parse_class(tokens: list[Token], pos: int):
+def parse_class(tokens: list[Token], pos: int, sealed: bool = False, dataclass: bool = False):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
@@ -1364,22 +1441,180 @@ def parse_class(tokens: list[Token], pos: int):
                 tokens[pos] if pos < len(tokens) else None,
             )
         pos += 1
-    body, pos = parse_suite(tokens, pos)
+    body, pos = parse_class_suite(tokens, pos)
     fields = []
     methods = []
+    properties = []
     for stmt in body:
         if isinstance(stmt, FuncDef):
             methods.append(stmt)
         elif isinstance(stmt, VarDecl):
             fields.append(Field(stmt.name, stmt.var_type, token=stmt._token))
+        elif isinstance(stmt, PropertyDef):
+            properties.append(stmt)
     return ClassDef(
         name,
         base=base,
         fields=fields,
         methods=methods,
+        properties=properties,
         generic_params=generic_params,
+        sealed=sealed,
+        dataclass=dataclass,
         token=tok,
     ), pos
+
+
+def parse_class_suite(tokens: list[Token], pos: int):
+    """Parse a class body suite, intercepting `property name:` blocks."""
+    if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+        raise ParseError('Expected ":"', tokens[pos] if pos < len(tokens) else None)
+    pos += 1
+
+    if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
+    pos += 1
+
+    if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
+    pos += 1
+
+    stmts = []
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
+        if (
+            tokens[pos].type == TokenType.IDENTIFIER
+            and tokens[pos].value == "property"
+        ):
+            pnode, pos = parse_property(tokens, pos)
+            stmts.append(pnode)
+            while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+                pos += 1
+            continue
+        stmt, pos = parse_statement(tokens, pos)
+        if stmt is not None:
+            stmts.append(stmt)
+        while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+            pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
+        pos += 1
+    return stmts, pos
+
+
+def parse_sealed_class(tokens: list[Token], pos: int):
+    """Parse `sealed class X:` (or `sealed dataclass class X:`) — a closed,
+    monomorphic class (no vtable)."""
+    pos += 1
+    dataclass = False
+    if (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.KEYWORD
+        and tokens[pos].value == "dataclass"
+    ):
+        dataclass = True
+        pos += 1
+    if pos >= len(tokens) or (
+        tokens[pos].type != TokenType.KEYWORD or tokens[pos].value != "class"
+    ):
+        raise ParseError(
+            'Expected "class" after "sealed"',
+            tokens[pos] if pos < len(tokens) else None,
+        )
+    return parse_class(tokens, pos, sealed=True, dataclass=dataclass)
+
+
+def parse_dataclass_class(tokens: list[Token], pos: int):
+    """Parse `dataclass class X:` (or `sealed dataclass class X:`) — a class
+    that auto-synthesizes `__init__`/`__eq__`/`__str__` from its fields
+    (Python-style dataclass)."""
+    pos += 1
+    sealed = False
+    if (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.KEYWORD
+        and tokens[pos].value == "sealed"
+    ):
+        sealed = True
+        pos += 1
+    if pos >= len(tokens) or (
+        tokens[pos].type != TokenType.KEYWORD or tokens[pos].value != "class"
+    ):
+        raise ParseError(
+            'Expected "class" after "dataclass"',
+            tokens[pos] if pos < len(tokens) else None,
+        )
+    return parse_class(tokens, pos, sealed=sealed, dataclass=True)
+
+
+def parse_property(tokens: list[Token], pos: int):
+    """Parse a `property name:` block with `get`/`set` accessor bodies."""
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        raise ParseError(
+            "Expected property name after `property`",
+            tokens[pos] if pos < len(tokens) else None,
+        )
+    name = tokens[pos].value
+    assert name is not None
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+        raise ParseError(
+            'Expected ":" after property name',
+            tokens[pos] if pos < len(tokens) else None,
+        )
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.NEWLINE:
+        raise ParseError(
+            'Expected newline after ":"', tokens[pos] if pos < len(tokens) else None
+        )
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.INDENT:
+        raise ParseError(
+            "Expected indented block", tokens[pos] if pos < len(tokens) else None
+        )
+    pos += 1
+
+    get = None
+    setm = None
+    while pos < len(tokens) and tokens[pos].type not in (
+        TokenType.DEDENT,
+        TokenType.EOF,
+    ):
+        if (
+            tokens[pos].type == TokenType.IDENTIFIER
+            and tokens[pos].value in ("get", "set")
+            and pos + 1 < len(tokens)
+            and tokens[pos + 1].type == TokenType.COLON
+        ):
+            atok = tokens[pos]
+            aname = tokens[pos].value
+            abody, pos = parse_suite(tokens, pos + 1)
+            accessor = FuncDef(aname, {}, abody, "auto", token=atok)
+            if aname == "get":
+                get = accessor
+            else:
+                setm = accessor
+        else:
+            stmt, pos = parse_statement(tokens, pos)
+            if isinstance(stmt, FuncDef):
+                if stmt.name == "get":
+                    get = stmt
+                elif stmt.name == "set":
+                    setm = stmt
+        while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
+            pos += 1
+    if pos < len(tokens) and tokens[pos].type == TokenType.DEDENT:
+        pos += 1
+    if get is None:
+        raise ParseError("Expected a `get` accessor in property block", tok)
+    return PropertyDef(name, get, setm, token=tok), pos
 
 
 def parse_try(tokens: list[Token], pos: int):
@@ -1660,6 +1895,7 @@ class FuncDef(Node):
         "const_params",
         "decorators",
         "generic_params",
+        "meta",
         "name",
         "params",
         "rettype",
@@ -1686,6 +1922,7 @@ class FuncDef(Node):
         self.generic_params = generic_params or []
         self.const_params = const_params or []
         self.decorators = decorators or []
+        self.meta = None
         self._token = token
 
     def __repr__(self):
@@ -1882,15 +2119,21 @@ class Raise(Node):
 
 
 class NewExpr(Node):
-    __slots__ = ("_token", "size", "type_expr")
+    __slots__ = ("_token", "size", "type_expr", "args", "inferred_type")
 
-    def __init__(self, type_expr, size=None, token=None):
+    def __init__(self, type_expr, size=None, token=None, args=None):
         self.type_expr = type_expr
         self.size = size
+        self.args = args
         self._token = token
 
     def __repr__(self):
-        return f"NewExpr({self.type_expr}, {self.size})"
+        extra = ""
+        if self.size is not None:
+            extra += f"[{self.size}]"
+        if self.args:
+            extra += f"({', '.join(repr(a) for a in self.args)})"
+        return f"NewExpr({self.type_expr}{extra})"
 
 
 class Deref(Node):
@@ -1939,6 +2182,27 @@ class CastExpr(Node):
 
     def __repr__(self):
         return f"CastExpr({self.type_expr}, {self.expr})"
+
+
+class AsExpr(Node):
+    """`expr as T` — safe runtime downcast (C#/Kotlin style).
+
+    `x as T` returns `x` re-typed as `T*` when the runtime class of `x` is a
+    descendant-or-equal of `T` (checked through the class-id RTTI ancestor
+    grid), and `null` otherwise. Unlike a parenthesized `(T)x` hard cast, an
+    `as` that fails yields null rather than silently re-typing the pointer.
+    """
+
+    __slots__ = ("_token", "inferred_type", "type_expr", "expr", "meta")
+
+    def __init__(self, type_expr: str, expr, token=None):
+        self.type_expr = type_expr
+        self.expr = expr
+        self._token = token
+        self.inferred_type = None
+
+    def __repr__(self):
+        return f"AsExpr({self.expr} as {self.type_expr})"
 
 
 class BorrowExpr(Node):
@@ -2068,7 +2332,17 @@ class InlineAsm(Node):
 
 
 class ClassDef(Node):
-    __slots__ = ("_token", "base", "fields", "generic_params", "methods", "name")
+    __slots__ = (
+        "_token",
+        "base",
+        "dataclass",
+        "fields",
+        "generic_params",
+        "methods",
+        "name",
+        "properties",
+        "sealed",
+    )
 
     def __init__(
         self,
@@ -2077,6 +2351,9 @@ class ClassDef(Node):
         fields: list | None = None,
         methods: list | None = None,
         generic_params: list | None = None,
+        sealed: bool = False,
+        dataclass: bool = False,
+        properties: list | None = None,
         token=None,
     ):
         self.name = name
@@ -2084,10 +2361,31 @@ class ClassDef(Node):
         self.fields = fields or []
         self.methods = methods or []
         self.generic_params = generic_params or []
+        self.sealed = sealed
+        self.dataclass = dataclass
+        self.properties = properties or []
         self._token = token
 
     def __repr__(self):
-        return f"ClassDef({self.name}, base={self.base}, fields={self.fields}, methods={self.methods})"
+        seal = "sealed " if self.sealed else ""
+        dc = "dataclass " if self.dataclass else ""
+        return f"ClassDef({seal}{dc}{self.name}, base={self.base}, fields={self.fields}, properties={self.properties}, methods={self.methods})"
+
+
+class PropertyDef(Node):
+    """A `property name:` block holding paired `get`/`set` accessor bodies."""
+
+    __slots__ = ("_token", "name", "get", "set", "_ptype")
+
+    def __init__(self, name: str, get, set=None, token=None):
+        self.name = name
+        self.get = get
+        self.set = set
+        self._ptype = None
+        self._token = token
+
+    def __repr__(self):
+        return f"PropertyDef({self.name}, get={self.get and self.get.name}, set={self.set and self.set.name})"
 
 
 def parse_ccode(tokens: list[Token], pos: int):
@@ -2586,6 +2884,8 @@ def parse_statement(tokens: list[Token], pos: int):
         "import",
         "enum",
         "type",
+        "sealed",
+        "dataclass",
     ):
         handler = {
             "while": parse_while,
@@ -2595,6 +2895,8 @@ def parse_statement(tokens: list[Token], pos: int):
             "import": parse_import,
             "enum": parse_enum,
             "type": parse_type_alias,
+            "sealed": parse_sealed_class,
+            "dataclass": parse_dataclass_class,
         }[tok.value]
         return handler(tokens, pos)
 

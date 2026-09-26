@@ -26,6 +26,7 @@ class CapabilityDeclaration:
 class ExtensionHooks:
     """Represents extension hook files provided by a package."""
 
+    lexer_hooks: list[str] = field(default_factory=list)
     parser_hooks: list[str] = field(default_factory=list)
     semantic_hooks: list[str] = field(default_factory=list)
     codegen_hooks: list[str] = field(default_factory=list)
@@ -205,7 +206,8 @@ class ManifestValidator:
         # Validate hook file paths exist if package_dir is provided
         if manifest.package_dir:
             all_hooks = (
-                manifest.extensions.parser_hooks
+                manifest.extensions.lexer_hooks
+                + manifest.extensions.parser_hooks
                 + manifest.extensions.semantic_hooks
                 + manifest.extensions.codegen_hooks
                 + manifest.extensions.runtime_hooks
@@ -303,6 +305,7 @@ class ManifestParser:
         # Parse extension hooks
         extensions_data = data.get("extensions", {})
         extensions = ExtensionHooks(
+            lexer_hooks=extensions_data.get("lexer_hooks", []),
             parser_hooks=extensions_data.get("parser_hooks", []),
             semantic_hooks=extensions_data.get("semantic_hooks", []),
             codegen_hooks=extensions_data.get("codegen_hooks", []),

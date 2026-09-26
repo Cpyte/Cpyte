@@ -249,10 +249,14 @@ class _Formatter:
             return f"sizeof({node.type_expr})"
         if isinstance(node, astparse.CastExpr):
             return f"({node.type_expr}){self._expr(node.expr)}"
+        if isinstance(node, astparse.AsExpr):
+            return f"{self._expr(node.expr)} as {node.type_expr}"
         if isinstance(node, astparse.NewExpr):
             text = f"new {node.type_expr}"
             if node.size is not None:
                 text += f"[{self._expr(node.size)}]"
+            if getattr(node, "args", None) is not None:
+                text += "(" + ", ".join(self._expr(a) for a in node.args) + ")"
             return text
         if isinstance(node, astparse.Input):
             return "input()"
@@ -429,11 +433,28 @@ class _Formatter:
     def _emit_classdef(self, node, level: int):
         generic = f"<{', '.join(node.generic_params)}>" if node.generic_params else ""
         base = f"({node.base})" if node.base else ""
-        self._header(node, f"class {node.name}{generic}{base}:", level)
+        if getattr(node, "sealed", False):
+            kw = "sealed class"
+        elif getattr(node, "dataclass", False):
+            kw = "dataclass class"
+        else:
+            kw = "class"
+        self._header(node, f"{kw} {node.name}{generic}{base}:", level)
         for f in node.fields:
             self._emit_field(f, level + 1)
+        for p in getattr(node, "properties", None) or ():
+            self._emit_property(p, level + 1)
         for m in node.methods:
             self._emit_funcdef(m, level + 1)
+
+    def _emit_property(self, node, level: int):
+        self._flush_before(_line(node), level)
+        self._header(node, f"property {node.name}:", level)
+        if node.get is not None:
+            self._emit_funcdef(node.get, level + 1)
+        if node.set is not None:
+            self._emit_funcdef(node.set, level + 1)
+        self._inline_after(_line(node))
 
     def _emit_enumdef(self, node, level: int):
         self._header(node, f"enum {node.name}:", level)

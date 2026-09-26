@@ -113,6 +113,9 @@ _BASE_KEYWORDS = {
     "move",
     "mut",
     "del",
+    "sealed",
+    "dataclass",
+    "as",
 }
 
 # Additional keywords registered by packages

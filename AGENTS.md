@@ -1,5 +1,463 @@
 # Notes
 
+## Sept 2026: Stage-1 OOP — vtables, dynamic dispatch, `sealed`, `__init__`
+
+First OOP stage, implemented **directly in the compiler core** (uncommitted
+working tree). Virtualness is a *class-hierarchy* property: a non-`sealed`
+class is virtual (vptr + vtable dispatch), a `sealed` class is monomorphic
+(static dispatch, no vptr, no vtable). Method-level `virtual`/`override`
+markers (parsed into `FuncDef.visibility` by `_parse_func_with_visibility`)
+remain **ignored** — Python-style default-virtual. One C runtime, no thunks.
+
+- **Vtable layout**: a virtual class's struct gets a synthetic vptr field 0
+  (`Field("@vptr", "void*")`, i8*, prepended to `index_fields` AND
+  `struct_fields` in `bytecoding.emit_classdef`) so every field-index GEP path
+  (`_emit_lvalue_attr`, `_field_type_name`, has/get_attr two-stage GEP)
+  auto-shifts. The vtable global is `vt.<cls>` = `LiteralStructType([i64] +
+  [fnty.as_pointer()...])` with initializer `[i64 classid] + [raw ir.Function
+  ...]` — **raw functions** (not `ir.Constant(fn.type.as_pointer(), fn)`, which
+  renders invalid inline-`declare` IR). Build order: (1) `_declare_class_method`
+  header declarations, (2) `_emit_class_vtable` (records `_vt_slots[cls]` =
+  name → (slot, fnty), `_vt_types`/`_vt_globals`, `_class_ids`), (3) method
+  bodies, then inherited wrappers. `__init__` is excluded from vtables and
+  slots.
+- **Dispatch** (`emit_call` Attr path): `obj.method(...)` with an object type
+  name that has vtable slots does virtual dispatch — receiver = pointer value /
+  value-address / pointer-to-pointer load, `gep [0,0]` → vptr → bitcast to
+  vtable type → `gep [0, slot+1]` → load typed fnptr → bitcast receiver to
+  `slot_fnty.args[0]` → call. Otherwise static call to `ClassName.method`; a
+  VALUE receiver is address-of'd and a differently-typed class pointer is
+  bitcast to the method's `this`. Receiver type on non-Variable exprs comes from
+  semantic: `_infer_type_recursive`'s Call branch now stamps the `.callee.obj`
+  subtree (CastExpr/Deref/Index/…) before resolving, and `emit_call` falls back
+  to `obj.inferred_type` / `_inferred_type`.
+- **`new X(args)`** calls the class's `__init__` (resolved up the base chain,
+  arity-checked via `_check_class_constructor`), storing the vptr first for
+  virtual classes. `new X` / `new X()` are bare allocations when no `__init__`
+  exists (non-empty args require one — clean semantic error).
+- **Semantic (`_visit_class`)**: base/`sealed` rules (non-sealed cannot extend
+  sealed; sealed cannot extend virtual) and override-signature equality
+  (`params` minus `this`, sorted, + `rettype`). **Pre-existing bug this stage
+  fixed**: a child OVERRIDE used to hit `redefinition of X` because `_visit_class`
+  copied base-method symbols into `class_scope` before `_visit_funcdef` ran; the
+  base-copied symbol is now `undefine`d before the override's `_visit_funcdef`.
+  New `_collect_class_fields` (base-first flattened) fixes Attr / has-field /
+  get_attr resolution for subclass objects (used to report `type 'X*' has no
+  field` on inherited fields). `_check_class_constructor` resolves `__init__`
+  up the base chain.
+- **Codegen support paths widened**: `_emit_lvalue` accepts a CastExpr whose
+  value is a pointer (the pointer IS the address) so `get_attr((Animal*)d,
+  "f")` works; `_struct_name_from_node` returns the cast target for CastExpr.
+- **Regression**: `test/test_oop_virtual.cpy` added to the CI corpus (now
+  23/23) — virtual dispatch via `Base*` (incl. multi-level `Animal*`→`Rott`),
+  sealed static dispatch + `sealed extends sealed` override, inherited methods,
+  value receivers, `__init__` args, vptr-shifted `get_attr`/`has`/`del` on
+  virtual + sealed objects. JIT opt0/opt3 and native AOT all print
+  `2 3 4 7 30 2 4 10 7 animal 1 0`. Error paths tested: override arity/signature
+  mismatch, sealed-invalid inheritance, ctor arity.
+- **Known sharp edges**: class VALUE locals cannot be initialized from `new`
+  (pointer→value: `Dog d = new Dog(7)` is a clean semantic reject; use
+  `Dog* d = new Dog(7)`). Cross-hierarchy assignment needs an explicit cast
+  (`Animal* a = (Animal*)new Dog(7)`). `new X(args)` on a class with no
+  `__init__` non-empty args is an error. `virtual`/`override` keywords still do
+  nothing. **Operational trap**: never run two `cpyte build`/`ci_test.py`
+  processes in parallel on the same checkout — they share `test/*.o` runtime
+  artifacts and hang (one CI run hung for >10 min solely from being launched
+  alongside a `cpyte build` on the same files).
+
+## Sept 2026: Stage-2 OOP — dunder operator overloading (implemented, CI 25/25)
+
+Second OOP stage, directly in the compiler core (uncommitted). Python-style
+magic methods on classes now intercept operators and protocol hooks. **Design:
+dunder dispatch synthesizes a `Call(Attr(left, "__op__"), [right])` node and
+re-emits it through `emit_call`'s Attr path**, so virtual classes dispatch
+through the receiver's vtable (an override in a child is honored, and a
+`Base*` holding a `Child` calls the child's dunder — verified) and `sealed`
+classes take the static `Class.method` path. Semantic mirrors it with a
+base-chain method walk.
+
+- **Binary operators** (`semantic._DUNDER_BINOPS` /
+  `bytecoding._DUNDER_BINOPS`): `+`→`__add__`, `-`→`__sub__`, `*`→`__mul__`,
+  `/`→`__truediv__`, `//`→`__floordiv__`, `%`→`__mod__`, `**`→`__pow__`,
+  `<`/`<=`/`>`/`>=`→`__lt__`/`__le__`/`__gt__`/`__ge__`, `==`/`!=`→`__eq__`/
+  `__ne__`. Left-operand receiver only (no `__radd__` mirroring). Guards:
+  skip `dynamic` operands, `and`/`or`, `in`; a class WITHOUT the dunder falls
+  through to the numeric/pointer paths (so `V* - V*` stays legal pointer
+  arithmetic and `a != b` without `__ne__` is pointer identity). Discovered in
+  `emit_binop` BEFORE algebraic simplify (class operands must never hit the
+  number folding lane).
+- **Protocol hooks**: `obj[i]`→`__getitem__` (`emit_index` + Index inference;
+  array-typed objects still use array indexing — `Foo[] x; x[i]` must NOT call
+  `Foo.__getitem__`), `len(obj)`→`__len__` (`_infer_len` +
+  `_emit_builtin_len`), `str(obj)`→`__str__` (`_emit_builtin_str`),
+  `obj(args)`→`__call__` (`_resolve_callee` + `emit_call` Variable-callee
+  path). For `__call__`, semantic stamps `Variable._dunder_via` with the class
+  name (new slot) and codegen rewrites the call to `obj.__call__(args)`.
+  Dunders are inherited up the chain (virtual via vtable slots, sealed via the
+  Stage-1 static wrappers).
+- **Class-VALUE method parameters were a latent crash — fixed.** A method
+  signature `def __add__(other: Counter)` lowers `other` to a **by-value
+  struct** in LLVM, but the caller passes a `Class*` pointer; the old Attr
+  path passed it raw and blew up (`Type of #2 arg mismatch`). New
+  `_coerce_call_arg` (extracted and wired into BOTH `emit_call` Attr branches,
+  virtual + static) bitcasts the pointer to the parameter's base struct and
+  loads it (Python-style object argument; sub-hierarchy pointers get the base
+  cast first). Includes the generic path's int width / sext trunc / sitofp /
+  fptosi / inttoptr / ptrtoint / pointer bitcast coercions. This fixes ALL
+  class-VALUE method params, not just dunders.
+- **Fieldless sealed classes now emit a struct.** `emit_classdef` only
+  registered an LLVM struct when the class had fields; a sealed class with no
+  fields (e.g. a `__call__`-only object) hit `unknown type has no LLVM
+  lowering` on `new T()`. The struct is now always registered
+  (`get_identified_type("class.T")`), with `set_body` only when fields exist.
+- **Lint fixes**: the unused-local walker now counts an instance callee
+  (`obj(...)` — the `Variable` callee was never collected) and a method-call
+  receiver (`obj.method(...)` — `_infer_children(Call)` omits the callee
+  Attr's obj), so class-typed locals used only as call receivers no longer
+  trigger W1001. (This also cleaned the Stage-1 test.)
+- **Test** `test/test_oop_dunder.cpy` added to the CI corpus (25/25 green):
+  virtual + sealed binops, `==`/`!=` (dunder and identity fallback), inherited
+  dunders on virtual child via vptr and on sealed child via static wrappers,
+  `__getitem__`/`__mul__` on sealed + sealed-child, `__len__`, `__str__`
+  (string-concat inside), `__call__`, and cross-hierarchy `Dog/ Cat` dunder
+  arg coercion (`__truediv__(other: Animal)` receiving a `Cat*`). Identical
+  golden output on JIT opt0/opt3 and native AOT. Error paths verified: dunder
+  arity mismatch (clean error), calling a class instance with no `__call__`
+  ("`v` is not callable").
+- **Sharp edges**: dunder dispatch is left-receiver only; `print(obj)` does
+  NOT use `__str__` (only the `str(obj)` builtin does). Class-typed dunder
+  args are passed by VALUE (base-struct copy) — pointer-typed params
+  (`other: Counter*`) keep reference semantics. Cross-hierarchy unary ops
+  (`-obj`, `!obj`) are not hooked yet (Stage 4/5 territory).
+
+## Sept 2026: Stage-3 OOP — `isinstance` O(1) class-id RTTI (implemented, CI 26/26)
+
+Third OOP stage, directly in the compiler core (uncommitted). `isinstance(obj,
+Class)` is a new shadowable builtin backed by the Stage-1 vtable class ids.
+
+- **Design**: a virtual object's vtable field 0 already holds its O(1) class
+  id (`_class_ids`, assigned in emit order). A new per-module RTTI global
+  `anc.grid` (i64 array, row-major `[class_id][depth]`) stores, for each
+  class, the ancestor class id at every depth (depth 0 = hierarchy root;
+  unused trailing slots = -1, never a real id). The runtime check is **one
+  read**: `grid[grid.runtime_id_from_vptr][depth(T)] == id(T)` — "is the
+  runtime class a descendant-or-equal of `T`". Built by `_emit_ancestor_grid`
+  after all classdefs + imports are registered in `emit_program` (lazily too,
+  via the idempotent guard).
+- **Semantic (`_infer_isinstance`)**: arity exactly 2; arg0 must infer to a
+  class value/pointer; arg1 must be an identifier resolving to a class symbol
+  (raw `int` etc. is a clean error "``int`` is not a class"); the class name
+  is NOT an expression and is excluded from the deep-walk children
+  (`_infer_children` returns `[node.args[0]]`, bytecoding's `_emit_children`
+  likewise). Result kinds stamped in `node.meta`: `is_const` (True/False) or
+  `is_runtime` (obj chain rooted virtual and target below the static type).
+  Decision rules: if `T ∈ chain(B)` → const True (every object of static type
+  B IS-A T — the fast *upward* path slashes most checks to a literal);
+  sealed obj chain (root `.sealed`) → const False for anything below/unrelated
+  (sealed = monomorphic, no vptr → no runtime type info; declared-type
+  semantics); unrelated virtual hierarchies → const False; else
+  `is_runtime` iff `B ∈ chain(T)`.
+- **`__init__` override-signature check relaxed** (Store-1 latent bug the RTTI
+  test exposed): `_visit_class` compared EVERY method's signature against the
+  base, so a subclass taking different ctor args hit
+  ``method `__init__` overrides a base method with a different signature``.
+  `__init__` is not a virtual method (excluded from vtables/slots) and `new`
+  resolves it up the chain per-class, so it is now skipped in the equality
+  check (the base-copied symbol is still `undefine`d so the override
+  registers cleanly).
+- **Codegen (`_emit_isinstance`)**: `is_const` → `i1` constant; `is_runtime`
+  → reuse the emit_call receiver 3-way (pointer value / pointer-to-pointer
+  load / class-VALUE address-of via `_emit_lvalue`), `gep [0,0]` → vptr →
+  bitcast to `i64*` → load class id, then the single-grid-read compare.
+  Shadowable like `len`/`has`: a user `def isinstance(...)` preempts the
+  builtin (semantic scope-lookup guard + codegen `"isinstance" not in
+  self.functions`).
+- **`anc.grid` pitfall**: `_struct_nodes` holds plain `StructDef`s too — the
+  grid build filters to `ClassDef` instances or every program with a struct
+  crashed `'StructDef' object has no attribute 'base'`.
+- **Test** `test/test_oop_rtti.cpy` added to the CI corpus (26/26 green):
+  multi-level virtual chain (`Animal*`→`Dog`→`Rott`) proven True/False at
+  both compile-time (const upward) and runtime (dynamic downcast) — e.g.
+  `isinstance(ra, Dog)`/`isinstance(ra, Rott)` true through a `Rott` object
+  held by an `Animal*`, `isinstance(a, Rott)` false for a `Dog`; sealed
+  `Point`/`Point3` const cases (including subclass→base True); `if
+  isinstance(...)` in both branches. Identical 15-line golden output on JIT
+  opt0/opt3 and native AOT. Error paths verified: non-class first arg, raw
+  builtin-type identifier as second arg, and user-shadowing `def isinstance`.
+- **Sharp edges**: for a SEALED chain, `isinstance(x, Subtype)` where the
+  variable's static type is an *ancestor* of `Subtype` answers False (no vptr
+  at runtime — prefer virtual classes for downcast checks). `dynamic` first
+  args are rejected (statically-typed classes only). DOWNCAST
+  (`x as T` / safe-cast returning null) is NOT implemented yet (Stage 6).
+
+## Sept 2026: Stage-4 OOP — `super` + `property` blocks (implemented, CI 27/27)
+
+Fourth OOP stage, directly in the compiler core (uncommitted). Two Python
+flavors shipped together: `super.method(args)` (incl. `super.__init__(...)`
+in constructors) and declared `property name:` blocks with bare `get:`/`set:`
+accessors.
+
+- **`super.method(args)` is a STATIC call to the nearest base-class method**
+  — no vtable involved: `_find_base_method(cls_node, mname)` walks the base
+  chain from the current class (child-first, exclusive of the class itself)
+  and returns `(FuncDef, defining_ClassDef)`; semantic stamps
+  `node.meta = {"kind":"super_call","base":definer,"name":mname}` and codegen
+  `_emit_super_call` loads `self.locals["this"]` (the `Class**` alloca → load
+  gives `Class*`), bitcasts to `ir.PointerType(self.structs[base])`, coerces
+  args via `_coerce_call_arg`, and calls `Base.method` directly. Works inside
+  constructors (`super.__init__(a, b)` after `new` resolves `/ destructures`
+  as usual, arity vs the base ctor's non-this params) and inside overrides
+  (`return super.speak()`). Recorded on the `Call` node, not the callee Attr.
+- **Guards**: `super` used OUTSIDE a class method is a clean error
+  ("``super`` can only be used inside a class method"); `super.g()` with no
+  matching base method is "no base method named `g`"; bare
+  `super.method` (non-call Attr) or `super.x = ...` (assign through `super`)
+  are errors. `_infer_children(Call)` and bytecoding's `_emit_children(Call)`
+  return `list(node.args)` for a super call so the iterative deep-mode paths
+  don't pre-visit the callee yet.
+- **`property name:` blocks** (grammar): in a class body,
+  `property <name>:` followed by an indented block of EXACTLY a bare `get:`
+  suite (required) and optionally a bare `set:` suite — these are NOT `def`
+  lines, they are `get:`/`set:` labels whose bodies are `parse_suite` blocks.
+  `property` is NOT a lexer keyword — `parse_class_suite` (the class-body
+  parser) intercepts IDENTIFIER value `"property"` at statement position, so
+  `property` remains a legal identifier everywhere else in a program.
+  Parsing produces `PropertyDef(name, get, set)` (new AST node, plus a new
+  `_ptype` slot) collected into `ClassDef.properties` (new slot on ClassDef).
+- **Semantics (`_visit_property`)**: the accessor FuncDefs are renamed
+  `{prop}.get` / `{prop}.set`; `this: Class*` is injected; the property type
+  `p._ptype` is the getter's return type (concrete; `auto` getters infer from
+  the body's return value via `inferred_type`); `getf.rettype`/`setf.rettype`
+  are stamped CONCRETE (`p._ptype` / `"void"`) because codegen defaults an
+  `auto`/missing rettype to `int`. Both accessors are visited in throwaway
+  `Scope(class_scope)` sub-scopes so the `get`/`set` labels don't collide.
+- **Dispatch**: property READS stamp `Attr.meta = {"kind":"prop_get","cls":
+  definer,"prop":name}` and `emit_attr` routes `_emit_prop_get` (calls
+  `Class.prop.get` via `_method_receiver` — pointer bitcast, or class-VALUE
+  receiver via `_emit_lvalue`). Property WRITES stamp
+  `Assign.target.meta = {"kind":"prop_set",...}` and `emit_assign` routes
+  `_emit_prop_set` (coerces the RHS to the setter's `value` param type).
+  `_find_class_property(type_expr, name)` walks the base chain child-first so
+  subclass properties shadow base ones and inherited ones resolve.
+- **Errors**: property/field/method NAME CLASH is an error; writing a
+  read-only property (get but no set) is an error; setter RHS type is checked
+  against `p._ptype` via the permissive module-level `_coerce_assign_ok`.
+- **Codegen plumbing**: `_declare_class_method`/`_emit_class_method` emit the
+  accessors in `emit_classdef` Phase 4 (after method bodies); the Phase 5
+  inherited-wrapper loop SKIPS names containing `"."` (property accessor
+  functions are `Base.prop.get`/`Base.prop.set` and must NOT get wrapper
+  copies). New `_method_receiver(self, obj_node, slot_this)` (emitted after
+  `emit_program`'s vtable setup) centralizes the receiver 3-way pushdown; it
+  must NOT carry the `@register_emitter(Call)` decorator (that belongs to
+  `emit_call`).
+- **Two latent issues this stage fixed**: (1) the return-type checker
+  rejected `return int` in an `auto` getter ("return type `int` does not match
+  declared return type `auto`") — the check is now skipped for `expected ==
+  "auto"`; (2) `Attr` had NO `meta` slot (`__slots__`) so semantic's
+  `prop_get` stamp crashed with `'Attr' object has no attribute 'meta'` — a
+  `meta` slot was added to `Attr`.
+- **Test** `test/test_oop_super_prop.cpy` added to the CI corpus (27/27 green):
+  sealed-class properties (get/set + +=-style re-assign + method mutation),
+  virtual `super.__init__` chains (`Dog(a,b)` → `Pup(a,b)`), `super.method()`
+  from overrides in a virtual chain (`Dog.speak`/`Dog.loud`), multi-level
+  `super` (`Pup.base_base` → `super.speak` bound at the nearest base = Dog),
+  inherited wrappers calling base-calls (`Pup.base_speak` stays bound to
+  `Animal.speak`), virtual dispatch through `Animal*` unaffected, and a
+  read-only getter (`doubled`). Golden `42 49 50 702 15 1 302 1 15 302 502 15
+  100 200 206` identical on JIT opt0/opt3, native `cpyte build`, and CI AOT.
+  Error paths verified: `super` outside a method, unknown base method,
+  read-only property set, property/field name clash.
+- **Sharp edges**: `super.speak()` binds to the NEAREST base method even when
+  an intermediate class re-implements it (no late binding — it is an explicit
+  static base call). Property accessors are NOT in vtables (monomorphic
+  static functions); a subclass property must be re-declared (no
+  `@property`-style overriding). `super` is not an expression (no
+  `super.prop` reads, no super in dunder defaults). Windows CI has not been
+  run this stage.
+- Here's how the body of the parser edit went wrong THREE times before landing:
+  the `get:`/`set:` label lines must each be followed by `parse_suite` (the
+  whole accessor body) BEFORE the next label is parsed, and the property block
+  reader must not consume the class body's trailing DEDENT (a stray
+  `parse_suite` at the wrong indent level eats the enclosing class body's
+  DEDENT and every member after the property silently becomes part of the
+  property). The landing grammar is: on `property`, `parse_property` reads
+  `property`, then the name token, then expects `:`; loops reading a bare
+  IDENTIFIER that is `get` or `set` followed by `:`, parsing its body via
+  `parse_suite`; stops at any other bare identifier (field/method) WITHOUT
+  consuming it.
+
+## Sept 2026: Stage-5 OOP — `dataclass` auto `__init__`/`__eq__`/`__str__` (implemented, CI 28/28)
+
+Fifth OOP stage, directly in the compiler core (uncommitted). `dataclass class
+X:` declares a Python-`@dataclass`-style class whose `__init__`/`__eq__`/
+`__str__` are **synthesized in semantic** from the flattened field list and
+appended to `ClassDef.methods`, so every downstream mechanism (ctor
+resolution `_check_class_constructor`, vtable slots, dunder dispatch,
+inherited wrappers, `str()`/`==`) picks them up exactly as if the user wrote
+them.
+
+- **Grammar**: `dataclass` is a REAL lexer keyword (added to
+  `_BASE_KEYWORDS` in `lexar.py`, unlike `property` which is
+  identifier-intercepted). `parse_class(tokens, pos, sealed=False,
+  dataclass=False)` and a new `parse_dataclass_class` (mirrors
+  `parse_sealed_class`, emits clean ``Expected "class" after "dataclass"`` if
+  the keyword is missing) plus dispatch entries in both
+  `_parse_standard_statement` and `parse_statement` maps. `ClassDef` gains a
+  `dataclass` slot/param/`__repr__`; `FuncDef` gains a `meta` slot (default
+  None — `Attr` already had one from Stage 4). Formatter emits the
+  `dataclass ` prefix in `_emit_classdef`. Note: `sealed dataclass class X:` is
+  legal (both flags) — monomorphic static-dispatch dataclass.
+- **Synthesis (`semantic._synth_dataclass_methods`)**: only appends a dunder
+  the user did NOT define (`have = {m.name ...}`), and each synthesized
+  FuncDef is stamped `m.meta = {"kind": "synth"}` so the class override
+  signature check skips it (a derived dataclass's regenerated `__eq__(other:
+  Child)` legitimately differs from the base's `__eq__(other: Base)`).
+  - `__init__(f1, f2, ...)` — one param per flattened base-first field
+    (`_collect_class_fields`), rettype `void`, body plain
+    `this.f = f` assigns. Python-faithful: derived dataclass `__init__`
+    covers inherited fields too (no `super` call). Skipped entirely for a
+    fieldless dataclass (bare `new X()` still works).
+  - `__eq__(other: ClassName)` — VALUE param (matches the Stage-2 dunder
+    convention), rettype `bool`, body `this.f == other.f` joined with `and`
+    (`BinOp(AND)`); fieldless -> constant `true` (`Number("1", t, is_bool=
+    True)`). NOT `int` — field `==` infers `bool` and the return-coercion
+    checker rejects `bool` bodies under an `int` rettype (this exact mismatch
+    was the first landing bug; `print(a == b)` renders the i1 fine).
+  - `__str__()` — rettype `str`, body `"Name(f1=" + str(this.f1) + ", f2=" +
+    ... + ")"` via `String`/`Call(Variable("str"), ...)`/`BinOp(PLUS)` concat
+    (one `str(...)` per field); fieldless -> `Name()`.
+  - All synthetic nodes are built with `node._token`; only `this`-less
+    param dicts are passed — `_visit_class`'s existing method loop injects
+    `this: X*` and visits them like user methods.
+- **Two REAL latent bugs this stage surfaced and fixed (not sharp edges):**
+  1. **`new X(args)` never coerced constructor args.** `emit_newexpr` passed
+     `self.emit(arg)` raw into `__init__`, so a class-VALUE ctor param
+     (`def __init__(p: Point)`) crashed (`Type of #2 arg mismatch:
+     %"class.Point" != %"class.Point"*`) even though method calls had been
+     fixed by Stage-2's `_coerce_call_arg`. Fixed: `emit_newexpr` now coerces
+     every arg against `init_fn.function_type.args[i+1]` via
+     `_coerce_call_arg` (int widths, pointer bitcasts, and the
+     pointer→base-struct LOAD for class-`Value` params).
+  2. **`NewExpr` never stored its `inferred_type`.** `Deref`/`Attr` set
+     `node.inferred_type` but the NewExpr branch just `return`ed, so an inline
+     `str(new Point(5, 6))` (NewExpr in expression position) had no type at
+     codegen, `_static_obj_class` returned None, and `__str__` was skipped
+     (printed a raw pointer via `_stringify_value`). Fixed: added the
+     `inferred_type` slot to `astparse.NewExpr.__slots__` and stamped the
+     array/`[]`/`Class*` results in the inference branch.
+- **Test** `test/test_oop_dataclass.cpy` added to the CI corpus (28/28 green):
+  sealed-dataclass `Point` (synth `__init__` field stores + user `area()`
+  coexisting + user `__str__` winning over the synthesized one),
+  `str(new Point(5, 6))` inline receivers, `a == b` field-wise equality +
+  mutation invalidation (`b.x = 7`), derived dataclass `Point3(Point)` — one
+  flattened `__init__(x, y, z)`, deep `==` vs `new Point3(...)` —, class-VALUE
+  ctor args (`new Holder(a)` with `__init__(p: Point)`), sealed dataclass
+  static `==`/`__str__` (`Tag(id=9)`), and a virtual dataclass `Critter` with
+  non-dataclass child `Cat` — cross-hierarchy `(Critter*)new Cat(...)`
+  dispatch through the vptr (`ca == cb`, `str(ca)`). Identical golden
+  (`3 4 12 P3 P5 1 0 0 1 1 3 1 0 3 1 9 1 0 Tag(id=9) 10 1 1
+  Critter(hp=10, level=2)`) on JIT opt0/opt3, native `cpyte build`, and CI
+  AOT. Error paths verified: `dataclass P:` without `class` -> clean parse
+  error; fieldless dataclass `==` constant-true; formatter round-trip emits
+  `dataclass class`.
+- **Sharp edges**: synthesized `__eq__` compares `str`/pointer fields by
+  POINTER identity (like every other field), not content — prefer int/class
+  fields for equality, or write a user `__eq__`. `print(obj)` still does NOT
+  use `__str__` (only the `str(obj)` builtin) — unchanged from Stage 2.
+  Generated dunder signatures are per-class (a derived dataclass regains a
+  full flattened `__init__` — no `super().__init__` delegation is emitted).
+
+## Sept 2026: Stage-6 OOP — `x as T` safe runtime downcast (implemented, CI 29/29)
+
+Sixth OOP stage, directly in the compiler core (uncommitted). `x as T`
+(C#/Kotlin style, new `as` lexer keyword) is a **safe runtime downcast** that
+shares the Stage-3 RTTI ancestor grid: it re-types `x` as `T*` when the
+runtime class of `x` is a descendant-or-equal of `T`, and yields `null`
+otherwise. A parenthesized `(T)x` remains a silent hard cast; `as` answers
+null on failure.
+
+- **Grammar**: `as` added to `_BASE_KEYWORDS` (no existing corpus program used
+  it as an identifier — verified with a word-boundary grep). New AST node
+  `AsExpr(type_expr, expr, meta)` (slots incl. `inferred_type` + `meta`), wired
+  into the **postfix loop of BOTH `_parse_postfix` and `_parse_expr_iterative`**
+  so `x as T` binds at postfix level — `(x as Dog).bark()`, `arr[i] as T` and
+  `f() as T` all work, and the loop continues postfixing after the wrap. The
+  type name is a bare identifier; anything else is a clean
+  ``Expected a class name after 'as'``. Formatter emits `{expr} as {T}`.
+  **Bonus fix**: `sealed dataclass class X:` (both modifiers, either order)
+  now parses — `parse_sealed_class`/`parse_dataclass_class` consume an
+  optional leading OTHER modifier keyword before the required `class`.
+- **Semantic (`_infer_as_expr`)**: mirrors `_infer_isinstance`'s decision
+  tree exactly, except the result is always `T*` (null is the failure
+  payload): left operand must resolve to a class value/pointer (else
+  ```as` requires a class object/pointer on its left side``); `T` must resolve
+  to a class symbol (else ``int` is not a class``). Then, for static type B:
+  `T` at/above B → `as_const` True (every object IS-A T); sealed root
+  (monomorphic, no vptr) → `as_const` False (runtime class == declared type,
+  so a strict-descent/unrelated target is always null); virtual and B at/above
+  T → `as_runtime` (grid check); unrelated virtual → `as_const` False.
+  `_infer_children` treats AsExpr like CastExpr (`→ [expr]`).
+- **Codegen (`emit_as`)**: receiver via the Stage-3 3-way pushdown (pointer
+  value / pointer-to-pointer load / class-VALUE address-of via
+  `_emit_lvalue`); `as_const` True → bitcast to `T*`; False → typed
+  `ir.Constant(T*, None)`; `as_runtime` → load class id from vptr, single
+  grid read vs `id(T)`, then `select` between the re-typed receiver and typed
+  null. `_emit_children` gains AsExpr → `[expr]`.
+- **Test** `test/test_oop_downcast.cpy` added to the CI corpus (29/29 green):
+  multi-level virtual chain (`Animal*`→`Dog`→`Rott`) — success paths reading
+  subclass fields through the downcast (`a as Dog` → legs, `rott as Dog` →
+  Rott's ancestor Dog, `a as Animal` const upcast), failure paths returning
+  null (`a as Cat` when `a` holds a Dog, `a as Rott` grandchild of Dog),
+  inherited-method call through a downcast receiver, and sealed const cases
+  (`Point*`→`Point3` is const-null even for a physically-Point3 pointer).
+  Golden `4 animal 9 0 1 100 1 4 1 1 1` on JIT opt0/opt3, native `cpyte
+  build`, and CI AOT. Error paths verified: non-class left operand, raw
+  builtin-type target, `sealed dataclass class` combo, formatter round-trip.
+- **Sharp edges**: sealed hierarchies answer const-null for any strict-descent
+  `as` target — there is no vptr to check at runtime, so `(Point*)new
+  Point3(...) as Point3` is null even though the pointer IS a Point3 (declare
+  the base virtual for real downcasts). Upcrossing initializers still need an
+  explicit hard cast first (`Animal* a = (Animal*)new Dog(1, 4)` — the Stage-1
+  sharp edge is unchanged). `as` does not unwrap arrays or generics.
+
+## Sept 2026: MCJIT inline-asm fix (`compiling.py`) + cross-platform asyncio
+
+- **The POSIX JIT never registered the LLVM asm parser, so ANY inline `__asm__`
+  in a runtime/`ccode:`/`llvm:` hook failed at module emission with
+  `LLVM ERROR: Inline asm not supported by this streamer because we don't have
+  an asm parser for this target`.** Only the Windows GCC stub path called
+  `binding.initialize_native_asmparser()` (it needed it for the `___chkstk_ms`
+  stub's `asm sideeffect`). Fix (uncommitted, `compiling.py` `host_target()`):
+  call `binding.initialize_native_asmparser()` for EVERY host next to
+  `initialize_native_asmprinter()`. Required by the asyncio runtime's
+  fiber-stack-switcher asm on glibc ≥ 2.34; harmless elsewhere. Released wheels
+  (≤ v4.2.6) still lack it — programs whose runtime/ccode contains inline asm
+  will fail to JIT on Linux until a release publishes this line.
+- **Cross-platform asyncio runtime (`WEW-stdlib/asyncio_ext`, metadata 2.1.0,
+  rewrite of `runtime_hooks.py`).** One C runtime, three stack-switch backends
+  selected by object-macros in `#if` (NEVER an undefined function-like macro:
+  Apple clang eagerly parses the whole `#if` expression, so
+  `!__GLIBC_PREREQ(2, 34)` behind a false short-circuit is a hard parse error —
+  use `(__GLIBC__ * 100 + __GLIBC_MINOR__) >= 234` instead, undefined→0):
+  `_WIN32` → Windows Fibers (`CreateFiber`/`SwitchToFiber` + `ConvertThreadTo
+  Fiber`, `GetTickCount64`, `Sleep`, `WSAPoll` on `WSAPOLLFD`, lazy WSAStartup);
+  glibc<2.34 or non-glibc (macOS/BSD/musl) → `ucontext`; glibc≥2.34 →
+  `__attribute__((naked))` asm switcher (x86_64 + aarch64, **single-`%`
+  registers**: clang emits a naked function's asm string verbatim, `%%` fails
+  even on Linux). Verified end-to-end: macOS ucontext JIT opt0/opt3 + native
+  AOT, and Linux x86_64 ASM JIT opt0/opt3 + native AOT — all four async tests
+  print identical golden outputs; cpyte CI corpus 22/22.
+- **Fiber-stack frame OOB (ASM backend) fixed.** `cpy_asm_stack_init` writes
+  its 7-word (x86) / 12-word (aarch64) resume frame at
+  `base = (stack + size) & ~15` — for a 16-aligned malloc'd stack + 16-aligned
+  size that is exactly `stack + size`, i.e. `base[0..6]` lands **past the end**
+  of the allocated stack and corrupted the following glibc chunk
+  (`malloc(): invalid size (unsorted)` at the next heap op on every multi-fiber
+  program). The standalone harness passed only because its scratch buffer was
+  1 MiB. Fix: allocate `ASYNC_STACK_SIZE + 64` so the frame sits inside the
+  block. Gap: the frame-start math should ideally place the frame 16 bytes
+  BELOW the top instead of relying on over-allocation.
+
 ## v4.2.6 release (Sept 2026, Linux JIT NULL-symbol fix)
 
 - **The v4.2.5 wheel was stale: shipped with the gc_runtime pthread-key TLS fix

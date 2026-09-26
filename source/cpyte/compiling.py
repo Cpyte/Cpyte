@@ -89,6 +89,7 @@ def host_target():
 
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
+    binding.initialize_native_asmparser()
     if _use_windows_gnu():
         return binding.Target.from_triple("x86_64-w64-windows-gnu")
     return binding.Target.from_default_triple()
@@ -469,7 +470,18 @@ def _find_llvm_cc():
         if exe:
             try:
                 r = subprocess.run(
-                    [exe, "-S", "-emit-llvm", "-O0", "-target", triple, "-o", "-", "-xc", "-"],
+                    [
+                        exe,
+                        "-S",
+                        "-emit-llvm",
+                        "-O0",
+                        "-target",
+                        triple,
+                        "-o",
+                        "-",
+                        "-xc",
+                        "-",
+                    ],
                     input="int __x = 0;",
                     capture_output=True,
                     text=True,
@@ -1644,9 +1656,13 @@ def _map_process_libc(engine, mod):
         name = fn.name
         if name.startswith("llvm.") or name in mapped or name in _explicit_mapped:
             continue
+        # clang marks a handful of externals (poll/pthread_cond_init/fputs/
+        # nanosleep) with LLVM's do-not-mangle prefix "\x01"; the runtime
+        # process symbol is the bare trailing name, so strip it for lookup.
+        lookup = name[1:] if name.startswith("\x01") else name
         for lib in libs:
             try:
-                sym = getattr(lib, name)
+                sym = getattr(lib, lookup)
             except AttributeError:
                 continue
             try:
@@ -1660,6 +1676,12 @@ def _map_process_libc(engine, mod):
                 except Exception:
                     pass
                 break
+    if os.environ.get("CPYTE_JIT_DEBUG"):
+        unset = [f.name for f in mod.functions if f.is_declaration
+                 and not f.name.startswith("llvm.") and f.name not in mapped
+                 and f.name not in _explicit_mapped]
+        if unset:
+            print("[jit] unresolved externs: %s" % sorted(unset), file=sys.stderr)
 
 
 def run_aot(

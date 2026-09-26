@@ -95,6 +95,7 @@ from .astparse import (
     AddrOf,
     Assert,
     Assign,
+    AsExpr,
     Attr,
     BinOp,
     Break,
@@ -490,6 +491,42 @@ def _is_literal_zero(node) -> bool:
 _HEAP_ALLOC_FNS = ("malloc", "calloc", "realloc")
 
 
+def _coerce_assign_ok(src_t, dst_t):
+    """Permissive assignment-type check used by property setters: exact matches,
+    dynamic, pointer-interchange, str/char, and the numeric widening pairs the
+    compiler already lowers for struct-field stores."""
+    if src_t is None or dst_t is None or src_t == dst_t:
+        return True
+    if src_t == "dynamic" or dst_t == "dynamic":
+        return True
+    if dst_t == "void*" and src_t.endswith("*"):
+        return True
+    if src_t == "void*" and dst_t.endswith("*"):
+        return True
+    if src_t.endswith("*") and dst_t.endswith("*"):
+        return True
+    if dst_t in ("str", "char") and src_t in ("str", "char"):
+        return True
+    if dst_t == "str" and (src_t.endswith("*") or src_t == "char"):
+        return True
+    if src_t == "str" and (dst_t.endswith("*") or dst_t == "char"):
+        return True
+    return (src_t, dst_t) in (
+        ("int", "int64"),
+        ("int", "uint64"),
+        ("int", "size_t"),
+        ("int64", "uint64"),
+        ("int64", "size_t"),
+        ("uint64", "int64"),
+        ("uint64", "size_t"),
+        ("size_t", "int"),
+        ("size_t", "int64"),
+        ("size_t", "uint64"),
+        ("float", "double"),
+        ("double", "float"),
+    )
+
+
 def _is_heap_alloc_expr(v):
     """True for `new` allocations and raw C heap allocs (`malloc`, `calloc`,
     `realloc`), so `del` and the ownership checker agree about what is
@@ -632,6 +669,18 @@ class SemanticAnalyzer:
         # spurious "not installed" diagnostics on correct installed libraries.
         if self._manifest_registry.is_loaded(package_name):
             self._loaded_packages.add(package_name)
+            # The CLI preloader (_load_package_manifests_from_source) registers
+            # the manifest + lexer/parser hooks eagerly, but deliberately defers
+            # semantic/codegen/runtime hooks to import time. Cloud that deferral
+            # never happened (this branch short-circuits), so install the
+            # deferred hooks here; re-installation is idempotent.
+            if self._workspace_root:
+                manifest_path = os.path.join(package_dir, "package.json")
+                if os.path.exists(manifest_path):
+                    manifest = ManifestParser.validate_and_parse(manifest_path)
+                    self._load_nonparser_hooks(
+                        manifest, package_dir, package_name
+                    )
             return True
 
         manifest_path = os.path.join(package_dir, "package.json")
@@ -650,25 +699,7 @@ class SemanticAnalyzer:
 
             # Load hooks if present
             if self._workspace_root:
-                context = self._hook_context()
-                context.data["package_dir"] = package_dir
-                context.data["package_name"] = package_name
-
-                all_hook_files = (
-                    manifest.extensions.parser_hooks
-                    + manifest.extensions.semantic_hooks
-                    + manifest.extensions.codegen_hooks
-                    + manifest.extensions.runtime_hooks
-                )
-
-                if all_hook_files:
-                    HookLoader.load_hooks_from_package(
-                        package_name,
-                        package_dir,
-                        all_hook_files,
-                        self._hook_registry,
-                        context,
-                    )
+                self._load_nonparser_hooks(manifest, package_dir, package_name)
 
             self._loaded_packages.add(package_name)
 
@@ -681,6 +712,45 @@ class SemanticAnalyzer:
         except Exception as e:
             self.error(f"Failed to load package manifest for '{package_name}': {e}")
             return False
+
+    def _load_nonparser_hooks(
+        self, manifest, package_dir: str, package_name: str
+    ) -> None:
+        """Install semantic/codegen/runtime hooks for an imported package.
+
+        Parser hooks are installed eagerly by the CLI preloader
+        (``_load_package_manifests_from_source``) so ``async``-style keywords
+        lex and parse before the source is analyzed. The remaining hook stages
+        are deferred to import time — but when the manifest was already
+        registered by the preloader, ``_load_package_manifest`` short-circuits,
+        so this helper is what actually installs the deferred hooks. It is
+        idempotent: a hook whose name is already in the registry is skipped
+        (LSP re-analyses must not raise "already registered").
+        """
+        all_hook_files = (
+            manifest.extensions.semantic_hooks
+            + manifest.extensions.codegen_hooks
+            + manifest.extensions.runtime_hooks
+        )
+        if not all_hook_files:
+            return
+
+        context = self._hook_context()
+        context.data["package_dir"] = package_dir
+        context.data["package_name"] = package_name
+
+        import os as _os
+
+        for relative_path in all_hook_files:
+            hook_path = _os.path.abspath(_os.path.join(package_dir, relative_path))
+            if not _os.path.isfile(hook_path):
+                raise HookLoadError(f"Hook file does not exist: {hook_path}")
+            hooks = HookLoader._load_hook_file(hook_path, package_name)
+            for hook in hooks:
+                if any(h.name == hook.name for h in self._hook_registry.all()):
+                    continue
+                hook.initialize(context)
+                self._hook_registry.register(hook)
 
     def _load_cpm_package_manifests(self) -> None:
         """Load manifests from all CPM packages in the workspace."""
@@ -806,6 +876,24 @@ class SemanticAnalyzer:
     _FLOAT_TYPES = ("float", "double")
     _WIDE_INT_TYPES = ("int64", "uint64")
     _CONV_BUILTINS = {"str": "str", "int": "int", "float": "float", "double": "float"}
+
+    # Binary operator -> overridable method (Python-style dunders). `this` is
+    # the receiver; the right operand is the single non-`this` parameter.
+    _DUNDER_BINOPS = {
+        "PLUS": "__add__",
+        "MINUS": "__sub__",
+        "STAR": "__mul__",
+        "SLASH": "__truediv__",
+        "SLASH_SLASH": "__floordiv__",
+        "PERCENT": "__mod__",
+        "POW": "__pow__",
+        "LESS": "__lt__",
+        "LESS_EQ": "__le__",
+        "GREATER": "__gt__",
+        "GREATER_EQ": "__ge__",
+        "EQ_EQ": "__eq__",
+        "NOT_EQ": "__ne__",
+    }
 
     def _numeric_promote(self, t1: str | None, t2: str | None) -> str | None:
         """C-like usual arithmetic conversions for numeric types.
@@ -1155,6 +1243,17 @@ class SemanticAnalyzer:
                 node.inferred_type = "dynamic"
                 return "dynamic"
 
+            # Dunder operator overloading: `a <op> b` -> `a.__op__(b)` when the
+            # left operand's class defines the operator method.
+            if left_t != "dynamic" and right_t != "dynamic":
+                dunder = self._DUNDER_BINOPS.get(node.op.name)
+                if dunder:
+                    m = self._find_class_dunder(left_t, dunder)
+                    if m is not None:
+                        if self._dunder_arity_ok(m, 1):
+                            node.inferred_type = m.rettype or "int"
+                            return node.inferred_type
+
             if node.op.name in (
                 "EQ_EQ",
                 "NOT_EQ",
@@ -1475,6 +1574,10 @@ class SemanticAnalyzer:
                     user_sym = self.current_scope.lookup(node.callee.name)
                     if user_sym is None or user_sym.kind != "function":
                         return self._infer_has_get_attr(node, node.callee.name)
+                if node.callee.name == "isinstance":
+                    user_sym = self.current_scope.lookup("isinstance")
+                    if user_sym is None or user_sym.kind != "function":
+                        return self._infer_isinstance(node)
                 if node.callee.name in ("append", "len"):
                     user_sym = self.current_scope.lookup(node.callee.name)
                     if user_sym is None or user_sym.kind != "function":
@@ -1493,6 +1596,17 @@ class SemanticAnalyzer:
                         return None
                     node.inferred_type = "dynamic"
                     return "dynamic"
+            if (
+                isinstance(node.callee, Attr)
+                and isinstance(node.callee.obj, Variable)
+                and node.callee.obj.name == "super"
+            ):
+                return self._infer_super_call(node)
+            if isinstance(node.callee, Attr):
+                # Stamp the receiver subtree (CastExpr/Deref/Index/… chained
+                # before `.method`) so codegen can resolve the virtual/static
+                # method against its class type.
+                self._infer_type(node.callee.obj)
             sym = self._resolve_callee(node.callee)
             if sym is not None:
                 for arg in node.args:
@@ -1526,6 +1640,12 @@ class SemanticAnalyzer:
             if obj_t == "dynamic":
                 node.inferred_type = "dynamic"
                 return "dynamic"
+            if obj_t and obj_t != "str" and not obj_t.endswith("[]"):
+                m = self._find_class_dunder(obj_t, "__getitem__")
+                if m is not None:
+                    if self._dunder_arity_ok(m, 1):
+                        node.inferred_type = m.rettype or "dynamic"
+                        return node.inferred_type
             if obj_t:
                 elem_t = _array_back(obj_t)
                 if elem_t is not None:
@@ -1546,6 +1666,9 @@ class SemanticAnalyzer:
             return None
 
         if isinstance(node, Attr):
+            if isinstance(node.obj, Variable) and node.obj.name == "super":
+                self.error("`super` must be called as `super.method(...)`", node)
+                return None
             obj_t = self._infer_type(node.obj)
             if obj_t:
                 lookup_t = obj_t.removesuffix("*")
@@ -1563,7 +1686,22 @@ class SemanticAnalyzer:
                     and struct_sym.kind in ("struct", "class")
                     and struct_sym.node
                 ):
-                    for field in struct_sym.node.fields:
+                    if struct_sym.kind == "class":
+                        prop = self._find_class_property(obj_t, node.name)
+                        if prop is not None:
+                            node.meta = {
+                                "kind": "prop_get",
+                                "cls": prop[0],
+                                "prop": node.name,
+                            }
+                            node.inferred_type = getattr(prop[1], "_ptype", "void")
+                            return node.inferred_type
+                    fields = (
+                        self._collect_class_fields(struct_sym.node)
+                        if struct_sym.kind == "class"
+                        else struct_sym.node.fields
+                    )
+                    for field in fields:
                         if field.name == node.name:
                             node.inferred_type = field.type_expr
                             return field.type_expr
@@ -1611,9 +1749,16 @@ class SemanticAnalyzer:
                 # `new dynamic[1]` -> `dynamic[1]`, NOT `dynamic[]`). A runtime
                 # size stays a dynamic array `T[]`.
                 if isinstance(node.size, Number):
-                    return f"{node.type_expr}[{node.size.value}]"
-                return node.type_expr + "[]"
-            return node.type_expr + "*"
+                    node.inferred_type = f"{node.type_expr}[{node.size.value}]"
+                    return node.inferred_type
+                node.inferred_type = node.type_expr + "[]"
+                return node.inferred_type
+            if node.args is not None:
+                # `new X(a, b, ...)` — validate the constructor call against the
+                # class's `__init__` (signature stored with the vtable).
+                self._check_class_constructor(node)
+            node.inferred_type = node.type_expr + "*"
+            return node.inferred_type
 
         if isinstance(node, SizeOf):
             return "int"
@@ -1624,6 +1769,9 @@ class SemanticAnalyzer:
             node.type_expr = resolved
             node.inferred_type = resolved
             return resolved
+
+        if isinstance(node, AsExpr):
+            return self._infer_as_expr(node)
 
         if isinstance(node, InlineAsm):
             for _, arg_expr in node.inputs:
@@ -1654,6 +1802,22 @@ class SemanticAnalyzer:
                 and not self._user_has_builtin(node.callee.name)
             ):
                 return []
+            if (
+                isinstance(node.callee, Variable)
+                and node.callee.name == "isinstance"
+                and not self._user_has_builtin(node.callee.name)
+            ):
+                # The class-name argument is not an expression; only the object
+                # expression needs pre-inference.
+                return [node.args[0]] if node.args else []
+            if (
+                isinstance(node.callee, Attr)
+                and isinstance(node.callee.obj, Variable)
+                and node.callee.obj.name == "super"
+            ):
+                # `super.method(...)` is resolved by `_infer_super_call`; the
+                # `super` receiver is not a real expression to pre-infer.
+                return list(node.args)
             return list(node.args)
         if isinstance(node, Index):
             return [node.obj, node.index]
@@ -1664,12 +1828,16 @@ class SemanticAnalyzer:
         if isinstance(node, AddrOf):
             return [node.operand]
         if isinstance(node, NewExpr):
-            return [node.size] if node.size is not None else []
+            children = [node.size] if node.size is not None else []
+            children.extend(node.args or [])
+            return children
         if isinstance(node, InlineAsm):
             return [arg_expr for _, arg_expr in node.inputs]
         if isinstance(node, ExprStmt):
             return [node.expr]
         if isinstance(node, CastExpr):
+            return [node.expr]
+        if isinstance(node, AsExpr):
             return [node.expr]
         if isinstance(node, BorrowExpr):
             return [node.operand]
@@ -1732,6 +1900,12 @@ class SemanticAnalyzer:
                 )
                 return None
             if sym.kind not in ("function", "builtin_func"):
+                # `obj()` -> `obj.__call__(...)`: a class-typed value/pointer
+                # whose class defines the callable dunder is callable.
+                m = self._find_class_dunder(sym.type, "__call__")
+                if m is not None:
+                    callee._dunder_via = self._base_of_t(sym.type)
+                    return Symbol("function", m.rettype or "dynamic", m)
                 self.error(
                     f"`{callee.name}` is not callable",
                     callee,
@@ -1741,13 +1915,51 @@ class SemanticAnalyzer:
             return sym
         return None
 
+    def _infer_super_call(self, node: Call):
+        """Resolve `super.method(args)` to the nearest base-class definition and
+        stamp `node.meta` so codegen performs the *static* base-class call (no
+        virtual dispatch — the base method is called directly)."""
+        callee = node.callee
+        mname = callee.name
+        if self.current_class is None:
+            self.error("`super` can only be used inside a class method", node)
+            return None
+        m, defnode = self._find_base_method(self.current_class, mname)
+        if m is None:
+            self.error(f"no base method named `{mname}`", node)
+            return None
+        expected = [k for k in m.params if k != "this"]
+        if len(node.args) != len(expected):
+            self.error(
+                f"`super.{mname}` expects {len(expected)} argument(s), "
+                f"found {len(node.args)}",
+                node,
+            )
+            return None
+        for arg in node.args:
+            self._infer_type(arg)
+        node.meta = {"kind": "super_call", "base": defnode.name, "name": mname}
+        t = m.rettype
+        if t in (None, "auto"):
+            t = "void"
+        node.inferred_type = t
+        return t
+
     def _check_call_args(self, call: Call, sym: Symbol):
         expected_count = 0
         if sym.kind == "builtin_func":
             return
+        callee_is_dunder = isinstance(call.callee, Variable) and bool(
+            getattr(call.callee, "_dunder_via", None)
+        )
         if sym.node and isinstance(sym.node, FuncDef):
-            expected_count = len(sym.node.params)
-            call.param_types = list(sym.node.params.values())
+            expected_count = len(sym.node.params) - (1 if callee_is_dunder else 0)
+            if callee_is_dunder:
+                call.param_types = [
+                    t for p, t in sym.node.params.items() if p != "this"
+                ]
+            else:
+                call.param_types = list(sym.node.params.values())
         elif sym.node and isinstance(sym.node, (Import, CCode, Llvm)):
             for fname, (_, params, vararg) in sym.node.symbols:
                 if fname == call.callee.name:
@@ -2682,6 +2894,11 @@ class SemanticAnalyzer:
                 acc.add(node.name)
                 return
             if isinstance(node, Call):
+                if isinstance(node.callee, Variable):
+                    acc.add(node.callee.name)
+                elif isinstance(node.callee, Attr):
+                    # Method-call receiver (`obj.method(...)`) counts as a read.
+                    _collect(node.callee.obj, acc)
                 if (
                     isinstance(node.callee, Variable)
                     and node.callee.name in ("has", "get_attr")
@@ -3174,6 +3391,7 @@ class SemanticAnalyzer:
                 expected = self.current_func.rettype
                 if (
                     expected
+                    and expected != "auto"
                     and val_type
                     and _array_family(expected) != _array_family(val_type)
                     and expected != "dynamic"
@@ -3310,6 +3528,12 @@ class SemanticAnalyzer:
             )
             return None
         arg_t = getattr(node.args[0], "inferred_type", None)
+        if arg_t and arg_t != "dynamic" and arg_t != "str":
+            m = self._find_class_dunder(arg_t, "__len__")
+            if m is not None:
+                if self._dunder_arity_ok(m, 0):
+                    node.inferred_type = m.rettype or "int64"
+                    return node.inferred_type
         if arg_t is None or not arg_t.endswith("[]"):
             self.error(
                 f"len() requires an array argument, got "
@@ -3444,7 +3668,9 @@ class SemanticAnalyzer:
         lookup_t = (obj_t or "").removesuffix("*").removesuffix("[]")
         struct_sym = self.current_scope.lookup(lookup_t) if lookup_t else None
         fields = []
-        if struct_sym and struct_sym.kind in ("struct", "class") and struct_sym.node:
+        if struct_sym and struct_sym.kind == "class" and struct_sym.node:
+            fields = self._collect_class_fields(struct_sym.node)
+        elif struct_sym and struct_sym.kind == "struct" and struct_sym.node:
             fields = list(struct_sym.node.fields)
         elif not (obj_t and obj_t.endswith("*")) and obj_t != "dynamic":
             if obj_t != "dynamic":
@@ -3566,7 +3792,11 @@ class SemanticAnalyzer:
                 obj,
             )
             return None
-        fields = list(struct_sym.node.fields)
+        fields = (
+            self._collect_class_fields(struct_sym.node)
+            if struct_sym.kind == "class"
+            else list(struct_sym.node.fields)
+        )
         if is_lit:
             node.inferred_type = "bool"
             node.meta = {
@@ -3581,6 +3811,149 @@ class SemanticAnalyzer:
             "obj": obj,
         }
         return "bool"
+
+    def _class_chain(self, cls: str) -> list:
+        """Resolve a class name to its ancestor chain `[cls, base, ..., root]`."""
+        chain = []
+        sym = self.current_scope.lookup(cls)
+        if sym is None or sym.kind != "class":
+            sym = self.globals.lookup(cls)
+        cnode = sym.node if sym is not None and sym.kind == "class" else None
+        seen = set()
+        while cnode is not None and cnode.name not in seen:
+            seen.add(cnode.name)
+            chain.append(cnode.name)
+            if cnode.base:
+                bsym = (self.current_scope or self.globals).lookup(cnode.base)
+                cnode = (
+                    bsym.node
+                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    else None
+                )
+            else:
+                cnode = None
+        return chain
+
+    def _infer_isinstance(self, node: Call):
+        """Semantic analysis for the `isinstance(obj, Class)` builtin.
+
+        O(1) class-id RTTI: a virtual class object carries a vtable whose field 0
+        is its class id; a per-class ancestor grid built at codegen turns
+        "is T an ancestor-or-equal of the runtime class?" into one grid read.
+        Sealed chains are monomorphic (no vptr), so those resolve at compile
+        time from the declared type.
+        """
+        if len(node.args) != 2:
+            self.error(
+                "isinstance() expects 2 arguments",
+                node,
+                note="isinstance(obj, Class) -> does `obj`'s runtime class "
+                "derive from `Class` (or equal it)?",
+            )
+            return None
+        obj, cls_arg = node.args[:2]
+        obj_t = self._infer_type(obj)
+        base_t = (obj_t or "").removesuffix("*").removesuffix("[]")
+        if not isinstance(cls_arg, Variable):
+            self.error(
+                "isinstance() class argument must be a class name",
+                cls_arg,
+                note="pass the class identifier directly, e.g. "
+                "`isinstance(x, Animal)`",
+            )
+            return None
+        cls_name = cls_arg.name
+        obj_sym = (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        if not (obj_sym and obj_sym.kind == "class"):
+            self.error(
+                "isinstance() requires a class object/pointer as its first "
+                "argument",
+                obj,
+                note=f"got `{obj_t}`",
+            )
+            return None
+        cls_sym = (self.current_scope or self.globals).lookup(cls_name)
+        if cls_sym is None or cls_sym.kind != "class":
+            self.error(f"`{cls_name}` is not a class", cls_arg)
+            return None
+        obj_chain = self._class_chain(base_t)
+        cls_chain = self._class_chain(cls_name)
+        node.inferred_type = "bool"
+        if cls_name in obj_chain:
+            # Static type B is at/under T: every object of static type B IS-A T.
+            node.meta = {"kind": "is_const", "value": True}
+            return "bool"
+        # Root decides virtualness: the whole chain is sealed iff its root is.
+        root_sym = (self.current_scope or self.globals).lookup(obj_chain[-1])
+        root_node = root_sym.node if root_sym is not None else None
+        if root_node is not None and getattr(root_node, "sealed", False):
+            # Sealed = monomorphic, no vptr -> no runtime type info. Anything
+            # below the declared type (or an unrelated class) is unknowable
+            # statically, so it answers false.
+            node.meta = {"kind": "is_const", "value": False}
+            return "bool"
+        if base_t in cls_chain:
+            # Virtual object whose static type underlies T: only the runtime
+            # class id (vtable field 0) can decide.
+            node.meta = {"kind": "is_runtime", "cls": cls_name}
+            return "bool"
+        node.meta = {"kind": "is_const", "value": False}
+        return "bool"
+
+    def _infer_as_expr(self, node: AsExpr):
+        """Semantic analysis for `x as T` — a safe runtime downcast.
+
+        Shares the Stage-3 RTTI decision tree with `_infer_isinstance`, but the
+        result is a `T*` pointer: `x as T` yields `x` re-typed as `T*` when the
+        runtime class of `x` is a descendant-or-equal of `T`, and `null`
+        otherwise. Decision rules:
+          * `T` at/above the static type `B` -> every object IS-A `T`, so the
+            cast always succeeds (const non-null).
+          * sealed hierarchy (monomorphic, no vptr) -> the runtime class equals
+            the declared type exactly, so a strict-descent target is const null.
+          * virtual and `B` at/above `T` -> only the runtime class id (vtable
+            field 0) can decide (runtime check).
+          * unrelated virtual hierarchies -> const null.
+        """
+        t = self._infer_type(node.expr)
+        base_t = (t or "").removesuffix("*").removesuffix("[]")
+        obj_sym = (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        if not (obj_sym and obj_sym.kind == "class"):
+            self.error(
+                "`as` requires a class object/pointer on its left side",
+                node.expr,
+                note=f"got `{t}`; `x as T` re-types an object's runtime class, "
+                "returning `T*` or null on failure",
+            )
+            node.inferred_type = "void"
+            return "void"
+        cls_sym = (self.current_scope or self.globals).lookup(node.type_expr)
+        if cls_sym is None or cls_sym.kind != "class":
+            self.error(f"`{node.type_expr}` is not a class", node)
+            node.inferred_type = "void"
+            return "void"
+        obj_chain = self._class_chain(base_t)
+        cls_chain = self._class_chain(node.type_expr)
+        node.inferred_type = node.type_expr + "*"
+        if node.type_expr in obj_chain:
+            # T at/above B: every object of static type B IS-A T.
+            node.meta = {"kind": "as_const", "value": True}
+            return node.inferred_type
+        # Root decides virtualness: the whole chain is sealed iff its root is.
+        root_sym = (self.current_scope or self.globals).lookup(obj_chain[-1])
+        root_node = root_sym.node if root_sym is not None else None
+        if root_node is not None and getattr(root_node, "sealed", False):
+            # Sealed = monomorphic, no vptr -> the runtime class is exactly the
+            # declared one, so a strict-descent (or unrelated) target is null.
+            node.meta = {"kind": "as_const", "value": False}
+            return node.inferred_type
+        if base_t in cls_chain:
+            # Virtual object whose static type underlies T: the runtime class
+            # id decides whether the object is a descendant-or-equal of T.
+            node.meta = {"kind": "as_runtime", "cls": node.type_expr}
+            return node.inferred_type
+        node.meta = {"kind": "as_const", "value": False}
+        return node.inferred_type
 
     def _visit_assign(self, node: Assign, scope: Scope | None = None):
         val_type = self._infer_type(node.value)
@@ -3747,6 +4120,9 @@ class SemanticAnalyzer:
                 self._gc_new_names.discard(name)
         elif isinstance(node.target, Attr):
             obj = node.target.obj
+            if isinstance(obj, Variable) and obj.name == "super":
+                self.error("cannot assign through `super`", node.target)
+                return
             if isinstance(obj, Variable):
                 s = scope or self.current_scope
                 obj_sym = s.lookup_local(obj.name)
@@ -3757,6 +4133,29 @@ class SemanticAnalyzer:
             obj_t = self._infer_type(node.target.obj)
             if obj_t:
                 lookup_t = obj_t.removesuffix("*")
+                prop = self._find_class_property(obj_t, node.target.name)
+                if prop is not None:
+                    pdef = prop[1]
+                    if pdef.set is None:
+                        self.error(
+                            f"property `{node.target.name}` is read-only",
+                            node.target,
+                        )
+                        return
+                    set_type = getattr(pdef, "_ptype", None)
+                    if not _coerce_assign_ok(val_type, set_type):
+                        self.error(
+                            f"cannot assign `{val_type}` to property "
+                            f"`{node.target.name}` of type `{set_type}`",
+                            node.target,
+                        )
+                        return
+                    node.target.meta = {
+                        "kind": "prop_set",
+                        "cls": prop[0],
+                        "prop": node.target.name,
+                    }
+                    return
                 struct_sym = (
                     scope.lookup(lookup_t)
                     if scope
@@ -4047,6 +4446,140 @@ class SemanticAnalyzer:
                     note="`void` functions/expressions return nothing to print",
                 )
 
+    @staticmethod
+    def _base_of_t(t):
+        """Strip pointer/array suffixes from a static type string."""
+        if not t:
+            return ""
+        return str(t).removesuffix("*").removesuffix("[]")
+
+    def _find_class_dunder(self, type_expr, dunder: str):
+        """Walk the base chain of the class named by `type_expr` looking for a
+        method named `dunder`. Returns the FuncDef node or None if the type is
+        not a class or has no such method."""
+        if not dunder:
+            return None
+        base = self._base_of_t(type_expr)
+        if not base:
+            return None
+        sym = self.current_scope.lookup(base)
+        if sym is None:
+            sym = self.globals.lookup(base)
+        cnode = sym.node if sym is not None and sym.kind == "class" else None
+        seen = set()
+        while cnode is not None:
+            if cnode.name in seen:
+                break
+            seen.add(cnode.name)
+            for m in cnode.methods:
+                if m.name == dunder:
+                    return m
+            if cnode.base:
+                bsym = self.current_scope.lookup(cnode.base)
+                if bsym is None:
+                    bsym = self.globals.lookup(cnode.base)
+                cnode = (
+                    bsym.node
+                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    else None
+                )
+            else:
+                cnode = None
+        return None
+
+    def _class_node(self, type_expr):
+        """Resolve a static type string to its ClassDef node (or None)."""
+        base = self._base_of_t(type_expr)
+        if not base:
+            return None
+        sym = self.current_scope.lookup(base)
+        if sym is None:
+            sym = self.globals.lookup(base)
+        if sym is not None and sym.kind == "class" and isinstance(sym.node, ClassDef):
+            return sym.node
+        return None
+
+    def _find_class_property(self, type_expr, name):
+        """Walk the base chain (child-first) looking for a property named `name`.
+        Returns `(defining_class_name, PropertyDef)` or None."""
+        if not name:
+            return None
+        cnode = self._class_node(type_expr)
+        seen = set()
+        while cnode is not None:
+            if cnode.name in seen:
+                break
+            seen.add(cnode.name)
+            for p in getattr(cnode, "properties", None) or ():
+                if p.name == name:
+                    return (cnode.name, p)
+            if cnode.base:
+                cnode = self._class_node(cnode.base)
+            else:
+                cnode = None
+        return None
+
+    def _find_base_method(self, cls_node, mname):
+        """Walk the base chain (exclusive of `cls_node`) for a method named
+        `mname`, returning `(FuncDef, defining_ClassDef)` or (None, None)."""
+        if cls_node is None or not mname:
+            return None, None
+        seen = set()
+        cnode = cls_node
+        while cnode is not None:
+            if cnode.name in seen:
+                break
+            seen.add(cnode.name)
+            if cnode.base:
+                cnode = self._class_node(cnode.base)
+            else:
+                cnode = None
+            if cnode is None:
+                break
+            for m in cnode.methods:
+                if m.name == mname:
+                    return m, cnode
+        return None, None
+
+    def _dunder_arity_ok(self, m, expected_extra: int) -> bool:
+        """Validate a dunder method's parameter count (`expected_extra` is the
+        number of non-`this` parameters, e.g. 0 for __len__/__str__)."""
+        extras = [p for p in m.params if p != "this"]
+        if len(extras) != expected_extra:
+            self.error(
+                f"method `{m.name}` must take exactly {expected_extra} "
+                f"argument(s) (besides the receiver), found {len(extras)}",
+                m,
+            )
+            return False
+        return True
+
+    def _collect_class_fields(self, cnode):
+        """Base-first flattened field list for a class, including inherited
+        fields (Attr resolution needs the same layout the codegen uses)."""
+        if cnode is None or not isinstance(cnode, ClassDef):
+            return []
+        chain = []
+        seen = set()
+        cur = cnode
+        while cur is not None:
+            chain.append(cur)
+            if cur.name in seen:
+                break
+            seen.add(cur.name)
+            if cur.base:
+                bsym = self.current_scope.lookup(cur.base)
+                if bsym is None:
+                    bsym = self.globals.lookup(cur.base)
+                cur = bsym.node if bsym is not None and isinstance(bsym.node, ClassDef) else None
+            else:
+                cur = None
+        out = []
+        for c in reversed(chain):
+            for f in c.fields:
+                out.append(f)
+        return out
+
     def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals
         class_sym = Symbol("class", node.name, node)
@@ -4060,6 +4593,19 @@ class SemanticAnalyzer:
             if base_sym is None or base_sym.kind != "class":
                 self.error(f"base class `{node.base}` not found", node)
             elif base_sym.node and isinstance(base_sym.node, ClassDef):
+                base_node = base_sym.node
+                # sealed-class rules: a non-sealed class cannot extend a sealed
+                # base, and a sealed class cannot extend a virtual base.
+                if base_node.sealed and not node.sealed:
+                    self.error(
+                        f"class `{node.name}` cannot inherit from sealed class `{node.base}`",
+                        node,
+                    )
+                elif node.sealed and not base_node.sealed:
+                    self.error(
+                        f"sealed class `{node.name}` cannot inherit from virtual class `{node.base}`",
+                        node,
+                    )
                 # Copy base class fields (for memory layout)
                 for f in base_sym.node.fields:
                     class_scope.define(f.name, Symbol("field", f.type_expr, f))
@@ -4077,14 +4623,201 @@ class SemanticAnalyzer:
                 class_scope.undefine(f.name)
             class_scope.define(f.name, Symbol("field", f.type_expr, f))
 
+        # Validate property definitions (name clashes, accessor arity) and
+        # derive each property's value type from its getter's return type.
+        for p in getattr(node, "properties", None) or ():
+            if class_scope.lookup_local(p.name) is not None:
+                self.error(
+                    f"property `{p.name}` clashes with an existing field or method",
+                    p,
+                )
+                continue
+
+        # Dataclass synthesis: append auto-generated `__init__`/`__eq__`/`__str__`
+        # FuncDefs to node.methods so they flow through EVERY existing mechanism
+        # (ctor resolution, vtable slots, dunder dispatch, inherited wrappers).
+        # Each is synthesized only when the user did not define it themselves.
+        if getattr(node, "dataclass", False):
+            self._synth_dataclass_methods(node, class_scope)
+
         # Visit methods (second pass: analyze bodies, which registers signatures)
         old_class = self.current_class
         self.current_class = node
+        base_methods = {}
+        if base_sym is not None and isinstance(base_sym.node, ClassDef):
+            base_methods = {m.name: m for m in base_sym.node.methods}
         for m in node.methods:
+            # Overriding methods must keep the base signature (the vtable slot
+            # type is fixed by the base class so no per-object thunk is needed).
+            # `__init__` is exempt: constructors are resolved up the chain by
+            # `new` and each class may take its own argument list.
+            bm = base_methods.get(m.name)
+            if bm is not None:
+                # Drop the base-copied method symbol so `_visit_funcdef` below
+                # can define the override without tripping the redefinition check.
+                held = class_scope.lookup_local(m.name)
+                if held is not None:
+                    class_scope.undefine(m.name)
+
+                is_synth = (getattr(m, "meta", None) or {}).get("kind") == "synth"
+                if m.name != "__init__" and not is_synth:
+                    def _sig(f):
+                        return (
+                            tuple(
+                                sorted(
+                                    (k, v) for k, v in f.params.items() if k != "this"
+                                )
+                            ),
+                            f.rettype,
+                        )
+
+                    if _sig(m) != _sig(bm):
+                        self.error(
+                            f"method `{m.name}` overrides a base method with a "
+                            "different signature (parameters/return type must match)",
+                            m,
+                        )
             # Inject 'this' parameter implicitly
             m.params = {"this": node.name + "*", **m.params}
             self._visit_funcdef(m, class_scope)
+        # Property accessors: visiting the getter first lets the property's
+        # value type (from its return) feed the setter's `value` parameter.
+        for p in getattr(node, "properties", None) or ():
+            self._visit_property(p, node, class_scope)
         self.current_class = old_class
+
+    def _synth_dataclass_methods(self, node: ClassDef, class_scope: Scope):
+        """Append auto-generated `__init__`/`__eq__`/`__str__` FuncDefs for a
+        `dataclass` class. Synthesis is Python-dataclass faithful: the
+        flattened base-first field list feeds one `__init__(f1, f2, ...)` that
+        assigns `this.f = f`, a field-wise `__eq__(other)` (combined with
+        `and`), and a `__str__` rendering `Name(f1=.., f2=..)`. Each dunder is
+        only emitted when the user did not define it themselves, and each is
+        marked `meta={"kind":"synth"}` so the override-signature check skips it
+        (regenerated per-class signatures legitimately differ from the base's).
+        Rather than tying the wrappers to the base-chain by type, the synthesized
+        method is merely appended to `node.methods`: everything downstream (ctor
+        resolution, vtable slots, dunder dispatch, inherited wrappers) picks it
+        up exactly as if the user had written it."""
+        have = {m.name for m in node.methods}
+        t = node._token
+        fields = self._collect_class_fields(node)
+
+        def append(m: FuncDef):
+            m.meta = {"kind": "synth"}
+            node.methods.append(m)
+
+        if "__init__" not in have and fields:
+            params = {f.name: f.type_expr for f in fields}
+            body = [
+                Assign(
+                    Attr(Variable("this", t), f.name, t),
+                    Variable(f.name, t),
+                    t,
+                )
+                for f in fields
+            ]
+            append(FuncDef("__init__", params, body, "void", token=t))
+
+        if "__eq__" not in have:
+            expr = None
+            this = Variable("this", t)
+            other = Variable("other", t)
+            for f in fields:
+                cmp = BinOp(
+                    Attr(this, f.name, t),
+                    TokenType.EQ_EQ,
+                    Attr(other, f.name, t),
+                    t,
+                )
+                expr = cmp if expr is None else BinOp(expr, TokenType.AND, cmp, t)
+            if expr is None:
+                expr = Number("1", t, is_bool=True)
+            append(FuncDef("__eq__", {"other": node.name}, [Return(expr, t)], "bool", token=t))
+
+        if "__str__" not in have:
+            parts = [String(f"{node.name}(", t)]
+            for i, f in enumerate(fields):
+                if i:
+                    parts.append(String(", ", t))
+                parts.append(String(f"{f.name}=", t))
+                parts.append(
+                    Call(
+                        Variable("str", t),
+                        [Attr(Variable("this", t), f.name, t)],
+                        t,
+                    )
+                )
+            parts.append(String(")", t))
+            expr = parts[0]
+            for p in parts[1:]:
+                expr = BinOp(expr, TokenType.PLUS, p, t)
+            append(FuncDef("__str__", {}, [Return(expr, t)], "str", token=t))
+
+    def _visit_property(self, p, cnode: ClassDef, class_scope: Scope):
+        """Analyze a property's `get`/`set` accessor bodies and stamp the
+        property's value type (used for reads and the setter's parameter)."""
+        getf = p.get
+        getf.name = f"{p.name}.get"
+        acc_scope = Scope(class_scope)
+        getf.params = {"this": cnode.name + "*"}
+        self._visit_funcdef(getf, acc_scope)
+        ptype = None
+        if getf.rettype and getf.rettype != "auto":
+            ptype = getf.rettype
+        if ptype is None:
+            for s in reversed(getf.body):
+                if isinstance(s, Return) and getattr(s.value, "inferred_type", None):
+                    ptype = s.value.inferred_type
+                    break
+        p._ptype = ptype or "void"
+        getf.rettype = p._ptype
+        if p.set is not None:
+            setf = p.set
+            setf.name = f"{p.name}.set"
+            setf.params = {"this": cnode.name + "*", "value": p._ptype}
+            setf.rettype = "void"
+            self._visit_funcdef(setf, Scope(class_scope))
+
+    def _check_class_constructor(self, node: NewExpr):
+        """Resolve `__init__` for `new X(args)` and validate the argument list."""
+        cls = node.type_expr.split("<")[0]
+        sym = self.current_scope.lookup(cls)
+        if sym is None:
+            sym = self.globals.lookup(cls)
+        ctor = None
+        cnode = sym.node if sym is not None and sym.kind == "class" else None
+        while cnode is not None:
+            for m in cnode.methods:
+                if m.name == "__init__":
+                    ctor = m
+                    break
+            if ctor is not None:
+                break
+            if cnode.base:
+                bsym = (self.current_scope or self.globals).lookup(cnode.base)
+                cnode = bsym.node if bsym is not None and isinstance(bsym.node, ClassDef) else None
+            else:
+                cnode = None
+        if ctor is None:
+            # `new X` / `new X()` on a constructor-less class is a bare
+            # allocation (Python's implicit object.__init__); only non-empty
+            # argument lists require a real __init__.
+            if node.args:
+                self.error(
+                    f"class `{cls}` cannot be constructed with arguments: no `__init__` method defined",
+                    node,
+                )
+            return
+        for arg in node.args:
+            self._infer_type(arg)
+        params = {k: v for k, v in ctor.params.items() if k != "this"}
+        if len(node.args) != len(params):
+            self.error(
+                f"constructor `{cls}.__init__` expects {len(params)} argument(s), "
+                f"got {len(node.args)}",
+                node,
+            )
 
     def _visit_try(self, node: Try, scope: Scope | None = None):
         for stmt in node.body:

@@ -1388,7 +1388,9 @@ def _parse_c_source_regex(filepath):
     with open(filepath) as f:
         content = f.read()
     symbols = {}
-    for m in _C_SRC_RE.finditer(content):
+    matches = list(_C_SRC_RE.finditer(content))
+    matches.extend(_C_DECL_RE.finditer(content))
+    for m in matches:
         raw_ret = m.group(1).strip()
         fname = m.group(2).strip()
         raw_params = m.group(3).strip()
@@ -1448,6 +1450,12 @@ _C_SRC_RE = re.compile(
     r"(?:(?:static|inline|extern)\s+)*"
     r"([\w\s\*]+?)\s+"
     r"(\w+)\s*\(([^)]*)\)\s*(?:\[[^\]]*\])?\s*\{"
+)
+
+_C_DECL_RE = re.compile(
+    r"(?:(?:static|inline|extern)\s+)*"
+    r"([\w\s\*]+?)\s+"
+    r"(\w+)\s*\(([^)]*)\)\s*;"
 )
 
 _LLVM_DEF_RE = re.compile(r"define\s+(.*?)\s@(\w+)\s*\(([^)]*)\)")

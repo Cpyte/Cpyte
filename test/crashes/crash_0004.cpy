@@ -1,50 +1,72 @@
-uint64 g1 = (559143952 / 13592222613580120435)
-str g2 = "hello"
-
 def main() -> int:
-    if ((g1 / g1) * g1):
-        g2 = g2
-        big v3 = g1
-    else:
-        int w4 = 1
-        while (((g1 >= g1)) and (w4 > 0)):
-            w4 = w4 - 1
-            print((g1 ^ g1))
-            g2 = g2
-        g2 = g2
-        if (*(new float) or g2):
-            big v5 = g1
-            char v6 = g2
-            for v7 in ' ':
-                int w8 = 3
-                while (((5589232636717733038 and v5)) and (w8 > 0)):
-                    w8 = w8 - 1
-                    v5
-                    int64 v9 = not g2
-                v7 = "c"
-        else:
-            *(new str)
-            for v10 in '\\n':
-                g2 = v10
-                if g1:
-                    str v11 = g2
-                    char v12 = v11
-                    int64 v13 = not v10
-                    if (v13 << 638024535):
-                        v13 //= v13
-                        char v14 = g2
-                        if g1:
-                            big v15 = v13
-                        int64 v16 = g1
-                        big v17 = v13
-                    int w18 = 3
-                    while (((g1 + v13)) and (w18 > 0)):
-                        w18 = w18 - 1
-                        g2 = g2
-                v10 = g2
-            g1 = 14620837527502900668
-            -96738.451439
-        not ((11640118326112880198 % (g1 | g1)) % 807314082522711357399796182431)
-        g2
-    float v19 = 123.456
+    print(((((1 - ~1320638851) << (5193870279195974294 // 15340772326791691100)) >> 111498711) >> (((7198100259650248930 ^ 16495752146537899374) & ((1000000000000 ^ 9009283661233388453) // (2119601084 // 2))) % 1644754774003778538)))
+    for v1 in '\\t':
+        int w2 = 4
+        while ((((0.0 + (1.5 - (123.456 * 123.456))) == (-1.0 * -74825.429956))) and (w2 > 0)):
+            w2 = w2 - 1
+            if v1:
+                int w3 = 3
+                while (((v1 or 9223372036854775808)) and (w3 > 0)):
+                    w3 = w3 - 1
+                    int w4 = 1
+                    while ((v1) and (w4 > 0)):
+                        w4 = w4 - 1
+                        v1
+                        v1 = v1
+                        if v1:
+                            big v5 = 649011648019619892248381265260
+                            if v1:
+                                print(0)
+                    v1 = v1
+                    v1 = "x"
+                    if v1:
+                        for v6 in 'hello world':
+                            for v7 in '12345':
+                                print(0)
+                            v1
+                            v6
+                            uint64 v8 = 15973046404614898877
+                        if v1:
+                            v1 = v1
+                            int w9 = 2
+                            while ((v1) and (w9 > 0)):
+                                w9 = w9 - 1
+                                print(0)
+                            int w10 = 4
+                            while ((v1) and (w10 > 0)):
+                                w10 = w10 - 1
+                                print(0)
+                            double v11 = 10394.127599
+                    else:
+                        int w12 = 3
+                        while ((v1) and (w12 > 0)):
+                            w12 = w12 - 1
+                            for v13 in ' ':
+                                print(0)
+                        if v1:
+                            v1 = v1
+                            v1 = v1
+                        else:
+                            int w14 = 1
+                            while ((v1) and (w14 > 0)):
+                                w14 = w14 - 1
+                                print(0)
+                        if v1:
+                            big v15 = 81290974239144722812028323366
+                    v1 = "c"
+                v1 = v1
+                str v16 = v1
+                v16 = v16
+                v16 = v1
+            if (("t" <= "hello") and ("7VWBbDU" <= "RxnS-Z4kQ_")):
+                int v17 = sizeof(v1)
+                return 0
+            v1 = "a"
+            10000000000000000000
+            v1 = " "
+            (((-36039.393152 - 2.71828) * 84259.450035) + -(-1.0))
+        if (-not sizeof(int64) < (not (new big) + 545596968)):
+            v1
+            print(3429034801063791630)
+    int v18 = 42
     return 0

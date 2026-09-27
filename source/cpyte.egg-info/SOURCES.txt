@@ -10,6 +10,7 @@ source/cpyte/bignum.c
 source/cpyte/bytecoding.py
 source/cpyte/clib.py
 source/cpyte/compiling.py
+source/cpyte/elf2sef.py
 source/cpyte/extension_hooks.py
 source/cpyte/formatter.py
 source/cpyte/gc_runtime.c
@@ -18,6 +19,7 @@ source/cpyte/lexar.py
 source/cpyte/linker.py
 source/cpyte/lsp_server.py
 source/cpyte/mainpie.py
+source/cpyte/mksef.py
 source/cpyte/optimizations.py
 source/cpyte/package_manifest.py
 source/cpyte/runtime.c

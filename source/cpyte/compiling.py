@@ -1806,6 +1806,25 @@ def _find_scorpion_tool(name, fallback):
     return fallback
 
 
+def _scorpion_tool(name):
+    """Locate a bundled Scorpion converter script (elf2sef.py / mksef.py).
+
+    Prefers the copy shipped inside the cpyte package so the installed wheel
+    works standalone; falls back to the WEW-scorpion sibling checkout for
+    source-tree development.
+    """
+    bundled = os.path.join(os.path.dirname(__file__), name)
+    if os.path.isfile(bundled):
+        return bundled
+    sibling = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)))),
+        "WEW-scorpion",
+        "tools" if name == "elf2sef.py" else "user",
+        name,
+    )
+    return sibling
+
+
 def run_scorpion(
     module,
     output="program.sef",
@@ -1917,14 +1936,7 @@ def run_scorpion(
 
     if pic:
         # Dynamic SEF v2: relocation + import/export records
-        elf2sef = os.path.join(
-            os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
-            "..",
-            "..",
-            "WEW-scorpion",
-            "tools",
-            "elf2sef.py",
-        )
+        elf2sef = _scorpion_tool("elf2sef.py")
         cmd = [sys.executable, elf2sef, elf_file, output]
         if final_exports:
             for name in final_exports:
@@ -1935,14 +1947,7 @@ def run_scorpion(
             raise SystemExit(1)
     else:
         # Static SEF v1 via mksef.py
-        mksef = os.path.join(
-            os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)),
-            "..",
-            "..",
-            "WEW-scorpion",
-            "user",
-            "mksef.py",
-        )
+        mksef = _scorpion_tool("mksef.py")
         if not os.path.isfile(mksef):
             # Fallback: inline SEF generation using objdump/objcopy
             _elf_to_sef(elf_file, output, 0)

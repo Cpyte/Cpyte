@@ -1807,7 +1807,13 @@ def _find_scorpion_tool(name, fallback):
 
 
 def run_scorpion(
-    module, output="program.sef", opt_level=3, src_files=None, pic=False, exports=None
+    module,
+    output="program.sef",
+    opt_level=3,
+    src_files=None,
+    pic=False,
+    exports=None,
+    auto_exports=None,
 ):
     """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file.
     Please use it good! :):)
@@ -1815,7 +1821,11 @@ def run_scorpion(
     With pic=True the module is compiled with -fPIC and the final ELF is linked
     with --emit-relocs so it can be converted to a dynamic (SEF v2) image via
     WEW-scorpion/tools/elf2sef.py. `exports` names the symbols to mark as
-    exported for dynamic linking (libraries).
+    exported for dynamic linking (libraries). `auto_exports` are additional
+    candidates discovered automatically (top-level `public` functions); only
+    those that actually resolve to a defined symbol in the emitted module are
+    added (elf2sef refuses unknown names). Returns (elf_file, [final exports])
+    so callers can report exactly what was published.
     """
     from llvmlite import binding
 
@@ -1828,6 +1838,18 @@ def run_scorpion(
     mod.verify()
     optimize(mod, opt_level)
     mod.verify()
+
+    defined = {
+        f.name for f in mod.functions if not getattr(f, "is_declaration", True)
+    }
+    final_exports = list(exports or [])
+    seen = set(final_exports)
+    if auto_exports:
+        for name in auto_exports:
+            if name in seen or name not in defined:
+                continue
+            seen.add(name)
+            final_exports.append(name)
 
     target = binding.Target.from_triple("riscv32-unknown-elf")
     if pic:
@@ -1904,8 +1926,8 @@ def run_scorpion(
             "elf2sef.py",
         )
         cmd = [sys.executable, elf2sef, elf_file, output]
-        if exports:
-            for name in exports:
+        if final_exports:
+            for name in final_exports:
                 cmd += ["--export", name]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
@@ -1935,7 +1957,7 @@ def run_scorpion(
                 raise SystemExit(1)
 
     print_ok(f"Wrote {os.path.getsize(output)} bytes to {output}")
-    return elf_file
+    return elf_file, final_exports
 
 
 def _elf_to_sef(elf_path, sef_output, flags=0):

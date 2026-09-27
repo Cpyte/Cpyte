@@ -4,7 +4,7 @@ import sys
 
 if __package__:
     from . import __version__, ui
-    from .astparse import Import, ParseError, parse_file
+    from .astparse import FuncDef, Import, ParseError, parse_file
     from .bytecoding import LLVM
     from .compiling import (
         _BIGNUM_C,
@@ -34,13 +34,13 @@ if __package__:
         get_global_registry,
         iter_cpm_version_dirs,
     )
-    from .sef import cmd_check, cmd_dump, cmd_pack, cmd_size
+    from .sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from .semantic_analasis import analyze
     from .update_check import report_update, start_check
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from cpyte import __version__, ui
-    from cpyte.astparse import Import, ParseError, parse_file
+    from cpyte.astparse import FuncDef, Import, ParseError, parse_file
     from cpyte.bytecoding import LLVM
     from cpyte.compiling import (
         _BIGNUM_C,
@@ -70,7 +70,7 @@ else:
         get_global_registry,
         iter_cpm_version_dirs,
     )
-    from cpyte.sef import cmd_check, cmd_dump, cmd_pack, cmd_size
+    from cpyte.sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from cpyte.semantic_analasis import analyze
     from cpyte.update_check import report_update, start_check
 
@@ -94,6 +94,7 @@ Global options:
   --cpu CPU           Override the target CPU (e.g. skylake, apple-m1, native)
   --mattr FEATURES    Override LLVM target-features (e.g. +avx2,+fma)
   --export NAME       Export NAME as a library symbol (dynamic SEF; repeatable)
+  --no-auto-export    Disable automatic export of `public` functions (scorpion)
   --lto               Enable link-time optimization (requires clang)
   --ast               Print the parsed AST
   --emit-llvm         Print the generated LLVM IR
@@ -106,7 +107,7 @@ Global options:
 Commands:
   build               Compile source.cpy to a native executable
   format              Canonically reformat source.cpy (AST-based)
-  sef                 Scorpion SEF binary tools (pack/dump/check/size)
+  sef                 Scorpion SEF binary tools (pack/dump/check/size/digest)
 """
 
 
@@ -478,6 +479,148 @@ def _collect_frameworks(nodes):
     return list(set(frameworks))
 
 
+def _collect_public_exports(parsed):
+    """Collect the automatic export list for a Scorpion dynamic build.
+
+    Every top-level `public def` in the module itself, plus the re-exported
+    public functions of modules it imports (recursed through Import.sub_ast,
+    mirroring emit_program's node walk), is a candidate library symbol. Names
+    unique; order preserved; no main.
+    """
+
+    def walk(nodes):
+        for node in nodes:
+            if isinstance(node, Import):
+                sub = getattr(node, "sub_ast", None)
+                if sub:
+                    yield from walk(sub)
+            elif isinstance(node, FuncDef):
+                if node.name != "main" and getattr(node, "visibility", None) == "public":
+                    yield node.name
+
+    seen = set()
+    out = []
+    for name in walk(parsed):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+_SCORPION_C_TYPES = {
+    "int": "int32_t",
+    "int64": "int64_t",
+    "uint64": "uint64_t",
+    "size_t": "uintptr_t",
+    "bool": "bool",
+    "char": "char",
+    "float": "float",
+    "double": "double",
+    "str": "const char *",
+    "void": "void",
+    "big": "void *",
+    "ubig": "void *",
+    "dynamic": "void *",
+}
+
+
+def _scorpion_c_type(t, seen=None):
+    """Best-effort cpy type name -> C declaration (RV32 ABI).
+
+    Class/unknown terms lower to opaque struct tags (forward-declared by the
+    header writer via `seen`), so `Vec*` becomes `struct cpyte_Vec *` and a
+    class VALUE `Vec` becomes `struct cpyte_Vec` (by-value struct, matching
+    the class-VALUE param convention).
+    """
+    t = (t or "int").strip()
+    if t.endswith("[]"):
+        return _scorpion_c_type(t[:-2], seen) + " *"
+    if t.endswith("*"):
+        return _scorpion_c_type(t[:-1], seen) + " *"
+    if t.endswith("&"):
+        return _scorpion_c_type(t[:-1], seen) + " *"
+    if t in _SCORPION_C_TYPES:
+        return _SCORPION_C_TYPES[t]
+    if "<" in t:
+        base = t.split("<", 1)[0].strip()
+        if base in _SCORPION_C_TYPES:
+            return _SCORPION_C_TYPES[base]
+        t = base
+    tag = "cpyte_%s" % t
+    if seen is not None:
+        seen.add(tag)
+    return "struct %s" % tag
+
+
+def _write_scorpion_header(path, export_names, parsed):
+    """Generate a C ABI header for the exported Scorpion library symbols.
+
+    For each exported name, a prototype is synthesized from the defining
+    FuncDef found by walking the module (and its imports). Names that do not
+    resolve to a FuncDef (e.g. hand-written `public` C helpers) are skipped
+    with a comment. The header can be `#include`d by C code linked against
+    the .sef via scorpion_dlsym/loadlib.
+    """
+    funcs = {}
+
+    def walk(nodes):
+        for node in nodes:
+            if isinstance(node, Import):
+                sub = getattr(node, "sub_ast", None)
+                if sub:
+                    walk(sub)
+            elif isinstance(node, FuncDef):
+                funcs.setdefault(node.name, node)
+
+    walk(parsed)
+
+    out = []
+    out.append("/* Generated by cpyte for the Scorpion (RISC-V 32) SEF library:")
+    out.append(" *   %s" % path)
+    out.append(" *")
+    out.append(" * Exports %d symbol(s). Link this library with the Scorpion"
+    % len(export_names))
+    out.append(" * loader and resolve these names with scorpion_dlsym().")
+    out.append(" */")
+    out.append("#ifndef CPYTE_SCORPION_ABI")
+    out.append("#define CPYTE_SCORPION_ABI")
+    out.append("")
+    out.append("#include <stdint.h>")
+    out.append("#include <stdbool.h>")
+    out.append("")
+    seen_tags = set()
+    protos = []
+    for name in export_names:
+        fd = funcs.get(name)
+        if fd is None:
+            protos.append(
+                "/* symbol \"%s\" exported (no cpyte signature available) */" % name
+            )
+            continue
+        ret = _scorpion_c_type(getattr(fd, "rettype", None), seen_tags)
+        params = []
+        for pname, ptype in (fd.params or {}).items():
+            if pname == "this":
+                continue
+            params.append("%s %s" % (_scorpion_c_type(ptype, seen_tags), pname))
+        if params:
+            proto = "%s %s(%s);" % (ret, name, ", ".join(params))
+        else:
+            proto = "%s %s(void);" % (ret, name)
+        protos.append(proto)
+    if seen_tags:
+        out.append("/* opaque cpyte class/struct types referenced by the ABI */")
+        for tag in sorted(seen_tags):
+            out.append("typedef struct %s %s;" % (tag, tag))
+        out.append("")
+    out.extend(protos)
+    out.append("")
+    out.append("#endif")
+
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+
+
 def cmd_build(
     args,
     tab_size=4,
@@ -777,6 +920,8 @@ Subcommands:
   dump    decode and pretty-print: cpy sef dump <input.sef>
   check   validate a SEF binary:  cpy sef check <input.sef>
   size    report footprint/layout: cpy sef size <input.sef>
+  digest  show dynamic-link exports/imports/relocs:
+            cpy sef digest <input.sef> [--json]
 """
 
 
@@ -841,12 +986,34 @@ def cmd_sef(args):
             )
         )
 
-    if cmd in ("dump", "check", "size"):
-        if len(rest) != 1:
-            ui.print_usage(f"Usage: cpy sef {cmd} <input.sef>")
+    if cmd in ("dump", "check", "size", "digest"):
+        json_out = False
+        positional = []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--json":
+                json_out = True
+                i += 1
+            elif not a.startswith("-"):
+                positional.append(a)
+                i += 1
+            else:
+                ui.print_warn(f"Unknown flag: {a}")
+                sys.exit(1)
+        if len(positional) != 1:
+            usage = f"Usage: cpy sef {cmd} <input.sef>"
+            if cmd == "digest":
+                usage += " [--json]"
+            ui.print_usage(usage)
             sys.exit(1)
-        fn = {"dump": cmd_dump, "check": cmd_check, "size": cmd_size}[cmd]
-        sys.exit(fn(rest[0]))
+        if cmd == "dump":
+            sys.exit(cmd_dump(positional[0]))
+        if cmd == "check":
+            sys.exit(cmd_check(positional[0]))
+        if cmd == "size":
+            sys.exit(cmd_size(positional[0]))
+        sys.exit(cmd_digest(positional[0], json_out=json_out))
 
     ui.print_warn(f"Unknown sef subcommand: {cmd}")
     print(ui.paint_usage(_SEF_USAGE, stream=sys.stderr), file=sys.stderr)
@@ -880,6 +1047,7 @@ def _main():
     lto = False
     no_gc = False
     exports = []
+    auto_export = True
     opt = None
     while args and args[0].startswith("--"):
         flag = args.pop(0)
@@ -895,6 +1063,8 @@ def _main():
             pic = True
         elif flag == "--export":
             exports.append(args.pop(0))
+        elif flag == "--no-auto-export":
+            auto_export = False
         elif flag in ("--cpu", "--march") and args:
             set_target_cpu(cpu=args.pop(0))
         elif flag == "--mattr" and args:
@@ -1015,10 +1185,19 @@ def _main():
     elif mode == "scorpion":
         out_base = args[0].rsplit(".", 1)[0] if "." in args[0] else "program"
         sef_file = out_base + ".sef"
-        run_scorpion(
-            prog, output=sef_file, src_files=src_files, pic=pic, exports=exports
+        auto_exports = _collect_public_exports(parsed) if auto_export else []
+        elf_file, final_exports = run_scorpion(
+            prog,
+            output=sef_file,
+            src_files=src_files,
+            pic=pic,
+            exports=exports,
+            auto_exports=auto_exports,
         )
-        ui.print_ok(f"Wrote {sef_file}")
+        if pic and final_exports:
+            header_file = out_base + ".scorpion.h"
+            _write_scorpion_header(header_file, final_exports, parsed)
+            ui.print_ok(f"Wrote {header_file} ({len(final_exports)} exports)")
     else:
         run_jit(
             prog,

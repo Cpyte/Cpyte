@@ -93,13 +93,13 @@ def _get_sdk_paths():
 
 from .astparse import (
     AddrOf,
+    AsExpr,
     Assert,
     Assign,
-    AsExpr,
     Attr,
     BinOp,
-    Break,
     BorrowExpr,
+    Break,
     Call,
     CastExpr,
     CCode,
@@ -115,13 +115,13 @@ from .astparse import (
     If,
     Import,
     Index,
-    MoveExpr,
     InlineAsm,
     Input,
     InputBig,
     InputStr,
     ListLit,
     Llvm,
+    MoveExpr,
     NewExpr,
     Number,
     ParseError,
@@ -225,7 +225,7 @@ def _c(text, *styles):
 
 
 class Diagnostic:
-    __slots__ = ("level", "message", "note", "span", "token", "code")
+    __slots__ = ("code", "level", "message", "note", "span", "token")
 
     def __init__(
         self,
@@ -1230,7 +1230,7 @@ class SemanticAnalyzer:
                     node.inferred_type = "bool"
                     return "bool"
                 self.error(
-                    f"operator `in` requires a list on the right-hand side",
+                    "operator `in` requires a list on the right-hand side",
                     node,
                     note=f"got `{right_t}`; the right operand of `in` must be a list",
                 )
@@ -2102,9 +2102,7 @@ class SemanticAnalyzer:
         code = getattr(diag, "code", None)
         if sev in (DiagnosticSeverity.ERROR, DiagnosticSeverity.FATAL):
             self.reporter.error(diag.message, tok, note, span=span, code=code)
-        elif sev == DiagnosticSeverity.WARNING:
-            self.reporter.warning(diag.message, tok, note, span=span, code=code)
-        elif sev == DiagnosticSeverity.NOTE:
+        elif sev == DiagnosticSeverity.WARNING or sev == DiagnosticSeverity.NOTE:
             self.reporter.warning(diag.message, tok, note, span=span, code=code)
 
     def _resolve_module_path(
@@ -2544,7 +2542,7 @@ class SemanticAnalyzer:
 
     def _try_cpm_import(self, node: Import, module: str) -> bool:
         # Support both @scope.name and @scope/name import forms.
-        import_name = module[1:] if module.startswith("@") else module
+        import_name = module.removeprefix("@")
         pkg_name = import_name.replace("/", ".").split(".")[-1]
 
         cpm_root = None

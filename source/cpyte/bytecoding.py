@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import os
 from traceback import print_exception
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 from llvmlite import binding, ir
 from llvmlite.ir import instructions
@@ -253,9 +253,7 @@ class LLVM:
         t = _bc_array_norm(t)
         if t == "int":
             result = ir.IntType(32)
-        elif t == "int64":
-            result = ir.IntType(64)
-        elif t == "uint64":
+        elif t == "int64" or t == "uint64":
             result = ir.IntType(64)
         elif t == "size_t":
             # Pointer-sized unsigned integer (i64 on every 64-bit cpyte target,
@@ -273,11 +271,7 @@ class LLVM:
             result = ir.PointerType(ir.IntType(8))
         elif t == "char":
             result = ir.IntType(8)
-        elif t == "void*":
-            result = ir.PointerType(ir.IntType(8))
-        elif t == "big":
-            result = ir.PointerType(ir.IntType(8))
-        elif t == "ubig":
+        elif t == "void*" or t == "big" or t == "ubig":
             result = ir.PointerType(ir.IntType(8))
         elif t == "dynamic":
             # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
@@ -288,10 +282,7 @@ class LLVM:
         elif t.endswith("[]"):
             base = self.llvm_type(t[:-2])
             result = ir.PointerType(base)
-        elif t.endswith("*"):
-            base = self.llvm_type(t[:-1])
-            result = ir.PointerType(base)
-        elif t.endswith("&"):
+        elif t.endswith("*") or t.endswith("&"):
             base = self.llvm_type(t[:-1])
             result = ir.PointerType(base)
         elif t in self.structs:
@@ -1656,7 +1647,7 @@ class LLVM:
             for table in (self.locals, self.local_types, self.ssa_values):
                 table.pop(name, None)
             self.const_vars.pop(name, None)
-            return None
+            return
         if kind == "dynamic":
             name = target.name
             if name in self.locals and getattr(
@@ -1679,15 +1670,15 @@ class LLVM:
                             ir.Constant(_i64, 0),
                         ],
                     )
-            return None
+            return
         if kind == "heap":
             self._emit_builtin_free(target)
-            return None
+            return
         if kind == "slot":
             slot = self._emit_lvalue(target)
             if isinstance(slot.type, ir.PointerType) and slot.type.pointee is not None:
                 self.builder.store(ir.Constant(slot.type.pointee, None), slot)
-            return None
+            return
         raise Exception(
             f"unhandled del_kind {kind!r} at L{node._token.line}:{node._token.column}"
         )
@@ -6409,7 +6400,7 @@ class LLVM:
         slot = self._emit_lvalue(target)
         cur = self.builder.load(slot, "append.cur")
 
-        elem_t = arr_t[:-2] if arr_t.endswith("[]") else arr_t
+        elem_t = arr_t.removesuffix("[]")
         if arr_t == "dynamic":
             # Element slot holds a DynValue; its i64 data is the inner list ptr.
             elem_llvm = _DynValue
@@ -6778,7 +6769,7 @@ class LLVM:
     def _is_const_var(self, name: str) -> bool:
         return name in self._const_prop
 
-    def _const_var_value(self, name: str) -> Optional[int]:
+    def _const_var_value(self, name: str) -> int | None:
         return self._const_prop.get(name)
 
     def _try_unroll_counted_loop(self, node: While, pending_ivs: dict) -> bool:

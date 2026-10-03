@@ -11,14 +11,12 @@ from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
 from .astparse import (
-    Assign,
     Call,
     ClassDef,
     EnumDef,
     FuncDef,
     If,
     Import,
-    NewExpr,
     ParseError,
     StructDef,
     Switch,
@@ -31,6 +29,7 @@ from .astparse import (
 from .formatter import format_source
 from .lexar import Lexer, LexerError, TokenType
 from .semantic_analasis import SemanticAnalyzer
+from . import scorpion_abi
 from .clib import _BUILTIN_LIB_HEADERS
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -282,7 +281,10 @@ def _analyze(source, filepath=None, workspace_root=None):
             return tokens, parsed, analyzer, error
         try:
             analyzer = SemanticAnalyzer(
-                source, filepath=filepath, workspace_root=workspace_root
+                source,
+                filepath=filepath,
+                workspace_root=workspace_root,
+                scorpion=scorpion_abi.detect(source)[1],
             )
             analyzer.analyze(parsed)
         except Exception as e:

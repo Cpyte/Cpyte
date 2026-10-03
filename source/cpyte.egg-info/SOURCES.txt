@@ -24,6 +24,7 @@ source/cpyte/optimizations.py
 source/cpyte/package_manifest.py
 source/cpyte/runtime.c
 source/cpyte/runtime_scorpion.c
+source/cpyte/scorpion_abi.py
 source/cpyte/sef.py
 source/cpyte/semantic_analasis.py
 source/cpyte/ugc.h
@@ -39,4 +40,6 @@ source/cpyte.egg-info/requires.txt
 source/cpyte.egg-info/top_level.txt
 test/test_bignum_jit.py
 test/test_fuzz_del_has.py
+test/test_scorpion_abi.py
+test/test_scorpion_dl.py
 test/test_sef_tools.py

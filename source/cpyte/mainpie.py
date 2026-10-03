@@ -34,6 +34,7 @@ if __package__:
         get_global_registry,
         iter_cpm_version_dirs,
     )
+    from . import scorpion_abi
     from .sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from .semantic_analasis import analyze
     from .update_check import report_update, start_check
@@ -70,6 +71,7 @@ else:
         get_global_registry,
         iter_cpm_version_dirs,
     )
+    from cpyte import scorpion_abi
     from cpyte.sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from cpyte.semantic_analasis import analyze
     from cpyte.update_check import report_update, start_check
@@ -93,8 +95,19 @@ Global options:
   --pic               Position-independent code
   --cpu CPU           Override the target CPU (e.g. skylake, apple-m1, native)
   --mattr FEATURES    Override LLVM target-features (e.g. +avx2,+fma)
-  --export NAME       Export NAME as a library symbol (dynamic SEF; repeatable)
+  --export NAME       Export NAME as a library symbol, or
+                      SYMBOL=WIRE_NAME to publish a symbol under a
+                      different wire name (dynamic SEF; repeatable)
   --no-auto-export    Disable automatic export of `public` functions (scorpion)
+  --require NAME=VER  Pin an import to a version (dynamic SEF; repeatable)
+  --scope S           Prefix unscope'd exports with `S::` (dynamic SEF)
+  --weak NAME         Mark an import weak: unresolved is not fatal
+                      (dynamic SEF; repeatable)
+  --lazy / --no-lazy  One PLT stub per call site, patched on first call
+                      (dynamic SEF)
+  --versym / --no-versym
+                      Wide v2.1 import/export records (the default), or
+                      v2.0 records for an older loader (dynamic SEF)
   --lto               Enable link-time optimization (requires clang)
   --ast               Print the parsed AST
   --emit-llvm         Print the generated LLVM IR
@@ -378,7 +391,13 @@ def _find_workspace_root(filepath: str | None) -> str:
 
 
 def _compile(
-    source, tab_size=4, strict=False, enable_extensions=True, no_gc=False, filepath=None
+    source,
+    tab_size=4,
+    strict=False,
+    enable_extensions=True,
+    no_gc=False,
+    filepath=None,
+    scorpion=False,
 ):
     workspace_root = _find_workspace_root(filepath)
 
@@ -401,6 +420,7 @@ def _compile(
         filepath=filepath,
         enable_extensions=enable_extensions,
         no_gc=no_gc,
+        scorpion=scorpion,
     )
     if result:
         sys.stderr.write(result + ("\n" if result else ""))
@@ -428,6 +448,17 @@ def _detect_nogc(source: str) -> tuple[str, bool]:
     return source, False
 
 
+def _detect_scorpion(source: str) -> tuple[str, bool]:
+    """Look for a `#scorpion` directive on the first non-blank line.
+
+    The directive builds the Scorpion ABI (syscall numbers, `SCORPION_*`
+    codes/flags, `ScorpionLibInfo`, every `scorpion_*` wrapper) into the
+    language. It is stripped from the source before lexing so it never reaches
+    the parser; the table itself lives in `scorpion_abi`.
+    """
+    return scorpion_abi.detect(source)
+
+
 def _emit(
     parsed,
     generic_instantiations=None,
@@ -436,6 +467,7 @@ def _emit(
     no_gc=False,
     target_triple=None,
     use_native_eh=False,
+    scorpion=False,
 ):
     c = LLVM(
         no_userspace=no_userspace,
@@ -443,6 +475,7 @@ def _emit(
         no_gc=no_gc,
         target_triple=target_triple,
         use_native_eh=use_native_eh,
+        scorpion=scorpion,
     )
     c.generic_instantiations = generic_instantiations or {}
     try:
@@ -495,7 +528,10 @@ def _collect_public_exports(parsed):
                 if sub:
                     yield from walk(sub)
             elif isinstance(node, FuncDef):
-                if node.name != "main" and getattr(node, "visibility", None) == "public":
+                if (
+                    node.name != "main"
+                    and getattr(node, "visibility", None) == "public"
+                ):
                     yield node.name
 
     seen = set()
@@ -552,14 +588,27 @@ def _scorpion_c_type(t, seen=None):
     return "struct %s" % tag
 
 
-def _write_scorpion_header(path, export_names, parsed):
-    """Generate a C ABI header for the exported Scorpion library symbols.
+def _scorpion_wire_name(entry):
+    """The name a consumer sees for one `--export` argument.
 
-    For each exported name, a prototype is synthesized from the defining
-    FuncDef found by walking the module (and its imports). Names that do not
-    resolve to a FuncDef (e.g. hand-written `public` C helpers) are skipped
-    with a comment. The header can be `#include`d by C code linked against
-    the .sef via scorpion_dlsym/loadlib.
+    elf2sef accepts `NAME` or `SYMBOL=WIRE_NAME`; only the wire name goes into
+    the loader's export table, so only that name belongs in the generated
+    header/stub. Any scope prefix applied by `--scope` is loader-side too and
+    is deliberately not reproduced here: the stub names the symbols this
+    image publishes, and the scope is chosen by whoever builds the library.
+    """
+    return entry.split("=", 1)[1] if "=" in entry else entry
+
+
+def _scorpion_prototypes(export_names, parsed):
+    """Synthesize C prototypes for the exported Scorpion library symbols.
+
+    For each exported name a prototype is built from the defining FuncDef
+    found by walking the module (and its imports). Names that do not resolve
+    to a FuncDef (e.g. hand-written `public` C helpers) are skipped with a
+    comment. Returns ``(protos, seen_tags)`` where ``protos`` is a list of C
+    lines (or comment lines for unresolvable names) and ``seen_tags`` collects
+    the opaque struct tags that need forward declarations.
     """
     funcs = {}
 
@@ -574,27 +623,29 @@ def _write_scorpion_header(path, export_names, parsed):
 
     walk(parsed)
 
-    out = []
-    out.append("/* Generated by cpyte for the Scorpion (RISC-V 32) SEF library:")
-    out.append(" *   %s" % path)
-    out.append(" *")
-    out.append(" * Exports %d symbol(s). Link this library with the Scorpion"
-    % len(export_names))
-    out.append(" * loader and resolve these names with scorpion_dlsym().")
-    out.append(" */")
-    out.append("#ifndef CPYTE_SCORPION_ABI")
-    out.append("#define CPYTE_SCORPION_ABI")
-    out.append("")
-    out.append("#include <stdint.h>")
-    out.append("#include <stdbool.h>")
-    out.append("")
     seen_tags = set()
     protos = []
-    for name in export_names:
-        fd = funcs.get(name)
+    seen_wire = set()
+    for entry in export_names:
+        wire = _scorpion_wire_name(entry)
+        # `NAME` and `SYMBOL=WIRE_NAME` can both publish the same wire name.
+        if wire in seen_wire:
+            continue
+        seen_wire.add(wire)
+        if not wire.isidentifier():
+            # A scoped (`ns::f`) or versioned (`f@2.0`) wire name is a real
+            # loader symbol but is not spellable as a cpyte identifier, so no
+            # ccode prototype can name it and a generated one would be a lie.
+            # Say so instead of emitting something that cannot link.
+            protos.append(
+                '/* exported as "%s": scoped/versioned wire name, not'
+                " importable from cpyte (declare it by hand if you must) */" % wire
+            )
+            continue
+        fd = funcs.get(wire)
         if fd is None:
             protos.append(
-                "/* symbol \"%s\" exported (no cpyte signature available) */" % name
+                '/* symbol "%s" exported (no cpyte signature available) */' % wire
             )
             continue
         ret = _scorpion_c_type(getattr(fd, "rettype", None), seen_tags)
@@ -604,10 +655,37 @@ def _write_scorpion_header(path, export_names, parsed):
                 continue
             params.append("%s %s" % (_scorpion_c_type(ptype, seen_tags), pname))
         if params:
-            proto = "%s %s(%s);" % (ret, name, ", ".join(params))
+            proto = "%s %s(%s);" % (ret, wire, ", ".join(params))
         else:
-            proto = "%s %s(void);" % (ret, name)
+            proto = "%s %s(void);" % (ret, wire)
         protos.append(proto)
+    return protos, seen_tags
+
+
+def _write_scorpion_header(path, protos, seen_tags, export_names):
+    """Generate a C ABI header for the exported Scorpion library symbols.
+
+    The header can be `#include`d by C code that links against the .sef; the
+    names are resolved at load time by the Scorpion loader from the SEF's
+    SEG_EXPORT table (see also `scorpion_sym()` for the runtime-dlopen form).
+    """
+    out = []
+    out.append("/* Generated by cpyte for the Scorpion (RISC-V 32) SEF library:")
+    out.append(" *   %s" % path)
+    out.append(" *")
+    out.append(
+        " * Exports %d symbol(s). Link this library with the Scorpion"
+        % len(export_names)
+    )
+    out.append(" * loader; it binds these names from the SEF's export table at")
+    out.append(" * load time, or look them up at runtime with scorpion_sym().")
+    out.append(" */")
+    out.append("#ifndef CPYTE_SCORPION_ABI")
+    out.append("#define CPYTE_SCORPION_ABI")
+    out.append("")
+    out.append("#include <stdint.h>")
+    out.append("#include <stdbool.h>")
+    out.append("")
     if seen_tags:
         out.append("/* opaque cpyte class/struct types referenced by the ABI */")
         for tag in sorted(seen_tags):
@@ -616,6 +694,53 @@ def _write_scorpion_header(path, export_names, parsed):
     out.extend(protos)
     out.append("")
     out.append("#endif")
+
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+
+
+def _write_scorpion_stub(path, protos, seen_tags, export_names):
+    """Generate a cpyte-consumable stub for the exported library symbols.
+
+    A SEF export table carries names and addresses but no type information, so
+    the consumer cannot type-check a call against a bare `import "lib.sef"`.
+    This stub closes that gap: it is imported like any other cpy module and
+    declares each exported function as a prototype, which cpyte lowers to an
+    LLVM `declare` and `elf2sef` turns into a SEG_IMPORT record.
+
+    The declarations live in a `ccode:` block because that is the one cpyte
+    construct that describes an external function with a C signature; the text
+    is byte-identical to the generated `.h`, so both consumers agree.
+    """
+    out = []
+    out.append("# Generated by cpyte for the Scorpion (RISC-V 32) SEF library:")
+    out.append("#   %s" % path)
+    out.append("#")
+    out.append(
+        "# Imports %d symbol(s) from the library built alongside it."
+        % len(export_names)
+    )
+    out.append("# Build the consumer with `--scorpion --pic` so these become")
+    out.append("# SEG_IMPORT records bound by the loader at load time.")
+    out.append("")
+    out.append("ccode:")
+    out.append("")
+    # The prototypes use the fixed-width stdint spellings (int32_t, uint32_t,
+    # ...). Those come from a header, and a ccode block is compiled verbatim, so
+    # it has to pull them in itself: the cross clang provides stdint implicitly
+    # but a host JIT/AOT build of the same stub does not.
+    out.append("    #include <stdint.h>")
+    out.append("    #include <stdbool.h>")
+    out.append("")
+    if seen_tags:
+        for tag in sorted(seen_tags):
+            out.append("    typedef struct %s %s;" % (tag, tag))
+        out.append("")
+    for line in protos:
+        # Every line of a ccode: block must be indented; a column-0 line ends
+        # the block and the next `;` then fails to lex.
+        out.append("    %s" % line)
+    out.append("")
 
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
@@ -705,6 +830,7 @@ def cmd_build(
         source = f.read()
 
     source, no_gc = _detect_nogc(source) if not no_gc else (source, True)
+    source, scorpion = _detect_scorpion(source)
 
     parsed, generic_instantiations = _compile(
         source,
@@ -713,6 +839,7 @@ def cmd_build(
         enable_extensions=not no_userspace,
         no_gc=no_gc,
         filepath=os.path.abspath(src_file),
+        scorpion=scorpion,
     )
 
     frameworks = _collect_frameworks(parsed)
@@ -726,6 +853,7 @@ def cmd_build(
         enable_extensions=not no_userspace,
         no_gc=no_gc,
         use_native_eh=True,
+        scorpion=scorpion,
     )
 
     out_base = src_file.rsplit(".", 1)[0] if "." in src_file else "a"
@@ -1043,11 +1171,17 @@ def _main():
 
     strict = False
     no_userspace = False
-    pic : bool = False
+    pic: bool = False
     lto = False
     no_gc = False
     exports = []
     auto_export = True
+    # Dynamic-linking options forwarded verbatim to elf2sef (SEF v2 only).
+    requires = []
+    scopes = []
+    weaks = []
+    lazy = None
+    versym = None
     opt = None
     while args and args[0].startswith("--"):
         flag = args.pop(0)
@@ -1065,6 +1199,20 @@ def _main():
             exports.append(args.pop(0))
         elif flag == "--no-auto-export":
             auto_export = False
+        elif flag == "--require":
+            requires.append(args.pop(0))
+        elif flag == "--scope":
+            scopes.append(args.pop(0))
+        elif flag == "--weak":
+            weaks.append(args.pop(0))
+        elif flag == "--lazy":
+            lazy = True
+        elif flag == "--no-lazy":
+            lazy = False
+        elif flag == "--versym":
+            versym = True
+        elif flag == "--no-versym":
+            versym = False
         elif flag in ("--cpu", "--march") and args:
             set_target_cpu(cpu=args.pop(0))
         elif flag == "--mattr" and args:
@@ -1125,6 +1273,7 @@ def _main():
         source = f.read()
 
     source, no_gc = _detect_nogc(source) if not no_gc else (source, True)
+    source, scorpion = _detect_scorpion(source)
 
     parsed, generic_instantiations = _compile(
         source,
@@ -1133,6 +1282,7 @@ def _main():
         enable_extensions=not no_userspace,
         no_gc=no_gc,
         filepath=os.path.abspath(args[0]),
+        scorpion=scorpion,
     )
 
     if mode == "ast":
@@ -1147,6 +1297,7 @@ def _main():
             enable_extensions=not no_userspace,
             no_gc=True,
             target_triple="riscv32-unknown-elf",
+            scorpion=scorpion,
         )
     elif mode == "aot":
         prog, src_files = _emit(
@@ -1156,6 +1307,7 @@ def _main():
             enable_extensions=not no_userspace,
             no_gc=no_gc,
             use_native_eh=True,
+            scorpion=scorpion,
         )
     else:
         prog, src_files = _emit(
@@ -1164,6 +1316,7 @@ def _main():
             no_userspace=no_userspace,
             enable_extensions=not no_userspace,
             no_gc=no_gc,
+            scorpion=scorpion,
         )
 
     if mode == "emit-llvm":
@@ -1185,6 +1338,22 @@ def _main():
     elif mode == "scorpion":
         out_base = args[0].rsplit(".", 1)[0] if "." in args[0] else "program"
         sef_file = out_base + ".sef"
+        dl_only = [
+            n
+            for n, v in (
+                ("--require", requires),
+                ("--scope", scopes),
+                ("--weak", weaks),
+                ("--lazy", lazy),
+                ("--versym", versym),
+            )
+            if v
+        ]
+        if dl_only and not pic:
+            ui.print_warn(
+                "%s %s only for dynamic SEF builds; add --pic"
+                % (", ".join(dl_only), "apply" if len(dl_only) > 1 else "applies")
+            )
         auto_exports = _collect_public_exports(parsed) if auto_export else []
         elf_file, final_exports = run_scorpion(
             prog,
@@ -1193,11 +1362,20 @@ def _main():
             pic=pic,
             exports=exports,
             auto_exports=auto_exports,
+            requires=requires,
+            scopes=scopes,
+            weaks=weaks,
+            lazy=lazy,
+            versym=versym,
         )
         if pic and final_exports:
+            protos, seen_tags = _scorpion_prototypes(final_exports, parsed)
             header_file = out_base + ".scorpion.h"
-            _write_scorpion_header(header_file, final_exports, parsed)
+            _write_scorpion_header(header_file, protos, seen_tags, final_exports)
             ui.print_ok(f"Wrote {header_file} ({len(final_exports)} exports)")
+            stub_file = out_base + ".scorpion.cpy"
+            _write_scorpion_stub(stub_file, protos, seen_tags, final_exports)
+            ui.print_ok(f"Wrote {stub_file} ({len(final_exports)} exports)")
     else:
         run_jit(
             prog,

@@ -1677,9 +1677,14 @@ def _map_process_libc(engine, mod):
                     pass
                 break
     if os.environ.get("CPYTE_JIT_DEBUG"):
-        unset = [f.name for f in mod.functions if f.is_declaration
-                 and not f.name.startswith("llvm.") and f.name not in mapped
-                 and f.name not in _explicit_mapped]
+        unset = [
+            f.name
+            for f in mod.functions
+            if f.is_declaration
+            and not f.name.startswith("llvm.")
+            and f.name not in mapped
+            and f.name not in _explicit_mapped
+        ]
         if unset:
             print("[jit] unresolved externs: %s" % sorted(unset), file=sys.stderr)
 
@@ -1817,7 +1822,9 @@ def _scorpion_tool(name):
     if os.path.isfile(bundled):
         return bundled
     sibling = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)))),
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(_RUNTIME_SCORPION_C)))
+        ),
         "WEW-scorpion",
         "tools" if name == "elf2sef.py" else "user",
         name,
@@ -1833,6 +1840,11 @@ def run_scorpion(
     pic=False,
     exports=None,
     auto_exports=None,
+    requires=None,
+    scopes=None,
+    weaks=None,
+    lazy=None,
+    versym=None,
 ):
     """Compile a Cpyte module for Scorpion (RV32 bare-metal) producing a SEF file.
     Please use it good! :):)
@@ -1840,11 +1852,20 @@ def run_scorpion(
     With pic=True the module is compiled with -fPIC and the final ELF is linked
     with --emit-relocs so it can be converted to a dynamic (SEF v2) image via
     WEW-scorpion/tools/elf2sef.py. `exports` names the symbols to mark as
-    exported for dynamic linking (libraries). `auto_exports` are additional
-    candidates discovered automatically (top-level `public` functions); only
-    those that actually resolve to a defined symbol in the emitted module are
-    added (elf2sef refuses unknown names). Returns (elf_file, [final exports])
-    so callers can report exactly what was published.
+    exported for dynamic linking (libraries); an entry is either `NAME` or
+    elf2sef's `SYMBOL=WIRE_NAME` form to publish SYMBOL under a different wire
+    name. `auto_exports` are additional candidates discovered automatically
+    (top-level `public` functions); only those that actually resolve to a
+    defined symbol in the emitted module are added (elf2sef refuses unknown
+    names).
+
+    `requires` (`NAME=VER`), `scopes`, `weaks`, `lazy` and `versym` are the
+    remaining elf2sef dynamic-linking controls, forwarded verbatim; see
+    WEW-scorpion/docs/dynamic-linking.md. `lazy`/`versym` are tri-state (None
+    = leave elf2sef's default). They only apply to the pic path.
+
+    Returns (elf_file, [final exports]) so callers can report exactly what was
+    published.
     """
     from llvmlite import binding
 
@@ -1858,9 +1879,7 @@ def run_scorpion(
     optimize(mod, opt_level)
     mod.verify()
 
-    defined = {
-        f.name for f in mod.functions if not getattr(f, "is_declaration", True)
-    }
+    defined = {f.name for f in mod.functions if not getattr(f, "is_declaration", True)}
     final_exports = list(exports or [])
     seen = set(final_exports)
     if auto_exports:
@@ -1941,6 +1960,28 @@ def run_scorpion(
         if final_exports:
             for name in final_exports:
                 cmd += ["--export", name]
+        # elf2sef rejects --no-versym together with --lazy (a v2.0 import record
+        # has no plt field, so a lazy site would point into an unresolvable
+        # hole). Surface that here instead of as a subprocess error.
+        if versym is False and lazy:
+            print_err(
+                "error: --no-versym cannot be combined with --lazy "
+                "(a v2.0 import record has no plt field)"
+            )
+            raise SystemExit(1)
+        for req in requires or ():
+            cmd += ["--require", req]
+        for scope in scopes or ():
+            cmd += ["--scope", scope]
+        for weak in weaks or ():
+            cmd += ["--weak", weak]
+        if lazy is not None:
+            cmd.append("--lazy" if lazy else "--no-lazy")
+        # elf2sef has no `--versym`: wide (v2.1) records are the default and
+        # only the downgrade is selectable. So `--versym` is an explicit
+        # restatement of the default and forwards nothing.
+        if versym is False:
+            cmd.append("--no-versym")
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print_err(f"error converting to SEF: {format_cc_diag(r.stderr)}")

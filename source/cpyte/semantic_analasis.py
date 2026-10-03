@@ -524,6 +524,24 @@ def _coerce_assign_ok(src_t, dst_t):
         ("size_t", "uint64"),
         ("float", "double"),
         ("double", "float"),
+        # Narrow unsigned words (the widths the ABI structs expose) convert
+        # freely with `int` in both directions; they are all <= 32 bits.
+        ("int", "uint8"),
+        ("int", "uint16"),
+        ("int", "uint32"),
+        ("uint8", "int"),
+        ("uint16", "int"),
+        ("uint32", "int"),
+        ("uint8", "uint16"),
+        ("uint8", "uint32"),
+        ("uint16", "uint32"),
+        ("uint32", "uint16"),
+        ("uint8", "int64"),
+        ("uint16", "int64"),
+        ("uint32", "int64"),
+        ("uint8", "uint64"),
+        ("uint16", "uint64"),
+        ("uint32", "uint64"),
     )
 
 
@@ -594,6 +612,7 @@ class SemanticAnalyzer:
         strict: bool = False,
         enable_extensions: bool = True,
         no_gc: bool = False,
+        scorpion: bool = False,
     ):
         self.reporter = Reporter(source)
         self.globals = Scope()
@@ -611,6 +630,8 @@ class SemanticAnalyzer:
         self.strict = strict
         self.enable_extensions = enable_extensions
         self.no_gc = no_gc
+        self.scorpion = scorpion
+        self._abi_node = None
         self.globals.define(
             "free", Symbol("builtin_func", "void", None, initialized=True)
         )
@@ -630,6 +651,31 @@ class SemanticAnalyzer:
         self._imported_clibs: set[str] = set()
         self._heap_names: set[str] = set()
         self._gc_new_names: set[str] = set()
+        if scorpion:
+            self._install_scorpion_abi()
+
+    def _install_scorpion_abi(self):
+        """Publish the Scorpion ABI (`#scorpion`) into the global scope.
+
+        The wrappers, the syscall numbers and the `SCORPION_*` codes/flags are
+        registered exactly like an `import` of the C runtime: functions carry a
+        synthetic `Llvm` node whose `.symbols` feed `_check_call_args` (so
+        arity and `Call.param_types` are checked), and constants carry a
+        `const_value` that folds at use sites. `ScorpionLibInfo` is registered
+        as a struct so `info.base` style field reads resolve.
+        """
+        from . import scorpion_abi
+        from .astparse import Llvm
+
+        abi_node = Llvm("", unsafe=False)
+        self._abi_node = abi_node
+        self._register_import_symbols(scorpion_abi.SYMBOLS, abi_node)
+        self._register_import_constants(scorpion_abi.CONSTANTS, abi_node)
+        # Registered through the normal struct path so field lookups work, but
+        # skipped for a user struct of the same name (theirs wins).
+        struct_node = scorpion_abi.lib_info_struct()
+        if self.globals.lookup_local(struct_node.name) is None:
+            self._visit_struct(struct_node)
 
     def _hook_context(self) -> CompilerContext:
         """Build a cached CompilerContext exposing this analyzer to hooks."""
@@ -678,9 +724,7 @@ class SemanticAnalyzer:
                 manifest_path = os.path.join(package_dir, "package.json")
                 if os.path.exists(manifest_path):
                     manifest = ManifestParser.validate_and_parse(manifest_path)
-                    self._load_nonparser_hooks(
-                        manifest, package_dir, package_name
-                    )
+                    self._load_nonparser_hooks(manifest, package_dir, package_name)
             return True
 
         manifest_path = os.path.join(package_dir, "package.json")
@@ -871,8 +915,20 @@ class SemanticAnalyzer:
         "ubig",
         "char",
         "size_t",
+        "uint8",
+        "uint16",
+        "uint32",
     )
-    _INT_TYPES = ("int", "int64", "uint64", "char", "size_t")
+    _INT_TYPES = (
+        "int",
+        "int64",
+        "uint64",
+        "char",
+        "size_t",
+        "uint8",
+        "uint16",
+        "uint32",
+    )
     _FLOAT_TYPES = ("float", "double")
     _WIDE_INT_TYPES = ("int64", "uint64")
     _CONV_BUILTINS = {"str": "str", "int": "int", "float": "float", "double": "float"}
@@ -1896,7 +1952,7 @@ class SemanticAnalyzer:
                 self.error(
                     f"use of undeclared identifier `{callee.name}`",
                     callee,
-                    note="call target must be a function defined in scope",
+                    note=self._undeclared_call_note(callee.name),
                 )
                 return None
             if sym.kind not in ("function", "builtin_func"):
@@ -1986,6 +2042,58 @@ class SemanticAnalyzer:
                         note="`void` functions/expressions return nothing to "
                         "pass to a parameter",
                     )
+        elif sym.node and isinstance(sym.node, (Import, CCode, Llvm)):
+            # Externs reached through a `ccode:`/`llvm:` block or a C import
+            # carry a real signature, so the arguments can be checked too.
+            # This is what makes a generated Scorpion library stub usable: a
+            # SEF export table has names and addresses but no types, so the
+            # stub is the only place those types exist.
+            self._check_external_arg_types(call)
+
+    # Types that carry no checking information: unknown, still-to-be-inferred,
+    # or the catch-all dynamic value. Comparing against them proves nothing.
+    _UNTYPED = frozenset((None, "", "dynamic", "auto", "void", "opaque"))
+
+    @staticmethod
+    def _is_null_constant(node) -> bool:
+        """True for a C null pointer constant: the literal `0` or `null`.
+
+        Both spellings parse to a Number whose value is "0", so a literal `0`
+        passed to a pointer parameter means NULL, not the number zero.
+        """
+        return isinstance(node, Number) and (node.value or "").strip() == "0"
+
+    def _check_external_arg_types(self, call: Call):
+        """Type-check a call to an extern declared in a ccode/llvm/C import."""
+        name = call.callee.name if isinstance(call.callee, Variable) else None
+        if not name:
+            return
+        params = call.param_types or []
+        for i, arg in enumerate(call.args):
+            if i >= len(params):
+                break
+            expected = params[i]
+            if expected in self._UNTYPED or expected.endswith("[]"):
+                continue
+            actual = self._infer_type(arg)
+            if actual in self._UNTYPED:
+                continue
+            # A null pointer constant is a valid argument for any pointer
+            # parameter; C spells it as a bare `0`, which infers to `int`.
+            # `str` parameters lower to `i8*` too, so they are included even
+            # though they are not spelled with a `*`.
+            if (expected.endswith("*") or expected == "str") and self._is_null_constant(
+                arg
+            ):
+                continue
+            if _coerce_assign_ok(actual, expected):
+                continue
+            self.error(
+                f"argument {i + 1} to `{name}` has type `{actual}`, "
+                f"expected `{expected}`",
+                arg,
+                note="declared by a ccode:/llvm: block or an imported C header",
+            )
 
     def _visit(self, node, scope: Scope | None = None):
         for hook in self._hook_registry.get(HookStage.SEMANTIC):
@@ -2434,6 +2542,17 @@ class SemanticAnalyzer:
         )
         self._lazy_load_error = None
         return True
+
+    def _undeclared_call_note(self, name: str) -> str:
+        """Help text for an unresolved call target.
+
+        A `scorpion_*` call in a program without the `#scorpion` directive is
+        almost always a missing opt-in rather than a typo, so point at the
+        directive instead of the generic scope advice.
+        """
+        if name.startswith("scorpion_") and not self.scorpion:
+            return "the Scorpion ABI needs `#scorpion` on the first line of the file"
+        return "call target must be a function defined in scope"
 
     def _lazy_register_used(self, node, name, entry, var_names=()):
         existing = self.globals.lookup_local(name)
@@ -3419,6 +3538,21 @@ class SemanticAnalyzer:
                         ("big", "ubig"),
                         ("ubig", "ubig"),
                         ("ubig", "big"),
+                        # Narrow unsigned words (ABI struct field widths).
+                        ("int", "uint8"),
+                        ("int", "uint16"),
+                        ("int", "uint32"),
+                        ("uint8", "int"),
+                        ("uint16", "int"),
+                        ("uint32", "int"),
+                        ("uint8", "uint16"),
+                        ("uint8", "uint32"),
+                        ("uint16", "uint32"),
+                        ("uint32", "uint16"),
+                        ("uint16", "int64"),
+                        ("uint32", "int64"),
+                        ("uint16", "uint64"),
+                        ("uint32", "uint64"),
                     ]
                     ok = (val_type, expected) in valid_conversions
                     ok = ok or (val_type == "int" and expected.endswith("*"))
@@ -3635,7 +3769,7 @@ class SemanticAnalyzer:
                 "has() expects 1 or 2 arguments",
                 node,
                 note="has(name) -> does the variable exist?; "
-                "has(obj, \"field\") -> does the field exist?",
+                'has(obj, "field") -> does the field exist?',
             )
             return None
         # get_attr
@@ -3643,8 +3777,7 @@ class SemanticAnalyzer:
             self.error(
                 "get_attr() expects 2 arguments",
                 node,
-                note="get_attr(obj, \"field\") reads a struct/class field "
-                "by name",
+                note='get_attr(obj, "field") reads a struct/class field ' "by name",
             )
             return None
         obj, name_arg = node.args[:2]
@@ -3779,14 +3912,13 @@ class SemanticAnalyzer:
         if not (struct_sym and struct_sym.kind in ("struct", "class")):
             if obj_t == "dynamic":
                 self.error(
-                    "has(obj, \"field\") requires a statically-typed struct "
+                    'has(obj, "field") requires a statically-typed struct '
                     "/class object",
                     obj,
                 )
                 return None
             self.error(
-                f"has(obj, \"field\") requires a struct/class object, got "
-                f"`{obj_t}`",
+                f'has(obj, "field") requires a struct/class object, got ' f"`{obj_t}`",
                 obj,
             )
             return None
@@ -3861,11 +3993,12 @@ class SemanticAnalyzer:
             )
             return None
         cls_name = cls_arg.name
-        obj_sym = (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        obj_sym = (
+            (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        )
         if not (obj_sym and obj_sym.kind == "class"):
             self.error(
-                "isinstance() requires a class object/pointer as its first "
-                "argument",
+                "isinstance() requires a class object/pointer as its first " "argument",
                 obj,
                 note=f"got `{obj_t}`",
             )
@@ -3915,7 +4048,9 @@ class SemanticAnalyzer:
         """
         t = self._infer_type(node.expr)
         base_t = (t or "").removesuffix("*").removesuffix("[]")
-        obj_sym = (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        obj_sym = (
+            (self.current_scope or self.globals).lookup(base_t) if base_t else None
+        )
         if not (obj_sym and obj_sym.kind == "class"):
             self.error(
                 "`as` requires a class object/pointer on its left side",
@@ -4199,6 +4334,22 @@ class SemanticAnalyzer:
                                 ("double", "float"),
                                 ("str", "char"),
                                 ("char", "str"),
+                                # Narrow unsigned words (the widths the ABI
+                                # structs expose, e.g. ScorpionLibInfo).
+                                ("int", "uint8"),
+                                ("int", "uint16"),
+                                ("int", "uint32"),
+                                ("uint8", "int"),
+                                ("uint16", "int"),
+                                ("uint32", "int"),
+                                ("uint8", "uint16"),
+                                ("uint8", "uint32"),
+                                ("uint16", "uint32"),
+                                ("uint32", "uint16"),
+                                ("uint16", "int64"),
+                                ("uint32", "int64"),
+                                ("uint16", "uint64"),
+                                ("uint32", "uint64"),
                             )
                             if not ok:
                                 self.error(
@@ -4569,7 +4720,11 @@ class SemanticAnalyzer:
                 bsym = self.current_scope.lookup(cur.base)
                 if bsym is None:
                     bsym = self.globals.lookup(cur.base)
-                cur = bsym.node if bsym is not None and isinstance(bsym.node, ClassDef) else None
+                cur = (
+                    bsym.node
+                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    else None
+                )
             else:
                 cur = None
         out = []
@@ -4659,6 +4814,7 @@ class SemanticAnalyzer:
 
                 is_synth = (getattr(m, "meta", None) or {}).get("kind") == "synth"
                 if m.name != "__init__" and not is_synth:
+
                     def _sig(f):
                         return (
                             tuple(
@@ -4731,7 +4887,11 @@ class SemanticAnalyzer:
                 expr = cmp if expr is None else BinOp(expr, TokenType.AND, cmp, t)
             if expr is None:
                 expr = Number("1", t, is_bool=True)
-            append(FuncDef("__eq__", {"other": node.name}, [Return(expr, t)], "bool", token=t))
+            append(
+                FuncDef(
+                    "__eq__", {"other": node.name}, [Return(expr, t)], "bool", token=t
+                )
+            )
 
         if "__str__" not in have:
             parts = [String(f"{node.name}(", t)]
@@ -4794,7 +4954,11 @@ class SemanticAnalyzer:
                 break
             if cnode.base:
                 bsym = (self.current_scope or self.globals).lookup(cnode.base)
-                cnode = bsym.node if bsym is not None and isinstance(bsym.node, ClassDef) else None
+                cnode = (
+                    bsym.node
+                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    else None
+                )
             else:
                 cnode = None
         if ctor is None:
@@ -5113,6 +5277,7 @@ def analyze(
     filepath: str | None = None,
     enable_extensions: bool = True,
     no_gc: bool = False,
+    scorpion: bool = False,
 ):
     analyzer = SemanticAnalyzer(
         source,
@@ -5121,6 +5286,7 @@ def analyze(
         workspace_root=workspace_root,
         enable_extensions=enable_extensions,
         no_gc=no_gc,
+        scorpion=scorpion,
     )
     # Pre-load CPM package manifests before analysis
     if enable_extensions:

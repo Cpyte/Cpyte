@@ -261,6 +261,12 @@ class LLVM:
             # i32 fallthrough) lets `(size_t)ptr`/`(ptr)(size_t)` round-trips
             # preserve the full address instead of truncating to 32 bits.
             result = ir.IntType(64)
+        elif t in ("uint8", "char"):
+            result = ir.IntType(8)
+        elif t == "uint16":
+            result = ir.IntType(16)
+        elif t in ("uint32", "unsigned"):
+            result = ir.IntType(32)
         elif t == "bool":
             result = ir.IntType(1)
         elif t in ("float", "double"):
@@ -269,8 +275,6 @@ class LLVM:
             result = ir.VoidType()
         elif t == "str":
             result = ir.PointerType(ir.IntType(8))
-        elif t == "char":
-            result = ir.IntType(8)
         elif t == "void*" or t == "big" or t == "ubig":
             result = ir.PointerType(ir.IntType(8))
         elif t == "dynamic":
@@ -674,9 +678,11 @@ class LLVM:
         debug_instrument=False,
         debug_nids=None,
         debug_step_ids=None,
+        scorpion=False,
     ):
         self.module = ir.Module("main")
         self.no_gc = no_gc
+        self.scorpion = scorpion
         self.use_native_eh = use_native_eh
         # --- cpdb debug instrumentation (opt-in, off by default) -------------
         # When enabled, the emitter emits one `cpdbd_t_<nid>` tracer per step
@@ -812,6 +818,9 @@ class LLVM:
             input_str_ty = ir.FunctionType(_i8ptr, [])
             input_str_fn = ir.Function(self.module, input_str_ty, "input_str")
             self.functions["input_str"] = input_str_fn
+
+        if self.scorpion:
+            self._declare_scorpion_abi()
 
         # BigNum runtime functions
         bignum_fns = [
@@ -985,6 +994,38 @@ class LLVM:
             self.module, ir.IntType(1), name="__code_skip"
         )
         self._code_skip.initializer = ir.Constant(ir.IntType(1), 0)  # type: ignore[attr-defined]
+
+    def _declare_scorpion_abi(self):
+        """Declare the Scorpion ABI wrappers and register `ScorpionLibInfo`.
+
+        Enabled by the `#scorpion` source directive. Each wrapper is an extern
+        resolved by `runtime_scorpion.c`, which ships the same `ecall`
+        encoding the Xtensa-only inline wrappers in `abi/scorpion.h` use (the
+        `a0`-`a7` register names are the RISC-V argument registers too, so the
+        ABI is identical on both architectures).
+
+        `ScorpionLibInfo` is materialized here rather than as a parsed
+        StructDef because it has no node in the AST: the kernel writes the
+        exact 32-byte layout through `scorpion_lib_info()`, so the `uint16`
+        tail must really be i16 (seven i32 + two i16, no padding).
+        """
+        from . import scorpion_abi
+
+        st = self.module.context.get_identified_type(
+            f"struct.{scorpion_abi.LIB_INFO_NAME}"
+        )
+        if st.is_opaque:
+            st.set_body(*[self.llvm_type(t) for _, t in scorpion_abi.LIB_INFO_FIELDS])
+        self.structs[scorpion_abi.LIB_INFO_NAME] = st
+        self.struct_fields[scorpion_abi.LIB_INFO_NAME] = scorpion_abi.lib_info_fields()
+
+        for name, (ret_type, params, vararg) in scorpion_abi.FUNCTIONS.items():
+            fnty = ir.FunctionType(
+                self.llvm_type(ret_type),
+                [self.llvm_type(t) for _, t in params],
+                var_arg=vararg,
+            )
+            self.functions[name] = ir.Function(self.module, fnty, name)
 
     # CRITICAL CONSTANT FOLDING BUG
     def _isolate_const_prop_branch(self, body):
@@ -1451,8 +1492,17 @@ class LLVM:
 
         if os.environ.get("CPYTE_JIT_DEBUG"):
             import sys as _sys
-            print("[bytecoding] runtime hooks:", [h.name for h in self._hook_registry.get(HookStage.RUNTIME)], file=_sys.stderr)
-            print("[bytecoding] import_src_files:", self.import_src_files, file=_sys.stderr)
+
+            print(
+                "[bytecoding] runtime hooks:",
+                [h.name for h in self._hook_registry.get(HookStage.RUNTIME)],
+                file=_sys.stderr,
+            )
+            print(
+                "[bytecoding] import_src_files:",
+                self.import_src_files,
+                file=_sys.stderr,
+            )
 
         for node in structs:
             if isinstance(node, ClassDef):
@@ -1638,25 +1688,20 @@ class LLVM:
             name = target.name
             if name in self.locals:
                 ptr = self.locals[name]
-                if not isinstance(
-                    getattr(ptr.type, "pointee", None), ir.PointerType
-                ):
-                    self.builder.store(
-                        ir.Constant(ptr.type.pointee, None), ptr
-                    )
+                if not isinstance(getattr(ptr.type, "pointee", None), ir.PointerType):
+                    self.builder.store(ir.Constant(ptr.type.pointee, None), ptr)
             for table in (self.locals, self.local_types, self.ssa_values):
                 table.pop(name, None)
             self.const_vars.pop(name, None)
             return
         if kind == "dynamic":
             name = target.name
-            if name in self.locals and getattr(
-                self.locals[name].type, "pointee", None
-            ) == _DynValue:
+            if (
+                name in self.locals
+                and getattr(self.locals[name].type, "pointee", None) == _DynValue
+            ):
                 zero = ir.Constant(_DynValue, ir.Undefined)
-                zero = self.builder.insert_value(
-                    zero, ir.Constant(_i32, _DYN_NONE), 0
-                )
+                zero = self.builder.insert_value(zero, ir.Constant(_i32, _DYN_NONE), 0)
                 zero = self.builder.insert_value(zero, ir.Constant(_i64, 0), 1)
                 self.builder.store(zero, self.locals[name])
             else:
@@ -2075,18 +2120,14 @@ class LLVM:
             index_fields = [Field("@vptr", "void*", token=node._token)] + all_fields
         field_tys = [self.llvm_type(f.type_expr) for f in index_fields]
         llvm_struct = self.structs.get(node.name)
-        if llvm_struct is None or not isinstance(
-            llvm_struct, ir.IdentifiedStructType
-        ):
+        if llvm_struct is None or not isinstance(llvm_struct, ir.IdentifiedStructType):
             # Pre-register an opaque identified struct BEFORE resolving field
             # types so self-referential fields resolve to a pointer to this
             # type instead of silently degrading to `i32`. get_identified_type
             # registers into the module's context so the definition is
             # serialized into the IR. Fieldless sealed classes still register
             # (as an empty struct) so `new T` can allocate them.
-            llvm_struct = self.module.context.get_identified_type(
-                f"class.{node.name}"
-            )
+            llvm_struct = self.module.context.get_identified_type(f"class.{node.name}")
             self.structs[node.name] = llvm_struct
         if field_tys or index_fields:
             if llvm_struct.is_opaque:
@@ -2141,9 +2182,7 @@ class LLVM:
                             wb.ret(ret)
                         self.functions[child_name] = wrapper
 
-    def _declare_class_method(
-        self, class_node: ClassDef, method: FuncDef
-    ):
+    def _declare_class_method(self, class_node: ClassDef, method: FuncDef):
         """Create the `Class.method` header function if it doesn't exist yet."""
         class_ty = self.structs.get(class_node.name)
         if class_ty is None:
@@ -2197,17 +2236,13 @@ class LLVM:
         slots = self._class_slot_list(cls)
         vt_ty = ir.LiteralStructType(
             [_i64]
-            + [
-                self.functions[f"{d}.{n}"].function_type.as_pointer()
-                for n, d in slots
-            ]
+            + [self.functions[f"{d}.{n}"].function_type.as_pointer() for n, d in slots]
         )
         cid = self._class_ids.setdefault(cls, len(self._class_ids))
         cv = ir.GlobalVariable(self.module, vt_ty, name=f"vt.{cls}")
         cv.initializer = ir.Constant(
             vt_ty,
-            [ir.Constant(_i64, cid)]
-            + [self.functions[f"{d}.{n}"] for n, d in slots],
+            [ir.Constant(_i64, cid)] + [self.functions[f"{d}.{n}"] for n, d in slots],
         )
         self._vt_types[cls] = vt_ty
         self._vt_globals[cls] = cv
@@ -2356,7 +2391,9 @@ class LLVM:
                 for i, arg in enumerate(node.args or []):
                     init_args.append(
                         self._coerce_call_arg(
-                            self.emit(arg), ptypes[i + 1], getattr(arg, "inferred_type", None)
+                            self.emit(arg),
+                            ptypes[i + 1],
+                            getattr(arg, "inferred_type", None),
                         )
                     )
                 self.builder.call(init_fn, init_args)
@@ -2694,7 +2731,9 @@ class LLVM:
             obj_decl = obj_decl or getattr(node.obj, "inferred_type", None)
             if not (obj_decl and str(obj_decl).endswith("[]")):
                 call = Call(
-                    Attr(node.obj, "__getitem__", token=getattr(node.obj, "_token", None)),
+                    Attr(
+                        node.obj, "__getitem__", token=getattr(node.obj, "_token", None)
+                    ),
                     [node.index],
                     token=node._token,
                 )
@@ -4629,7 +4668,9 @@ class LLVM:
         typed class pointers and integer/fp literals."""
         if isinstance(expected, ir.PointerType):
             if isinstance(val.type, ir.PointerType):
-                return self.builder.bitcast(val, expected) if val.type != expected else val
+                return (
+                    self.builder.bitcast(val, expected) if val.type != expected else val
+                )
             if isinstance(val.type, ir.IntType):
                 return self.builder.inttoptr(val, expected)
             return val
@@ -4640,7 +4681,9 @@ class LLVM:
                         return self.builder.sext(val, expected)
                     return self.builder.trunc(val, expected)
                 return val
-            if isinstance(val.type, ir.DoubleType) or isinstance(val.type, ir.FloatType):
+            if isinstance(val.type, ir.DoubleType) or isinstance(
+                val.type, ir.FloatType
+            ):
                 return self.builder.fptosi(val, expected)
             if isinstance(val.type, ir.PointerType) and expected.width >= 32:
                 return self.builder.ptrtoint(val, expected)
@@ -5731,7 +5774,8 @@ class LLVM:
                     for arg in node.args:
                         arg_val = self.emit(arg)
                         arg_val = self._coerce_call_arg(
-                            arg_val, slot_fnty.args[len(args)],
+                            arg_val,
+                            slot_fnty.args[len(args)],
                             getattr(arg, "inferred_type", None),
                         )
                         args.append(arg_val)
@@ -5760,7 +5804,8 @@ class LLVM:
                     for arg in node.args:
                         arg_val = self.emit(arg)
                         arg_val = self._coerce_call_arg(
-                            arg_val, func.function_type.args[len(args)],
+                            arg_val,
+                            func.function_type.args[len(args)],
                             getattr(arg, "inferred_type", None),
                         )
                         args.append(arg_val)
@@ -5859,10 +5904,7 @@ class LLVM:
             dunder_cls = node.callee._dunder_via
             if dunder_cls is None:
                 dunder_cls = self._static_obj_class(node.callee)
-            if (
-                dunder_cls
-                and self._dunder_fn_name(dunder_cls, "__call__") is not None
-            ):
+            if dunder_cls and self._dunder_fn_name(dunder_cls, "__call__") is not None:
                 call = Call(
                     Attr(node.callee, "__call__", token=node.callee._token),
                     node.args,
@@ -6238,9 +6280,7 @@ class LLVM:
             for f in fields:
                 fname = self._string_const(f.name)
                 cmp_res = self.builder.call(self._strcmp_fn, [name_val, fname])
-                match = self.builder.icmp_signed(
-                    "==", cmp_res, ir.Constant(_i32, 0)
-                )
+                match = self.builder.icmp_signed("==", cmp_res, ir.Constant(_i32, 0))
                 result = self.builder.or_(result, match)
             return result
         if kind == "get_attr_lit":
@@ -6259,12 +6299,8 @@ class LLVM:
             for i, f in enumerate(fields):
                 fname = self._string_const(f.name)
                 cmp_res = self.builder.call(self._strcmp_fn, [name_val, fname])
-                match = self.builder.icmp_signed(
-                    "==", cmp_res, ir.Constant(_i32, 0)
-                )
-                idx = self.builder.select(
-                    match, ir.Constant(_i32, i), idx
-                )
+                match = self.builder.icmp_signed("==", cmp_res, ir.Constant(_i32, 0))
+                idx = self.builder.select(match, ir.Constant(_i32, i), idx)
             struct_start = self.builder.gep(
                 obj_ptr,
                 [ir.Constant(_i32, 0), ir.Constant(_i32, 0)],
@@ -6289,9 +6325,7 @@ class LLVM:
         if getattr(self, "_ancestor_grid_emitted", False):
             return
         self._ancestor_grid_emitted = True
-        classes = [
-            c for c, n in self._struct_nodes.items() if isinstance(n, ClassDef)
-        ]
+        classes = [c for c, n in self._struct_nodes.items() if isinstance(n, ClassDef)]
         chains = {}
         for c in classes:
             cur = self._struct_nodes.get(c)
@@ -6359,13 +6393,9 @@ class LLVM:
             self.builder.mul(rcid, ir.Constant(_i64, stride)),
             ir.Constant(_i64, depth_t),
         )
-        row = self.builder.gep(
-            grid, [ir.Constant(_i32, 0), off], inbounds=True
-        )
+        row = self.builder.gep(grid, [ir.Constant(_i32, 0), off], inbounds=True)
         anc = self.builder.load(row)
-        return self.builder.icmp_signed(
-            "==", anc, ir.Constant(_i64, id_t)
-        )
+        return self.builder.icmp_signed("==", anc, ir.Constant(_i64, id_t))
 
     def _emit_builtin_append(self, node):
         """append(arr, x) — grow a registered array by one element.
@@ -6941,7 +6971,6 @@ class LLVM:
         self._const_prop_f = saved_f
 
     def _emit_for_worker(self, node, var_name, iterable, body, iter_type, var_type):
-
         # ---- 3.  Bounded loop unrolling for constant-size list literals ----
         if (
             isinstance(iterable, ListLit)

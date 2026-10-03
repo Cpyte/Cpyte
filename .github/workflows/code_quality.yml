@@ -48,6 +48,34 @@ jobs:
       - name: Run Cpyte tests
         run: python ci_test.py
 
+  scorpion:
+    name: Scorpion ABI + dynamic linking
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install RISC-V cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+
+      - name: #scorpion ABI (directive, semantic, LLVM layout, runtime, LSP)
+        run: python test/test_scorpion_abi.py
+
+      - name: Scorpion dynamic linking (SEF export/import)
+        run: python test/test_scorpion_dl.py
+
   bomb:
     name: Bomb test (2500 crash reproducers)
     runs-on: ubuntu-24.04

@@ -122,6 +122,13 @@ def _node_signature(node):
             _node_signature(node.left),
             _node_signature(node.right),
         )
+    if isinstance(node, astparse.IfExp):
+        return (
+            cname,
+            _node_signature(node.body),
+            _node_signature(node.cond),
+            _node_signature(node.orelse),
+        )
     return cname, _line(node)
 
 
@@ -171,9 +178,28 @@ class _Formatter:
             if parent_op is not None and _need_parens(node, parent_op, is_right):
                 return "(" + body + ")"
             return body
+        if isinstance(node, astparse.IfExp):
+            body = self._ifexp_text(node)
+            # A ternary binds looser than every binary operator, so a BinOp
+            # parent always has to parenthesize it.
+            if parent_op is not None:
+                return "(" + body + ")"
+            return body
         if isinstance(node, astparse.UnaryOp):
             return self._unary_text(node)
         return self._atom_text(node)
+
+    def _ifexp_text(self, node):
+        # The condition is an `or_test` in the grammar, so a nested ternary
+        # there REQUIRES parens; the body is looser than unary so it gets them
+        # for readability; the else-branch may nest bare (right-associative).
+        body = self._expr(node.body)
+        if isinstance(node.body, astparse.IfExp):
+            body = "(" + body + ")"
+        cond = self._expr(node.cond)
+        if isinstance(node.cond, astparse.IfExp):
+            cond = "(" + cond + ")"
+        return f"{body} if {cond} else {self._expr(node.orelse)}"
 
     def _binop_text(self, node):
         left = self._expr(node.left, node.op, False)
@@ -184,7 +210,10 @@ class _Formatter:
     def _unary_text(self, node):
         prefix = _UNARY_TEXT[node.op]
         operand = node.operand
-        if isinstance(operand, astparse.BinOp):
+        # unary binds tighter than a ternary, so `-a if c else b` means
+        # `(-a) if c else b` and the operand needs parens to survive a
+        # round-trip through the formatter.
+        if isinstance(operand, (astparse.BinOp, astparse.IfExp)):
             operand_text = "(" + self._expr(operand) + ")"
         else:
             operand_text = self._expr(operand)

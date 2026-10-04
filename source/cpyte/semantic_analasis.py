@@ -113,12 +113,14 @@ from .astparse import (
     FString,
     FuncDef,
     If,
+    IfExp,
     Import,
     Index,
     InlineAsm,
     Input,
     InputBig,
     InputStr,
+    KeywordArg,
     ListLit,
     Llvm,
     MoveExpr,
@@ -515,13 +517,38 @@ def _coerce_assign_ok(src_t, dst_t):
         ("int", "int64"),
         ("int", "uint64"),
         ("int", "size_t"),
+        ("int", "ssize_t"),
+        ("int", "ptrdiff_t"),
+        ("int", "intptr_t"),
+        ("int", "uintptr_t"),
         ("int64", "uint64"),
         ("int64", "size_t"),
+        ("int64", "ssize_t"),
+        ("int64", "ptrdiff_t"),
+        ("int64", "intptr_t"),
+        ("int64", "uintptr_t"),
         ("uint64", "int64"),
         ("uint64", "size_t"),
+        ("uint64", "ssize_t"),
+        ("uint64", "ptrdiff_t"),
+        ("uint64", "intptr_t"),
+        ("uint64", "uintptr_t"),
         ("size_t", "int"),
         ("size_t", "int64"),
         ("size_t", "uint64"),
+        ("ssize_t", "int"),
+        ("ssize_t", "int64"),
+        ("ssize_t", "uint64"),
+        ("ptrdiff_t", "int"),
+        ("ptrdiff_t", "int64"),
+        ("ptrdiff_t", "ssize_t"),
+        ("intptr_t", "int"),
+        ("intptr_t", "int64"),
+        ("intptr_t", "ssize_t"),
+        ("uintptr_t", "int"),
+        ("uintptr_t", "int64"),
+        ("uintptr_t", "uint64"),
+        ("uintptr_t", "size_t"),
         ("float", "double"),
         ("double", "float"),
         # Narrow unsigned words (the widths the ABI structs expose) convert
@@ -915,6 +942,10 @@ class SemanticAnalyzer:
         "ubig",
         "char",
         "size_t",
+        "ssize_t",
+        "ptrdiff_t",
+        "intptr_t",
+        "uintptr_t",
         "uint8",
         "uint16",
         "uint32",
@@ -925,12 +956,20 @@ class SemanticAnalyzer:
         "uint64",
         "char",
         "size_t",
+        "ssize_t",
+        "ptrdiff_t",
+        "intptr_t",
+        "uintptr_t",
         "uint8",
         "uint16",
         "uint32",
     )
     _FLOAT_TYPES = ("float", "double")
     _WIDE_INT_TYPES = ("int64", "uint64")
+    # Pointer-sized integers (i64 on every cpyte target). `size_t` is handled
+    # separately in _numeric_promote because it dominates int64; the signed
+    # members just widen like int64 does.
+    _PTR_WIDTH_TYPES = ("ssize_t", "ptrdiff_t", "intptr_t", "uintptr_t")
     _CONV_BUILTINS = {"str": "str", "int": "int", "float": "float", "double": "float"}
 
     # Binary operator -> overridable method (Python-style dunders). `this` is
@@ -993,6 +1032,10 @@ class SemanticAnalyzer:
                 return "int64"
             if t1 == "size_t" or t2 == "size_t":
                 return "size_t"
+            # Every pointer-sized type is 64-bit, so mixing one with a narrow
+            # int widens the same way int64 does.
+            if (t1 in self._PTR_WIDTH_TYPES) or (t2 in self._PTR_WIDTH_TYPES):
+                return "int64"
             return "int"
         return None
 
@@ -1259,6 +1302,40 @@ class SemanticAnalyzer:
             node.dynamic = sym.dynamic
             node.inferred_type = sym.type
             return sym.type
+
+        if isinstance(node, IfExp):
+            # `body if cond else orelse`. The condition must be boolean-ish
+            # (cpyte has no truthiness for non-numeric types), and the two
+            # branches must be mutually promotable -- the result type follows
+            # the same usual-arithmetic-conversion rule as a BinOp.
+            cond_t = self._infer_type(node.cond)
+            body_t = self._infer_type(node.body)
+            else_t = self._infer_type(node.orelse)
+            if cond_t not in ("bool", "int", None):
+                self.error(
+                    "the condition of a conditional expression must be a "
+                    f"boolean, got `{cond_t}`",
+                    node.cond,
+                )
+            if body_t is None or else_t is None:
+                node.inferred_type = body_t or else_t
+                return node.inferred_type
+            if body_t != else_t:
+                promoted = self._numeric_promote(body_t, else_t)
+                if promoted is None:
+                    self.error(
+                        "the branches of a conditional expression have "
+                        f"incompatible types: `{body_t}` and `{else_t}`",
+                        node,
+                        note="both branches must have the same type, or types "
+                        "that promote to a common one (e.g. int and double)",
+                    )
+                    node.inferred_type = body_t
+                    return node.inferred_type
+                node.inferred_type = promoted
+                return promoted
+            node.inferred_type = body_t
+            return body_t
 
         if isinstance(node, BinOp):
             left_t = self._infer_type(node.left)
@@ -1672,6 +1749,11 @@ class SemanticAnalyzer:
                 return sym.type
             return None
 
+        if isinstance(node, KeywordArg):
+            # `f(name=value)` -- the argument node is a KeywordArg; the call
+            # itself is rewritten to positional form by _bind_call_args.
+            return self._infer_type(node.value)
+
         if isinstance(node, Input):
             return "int"
 
@@ -1845,6 +1927,10 @@ class SemanticAnalyzer:
         """Child nodes that `_infer_type_recursive` descends into, in order."""
         if isinstance(node, BinOp):
             return [node.left, node.right]
+        if isinstance(node, IfExp):
+            return [node.cond, node.body, node.orelse]
+        if isinstance(node, KeywordArg):
+            return [node.value]
         if isinstance(node, UnaryOp):
             return [node.operand]
         if isinstance(node, Call):
@@ -2001,6 +2087,62 @@ class SemanticAnalyzer:
         node.inferred_type = t
         return t
 
+    def _bind_call_args(self, call: Call, fn: FuncDef, skip_first: bool) -> bool:
+        """Resolve keyword arguments and parameter defaults into positional form.
+
+        Rewrites `call.args` into one plain expression per declared parameter
+        (in declaration order), substituting each parameter's default
+        expression where the caller supplied neither a positional nor a
+        keyword argument. Returns False without touching the call when the
+        binding is not applicable or is malformed, so the ordinary arity/type
+        diagnostics in `_check_call_args` still report the problem.
+
+        `skip_first` drops a leading implicit receiver (`this`), which applies
+        only to the synthesized `obj(...)` -> `obj.__call__(...)` call.
+        """
+        params = list(fn.params.keys())
+        defaults = getattr(fn, "defaults", None) or {}
+        has_kw = any(isinstance(a, KeywordArg) for a in call.args)
+        if not defaults and not has_kw:
+            return False
+        if skip_first:
+            params = params[1:]
+        positional = [a for a in call.args if not isinstance(a, KeywordArg)]
+        if len(positional) > len(params):
+            return False  # too many positionals: let the arity check report it
+        bound: dict = {}
+        for name, arg in zip(params, positional):
+            bound[name] = arg
+        for a in call.args:
+            if not isinstance(a, KeywordArg):
+                continue
+            if a.name not in params:
+                self.error(
+                    f"function `{fn.name}` has no parameter named `{a.name}`",
+                    a,
+                    note=f"parameters are: {', '.join(params)}"
+                    if params
+                    else "this function takes no parameters",
+                )
+                return False
+            if a.name in bound:
+                self.error(
+                    f"argument `{a.name}` given more than once",
+                    a,
+                    note="pass it either positionally or by keyword, not both",
+                )
+                return False
+            bound[a.name] = a.value
+        for name in params:
+            if name in bound:
+                continue
+            if name in defaults:
+                bound[name] = defaults[name]
+            else:
+                return False  # missing a required argument: arity check reports it
+        call.args = [bound[name] for name in params]
+        return True
+
     def _check_call_args(self, call: Call, sym: Symbol):
         expected_count = 0
         if sym.kind == "builtin_func":
@@ -2016,6 +2158,9 @@ class SemanticAnalyzer:
                 ]
             else:
                 call.param_types = list(sym.node.params.values())
+            # Keyword arguments / omitted trailing defaults are folded into a
+            # plain positional list here, so codegen stays position-agnostic.
+            self._bind_call_args(call, sym.node, callee_is_dunder)
         elif sym.node and isinstance(sym.node, (Import, CCode, Llvm)):
             for fname, (_, params, vararg) in sym.node.symbols:
                 if fname == call.callee.name:
@@ -3660,7 +3805,13 @@ class SemanticAnalyzer:
             )
             return None
         arg_t = getattr(node.args[0], "inferred_type", None)
-        if arg_t and arg_t != "dynamic" and arg_t != "str":
+        # `len(s)` on a string is strlen(), not an array-length lookup. This
+        # used to be unreachable: `str` was excluded from the dunder branch
+        # below and then failed the `[]` test, so no spelling could succeed.
+        if arg_t == "str":
+            node.inferred_type = "int64"
+            return "int64"
+        if arg_t and arg_t != "dynamic":
             m = self._find_class_dunder(arg_t, "__len__")
             if m is not None:
                 if self._dunder_arity_ok(m, 0):
@@ -3672,8 +3823,9 @@ class SemanticAnalyzer:
                 f"`{arg_t if arg_t is not None else 'unknown'}`",
                 node,
                 note="len() returns the registered element count of an array "
-                "(`new T[n]`, `range()`, a list literal or `str_split()` result); "
-                "fixed-size and raw C buffers have no registered length",
+                "(`range()` or a list literal or `str_split()` result), or "
+                "strlen() for a `str`; fixed-size and raw C buffers have no "
+                "registered length",
             )
             return None
         node.inferred_type = "int64"
@@ -4442,6 +4594,35 @@ class SemanticAnalyzer:
                     ("big", "ubig"),
                     ("ubig", "ubig"),
                     ("ubig", "big"),
+                    # Pointer-width integers (all i64 on cpyte targets) accept
+                    # int/int64/uint64 initializers, exactly like size_t above.
+                    # NOTE: this table is duplicated in _coerce_assign_ok and
+                    # friends -- keep every copy in sync when adding a type.
+                    ("int", "ssize_t"),
+                    ("int", "ptrdiff_t"),
+                    ("int", "intptr_t"),
+                    ("int", "uintptr_t"),
+                    ("int64", "ssize_t"),
+                    ("int64", "ptrdiff_t"),
+                    ("int64", "intptr_t"),
+                    ("int64", "uintptr_t"),
+                    ("uint64", "ssize_t"),
+                    ("uint64", "ptrdiff_t"),
+                    ("uint64", "intptr_t"),
+                    ("uint64", "uintptr_t"),
+                    ("ssize_t", "int"),
+                    ("ssize_t", "int64"),
+                    ("ssize_t", "uint64"),
+                    ("ptrdiff_t", "int"),
+                    ("ptrdiff_t", "int64"),
+                    ("ptrdiff_t", "ssize_t"),
+                    ("intptr_t", "int"),
+                    ("intptr_t", "int64"),
+                    ("intptr_t", "ssize_t"),
+                    ("uintptr_t", "int"),
+                    ("uintptr_t", "int64"),
+                    ("uintptr_t", "uint64"),
+                    ("uintptr_t", "size_t"),
                 ]
                 ok = (init_type, val_type) in valid_conversions
                 ok = ok or (init_type == "int" and val_type.endswith("*"))

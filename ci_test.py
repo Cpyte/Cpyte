@@ -56,6 +56,7 @@ CORPUS: tuple[str, ...] = (
     "test/test_int64_fold.cpy",
     "test/test_big_return_coerce.cpy",
     "test/test_big_print_newline.cpy",
+    "test/test_python_tier1.cpy",
     "test/most_complex.cpy",
 )
 

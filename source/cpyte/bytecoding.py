@@ -79,6 +79,12 @@ def _bc_array_norm(t):
 _i8 = ir.IntType(8)
 _i32 = ir.IntType(32)
 _i64 = ir.IntType(64)
+
+# Declared 64-bit integer types whose initializer must be SIGN-extended when
+# widened from i32 (`_extend_to_i64`). `size_t`/`uintptr_t` are absent on
+# purpose: they are unsigned, so the generic zero-extending path is correct
+# for them. `uint64` is kept here because that is its pre-existing behavior.
+_I64_EXTEND_TYPES = ("int64", "uint64", "ssize_t", "ptrdiff_t", "intptr_t")
 _i1 = ir.IntType(1)
 _double = ir.DoubleType()
 _void = ir.VoidType()
@@ -189,6 +195,10 @@ def _emit_children(node) -> list:
     """Child nodes that the pure emitters descend into, in emit order."""
     if isinstance(node, BinOp):
         return [node.left, node.right]
+    if isinstance(node, IfExp):
+        return [node.cond, node.body, node.orelse]
+    if isinstance(node, KeywordArg):
+        return [node.value]
     if isinstance(node, UnaryOp):
         return [node.operand]
     if isinstance(node, Deref):
@@ -255,9 +265,10 @@ class LLVM:
             result = ir.IntType(32)
         elif t == "int64" or t == "uint64":
             result = ir.IntType(64)
-        elif t == "size_t":
-            # Pointer-sized unsigned integer (i64 on every 64-bit cpyte target,
-            # incl. macOS/Linux arm64 & x86-64 LP64). Keeping it i64 (not the
+        elif t in ("size_t", "ssize_t", "ptrdiff_t", "intptr_t", "uintptr_t"):
+            # Pointer-sized integers: i64 on every 64-bit cpyte target
+            # (macOS/Linux arm64 & x86-64 LP64). `size_t` is unsigned, the rest
+            # signed, but LLVM only sees the width. Keeping them i64 (not the
             # i32 fallthrough) lets `(size_t)ptr`/`(ptr)(size_t)` round-trips
             # preserve the full address instead of truncating to 32 bits.
             result = ir.IntType(64)
@@ -4299,13 +4310,13 @@ class LLVM:
             if cv is not None and left_node.name in self.locals:
                 left_decl = self.local_types.get(left_node.name, "int")
                 left_node = Number(str(cv))
-                left_width = 64 if left_decl in ("int64", "uint64") else 32
+                left_width = 64 if left_decl in _I64_EXTEND_TYPES else 32
         if isinstance(right_node, Variable) and self._is_const_var(right_node.name):
             cv = self._const_var_value(right_node.name)
             if cv is not None and right_node.name in self.locals:
                 right_decl = self.local_types.get(right_node.name, "int")
                 right_node = Number(str(cv))
-                right_width = 64 if right_decl in ("int64", "uint64") else 32
+                right_width = 64 if right_decl in _I64_EXTEND_TYPES else 32
         if isinstance(left_node, Variable) and left_node.name in self._const_prop_f:
             fv = self._const_prop_f.get(left_node.name)
             if fv is not None and left_node.name in self.locals:
@@ -4710,6 +4721,72 @@ class LLVM:
                 val = self.builder.bitcast(val, base_ptr)
             return self.builder.load(val)
         return val
+
+    @register_emitter(IfExp)
+    def emit_ifexp(self, node):
+        """`body if cond else orelse` — a Python conditional expression.
+
+        Uses an alloca rather than a phi node because the two branches
+        routinely arrive with different LLVM types (an `int` literal is i32
+        while the declared result of the ternary is i64), and a phi would
+        demand one agreed type before either branch was even emitted. Each
+        branch is coerced to the semantic result type first.
+        """
+        # Constant condition: emit only the taken branch. Keeps
+        # `1 if true else 2` branch-free and avoids emitting the dead side
+        # (which could be an invalid expression for this type).
+        folded = _const_int_value(node.cond)
+        if (
+            folded is None
+            and isinstance(node.cond, Variable)
+            and self._is_const_var(node.cond.name)
+        ):
+            cv = self._const_var_value(node.cond.name)
+            if cv is not None:
+                folded = 1 if cv != 0 else 0
+        if folded is not None:
+            return self.emit(node.body if folded else node.orelse)
+
+        cond = self._truthy_expr(node.cond)
+        result_t = getattr(node, "inferred_type", None)
+        llvm_res = self.llvm_type(result_t) if result_t else None
+        # The slot must be allocated BEFORE the cbranch: anything appended
+        # after a block's terminator is not part of that block, and LLVM
+        # rejects it ("expected instruction opcode" at the next label).
+        slot = self.builder.alloca(llvm_res) if llvm_res is not None else None
+
+        then_bb = self.builder.append_basic_block("tern.then")
+        else_bb = self.builder.append_basic_block("tern.else")
+        merge_bb = self.builder.append_basic_block("tern.end")
+        self.builder.cbranch(cond, then_bb, else_bb)
+
+        self.builder.position_at_end(then_bb)
+        then_val = self.emit(node.body)
+        if slot is not None:
+            self.builder.store(
+                self._coerce_call_arg(then_val, llvm_res, result_t), slot
+            )
+            self.builder.branch(merge_bb)
+
+        self.builder.position_at_end(else_bb)
+        else_val = self.emit(node.orelse)
+        if slot is not None:
+            self.builder.store(
+                self._coerce_call_arg(else_val, llvm_res, result_t), slot
+            )
+            self.builder.branch(merge_bb)
+            else_val = None
+        else:
+            # No semantic type to coerce to: fall back to a phi, widening the
+            # odd branch to whatever the other one produced.
+            if then_val.type != else_val.type:
+                else_val = self._coerce_call_arg(else_val, then_val.type)
+            self.builder.branch(merge_bb)
+
+        self.builder.position_at_end(merge_bb)
+        if slot is not None:
+            return self.builder.load(slot)
+        return self.builder.phi(then_val.type, [then_val, else_val])
 
     def _try_dunder_binop(self, node):
         """`left OP right` -> `left.__op__(right)` when the left operand's class
@@ -5559,7 +5636,7 @@ class LLVM:
                     else:
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
-                if var_type in ("int64", "uint64"):
+                if var_type in _I64_EXTEND_TYPES:
                     value = self._extend_to_i64(value)
                 self.builder.store(value, ptr)
                 cv = _const_int_value(node.value)
@@ -5618,7 +5695,7 @@ class LLVM:
                     else:
                         value = self._coerce_store(value, pointee)
                 var_type = self.local_types.get(name)
-                if var_type in ("int64", "uint64"):
+                if var_type in _I64_EXTEND_TYPES:
                     value = self._extend_to_i64(value)
                 self.builder.store(value, ptr)
                 self._set_const_prop(name, _const_int_value(node.value))
@@ -6204,10 +6281,10 @@ class LLVM:
         return self.builder.call(fn, [str_val, sep_val])
 
     def _emit_builtin_len(self, node):
-        """len(arr) — return the registered element count of an array.
+        """len(x) — strlen() for a `str`, else the registered element count.
 
-        Uses the array-length side table (cpyte_array_len), so it works for
-        `new T[n]`, `range()`, list literals and `str_split()` results. Not
+        For an array it uses the array-length side table (cpyte_array_len), so
+        it works for `range()`, list literals and `str_split()` results. Not
         supported (semantically rejected) on fixed-size local arrays or
         raw/C buffers that were never length-registered."""
         arg = node.args[0]
@@ -6219,9 +6296,13 @@ class LLVM:
                 token=node._token,
             )
             return self.emit(call)
-        arg = self.emit(node.args[0])
-        if arg.type != _i8ptr:
-            arg = self.builder.bitcast(arg, _i8ptr)
+        arg_val = self.emit(node.args[0])
+        # A string has no array-length record; it is just a NUL-terminated
+        # buffer, so measure it directly. _get_strlen_fn already returns i64.
+        if getattr(arg, "inferred_type", None) == "str":
+            return self.builder.call(self._get_strlen_fn(), [arg_val])
+        if arg_val.type != _i8ptr:
+            arg_val = self.builder.bitcast(arg_val, _i8ptr)
         fn = self.functions.get("cpyte_array_len")
         if fn is None:
             fn = ir.Function(
@@ -6230,7 +6311,7 @@ class LLVM:
                 name="cpyte_array_len",
             )
             self.functions["cpyte_array_len"] = fn
-        return self.builder.call(fn, [arg])
+        return self.builder.call(fn, [arg_val])
 
     def _emit_builtin_has_get_attr(self, node):
         """has()/get_attr() — existence checks and runtime field access.
@@ -7354,7 +7435,7 @@ class LLVM:
                         if node.var_type == "ubig"
                         else self._promote_to_big(value, src_t)
                     )
-                elif node.var_type in ("int64", "uint64"):
+                elif node.var_type in _I64_EXTEND_TYPES:
                     value = self._extend_to_i64(value)
                 if isinstance(value, ir.Constant):
                     self._declare_const(node.name, value)
@@ -7381,7 +7462,7 @@ class LLVM:
                 )
             elif self._is_biglike(node.init) and node.var_type not in ("big", "ubig"):
                 pass
-            elif node.var_type in ("int64", "uint64"):
+            elif node.var_type in _I64_EXTEND_TYPES:
                 value = self._extend_to_i64(value)
             if value.type != ty:
                 if self.no_userspace and value.type == _DynValue:

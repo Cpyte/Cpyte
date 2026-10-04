@@ -237,6 +237,49 @@ class BinOp(Node):
         return f"BinOp({self.left}, {self.op.name}, {self.right})"
 
 
+class KeywordArg(Node):
+    """A call argument written as `name=value`.
+
+    Semantic analysis resolves it against the callee's parameter list and
+    rewrites the call's `args` into a plain positional list, so code
+    generation only ever sees ordinary expressions.
+    """
+
+    __slots__ = ("_token", "inferred_type", "name", "value")
+
+    def __init__(self, name: str, value, token=None):
+        self.name = name
+        self.value = value
+        self._token = token
+        self.inferred_type = None
+
+    def __repr__(self):
+        return f"KeywordArg({self.name}={self.value})"
+
+
+class IfExp(Node):
+    """Python conditional expression: `body if cond else orelse`.
+
+    Precedence sits below `or` (as in CPython's grammar: the body and the
+    condition are `or_test`s, only the else-branch may nest another ternary),
+    so it is parsed by a thin wrapper around _parse_binary rather than inside
+    the binary loop.
+    """
+
+    inferred_type: str | None
+    __slots__ = ("_token", "inferred_type", "body", "cond", "orelse")
+
+    def __init__(self, body, cond, orelse, token=None):
+        self.body = body
+        self.cond = cond
+        self.orelse = orelse
+        self._token = token
+        self.inferred_type = None
+
+    def __repr__(self):
+        return f"IfExp({self.body}, {self.cond}, {self.orelse})"
+
+
 class CCode(Node):
     inferred_type: str | None
     __slots__ = (
@@ -390,12 +433,61 @@ class ParseError(Exception):
         super().__init__(f"{msg}{loc}")
 
 
+class TernaryParseError(ParseError):
+    """A malformed conditional expression.
+
+    A distinct subclass because statement dispatch speculatively tries
+    `parse_var_decl` inside `except ParseError: pass` (to tell `int x` from an
+    `int(x)` call). Without a dedicated type that bare `except` would swallow
+    the real diagnostic and the user would just see "Expected newline after
+    statement". Re-raised ahead of the general handler where it matters.
+    """
+
+
 def _prec(tok: Token) -> int:
     return _PREC.get(tok.type, 0)
 
 
 def parse_expression(tokens: list[Token], pos: int = 0):
-    return _parse_binary(tokens, pos, 0)
+    return _parse_ternary(tokens, pos)
+
+
+def _parse_ternary(tokens: list[Token], pos: int):
+    """`body if cond else orelse` — Python's conditional expression.
+
+    Sits below `or` in precedence, so it wraps the whole binary parse instead
+    of joining the operator loop. Only the else-branch recurses (matching
+    CPython's `or_test ['if' or_test 'else' ternary]`), which makes
+    `a if b else c if d else e` right-associative.
+
+    Living outside _parse_binary means the depth-limit iterative fallback in
+    there is inherited for free: a deep ternary still parses because the `if`
+    check happens after control returns from the iterative parser.
+    """
+    body, pos = _parse_binary(tokens, pos, 0)
+    if not _is_ternary_if(tokens, pos):
+        return body, pos
+    tok = tokens[pos]
+    pos += 1
+    cond, pos = _parse_binary(tokens, pos, 0)
+    pos = _skip_expr_newlines(tokens, pos)
+    if pos >= len(tokens) or not (
+        tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "else"
+    ):
+        raise TernaryParseError(
+            'Expected "else" in conditional expression', tok
+        )
+    pos += 1
+    orelse, pos = _parse_ternary(tokens, pos)
+    return IfExp(body, cond, orelse, token=tok), pos
+
+
+def _is_ternary_if(tokens: list[Token], pos: int) -> bool:
+    return (
+        pos < len(tokens)
+        and tokens[pos].type == TokenType.KEYWORD
+        and tokens[pos].value == "if"
+    )
 
 
 def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
@@ -824,8 +916,19 @@ def _parse_call_args(tokens: list[Token], pos: int, callee):
     pos += 1
     args = []
     while pos < len(tokens) and tokens[pos].type != TokenType.RPAREN:
-        arg, pos = parse_expression(tokens, pos)
-        args.append(arg)
+        # `name=value` is a keyword argument; a bare `name` is positional.
+        if (
+            tokens[pos].type == TokenType.IDENTIFIER
+            and pos + 1 < len(tokens)
+            and tokens[pos + 1].type == TokenType.EQUAL
+        ):
+            name_tok = tokens[pos]
+            pos += 2
+            value, pos = parse_expression(tokens, pos)
+            args.append(KeywordArg(name_tok.value, value, token=name_tok))
+        else:
+            arg, pos = parse_expression(tokens, pos)
+            args.append(arg)
         if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
@@ -1300,6 +1403,9 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
                 if node is None:
                     pos = save
                     node, pos = parse_expr_stmt(tokens, pos)
+            except TernaryParseError:
+                # Genuine error, not the `int x` vs `int(x)` ambiguity.
+                raise
             except ParseError:
                 pos = save
                 node, pos = parse_expr_stmt(tokens, pos)
@@ -1321,11 +1427,18 @@ def _parse_func_with_visibility(
     ):
         pos += 1
     name, pos = _parse_func_name(tokens, pos)
-    params, const_params, pos = _parse_func_params(tokens, pos)
+    params, const_params, defaults, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
     return FuncDef(
-        name, params, body, rettype, visibility, const_params=const_params, token=tok
+        name,
+        params,
+        body,
+        rettype,
+        visibility,
+        const_params=const_params,
+        defaults=defaults,
+        token=tok,
     ), pos
 
 
@@ -1340,11 +1453,19 @@ def _parse_func_name(tokens: list[Token], pos: int):
 
 
 def _parse_func_params(tokens: list[Token], pos: int):
+    """Parse a parameter list into (types, const-view names, defaults, pos).
+
+    `defaults` maps a parameter name to the AST of its default expression, for
+    parameters written as `name: T = expr`. A parameter with a default may be
+    omitted (or passed by keyword) at the call site.
+    """
     if pos >= len(tokens) or tokens[pos].type != TokenType.LPAREN:
         raise ParseError('Expected "("', tokens[pos] if pos < len(tokens) else None)
     pos += 1
     params = {}
     const_params = []
+    defaults = {}
+    saw_default = False
     while pos < len(tokens) and tokens[pos].type != TokenType.RPAREN:
         tok = tokens[pos]
         is_const_view = tok.type == TokenType.LPAREN
@@ -1371,6 +1492,7 @@ def _parse_func_params(tokens: list[Token], pos: int):
         if pos < len(tokens) and tokens[pos].type not in (
             TokenType.COMMA,
             TokenType.RPAREN,
+            TokenType.EQUAL,
         ):
             param_type, pos = parse_type(tokens, pos)
             param_type_str = (
@@ -1381,11 +1503,28 @@ def _parse_func_params(tokens: list[Token], pos: int):
             params[param_name] = param_type_str
         else:
             params[param_name] = "int"
+        # Optional default value: `name: T = expr`. Once one parameter has a
+        # default every later parameter must have one too, so that omitting
+        # trailing arguments can never leave a hole.
+        has_default = (
+            pos < len(tokens) and tokens[pos].type == TokenType.EQUAL
+        )
+        if has_default:
+            saw_default = True
+            pos += 1
+            default_expr, pos = parse_expression(tokens, pos)
+            defaults[param_name] = default_expr
+        elif saw_default:
+            raise ParseError(
+                f"parameter `{param_name}` has no default value but follows "
+                "a parameter that does",
+                tok,
+            )
         if pos < len(tokens) and tokens[pos].type == TokenType.COMMA:
             pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
         raise ParseError('Expected ")"', tokens[pos] if pos < len(tokens) else None)
-    return params, const_params, pos + 1
+    return params, const_params, defaults, pos + 1
 
 
 def _parse_func_rettype(tokens: list[Token], pos: int):
@@ -1894,6 +2033,7 @@ class FuncDef(Node):
         "body",
         "const_params",
         "decorators",
+        "defaults",
         "generic_params",
         "meta",
         "name",
@@ -1912,6 +2052,7 @@ class FuncDef(Node):
         generic_params: list | None = None,
         const_params: list | None = None,
         decorators: list | None = None,
+        defaults: dict | None = None,
         token=None,
     ):
         self.name = name
@@ -1922,6 +2063,7 @@ class FuncDef(Node):
         self.generic_params = generic_params or []
         self.const_params = const_params or []
         self.decorators = decorators or []
+        self.defaults = defaults or {}
         self.meta = None
         self._token = token
 
@@ -2653,6 +2795,10 @@ _TYPE_NAMES = {
     "big",
     "ubig",
     "size_t",
+    "ssize_t",
+    "ptrdiff_t",
+    "intptr_t",
+    "uintptr_t",
     "dynamic",
 }
 
@@ -2925,6 +3071,10 @@ def parse_statement(tokens: list[Token], pos: int):
         if tok.value in _TYPE_NAMES or _looks_like_type(tokens, pos):
             try:
                 return parse_var_decl(tokens, pos)
+            except TernaryParseError:
+                # A malformed ternary in the initializer is a genuine error,
+                # not the `int x` vs `int(x)` ambiguity this probe resolves.
+                raise
             except ParseError:
                 pass
 
@@ -3298,7 +3448,7 @@ def parse_def(tokens: list[Token], pos: int):
     pos += 1
     name, pos = _parse_func_name(tokens, pos)
     generic_params, pos = parse_generic_params(tokens, pos)
-    params, const_params, pos = _parse_func_params(tokens, pos)
+    params, const_params, defaults, pos = _parse_func_params(tokens, pos)
     rettype, pos = _parse_func_rettype(tokens, pos)
     body, pos = parse_suite(tokens, pos)
     return FuncDef(
@@ -3307,6 +3457,7 @@ def parse_def(tokens: list[Token], pos: int):
         body,
         rettype,
         generic_params=generic_params,
+        defaults=defaults,
         const_params=const_params,
         token=tok,
     ), pos

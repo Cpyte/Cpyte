@@ -474,9 +474,7 @@ def _parse_ternary(tokens: list[Token], pos: int):
     if pos >= len(tokens) or not (
         tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "else"
     ):
-        raise TernaryParseError(
-            'Expected "else" in conditional expression', tok
-        )
+        raise TernaryParseError('Expected "else" in conditional expression', tok)
     pos += 1
     orelse, pos = _parse_ternary(tokens, pos)
     return IfExp(body, cond, orelse, token=tok), pos
@@ -598,9 +596,8 @@ def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
 
     for hook in _get_all_parser_hooks(True):
-        if (
-            hasattr(hook, "should_handle_expression")
-            and hook.should_handle_expression(tokens, pos)
+        if hasattr(hook, "should_handle_expression") and hook.should_handle_expression(
+            tokens, pos
         ):
             return hook.parse_expression(
                 tokens,
@@ -940,7 +937,8 @@ def _parse_call_args(tokens: list[Token], pos: int, callee):
 
 def _parse_postfix(tokens: list[Token], pos: int, node):
     while pos < len(tokens) and (
-        tokens[pos].type in (
+        tokens[pos].type
+        in (
             TokenType.LPAREN,
             TokenType.LBRACKET,
             TokenType.DOT,
@@ -1165,7 +1163,8 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
             prefixes = frame[1]
             node = vals.pop()
             while pos < len(tokens) and (
-                tokens[pos].type in (
+                tokens[pos].type
+                in (
                     TokenType.LPAREN,
                     TokenType.LBRACKET,
                     TokenType.DOT,
@@ -1506,9 +1505,7 @@ def _parse_func_params(tokens: list[Token], pos: int):
         # Optional default value: `name: T = expr`. Once one parameter has a
         # default every later parameter must have one too, so that omitting
         # trailing arguments can never leave a hole.
-        has_default = (
-            pos < len(tokens) and tokens[pos].type == TokenType.EQUAL
-        )
+        has_default = pos < len(tokens) and tokens[pos].type == TokenType.EQUAL
         if has_default:
             saw_default = True
             pos += 1
@@ -1554,7 +1551,9 @@ def parse_decorated_def(tokens: list[Token], pos: int):
     return _parse_func_with_visibility(tokens, pos, visibility, tok)
 
 
-def parse_class(tokens: list[Token], pos: int, sealed: bool = False, dataclass: bool = False):
+def parse_class(
+    tokens: list[Token], pos: int, sealed: bool = False, dataclass: bool = False
+):
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
@@ -1627,10 +1626,7 @@ def parse_class_suite(tokens: list[Token], pos: int):
         TokenType.DEDENT,
         TokenType.EOF,
     ):
-        if (
-            tokens[pos].type == TokenType.IDENTIFIER
-            and tokens[pos].value == "property"
-        ):
+        if tokens[pos].type == TokenType.IDENTIFIER and tokens[pos].value == "property":
             pnode, pos = parse_property(tokens, pos)
             stmts.append(pnode)
             while pos < len(tokens) and tokens[pos].type == TokenType.NEWLINE:
@@ -2036,6 +2032,7 @@ class FuncDef(Node):
         "defaults",
         "generic_params",
         "meta",
+        "module",
         "name",
         "params",
         "rettype",
@@ -2065,6 +2062,7 @@ class FuncDef(Node):
         self.decorators = decorators or []
         self.defaults = defaults or {}
         self.meta = None
+        self.module = None
         self._token = token
 
     def __repr__(self):
@@ -2199,6 +2197,7 @@ class Import(Node):
         "frameworks",
         "is_package",
         "module",
+        "module_tag",
         "prebuilt_ll_files",
         "sdk_path",
         "src_file",
@@ -2209,6 +2208,7 @@ class Import(Node):
 
     def __init__(self, module: str, symbols=None, token=None):
         self.module = module
+        self.module_tag = None
         self.symbols = symbols or []
         self.src_file = None
         self._token = token
@@ -2424,7 +2424,7 @@ class DelStmt(Node):
 
 
 class StructDef(Node):
-    __slots__ = ("_token", "fields", "generic_params", "name")
+    __slots__ = ("_token", "fields", "generic_params", "module", "name")
 
     def __init__(
         self, name: str, fields: list, generic_params: list | None = None, token=None
@@ -2432,6 +2432,7 @@ class StructDef(Node):
         self.name = name
         self.fields = fields
         self.generic_params = generic_params or []
+        self.module = None
         self._token = token
 
     def __repr__(self):
@@ -2481,6 +2482,7 @@ class ClassDef(Node):
         "fields",
         "generic_params",
         "methods",
+        "module",
         "name",
         "properties",
         "sealed",
@@ -2506,6 +2508,7 @@ class ClassDef(Node):
         self.sealed = sealed
         self.dataclass = dataclass
         self.properties = properties or []
+        self.module = None
         self._token = token
 
     def __repr__(self):

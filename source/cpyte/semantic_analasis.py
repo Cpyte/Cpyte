@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import subprocess
@@ -630,6 +631,32 @@ def _is_compile_time_true(node) -> bool:
 _ANALYZE_DEPTH_LIMIT = 120
 
 
+def module_tag(path: str | None) -> str:
+    """Stable, collision-resistant namespace tag for a source module.
+
+    cpyte has a single flat namespace for type names, so two modules may each
+    define a different ``SparseMatrix``. Codegen needs to tell those apart, so
+    every StructDef/ClassDef/FuncDef carries the tag of the module that defined
+    it. The tag is derived from the defining file's path (not its basename) so
+    two ``main.cpy`` files in different packages still get distinct tags, and it
+    is restricted to identifier-safe characters so it can appear in LLVM type
+    names verbatim.
+    """
+    if not path:
+        return "main"
+    stem = os.path.splitext(os.path.basename(path))[0]
+    safe = re.sub(r"[^0-9A-Za-z_]", "_", stem) or "mod"
+    digest = hashlib.sha1(path.encode("utf-8", "replace")).hexdigest()[:6]
+    return f"{safe}_{digest}"
+
+
+def stamp_module(nodes, tag: str) -> None:
+    """Tag every top-level type/function definition with its module's tag."""
+    for n in nodes:
+        if isinstance(n, (StructDef, ClassDef, FuncDef)):
+            n.module = tag
+
+
 class SemanticAnalyzer:
     def __init__(
         self,
@@ -999,7 +1026,21 @@ class SemanticAnalyzer:
         if t1 is None or t2 is None:
             return None
         if t1 == t2:
-            return t1 if t1 in self._NUMERIC_TYPES else None
+            return (
+                t1 if t1 in self._NUMERIC_TYPES else None
+            )  # Pointer arithmetic: pointer + integer offset (any integer width)
+
+        def is_ptr(t):
+            return t is not None and t.endswith("*")
+
+        def is_intlike(t):
+            if t is None or t.endswith("*") or t in ("str", "void"):
+                return False
+            return True
+
+        if (is_ptr(t1) and is_intlike(t2)) or (is_ptr(t2) and is_intlike(t1)):
+            return t1 if is_ptr(t1) else t2
+
         if t1 in self._FLOAT_TYPES or t2 in self._FLOAT_TYPES:
             if (t1 in self._FLOAT_TYPES or t1 in self._INT_TYPES) and (
                 t2 in self._FLOAT_TYPES or t2 in self._INT_TYPES
@@ -1040,6 +1081,10 @@ class SemanticAnalyzer:
         return None
 
     def analyze(self, nodes: list) -> bool:
+        # Tag definitions with the defining module so codegen can namespace
+        # same-named structs/classes across modules instead of silently letting
+        # the last-emitted definition win.
+        stamp_module(nodes, module_tag(self.filepath))
         self._predeclare(nodes)
         for node in nodes:
             self._visit(node)
@@ -1558,8 +1603,18 @@ class SemanticAnalyzer:
                     left_ptr = left_t.endswith("*")
                     right_ptr = right_t.endswith("*")
                     if node.op.name in ("PLUS", "MINUS") and (
-                        (left_ptr and right_t == "int")
-                        or (right_ptr and left_t == "int")
+                        (
+                            left_ptr
+                            and right_t
+                            and not right_t.endswith("*")
+                            and right_t not in ("str", "void")
+                        )
+                        or (
+                            right_ptr
+                            and left_t
+                            and not left_t.endswith("*")
+                            and left_t not in ("str", "void")
+                        )
                     ):
                         node.inferred_type = left_t if left_ptr else right_t
                         return node.inferred_type
@@ -1572,6 +1627,38 @@ class SemanticAnalyzer:
                     if promoted is not None:
                         node.inferred_type = promoted
                         return promoted
+
+                    # Allow pointer + integer offset
+                    def is_ptr(t):
+                        return t and t.endswith("*")
+
+                    def is_intlike(t):
+                        return t and not t.endswith("*") and t not in ("str", "void")
+
+                    if node.op.name in ("PLUS", "MINUS") and (
+                        (is_ptr(left_t) and is_intlike(right_t))
+                        or (is_ptr(right_t) and is_intlike(left_t))
+                    ):
+                        node.inferred_type = left_t if is_ptr(left_t) else right_t
+                        return node.inferred_type
+
+                    # Allow pointer arithmetic with any integer width
+                    def is_ptr(t):
+                        return t and t.endswith("*")
+
+                    def is_intish(t):
+                        if not t or t.endswith("*"):
+                            return False
+                        if t in ("str", "void", "bool"):
+                            return False
+                        return True
+
+                    if node.op.name in ("PLUS", "MINUS") and (
+                        (is_ptr(left_t) and is_intish(right_t))
+                        or (is_ptr(right_t) and is_intish(left_t))
+                    ):
+                        node.inferred_type = left_t if is_ptr(left_t) else right_t
+                        return node.inferred_type
                     self.error(
                         f"mismatched types `{left_t}` and `{right_t}` in arithmetic expression",
                         node,
@@ -2452,10 +2539,14 @@ class SemanticAnalyzer:
                     return
 
         if not is_file_import:
-            if self._try_cpm_import(node, module):
+            if module.startswith("@std."):
+                pass  # deep extension
+            elif self._try_cpm_import(node, module):
                 return
 
         if module.startswith("@"):
+            if module.startswith("@std."):
+                return  # deep extension resolved at runtime
             self.error(f"package `{module}` not installed — run 'cpm install'", node)
             return
 
@@ -2891,7 +2982,10 @@ class SemanticAnalyzer:
             self.error(f"parse error in imported `{module}`: {e}")
             return None
 
-        # Run semantic analysis on imported file
+        # Run semantic analysis on imported file. The sub-analyzer tags every
+        # top-level definition it visits with this module's own tag, so the
+        # definitions below keep their provenance as they are propagated into
+        # the importing program.
         sub = SemanticAnalyzer(
             source, filepath=module, workspace_root=self._workspace_root
         )
@@ -2951,6 +3045,10 @@ class SemanticAnalyzer:
                     sub_ast.append(ast_node)
 
         if node is not None:
+            # Tag the import so codegen knows which module this symbol table
+            # came from (used to resolve imported parameter types against the
+            # defining module's structs).
+            node.module_tag = module_tag(module)
             node.sub_ast = sub_ast
         return symbols, "cpy"
 

@@ -255,10 +255,69 @@ def _emit_children(node) -> list:
 
 
 class LLVM:
+    def _lookup_module_struct(self, name):
+        """LLVM type for `name` as seen from the module currently being emitted.
+
+        A struct defined in the current module wins over same-named structs
+        pulled in from other modules; with no local definition we fall back to
+        the flat registry, which is correct whenever the name is unambiguous.
+        """
+        tag = self._cur_module
+        if tag is not None:
+            local = self._module_structs.get((tag, name))
+            if local is not None:
+                return local
+        return self.structs.get(name)
+
+    def _lookup_module_fields(self, name):
+        """Field list for `name`, preferring the current module's definition."""
+        tag = self._cur_module
+        if tag is not None:
+            local = self._module_fields.get((tag, name))
+            if local is not None:
+                return local
+        return self.struct_fields.get(name)
+
+    def _lookup_module_node(self, name):
+        """StructDef/ClassDef node for `name`, preferring the current module."""
+        tag = self._cur_module
+        if tag is not None:
+            local = self._module_nodes.get((tag, name))
+            if local is not None:
+                return local
+        return self._struct_nodes.get(name)
+
+    def _register_module_struct(self, tag, name, llvm_type, fields, node):
+        """Record a struct/class under (module tag, name) and keep the flat
+        registries in sync.
+
+        The flat `self.structs` / `self.struct_fields` / `self._struct_nodes`
+        maps are first-definition-wins: the very first module to define a name
+        keeps it there, so every pre-existing single-definition program is
+        byte-for-byte unaffected, while `_lookup_module_*` still lets each
+        module reach its own definition.
+        """
+        if tag is not None:
+            self._module_structs[(tag, name)] = llvm_type
+            self._module_fields[(tag, name)] = fields
+            self._module_nodes[(tag, name)] = node
+            owners = self._module_owners.setdefault(name, [])
+            if tag not in owners:
+                owners.append(tag)
+        if name not in self.structs:
+            self.structs[name] = llvm_type
+        if name not in self.struct_fields:
+            self.struct_fields[name] = fields
+        if name not in self._struct_nodes:
+            self._struct_nodes[name] = node
+
     def llvm_type(self, t: str):
-        # PERFORMANCE: Cache type resolution to avoid repeated string parsing
-        if t in self._llvm_type_cache:
-            return self._llvm_type_cache[t]
+        # PERFORMANCE: Cache type resolution to avoid repeated string parsing.
+        # The key includes the current module because the same bare type name
+        # can denote a different LLVM type in each module.
+        ckey = (self._cur_module, t)
+        if ckey in self._llvm_type_cache:
+            return self._llvm_type_cache[ckey]
 
         t = _bc_array_norm(t)
         if t == "int":
@@ -300,8 +359,17 @@ class LLVM:
         elif t.endswith("*") or t.endswith("&"):
             base = self.llvm_type(t[:-1])
             result = ir.PointerType(base)
-        elif t in self.structs:
-            result = self.structs[t]
+        elif t in self.structs or (
+            self._module_structs and (self._cur_module, t) in self._module_structs
+        ):
+            resolved = self._lookup_module_struct(t)
+            if resolved is not None:
+                result = resolved
+            else:
+                result = self._codegen_error(
+                    f"struct `{t}` is not defined in this program; cannot emit code "
+                    f"for it"
+                )
         elif "<" in t:
             # Handle generic types like Pair<int, string>
             # Check if we have a monomorphized version
@@ -330,7 +398,7 @@ class LLVM:
             )
             result = None  # Should never reach here
 
-        self._llvm_type_cache[t] = result
+        self._llvm_type_cache[ckey] = result
         return result
 
     @staticmethod
@@ -761,7 +829,7 @@ class LLVM:
         self._gc_alloc_fn = None
         self._gc_write_barrier_fn = None
         self._sizeof_cache = {}
-        self._llvm_type_cache = {}  # PERFORMANCE: Cache type resolution
+        self._llvm_type_cache = {}  # (module tag, type name) -> ir.Type
         self._strlen_fn = None
         self._memcpy_fn = None
         self.no_userspace = no_userspace
@@ -775,6 +843,20 @@ class LLVM:
         self._decorator_skip = False  # Flag to skip original function
         self.generic_instantiations = {}  # name -> [(type_args_tuple, ...)]
         self._struct_nodes = {}  # name -> StructDef AST node (for generic resolution)
+        # Module-scoped struct registry. cpyte has ONE flat type namespace, so
+        # two imported modules can each define a different `SparseMatrix`.
+        # Keying the primary registries by bare name made the last-emitted
+        # definition silently win, so a field access in an earlier module was
+        # lowered against the wrong field list. These maps key by
+        # (module tag, type name) so every definition keeps its own layout, and
+        # `_cur_module` selects the right one while a function body is emitted.
+        # The flat dicts above stay authoritative for the unambiguous
+        # single-definition case, which is every pre-existing program.
+        self._module_structs = {}  # (tag, name) -> ir.IdentifiedStructType
+        self._module_fields = {}  # (tag, name) -> [Field]
+        self._module_nodes = {}  # (tag, name) -> StructDef
+        self._module_owners = {}  # name -> {tag, ...} (ambiguity detection)
+        self._cur_module = None  # module tag of the body being emitted
         # Class-vtable machinery (Stage 1 OOP): virtualness, flattened method
         # slots, vtable struct types/globals and per-class type ids.
         self._class_virtual = {}  # name -> bool (hierarchy has a vtable)
@@ -1521,9 +1603,13 @@ class LLVM:
             # Register an opaque identified struct in THIS module's context
             # (not the shared global context) so self-referential fields resolve
             # to a pointer to the same type, and so per-program modules compiled
-            # in one process don't collide on struct names.
-            st = self.module.context.get_identified_type(f"struct.{node.name}")
-            self.structs[node.name] = st
+            # in one process don't collide on struct names. The LLVM type name
+            # is module-qualified so two modules may each define their own
+            # `SparseMatrix` without one silently replacing the other.
+            tag = getattr(node, "module", None)
+            llvm_name = f"struct.{tag}.{node.name}" if tag else f"struct.{node.name}"
+            st = self.module.context.get_identified_type(llvm_name)
+            self._register_module_struct(tag, node.name, st, [], node)
 
         for node in structs:
             self.emit(node)
@@ -2062,28 +2148,42 @@ class LLVM:
 
     @register_emitter(StructDef)
     def emit_structdef(self, node: StructDef):
-        self._struct_nodes[node.name] = node
+        tag = getattr(node, "module", None)
         if node.generic_params:
             # For generic structs, don't emit the base version with raw type params.
             # Specialized versions are generated on demand by _resolve_generic_type.
             # Still register it so lookup works.
+            self._register_module_struct(tag, node.name, None, node.fields, node)
             return
-        llvm_struct = self.structs.get(node.name)
-        if llvm_struct is None or not isinstance(llvm_struct, ir.IdentifiedStructType):
-            # Pre-register an opaque identified struct BEFORE resolving field
-            # types so self-referential fields (`BSTNode* left`) resolve to a
-            # pointer to this type instead of silently degrading to `i32` (the
-            # old behavior corrupted the struct layout). get_identified_type
-            # registers into the module's context, so the definition is
-            # serialized into the IR (a bare IdentifiedStructType never is).
-            llvm_struct = self.module.context.get_identified_type(f"struct.{node.name}")
-            self.structs[node.name] = llvm_struct
-        field_tys = []
-        for f in node.fields:
-            field_tys.append(self.llvm_type(f.type_expr))
-        if llvm_struct.is_opaque:
-            llvm_struct.set_body(*field_tys)
-        self.struct_fields[node.name] = node.fields
+        # Resolve this definition's own fields against ITS module, so a
+        # self-referential field (`BSTNode* left`) or a field naming a
+        # same-named struct from another module binds to the right type.
+        prev_module = self._cur_module
+        self._cur_module = tag
+        try:
+            llvm_struct = self._lookup_module_struct(node.name)
+            if llvm_struct is None or not isinstance(
+                llvm_struct, ir.IdentifiedStructType
+            ):
+                # Pre-register an opaque identified struct BEFORE resolving field
+                # types so self-referential fields (`BSTNode* left`) resolve to a
+                # pointer to this type instead of silently degrading to `i32` (the
+                # old behavior corrupted the struct layout). get_identified_type
+                # registers into the module's context, so the definition is
+                # serialized into the IR (a bare IdentifiedStructType never is).
+                llvm_name = (
+                    f"struct.{tag}.{node.name}" if tag else f"struct.{node.name}"
+                )
+                llvm_struct = self.module.context.get_identified_type(llvm_name)
+                self._module_structs[(tag, node.name)] = llvm_struct
+            field_tys = []
+            for f in node.fields:
+                field_tys.append(self.llvm_type(f.type_expr))
+            if llvm_struct.is_opaque:
+                llvm_struct.set_body(*field_tys)
+            self._register_module_struct(tag, node.name, llvm_struct, node.fields, node)
+        finally:
+            self._cur_module = prev_module
 
     @register_emitter(EnumDef)
     def emit_enumdef(self, node: EnumDef):
@@ -2108,7 +2208,15 @@ class LLVM:
         method pointers. Method calls then dispatch through the receiver's own
         vtable, so a `Base*` holding a `Child` calls `Child`'s override.
         `sealed` classes keep the old zero-cost static dispatch (no vptr)."""
-        self._struct_nodes[node.name] = node
+        ctag = getattr(node, "module", None)
+        prev_cmodule = self._cur_module
+        self._cur_module = ctag
+        try:
+            self._emit_classdef_body(node, ctag)
+        finally:
+            self._cur_module = prev_cmodule
+
+    def _emit_classdef_body(self, node: ClassDef, ctag=None):
         # Virtualness is a hierarchy property: the (sealed) root decides. A
         # sealed class may only sit in a fully sealed chain (validated in
         # semantic), so re-deriving it here is safe.
@@ -2123,14 +2231,16 @@ class LLVM:
         # correct against the shifted offsets. Its type resolves through
         # `llvm_type("void*")` == _i8ptr.
         all_fields = []
-        if node.base and node.base in self.struct_fields:
-            all_fields.extend(self.struct_fields[node.base])
+        if node.base:
+            base_fields = self._lookup_module_fields(node.base)
+            if base_fields:
+                all_fields.extend(base_fields)
         all_fields.extend(node.fields)
         index_fields = all_fields
         if virtual and not node.base:
             index_fields = [Field("@vptr", "void*", token=node._token)] + all_fields
         field_tys = [self.llvm_type(f.type_expr) for f in index_fields]
-        llvm_struct = self.structs.get(node.name)
+        llvm_struct = self._lookup_module_struct(node.name)
         if llvm_struct is None or not isinstance(llvm_struct, ir.IdentifiedStructType):
             # Pre-register an opaque identified struct BEFORE resolving field
             # types so self-referential fields resolve to a pointer to this
@@ -2138,12 +2248,13 @@ class LLVM:
             # registers into the module's context so the definition is
             # serialized into the IR. Fieldless sealed classes still register
             # (as an empty struct) so `new T` can allocate them.
-            llvm_struct = self.module.context.get_identified_type(f"class.{node.name}")
-            self.structs[node.name] = llvm_struct
+            llvm_name = f"class.{ctag}.{node.name}" if ctag else f"class.{node.name}"
+            llvm_struct = self.module.context.get_identified_type(llvm_name)
+            self._module_structs[(ctag, node.name)] = llvm_struct
         if field_tys or index_fields:
             if llvm_struct.is_opaque:
                 llvm_struct.set_body(*field_tys)
-            self.struct_fields[node.name] = index_fields
+        self._register_module_struct(ctag, node.name, llvm_struct, index_fields, node)
         # Phase 1: declare method headers (so the vtable can reference their
         # addresses before any method body is emitted — `new X` inside a
         # method of X needs the vtable global to exist).
@@ -2819,9 +2930,9 @@ class LLVM:
         return self.builder.load(ptr)
 
     def _field_type_name(self, struct_name: str, field_name: str) -> str | None:
-        if struct_name not in self.struct_fields:
+        fields = self._lookup_module_fields(struct_name)
+        if not fields:
             return None
-        fields = self.struct_fields[struct_name]
         field_idx = None
         for i, f in enumerate(fields):
             if f.name == field_name:
@@ -2829,7 +2940,7 @@ class LLVM:
                 break
         if field_idx is None:
             return None
-        struct_type = self.structs.get(struct_name)
+        struct_type = self._lookup_module_struct(struct_name)
         if (
             struct_type
             and hasattr(struct_type, "elements")
@@ -2877,7 +2988,7 @@ class LLVM:
                     return self._base_type_name(sub)
         if isinstance(node, Attr):
             parent_struct = self._struct_name_from_node(node.obj)
-            if parent_struct and parent_struct in self.struct_fields:
+            if parent_struct and self._lookup_module_fields(parent_struct):
                 return self._field_type_name(parent_struct, node.name)
         if isinstance(node, Index):
             base = self._struct_name_from_node(node.obj)
@@ -2894,16 +3005,19 @@ class LLVM:
         struct_name = self._struct_name_from_node(node.obj)
         if struct_name:
             # Handle generic struct names
-            if "<" in struct_name and struct_name not in self.struct_fields:
+            if "<" in struct_name and not self._lookup_module_fields(struct_name):
                 self._resolve_generic_type(struct_name)
-            # Try the full generic name first, then base name
+            # Try the full generic name first, then base name. Field lists are
+            # resolved against the module being emitted, so `SparseMatrix` in a
+            # body from module A finds module A's layout even when module B
+            # defines a different struct of the same name.
             for sn in (struct_name, struct_name.split("<")[0]):
-                if sn and sn in self.struct_fields:
+                fields = self._lookup_module_fields(sn) if sn else None
+                if fields:
                     if isinstance(
                         getattr(obj_ptr.type, "pointee", None), ir.PointerType
                     ):
                         obj_ptr = self.builder.load(obj_ptr)
-                    fields = self.struct_fields[sn]
                     for i, f in enumerate(fields):
                         if f.name == node.name:
                             return self.builder.gep(
@@ -2911,6 +3025,13 @@ class LLVM:
                                 [ir.Constant(_i32, 0), ir.Constant(_i32, i)],
                                 inbounds=True,
                             )
+            owners = self._module_owners.get(struct_name) or []
+            if len(owners) > 1:
+                raise Exception(
+                    f"struct `{struct_name}` is defined differently in "
+                    f"{len(owners)} imported modules; this expression cannot be "
+                    f"resolved to one of them"
+                )
         raise Exception(f"Unknown field '{node.name}' in struct '{struct_name}'")
 
     def _emit_lvalue(self, node):
@@ -2944,6 +3065,17 @@ class LLVM:
     def emit_funcdef(self, node: FuncDef):
         if node.decorators and node.name != "main":
             return self._emit_decorated_funcdef(node)
+        # Field accesses and type resolutions in this body must bind to the
+        # structs defined by THIS module (a name may be defined differently by
+        # another imported module).
+        prev_module = self._cur_module
+        self._cur_module = getattr(node, "module", None)
+        try:
+            return self._emit_funcdef_body(node)
+        finally:
+            self._cur_module = prev_module
+
+    def _emit_funcdef_body(self, node: FuncDef):
         ret_ty = self.llvm_type(node.rettype or "int")
         param_tys = [self.llvm_type(t) for t in node.params.values()]
         self._check_params_no_void(param_tys, list(node.params.keys()), node)
@@ -7527,29 +7659,63 @@ class LLVM:
         elif isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):
             self.builder.store(ir.Constant(ty, 0), ptr)
 
+    def _import_symbol_modules(self, node):
+        """Map every function exported by an Import to the module defining it.
+
+        `node.sub_ast` holds this module's own FuncDefs plus nested Import
+        nodes for anything it re-exports, so a single Import can carry
+        functions from several source files (each of which may define its own
+        `SparseMatrix`).
+        """
+        owners = {}
+
+        def _walk(nodes):
+            for n in nodes or []:
+                if isinstance(n, FuncDef):
+                    tag = getattr(n, "module", None)
+                    if tag:
+                        owners.setdefault(n.name, tag)
+                elif isinstance(n, Import):
+                    _walk(getattr(n, "sub_ast", None) or [])
+
+        _walk(getattr(node, "sub_ast", None) or [])
+        return owners
+
     @register_emitter(Import)
     def emit_import(self, node):
         var_names = getattr(node, "var_names", set()) or set()
-        for fname, (ret_type, params, vararg) in node.symbols:
-            if fname in self.functions or fname in self.global_vars:
-                continue
-            if fname in var_names:
-                # Variable declaration (e.g., CF_EXPORT const ...)
-                var_ty = self.llvm_type(ret_type)
-                if isinstance(var_ty, ir.VoidType):
+        # Imported function signatures must be declared against the module that
+        # DEFINES the function, not against whatever struct happened to win the
+        # flat name registry. A `SparseMatrix` parameter or return type would
+        # otherwise be lowered to the first module with that name, so the
+        # signature would not match the body that `emit_funcdef` later lowers
+        # against the defining module's struct.
+        owner = self._import_symbol_modules(node)
+        prev_module = self._cur_module
+        try:
+            for fname, (ret_type, params, vararg) in node.symbols:
+                self._cur_module = owner.get(fname) or getattr(node, "module_tag", None)
+                if fname in self.functions or fname in self.global_vars:
                     continue
-                gv = ir.GlobalVariable(self.module, var_ty, name=fname)
-                gv.linkage = "extern_weak"
-                self.global_vars[fname] = gv
-            else:
-                ret_ty = self.llvm_type(ret_type)
-                if isinstance(ret_ty, ir.VoidType) and not params and not vararg:
-                    param_tys = []
+                if fname in var_names:
+                    # Variable declaration (e.g., CF_EXPORT const ...)
+                    var_ty = self.llvm_type(ret_type)
+                    if isinstance(var_ty, ir.VoidType):
+                        continue
+                    gv = ir.GlobalVariable(self.module, var_ty, name=fname)
+                    gv.linkage = "extern_weak"
+                    self.global_vars[fname] = gv
                 else:
-                    param_tys = [self.llvm_type(t) for _, t in params]
-                fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
-                func = ir.Function(self.module, fnty, name=fname)
-                self.functions[fname] = func
+                    ret_ty = self.llvm_type(ret_type)
+                    if isinstance(ret_ty, ir.VoidType) and not params and not vararg:
+                        param_tys = []
+                    else:
+                        param_tys = [self.llvm_type(t) for _, t in params]
+                    fnty = ir.FunctionType(ret_ty, param_tys, var_arg=vararg)
+                    func = ir.Function(self.module, fnty, name=fname)
+                    self.functions[fname] = func
+        finally:
+            self._cur_module = prev_module
         if node.src_file:
             self.import_src_files.append(node.src_file)
         if getattr(node, "prebuilt_ll_files", None):

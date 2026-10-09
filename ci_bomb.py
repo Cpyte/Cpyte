@@ -36,7 +36,21 @@ FAIL_MARKERS = (
 
 PER_FILE_TIMEOUT_S = 60
 
+# Give every child Python a faulthandler so a SIGSEGV dumps the faulting
+# Python stack to stderr (which we capture and surface below) instead of
+# dying silently with just `exit -11`. Harmless for clean runs.
+_CHILD_ENV = {**os.environ, "PYTHONFAULTHANDLER": "1"}
 
+
+def _output_tail(text: str, head: int = 300, tail: int = 300) -> str:
+    """Collapse `text` onto one line keeping its FIRST and LAST chars."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+    if len(text) <= head + tail + 5:
+        return text
+    return text[:head] + " ... " + text[-tail:]
 def _check_one(python: str, src: Path) -> tuple[Path, str, float]:
     start = time.monotonic()
     try:
@@ -48,16 +62,22 @@ def _check_one(python: str, src: Path) -> tuple[Path, str, float]:
             encoding="utf-8",
             errors="replace",
             timeout=PER_FILE_TIMEOUT_S,
+            env=_CHILD_ENV,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return src, "hang (>%ds)" % PER_FILE_TIMEOUT_S, time.monotonic() - start
     elapsed = time.monotonic() - start
     if r.returncode not in (0, 1):
-        return src, f"exit {r.returncode}", elapsed
+        reason = f"exit {r.returncode}"
+        tail = _output_tail((r.stderr or "") + (r.stdout or ""))
+        return src, (f"{reason}: {tail}" if tail else reason), elapsed
     combined = (r.stdout or "") + (r.stderr or "")
     for marker in FAIL_MARKERS:
         if marker in combined:
-            return src, f"crash marker {marker!r}", elapsed
+            reason = f"crash marker {marker!r}"
+            tail = _output_tail(combined)
+            return src, (f"{reason}: {tail}" if tail else reason), elapsed
     return src, "", elapsed
 
 

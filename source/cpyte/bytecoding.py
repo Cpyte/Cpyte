@@ -865,6 +865,7 @@ class LLVM:
         self._vt_globals = {}  # name -> ir.GlobalVariable of the vtable
         self._vt_slots = {}  # name -> {method_name: (slot_index, fnty)}
         self._class_ids = {}  # name -> int (O(1) RTTI for isinstance, stage 3)
+        self._class_meta_globals = {}  # name -> ir.GlobalVariable
         self._emit_depth = 0
         self._emit_memo = {}
         self._in_emit_iterative = False
@@ -1559,7 +1560,6 @@ class LLVM:
 
         # Collect runtime code from extension hooks
         if self.enable_extensions:
-            import os
             import tempfile
 
             context = self._hook_context()
@@ -1620,6 +1620,10 @@ class LLVM:
         # All classdefs (local + imported) are registered now: their vtable
         # class ids are final, so the RTTI ancestor grid can be materialized.
         self._emit_ancestor_grid()
+        try:
+            self._emit_class_meta()
+        except Exception:
+            pass
 
         # Emit all ccode/llvm blocks before function definitions so that
         # ccode-declared and llvm-declared functions are available to every
@@ -6525,6 +6529,43 @@ class LLVM:
             f"unknown has()/get_attr() meta kind {kind!r} at "
             f"L{node._token.line}:{node._token.column}"
         )
+
+
+    def _emit_class_meta(self):
+        if getattr(self, "_class_meta_emitted", False):
+            return
+        self._class_meta_emitted = True
+        classes = [c for c, n in self._struct_nodes.items() if isinstance(n, ClassDef)]
+        if not classes:
+            return
+        # Minimal struct: classid(i64), name(i8*), size_bytes(i64), is_virtual(i1), is_sealed(i1), is_dataclass(i1), vt_ptr(i8*)
+        from llvmlite import ir
+        meta_ty = ir.LiteralStructType([
+            _i64,      # classid
+            _i8ptr,    # name
+            _i64,      # size_bytes
+            _i1,       # is_virtual
+            _i1,       # is_sealed
+            _i1,       # is_dataclass
+            _i8ptr,    # vt_ptr
+        ])
+        for c in classes:
+            cid = self._class_ids.get(c, -1)
+            node = self._struct_nodes.get(c)
+            name_cstr = self._const_string(c)
+            # size: sizeof identified struct (approx) - use LLVM type
+            cls_ty = self.structs.get(c) or (self._module_structs.get((self._cur_module, c)) if self._cur_module else None)
+            if cls_ty is None:
+                cls_ty = self._module_structs.get((None, c))
+            size = ir.Constant(_i64, cls_ty.get_abi_size(self.target_data)) if hasattr(cls_ty, 'get_abi_size') else ir.Constant(_i64, 0)
+            is_v = ir.Constant(_i1, 1 if self._class_virtual.get(c) else 0)
+            is_s = ir.Constant(_i1, 1 if getattr(node, 'sealed', False) else 0)
+            is_d = ir.Constant(_i1, 1 if getattr(node, 'dataclass', False) else 0)
+            vt_g = self._vt_globals.get(c)
+            vt_ptr = self.builder.bitcast(vt_g, _i8ptr) if vt_g is not None else ir.Constant(_i8ptr, None)
+            g = ir.GlobalVariable(self.module, meta_ty, name=f"cm.meta.{c}")
+            g.initializer = ir.Constant(meta_ty, [ir.Constant(_i64, cid), name_cstr, size, is_v, is_s, is_d, vt_ptr])
+            self._class_meta_globals[c] = g
 
     def _emit_ancestor_grid(self):
         """Build the RTTI ancestor table: `anc.grid[class_id][depth]` = the

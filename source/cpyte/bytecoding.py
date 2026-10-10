@@ -1580,8 +1580,19 @@ class LLVM:
                         with os.fdopen(fd, "w") as f:
                             f.write(runtime_code)
                         self.import_src_files.append(tmp_path)
-                except Exception:
-                    pass
+                except Exception as _hook_exc:
+                    # A runtime hook that raises is skipped (its code is not
+                    # linked). Surface it under CPYTE_JIT_DEBUG so a stale hook
+                    # (e.g. an old get_runtime_code(self) signature) is not a
+                    # fully silent failure.
+                    if os.environ.get("CPYTE_JIT_DEBUG"):
+                        import sys as _sys
+
+                        print(
+                            f"[bytecoding] runtime hook {hook.name!r} skipped: "
+                            f"{type(_hook_exc).__name__}: {_hook_exc}",
+                            file=_sys.stderr,
+                        )
 
         if os.environ.get("CPYTE_JIT_DEBUG"):
             import sys as _sys

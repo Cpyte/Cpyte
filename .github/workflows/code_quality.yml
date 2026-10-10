@@ -45,6 +45,9 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Run compiler API regression tests
+        run: python test/test_compiler_regressions.py
+
       - name: Run Cpyte tests
         run: python ci_test.py
 

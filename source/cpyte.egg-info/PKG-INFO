@@ -8,6 +8,7 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: llvmlite>=0.45
 Requires-Dist: lsprotocol>=2025.0.0
+Requires-Dist: pygls>=1.3.1
 
 DEVELOPMENT IS CONTINUED. WINDOWS SUPPORT IS IN PROGRESS.
 

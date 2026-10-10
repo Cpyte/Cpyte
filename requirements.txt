@@ -1,2 +1,3 @@
 llvmlite>=0.45
 lsprotocol>=2025.0.0
+pygls>=1.3.1

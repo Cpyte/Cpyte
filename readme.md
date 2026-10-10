@@ -1,5 +1,4 @@
-DEVELOPMENT IS CONTINUED. WINDOWS SUPPORT IS IN PROGRESS.
-
+NOTICE: It seems cpyte has been going through a lot of changes, including the OOP work which was quite fabulous and python-like. I liked how the syntax changes very interestingly and made the language better. However, as many changes are breaking-change and usualy a prone to error, I've decided to finalize a syntax-lock, in just a 2 months. After that, improvements will be delivered through the @std/improvements package with the extension hook framework.
 
 Check out the official documentation [here](https://gitea.5gnew.io.vn/Cpyte-Project/Cpyte/src/branch/main/source/cpyte/cpy_language_documentation.md).
 

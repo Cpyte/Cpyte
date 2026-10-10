@@ -8,7 +8,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
-from .generate_bc import _remove_probe_stack_ir
+from .generate_bc import _find_gmp_include, _remove_probe_stack_ir
 from .linker import Linker, LinkerNotFoundError, format_cc_diag
 from .ui import print_err, print_ok
 from .winjit_patch import link_jit_anchors, patch_windows_gnu_relocs
@@ -576,7 +576,31 @@ _libm = _load_optional_lib(
 _libgcc = _load_optional_lib(
     ctypes.util.find_library("gcc_s"), "libgcc_s.so.1", "/usr/lib/libgcc_s.so.1"
 )
-_process_libs = tuple(lib for lib in (_libc, _libm, _libgcc) if lib is not None)
+# GNU GMP + MPFR back the cpyte arbitrary-precision types (big/ubig bignum and
+# the MPFR-backed float). Their symbols are resolved the same in-process way as
+# libc/libm: ctypes loads the library and _map_process_libc maps each external
+# declaration to the real address the JIT engine sees. If GMP is not installed
+# the libs are None and only programs that actually use big/ubig/float fail
+# (with a compile-time error when bignum.c or the mpfr float runtime is built).
+_libgmp = _load_optional_lib(
+    ctypes.util.find_library("gmp"),
+    "libgmp.so.10",
+    "libgmp.so",
+    "libgmp.dylib",
+    "/opt/homebrew/lib/libgmp.dylib",
+    "/usr/local/lib/libgmp.dylib",
+)
+_libmpfr = _load_optional_lib(
+    ctypes.util.find_library("mpfr"),
+    "libmpfr.so.6",
+    "libmpfr.so",
+    "libmpfr.dylib",
+    "/opt/homebrew/lib/libmpfr.dylib",
+    "/usr/local/lib/libmpfr.dylib",
+)
+_process_libs = tuple(
+    lib for lib in (_libc, _libm, _libgcc, _libgmp, _libmpfr) if lib is not None
+)
 _libc.strlen.argtypes = [ctypes.c_char_p]
 _libc.strlen.restype = ctypes.c_int
 _libc.memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
@@ -1024,6 +1048,53 @@ def _prune_module(mod):
     mpm.run(mod, pb)
 
 
+_GMP_INCLUDE_CACHE = None
+
+
+def _gmp_include_dir() -> str | None:
+    """Memoized GMP/MPFR header dir (spawning brew per launch is too slow)."""
+    global _GMP_INCLUDE_CACHE
+    if _GMP_INCLUDE_CACHE is None:
+        _GMP_INCLUDE_CACHE = _find_gmp_include()
+    return _GMP_INCLUDE_CACHE
+
+
+def _runtime_extra_flags(src_path: str) -> tuple:
+    """Extra clang flags needed to compile a runtime C source.
+
+    bignum.c (and the MPFR float runtime) include <gmp.h>/<mpfr.h>, which live
+    outside clang's default include path on Homebrew/macOS and some Linux
+    toolchains. The resolved include dir is cached by generate_bc's probe.
+    """
+    if os.path.basename(src_path) == "bignum.c" or os.path.basename(
+        src_path
+    ) == "float_mpfr.c":
+        inc = _gmp_include_dir()
+        if inc:
+            return (f"-I{inc}",)
+    return ()
+
+
+def _gmp_library_paths() -> list:
+    """Return AOT link ``-L`` dirs needed to resolve GMP/MPFR.
+
+    Mirrors the include probe: the directory holding the shared library is
+    derived from the same root that holds the headers (``<prefix>/lib`` next to
+    ``<prefix>/include``).
+    """
+    if _libgmp is None:
+        return []
+    paths = set()
+    found = ctypes.util.find_library("gmp")
+    if found:
+        paths.add(os.path.dirname(found)) if os.path.isabs(found) else None
+    inc = _gmp_include_dir()
+    if inc:
+        libdir = os.path.join(os.path.dirname(inc), "lib")
+        paths.add(libdir)
+    return sorted(p for p in paths if p and os.path.isdir(p))
+
+
 def _cached_c_ir(
     llvm_cc,
     src_path,
@@ -1219,7 +1290,12 @@ def run_jit(
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = {
             ex.submit(
-                _cached_c_ir, llvm_cc, src, target.triple, jit_opt_level=opt_level
+                _cached_c_ir,
+                llvm_cc,
+                src,
+                target.triple,
+                jit_opt_level=opt_level,
+                extra_flags=_runtime_extra_flags(src),
             ): src
             for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C)
         }
@@ -1532,7 +1608,18 @@ def run_jit(
     except NameError:
         pass
 
-    _map_process_libc(engine, mod)
+    unresolved = _map_process_libc(engine, mod)
+    if unresolved:
+        print_err(
+            "error: unresolved external symbol(s): "
+            + ", ".join(sorted(unresolved))
+        )
+        print_err(
+            "  a ccode:/llvm: block references a symbol that is not provided "
+            "by the runtime or the host image (removed runtime API or missing "
+            "definition)"
+        )
+        raise SystemExit(1)
 
     engine.finalize_object()
     if _use_windows_gnu():
@@ -1676,6 +1763,21 @@ def _map_process_libc(engine, mod):
                 except Exception:
                     pass
                 break
+    # Externals clang tags with its do-not-mangle prefix "\x01" (fputs,
+    # nanosleep, pthread_join, ...) are resolved lazily by RuntimeDyld through
+    # the process symbol table, so they are not errors even though ctypes
+    # cannot introspect them. Everything else that is still unmapped is a real
+    # missing symbol: MCJIT would leave its call site at address 0 and the
+    # program would SIGSEGV at an unrelated location, so surface it instead.
+    unresolved = [
+        f.name
+        for f in mod.functions
+        if f.is_declaration
+        and not f.name.startswith("llvm.")
+        and not f.name.startswith("\x01")
+        and f.name not in mapped
+        and f.name not in _explicit_mapped
+    ]
     if os.environ.get("CPYTE_JIT_DEBUG"):
         unset = [
             f.name
@@ -1687,6 +1789,7 @@ def _map_process_libc(engine, mod):
         ]
         if unset:
             print("[jit] unresolved externs: %s" % sorted(unset), file=sys.stderr)
+    return unresolved
 
 
 def run_aot(
@@ -1719,7 +1822,12 @@ def run_aot(
     # runtime code, keeping only the helpers this program uses and everything
     # _BIGNUM_KEEP lists for the native AOT link of runtime.o.
     llvm_cc = _find_llvm_cc()
-    bignum_ir, err = _cached_c_ir(llvm_cc, _BIGNUM_C, host_target().triple)
+    bignum_ir, err = _cached_c_ir(
+        llvm_cc,
+        _BIGNUM_C,
+        host_target().triple,
+        extra_flags=_runtime_extra_flags(_BIGNUM_C),
+    )
     if bignum_ir is None:
         print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
         raise SystemExit(1)
@@ -1778,7 +1886,15 @@ def run_aot(
     objs.extend(compiled_objs)
 
     out_name = output.rsplit(".", 1)[0] if "." in output else output
-    linker.link(objs, out_name, opt_level=3, pic=pic, frameworks=frameworks)
+    linker.link(
+        objs,
+        out_name,
+        opt_level=3,
+        pic=pic,
+        frameworks=frameworks,
+        libraries=["gmp"],
+        library_paths=_gmp_library_paths(),
+    )
 
 
 if getattr(sys, "frozen", False):

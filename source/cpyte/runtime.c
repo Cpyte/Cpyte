@@ -829,6 +829,16 @@ cpyte_array_unregister(void *arr) {
     (void)arr;
 }
 
+void
+cpyte_array_register(void *arr, int64_t n) {
+    // Backward-compatibility shim for packages built against the pre-v4.1.0
+    // hash-table array registry. New arrays carry their length in the
+    // length-prefixed header (see cpyte_array_alloc), so registration is a
+    // no-op; the symbol is retained so older packages still link and run.
+    (void)arr;
+    (void)n;
+}
+
 /* Grow an array's capacity so that (length + increment) elements fit.
  * Returns the (possibly moved) data pointer.  When growing is needed a new
  * header + buffer is malloc'd, data is copied and the old block freed, which

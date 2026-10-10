@@ -128,6 +128,7 @@ class Linker:
         debug=False,
         pic=False,
         eh=False,
+        extra_flags=(),
     ):
         if output is None:
             base = src.rsplit(".", 1)[0] if "." in src else src
@@ -146,6 +147,7 @@ class Linker:
             cmd.append("-Oz")
         elif opt_level is not None:
             cmd.append(f"-O{opt_level}")
+        cmd.extend(extra_flags)
         cmd.extend(["-o", output, src])
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:

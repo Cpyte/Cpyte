@@ -11,8 +11,10 @@ if __package__:
         _GC_RUNTIME_C,
         _RUNTIME_C,
         _find_llvm_cc,
+        _gmp_library_paths,
         _host_default_pic,
         _remove_probe_stack_ir,
+        _runtime_extra_flags,
         host_target,
         make_target_machine,
         optimize,
@@ -48,8 +50,10 @@ else:
         _GC_RUNTIME_C,
         _RUNTIME_C,
         _find_llvm_cc,
+        _gmp_library_paths,
         _host_default_pic,
         _remove_probe_stack_ir,
+        _runtime_extra_flags,
         host_target,
         make_target_machine,
         optimize,
@@ -882,6 +886,7 @@ def cmd_build(
                 "-target",
                 _host_target_triple(),
                 "-fno-stack-protector",
+                *(_runtime_extra_flags(_BIGNUM_C)),
                 "-o",
                 "-",
                 _BIGNUM_C,
@@ -924,6 +929,7 @@ def cmd_build(
             opt_size=opt_size,
             debug=debug,
             pic=pic,
+            extra_flags=_runtime_extra_flags(_BIGNUM_C),
         )
         objs.append(bignum_obj)
 
@@ -963,7 +969,8 @@ def cmd_build(
     linker.link(
         objs,
         executable,
-        libraries=["m"],
+        libraries=["m", "gmp"],
+        library_paths=_gmp_library_paths(),
         opt_level=opt,
         opt_size=opt_size,
         debug=debug,

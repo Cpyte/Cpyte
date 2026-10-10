@@ -1026,20 +1026,7 @@ class SemanticAnalyzer:
         if t1 is None or t2 is None:
             return None
         if t1 == t2:
-            return (
-                t1 if t1 in self._NUMERIC_TYPES else None
-            )  # Pointer arithmetic: pointer + integer offset (any integer width)
-
-        def is_ptr(t):
-            return t is not None and t.endswith("*")
-
-        def is_intlike(t):
-            if t is None or t.endswith("*") or t in ("str", "void"):
-                return False
-            return True
-
-        if (is_ptr(t1) and is_intlike(t2)) or (is_ptr(t2) and is_intlike(t1)):
-            return t1 if is_ptr(t1) else t2
+            return t1 if t1 in self._NUMERIC_TYPES else None
 
         if t1 in self._FLOAT_TYPES or t2 in self._FLOAT_TYPES:
             if (t1 in self._FLOAT_TYPES or t1 in self._INT_TYPES) and (
@@ -1602,25 +1589,19 @@ class SemanticAnalyzer:
                 if left_t is not None and right_t is not None:
                     left_ptr = left_t.endswith("*")
                     right_ptr = right_t.endswith("*")
-                    if node.op.name in ("PLUS", "MINUS") and (
-                        (
-                            left_ptr
-                            and right_t
-                            and not right_t.endswith("*")
-                            and right_t not in ("str", "void")
-                        )
-                        or (
-                            right_ptr
-                            and left_t
-                            and not left_t.endswith("*")
-                            and left_t not in ("str", "void")
-                        )
-                    ):
-                        node.inferred_type = left_t if left_ptr else right_t
-                        return node.inferred_type
                     if node.op.name == "MINUS" and left_ptr and right_ptr:
                         node.inferred_type = "int"
                         return "int"
+                    left_integer = left_t in self._INT_TYPES
+                    right_integer = right_t in self._INT_TYPES
+                    if node.op.name == "PLUS" and (
+                        (left_ptr and right_integer) or (left_integer and right_ptr)
+                    ):
+                        node.inferred_type = left_t if left_ptr else right_t
+                        return node.inferred_type
+                    if node.op.name == "MINUS" and left_ptr and right_integer:
+                        node.inferred_type = left_t
+                        return left_t
                 if left_t is not None and right_t is not None and left_t != right_t:
                     # Usual arithmetic conversions: promote to the widest type
                     promoted = self._numeric_promote(left_t, right_t)
@@ -1628,37 +1609,6 @@ class SemanticAnalyzer:
                         node.inferred_type = promoted
                         return promoted
 
-                    # Allow pointer + integer offset
-                    def is_ptr(t):
-                        return t and t.endswith("*")
-
-                    def is_intlike(t):
-                        return t and not t.endswith("*") and t not in ("str", "void")
-
-                    if node.op.name in ("PLUS", "MINUS") and (
-                        (is_ptr(left_t) and is_intlike(right_t))
-                        or (is_ptr(right_t) and is_intlike(left_t))
-                    ):
-                        node.inferred_type = left_t if is_ptr(left_t) else right_t
-                        return node.inferred_type
-
-                    # Allow pointer arithmetic with any integer width
-                    def is_ptr(t):
-                        return t and t.endswith("*")
-
-                    def is_intish(t):
-                        if not t or t.endswith("*"):
-                            return False
-                        if t in ("str", "void", "bool"):
-                            return False
-                        return True
-
-                    if node.op.name in ("PLUS", "MINUS") and (
-                        (is_ptr(left_t) and is_intish(right_t))
-                        or (is_ptr(right_t) and is_intish(left_t))
-                    ):
-                        node.inferred_type = left_t if is_ptr(left_t) else right_t
-                        return node.inferred_type
                     self.error(
                         f"mismatched types `{left_t}` and `{right_t}` in arithmetic expression",
                         node,

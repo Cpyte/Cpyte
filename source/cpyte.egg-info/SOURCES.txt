@@ -39,6 +39,7 @@ source/cpyte.egg-info/entry_points.txt
 source/cpyte.egg-info/requires.txt
 source/cpyte.egg-info/top_level.txt
 test/test_bignum_jit.py
+test/test_compiler_regressions.py
 test/test_fuzz_del_has.py
 test/test_scorpion_abi.py
 test/test_scorpion_dl.py

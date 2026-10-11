@@ -1904,12 +1904,16 @@ if getattr(sys, "frozen", False):
 else:
     _RUNTIME_SCORPION_C = os.path.join(os.path.dirname(__file__), "runtime_scorpion.c")
 
-_SCORPION_CC = "riscv32-unknown-elf-gcc"
+_SCORPION_DEFAULT_TRIPLE = "riscv32-unknown-elf"
+_SCORPION_DEFAULT_ARCH = "-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb"
+_SCORPION_DEFAULT_ABI = "-mabi=ilp32"
+_SCORPION_DEFAULT_CC = "riscv32-unknown-elf-gcc"
+_SCORPION_CC = _SCORPION_DEFAULT_CC
 _SCORPION_AS = "riscv64-elf-as"
 _SCORPION_LD = "riscv64-elf-ld"
 _SCORPION_OBJCOPY = "riscv64-elf-objcopy"
-_SCORPION_ARCH = "-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb"
-_SCORPION_ABI = "-mabi=ilp32"
+_SCORPION_DEFAULT_ARCH = "-march=rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb"
+_SCORPION_DEFAULT_ABI = "-mabi=ilp32"
 
 
 def _find_scorpion_tool(name, fallback):
@@ -1947,6 +1951,13 @@ def _scorpion_tool(name):
     )
     return sibling
 
+
+def _scorpion_cc_flags():
+    import os
+    triple = os.environ.get("CPYTE_SCORPION_TRIPLE", _SCORPION_DEFAULT_TRIPLE)
+    arch = os.environ.get("CPYTE_SCORPION_ARCH", _SCORPION_DEFAULT_ARCH)
+    abi = os.environ.get("CPYTE_SCORPION_ABI", _SCORPION_DEFAULT_ABI)
+    return arch, abi, triple
 
 def run_scorpion(
     module,
@@ -2022,12 +2033,13 @@ def run_scorpion(
     # Compile Scorpion runtime
     runtime_obj = output.rsplit(".", 1)[0] + ".runtime.o"
     cc = _find_scorpion_tool("gcc", _SCORPION_CC)
+    arch, abi, _tr = _scorpion_cc_flags()
     cmd = [
         cc,
         "-c",
         "-O3",
-        _SCORPION_ARCH,
-        _SCORPION_ABI,
+        arch,
+        abi,
         "-nostdlib",
         "-ffreestanding",
         "-o",
@@ -2049,8 +2061,8 @@ def run_scorpion(
     cmd = (
         [
             cc,
-            _SCORPION_ARCH,
-            _SCORPION_ABI,
+            arch,
+            abi,
             "-nostdlib",
             "-nostartfiles",
             "-Wl,-e,main",

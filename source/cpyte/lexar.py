@@ -39,6 +39,7 @@ class TokenType(Enum):
     AND = auto()
     OR = auto()
     NOT = auto()
+    OPERATOR = auto()
 
     LPAREN = auto()
     RPAREN = auto()
@@ -114,12 +115,19 @@ _BASE_KEYWORDS = {
     "mut",
     "del",
     "sealed",
+    "interface",
+    "protocol",
+    "interface",
+    "protocol",
     "dataclass",
     "as",
 }
 
 # Additional keywords registered by packages
 _additional_keywords: set[str] = set()
+
+# Additional operators registered by packages (longest-match wins)
+_additional_operators: set[str] = set()
 
 
 def register_keywords(keywords: set[str]) -> None:
@@ -136,6 +144,21 @@ def unregister_keywords(keywords: set[str]) -> None:
     # Update legacy KEYWORDS for backward compatibility
     global KEYWORDS
     KEYWORDS = get_keywords()
+
+
+def register_operators(operators: set[str]) -> None:
+    """Register additional operator tokens from packages."""
+    _additional_operators.update(operators)
+
+
+def unregister_operators(operators: set[str]) -> None:
+    """Unregister additional operator tokens from packages."""
+    _additional_operators.difference_update(operators)
+
+
+def get_operators() -> set[str]:
+    """Get the set of package-registered operator tokens."""
+    return set(_additional_operators)
 
 
 def get_keywords() -> set[str]:
@@ -304,6 +327,12 @@ class _LineLexer:
                 self.peek().isdigit() or self.peek().lower() in "abcdef"
             ):
                 self.advance()
+            if self.pos == start + 2:
+                raise LexerError(
+                    "Hexadecimal literal requires at least one digit",
+                    self.line_number,
+                    start_col,
+                )
             value = self.line[start : self.pos]
             return Token(TokenType.NUMBER, value, self.line_number, start_col)
 

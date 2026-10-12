@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.util
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -27,6 +28,7 @@ if getattr(sys, "frozen", False):
     _GC_RUNTIME_C = os.path.join(getattr(sys, "_MEIPASS", ""), "gc_runtime.c")
 else:
     _GC_RUNTIME_C = os.path.join(os.path.dirname(__file__), "gc_runtime.c")
+_FLOATS_RUNTIME_C = os.path.join(os.path.dirname(__file__), "floats_runtime.c")
 
 if getattr(sys, "frozen", False):
     _BIGNUM_C = os.path.join(getattr(sys, "_MEIPASS", ""), "bignum.c")
@@ -1049,6 +1051,7 @@ def _prune_module(mod):
 
 
 _GMP_INCLUDE_CACHE = None
+_MPFR_INCLUDE_CACHE = None
 
 
 def _gmp_include_dir() -> str | None:
@@ -1059,6 +1062,42 @@ def _gmp_include_dir() -> str | None:
     return _GMP_INCLUDE_CACHE
 
 
+def _mpfr_include_dir() -> str | None:
+    """Find MPFR headers, which may be installed separately from GMP."""
+    global _MPFR_INCLUDE_CACHE
+    if _MPFR_INCLUDE_CACHE is not None:
+        return _MPFR_INCLUDE_CACHE
+
+    candidates = [
+        os.environ.get("CPYTE_MPFR_INCLUDE"),
+        "/opt/homebrew/opt/mpfr/include",
+        "/usr/local/opt/mpfr/include",
+        "/opt/homebrew/include",
+        "/usr/local/include",
+        "/usr/include",
+    ]
+    brew = shutil.which("brew")
+    if brew:
+        try:
+            prefix = subprocess.run(
+                [brew, "--prefix", "mpfr"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            prefix = ""
+        if prefix:
+            candidates.insert(0, os.path.join(prefix, "include"))
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(os.path.join(candidate, "mpfr.h")):
+            _MPFR_INCLUDE_CACHE = candidate
+            return candidate
+    return None
+
+
 def _runtime_extra_flags(src_path: str) -> tuple:
     """Extra clang flags needed to compile a runtime C source.
 
@@ -1066,12 +1105,13 @@ def _runtime_extra_flags(src_path: str) -> tuple:
     outside clang's default include path on Homebrew/macOS and some Linux
     toolchains. The resolved include dir is cached by generate_bc's probe.
     """
-    if os.path.basename(src_path) == "bignum.c" or os.path.basename(
-        src_path
-    ) == "float_mpfr.c":
-        inc = _gmp_include_dir()
-        if inc:
-            return (f"-I{inc}",)
+    if os.path.basename(src_path) in {
+        "bignum.c",
+        "float_mpfr.c",
+        "floats_runtime.c",
+    }:
+        includes = [_gmp_include_dir(), _mpfr_include_dir()]
+        return tuple(f"-I{inc}" for inc in dict.fromkeys(includes) if inc)
     return ()
 
 
@@ -1297,7 +1337,7 @@ def run_jit(
                 jit_opt_level=opt_level,
                 extra_flags=_runtime_extra_flags(src),
             ): src
-            for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C)
+            for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C, _FLOATS_RUNTIME_C)
         }
         runtime_irs = {}
         for fut, src in futures.items():
@@ -1311,8 +1351,9 @@ def run_jit(
         _RUNTIME_C: "external",
         _BIGNUM_C: _BIGNUM_KEEP,
         _GC_RUNTIME_C: frozenset(),
+        _FLOATS_RUNTIME_C: frozenset(),
     }
-    for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C):
+    for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C, _FLOATS_RUNTIME_C):
         with _llvm_binding_lock:
             m = binding.parse_assembly(_remove_probe_stack_ir(runtime_irs[src]))
             keep = internal_keep[src]

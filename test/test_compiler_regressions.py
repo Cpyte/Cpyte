@@ -2,7 +2,9 @@
 """Regression checks for compiler API and pointer arithmetic semantics."""
 
 import os
+import struct
 import sys
+import tempfile
 
 from llvmlite import binding as llvm
 
@@ -10,6 +12,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "source"))
 
 from cpyte import CpyteCompileError, emit_program, parse_and_analyze  # noqa: E402
+from cpyte import sef  # noqa: E402
+from cpyte.package_manifest import iter_cpm_version_dirs, sort_cpm_versions  # noqa: E402
 
 
 def compile_program(source):
@@ -69,8 +73,100 @@ def test_invalid_pointer_arithmetic_is_rejected():
         raise AssertionError(f"invalid pointer expression was accepted:\n{source}")
 
 
+def test_invalid_hex_literal_is_lexer_error():
+    try:
+        parse_and_analyze(
+            "public main() -> int:\n    return 0x\n",
+            enable_extensions=False,
+        )
+    except CpyteCompileError as exc:
+        assert "requires at least one digit" in str(exc)
+    else:
+        raise AssertionError("0x without hexadecimal digits was accepted")
+
+
+def test_cpm_versions_use_semver_order():
+    versions = ["2.9.0", "2.10.0", "2.10.0-beta.2", "2.10.0-beta.11"]
+    assert sort_cpm_versions(versions) == [
+        "2.10.0",
+        "2.10.0-beta.11",
+        "2.10.0-beta.2",
+        "2.9.0",
+    ]
+    with tempfile.TemporaryDirectory() as root:
+        package = os.path.join(root, "pkg")
+        for version in ("2.9.0", "2.10.0"):
+            os.makedirs(os.path.join(package, version))
+        result = list(iter_cpm_version_dirs(root))
+        assert result[0][1].endswith(os.path.join("pkg", "2.10.0"))
+
+
+def test_compound_index_assignment_evaluates_index_once():
+    ir = compile_program(
+        "def idx() -> int:\n"
+        "    return 0\n"
+        "public main() -> int:\n"
+        "    int[2] values\n"
+        "    values[idx()] += 1\n"
+        "    return 0\n"
+    )
+    assert ir.count('call i32 @"idx"()') == 1
+
+
+def test_zero_multiplication_preserves_call_side_effects():
+    ir = compile_program(
+        "def side() -> int:\n"
+        "    print(7)\n"
+        "    return 3\n"
+        "public main() -> int:\n"
+        "    return 0 * side()\n"
+    )
+    assert ir.count('call i32 @"side"()') == 1
+
+
+def test_counted_loop_unrolling_preserves_integer_wraparound():
+    ir = compile_program(
+        "public main() -> int:\n"
+        "    int i = 2147483647\n"
+        "    while i <= 2147483647:\n"
+        "        i = i + 1\n"
+        "    return i\n"
+    )
+    assert 'while.cond:' in ir
+    assert 'while.body:' in ir
+
+
+def test_sef_checker_rejects_truncated_relocation_records():
+    data = bytearray(
+        sef.pack_segments(
+            [
+                {"type": "text", "data": b"\0" * 4},
+                {"type": sef.SEG_RELOC, "data": b"\0" * 12},
+            ],
+            entry=0,
+            flags=sef.SEF_FLAG_DYNAMIC,
+        )
+    )
+    reloc_size_offset = sef.HEADER_SIZE + sef.SEGMENT_SIZE + 8
+    size = struct.unpack_from("<I", data, reloc_size_offset)[0]
+    data.append(0)
+    struct.pack_into("<I", data, reloc_size_offset, size + 1)
+
+    findings = sef.check(bytes(data))
+    assert any(
+        level == "fail" and "RELOC" in message and "multiple of 12" in message
+        for level, message in findings
+    )
+
+
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_integer_pointer_arithmetic()
     test_invalid_pointer_arithmetic_is_rejected()
+    test_invalid_hex_literal_is_lexer_error()
+    test_cpm_versions_use_semver_order()
+    test_compound_index_assignment_evaluates_index_once()
+    test_zero_multiplication_preserves_call_side_effects()
+    test_counted_loop_unrolling_preserves_integer_wraparound()
+    test_sef_checker_rejects_truncated_relocation_records()
     print("Compiler regression tests passed.")

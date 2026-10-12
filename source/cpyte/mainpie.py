@@ -27,9 +27,15 @@ if __package__:
         CompilerContext,
         HookLoader,
         HookStage,
+        get_global_hook_dispatcher,
         get_global_hook_registry,
     )
-    from .lexar import Lexer, LexerError, register_keywords
+    from .lexar import (
+        Lexer,
+        LexerError,
+        register_keywords,
+        register_operators,
+    )
     from .linker import Linker, format_cc_diag
     from .package_manifest import (
         ManifestParser,
@@ -66,9 +72,15 @@ else:
         CompilerContext,
         HookLoader,
         HookStage,
+        get_global_hook_dispatcher,
         get_global_hook_registry,
     )
-    from cpyte.lexar import Lexer, LexerError, register_keywords
+    from cpyte.lexar import (
+        Lexer,
+        LexerError,
+        register_keywords,
+        register_operators,
+    )
     from cpyte.linker import Linker, format_cc_diag
     from cpyte.package_manifest import (
         ManifestParser,
@@ -305,6 +317,26 @@ def pretty_ast(node, indent=0):
     return f"{pad}{node}"
 
 
+def _sync_lexer_hooks() -> None:
+    """Publish keyword/operator capabilities declared by loaded lexer hooks.
+
+    Manifest ``capabilities`` are registered directly, but hooks may also
+    declare keywords/operators programmatically (``get_additional_keywords``
+    and the legacy ``get_new_keywords`` alias). This pulls both sets out of the
+    global dispatcher and feeds them to the lexer so they are known before
+    tokenizing.
+    """
+    dispatcher = get_global_hook_dispatcher()
+
+    keywords = dispatcher.additional_keywords()
+    if keywords:
+        register_keywords(keywords)
+
+    operators = dispatcher.additional_operators()
+    if operators:
+        register_operators(operators)
+
+
 def _load_package_manifests_from_source(workspace_root: str) -> None:
     """
     Load all package manifests from CPM packages in the workspace.
@@ -331,31 +363,35 @@ def _load_package_manifests_from_source(workspace_root: str) -> None:
         try:
             manifest = ManifestParser.validate_and_parse(manifest_path)
 
-            # Register keywords with lexer
+            # Register declared keywords/operators with the lexer.
             if manifest.capabilities.keywords:
                 register_keywords(manifest.capabilities.keywords)
+            if manifest.capabilities.operators:
+                register_operators(manifest.capabilities.operators)
 
             # Register manifest
             manifest_registry.register(manifest)
 
-            # Parser hooks must be loaded before parsing the source file.
-            if manifest.extensions.parser_hooks:
+            # Lexer + parser hooks must be available before lexing/parsing the
+            # source file. Remaining stages load lazily when the package is
+            # actually imported (see semantic analysis).
+            parser_phase = manifest.extensions.parser_phase_hooks()
+            if parser_phase:
                 HookLoader.load_hooks_from_package(
                     package_name,
                     version_dir,
-                    manifest.extensions.parser_hooks,
+                    parser_phase,
                     get_global_hook_registry(),
                     CompilerContext(data={"package_dir": version_dir}),
                 )
 
-            # Note: hooks are NOT loaded here. Per the "hooks only when
-            # imported" rule, a package's extension hooks are introduced by the
-            # semantic analyzer when the package is actually imported. This
-            # function only registers the manifest (for import resolution) and
-            # any lexer keywords so imports of that package resolve correctly.
-
         except Exception as e:
+            if get_global_hook_registry().strict:
+                raise
             ui.print_warn(f"Failed to load package manifest for '{package_name}': {e}")
+
+    # Feed hook-declared keywords/operators to the lexer.
+    _sync_lexer_hooks()
 
 
 _DEEP_INTEGRATION_STAGES = {
@@ -1329,8 +1365,8 @@ def _main():
     if mode == "emit-llvm":
         print(prog)
     elif mode == "aot":
-        out_base = args[0].rsplit(".", 1)[0] if "." in args[0] else "program"
-        obj_file = "program.o"
+        out_base = os.path.splitext(args[0])[0]
+        obj_file = out_base + ".o"
         frameworks = _collect_frameworks(parsed)
         run_aot(
             prog,
@@ -1343,7 +1379,7 @@ def _main():
         )
         ui.print_ok(f"Wrote {out_base}")
     elif mode == "scorpion":
-        out_base = args[0].rsplit(".", 1)[0] if "." in args[0] else "program"
+        out_base = os.path.splitext(args[0])[0]
         sef_file = out_base + ".sef"
         dl_only = [
             n

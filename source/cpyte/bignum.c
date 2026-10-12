@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <gmp.h>
+#include <mpfr.h>
 
 // Bignum backed by GNU GMP (mpz_t). Each cpyte `big` value is a heap-allocated
 // __mpz_struct returned as an opaque void*. `ubig` reuses the same
@@ -56,6 +57,44 @@ void* bigint_from_int(int64_t val) {
 }
 
 void* bigint_from_uint64(uint64_t val) { return _z_from_u64(val); }
+
+void* bigint_from_mpz(mpz_srcptr value) {
+    if (!value) return NULL;
+    mpz_ptr result = _z_alloc();
+    mpz_set(result, value);
+    return result;
+}
+
+int bigint_to_mpfr(mpfr_ptr result, void* value) {
+    if (!result || !value) return 0;
+    mpfr_set_z(result, (mpz_srcptr)value, MPFR_RNDN);
+    return 1;
+}
+
+void* bigint_copy(void* value) {
+    if (!value) return bigint_new();
+    mpz_ptr result = _z_alloc();
+    mpz_set(result, (mpz_srcptr)value);
+    return result;
+}
+
+void* bigint_abs(void* value) {
+    if (!value) return bigint_new();
+    mpz_ptr result = _z_alloc();
+    mpz_abs(result, (mpz_srcptr)value);
+    return result;
+}
+
+void* bigint_gcd(void* left, void* right) {
+    mpz_ptr result = _z_alloc();
+    mpz_t zero;
+    mpz_init(zero);
+    mpz_gcd(result,
+            left ? (mpz_srcptr)left : zero,
+            right ? (mpz_srcptr)right : zero);
+    mpz_clear(zero);
+    return result;
+}
 
 void* bigint_from_str(const char* str) {
     mpz_ptr z = _z_alloc();

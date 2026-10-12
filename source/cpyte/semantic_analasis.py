@@ -160,7 +160,12 @@ from .extension_hooks import (
     get_global_hook_registry,
 )
 from .lexar import Lexer, LexerError, TokenType, register_keywords
-from .package_manifest import ManifestParser, get_global_registry, iter_cpm_version_dirs
+from .package_manifest import (
+    ManifestParser,
+    get_global_registry,
+    iter_cpm_version_dirs,
+    sort_cpm_versions,
+)
 
 _ARRAY_SUFFIX_RE = re.compile(r"^(.*)\[\d*\]$")
 _FIXED_ARRAY_RE = re.compile(r"^(.*?)\[(\d+)\]$")
@@ -825,11 +830,7 @@ class SemanticAnalyzer:
         idempotent: a hook whose name is already in the registry is skipped
         (LSP re-analyses must not raise "already registered").
         """
-        all_hook_files = (
-            manifest.extensions.semantic_hooks
-            + manifest.extensions.codegen_hooks
-            + manifest.extensions.runtime_hooks
-        )
+        all_hook_files = manifest.extensions.deferred_hooks()
         if not all_hook_files:
             return
 
@@ -2876,13 +2877,12 @@ class SemanticAnalyzer:
                 pkg_dir = os.path.join(cpm_root, *module.replace("/", ".").split("."))
 
             if os.path.isdir(pkg_dir):
-                versions = sorted(
+                versions = sort_cpm_versions(
                     [
                         d
                         for d in os.listdir(pkg_dir)
                         if os.path.isdir(os.path.join(pkg_dir, d))
-                    ],
-                    reverse=True,
+                    ]
                 )
                 if versions:
                     version_dir = os.path.join(pkg_dir, versions[0])

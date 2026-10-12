@@ -1261,8 +1261,8 @@ dyn_op(DynValue *out, int op, int k1, uint64_t b1, int k2, uint64_t b2) {
             case DYNOP_BAND: r = a & c; break;
             case DYNOP_BOR:  r = a | c; break;
             case DYNOP_BXOR: r = a ^ c; break;
-            case DYNOP_SHL:  r = a << c; break;
-            case DYNOP_SHR:  r = a >> c; break;
+            case DYNOP_SHL: r = a << (c > 63 ? 63 : c); break;
+            case DYNOP_SHR: r = a >> (c > 63 ? 63 : c); break;
             default:         r = 0; break;
             }
             out->kind = DYN_UINT64;
@@ -1283,8 +1283,16 @@ dyn_op(DynValue *out, int op, int k1, uint64_t b1, int k2, uint64_t b2) {
         case DYNOP_BAND: r = a & c; break;
         case DYNOP_BOR:  r = a | c; break;
         case DYNOP_BXOR: r = a ^ c; break;
-        case DYNOP_SHL:  r = a << c; break;
-        case DYNOP_SHR:  r = a >> c; break;
+        case DYNOP_SHL:
+            c = k2 == DYN_UINT64 ? (b2 > 63 ? 63 : (int64_t)b2)
+                                 : (c < 0 ? 0 : (c > 63 ? 63 : c));
+            r = (int64_t)((uint64_t)a << (uint64_t)c);
+            break;
+        case DYNOP_SHR:
+            c = k2 == DYN_UINT64 ? (b2 > 63 ? 63 : (int64_t)b2)
+                                 : (c < 0 ? 0 : (c > 63 ? 63 : c));
+            r = a >> c;
+            break;
         default:         r = 0; break;
         }
         out->kind = DYN_INT64;

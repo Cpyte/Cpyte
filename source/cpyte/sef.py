@@ -146,6 +146,8 @@ def _align4(n):
 
 def decode_relocs(data, offset, size):
     """Decode SEG_RELOC records -> list of dicts {type, offset, value}."""
+    if size % 12:
+        raise SefError("RELOC segment size %d is not a multiple of 12" % size)
     out = []
     end = offset + size
     p = offset
@@ -172,7 +174,9 @@ def decode_imports(data, offset, size, versym=False):
     end = offset + size
     p = offset
     hdr = 24 if versym else 12
-    while p + hdr <= end:
+    while p < end:
+        if p + hdr > end:
+            raise SefError("truncated IMPORT record header")
         itype, slot = struct.unpack_from("<II", data, p)
         if versym:
             plt, ver_hash, flags, name_len = struct.unpack_from("<IIII", data, p + 8)
@@ -181,8 +185,9 @@ def decode_imports(data, offset, size, versym=False):
             plt = 0
             ver_hash = 0
             flags = 0
-        if name_len > end - (p + hdr):
-            break
+        record_size = hdr + _align4(name_len)
+        if record_size > end - p:
+            raise SefError("truncated IMPORT record name")
         name = data[p + hdr : p + hdr + name_len].decode("latin1")
         out.append(
             {
@@ -195,7 +200,7 @@ def decode_imports(data, offset, size, versym=False):
                 "name": name,
             }
         )
-        p += hdr + _align4(name_len)
+        p += record_size
     return out
 
 
@@ -207,18 +212,21 @@ def decode_exports(data, offset, size, versym=False):
     end = offset + size
     p = offset
     hdr = 12 if versym else 8
-    while p + hdr <= end:
+    while p < end:
+        if p + hdr > end:
+            raise SefError("truncated EXPORT record header")
         value, = struct.unpack_from("<I", data, p)
         if versym:
             ver_hash, name_len = struct.unpack_from("<II", data, p + 4)
         else:
             name_len, = struct.unpack_from("<I", data, p + 4)
             ver_hash = 0
-        if name_len > end - (p + hdr):
-            break
+        record_size = hdr + _align4(name_len)
+        if record_size > end - p:
+            raise SefError("truncated EXPORT record name")
         name = data[p + hdr : p + hdr + name_len].decode("latin1")
         out.append({"value": value, "ver_hash": ver_hash, "name": name})
-        p += hdr + _align4(name_len)
+        p += record_size
     return out
 
 
@@ -333,25 +341,35 @@ def check(data):
                 if seg["offset"] + seg["size"] > len(data):
                     continue  # already flagged
                 if seg["type"] == SEG_RELOC:
-                    records = decode_relocs(data, seg["offset"], seg["size"])
-                    if not records and seg["size"]:
-                        record("warn", "seg %d (RELOC): undecodable records" % i)
+                    if seg["size"] % 12:
+                        record(
+                            "fail",
+                            "seg %d (RELOC): size %d is not a multiple of 12"
+                            % (i, seg["size"]),
+                        )
+                        continue
+                    try:
+                        records = decode_relocs(data, seg["offset"], seg["size"])
+                    except SefError as exc:
+                        record("fail", "seg %d (RELOC): %s" % (i, exc))
                         continue
                     record("pass", "seg %d (RELOC): %d record(s)" % (i, len(records)))
                 elif seg["type"] == SEG_IMPORT:
-                    records = decode_imports(
-                        data, seg["offset"], seg["size"], versym=versym
-                    )
-                    if not records and seg["size"]:
-                        record("warn", "seg %d (IMPORT): undecodable records" % i)
+                    try:
+                        records = decode_imports(
+                            data, seg["offset"], seg["size"], versym=versym
+                        )
+                    except SefError as exc:
+                        record("fail", "seg %d (IMPORT): %s" % (i, exc))
                         continue
                     record("pass", "seg %d (IMPORT): %d record(s)" % (i, len(records)))
                 else:
-                    records = decode_exports(
-                        data, seg["offset"], seg["size"], versym=versym
-                    )
-                    if not records and seg["size"]:
-                        record("warn", "seg %d (EXPORT): undecodable records" % i)
+                    try:
+                        records = decode_exports(
+                            data, seg["offset"], seg["size"], versym=versym
+                        )
+                    except SefError as exc:
+                        record("fail", "seg %d (EXPORT): %s" % (i, exc))
                         continue
                     record("pass", "seg %d (EXPORT): %d record(s)" % (i, len(records)))
 

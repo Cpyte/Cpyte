@@ -117,8 +117,6 @@ _BASE_KEYWORDS = {
     "sealed",
     "interface",
     "protocol",
-    "interface",
-    "protocol",
     "dataclass",
     "as",
 }
@@ -164,6 +162,19 @@ def get_operators() -> set[str]:
 def get_keywords() -> set[str]:
     """Get the complete set of keywords (base + additional)."""
     return _BASE_KEYWORDS | _additional_keywords
+
+
+def get_lexer_hook_dispatcher():
+    """Return the global hook dispatcher, or None if unavailable.
+
+    Imported lazily so the lexer keeps working when the extension framework is
+    not importable (e.g. during early bootstrap).
+    """
+    try:
+        from .extension_hooks import get_global_hook_dispatcher
+    except Exception:
+        return None
+    return get_global_hook_dispatcher()
 
 
 # Bruh, dead code.
@@ -516,6 +527,20 @@ class _LineLexer:
             self.advance()
             return Token(op_map_2[two_char], two_char, self.line_number, col)
 
+        # Package-registered operators (longest-match wins). Built-in operators
+        # take precedence and reserved ones cannot be overridden, so this only
+        # fires for genuinely new spellings.
+        if _additional_operators:
+            rest = self.line[col - 1 :]
+            best = ""
+            for op in _additional_operators:
+                if len(op) > len(best) and rest.startswith(op):
+                    best = op
+            if best:
+                for _ in range(len(best) - 1):
+                    self.advance()
+                return Token(TokenType.OPERATOR, best, self.line_number, col)
+
         single_map = {
             "+": TokenType.PLUS,
             "-": TokenType.MINUS,
@@ -640,6 +665,26 @@ class Lexer:
         """Unregister keywords from a package."""
         unregister_keywords(keywords)
 
+    @staticmethod
+    def _apply_token_hook(token: Token, customize_token) -> Token:
+        """Give lexer hooks a chance to rewrite one token.
+
+        ``customize_token`` returns a ``{"type": ..., "value": ...}`` mapping
+        or None. The type may be a ``TokenType`` or its name.
+        """
+        replacement = customize_token(
+            token.type.name, token.value or "", token.line, token.column
+        )
+        if not replacement:
+            return token
+        new_type = replacement.get("type")
+        if isinstance(new_type, str):
+            new_type = TokenType[new_type]
+        if new_type is None:
+            new_type = token.type
+        new_value = replacement.get("value", token.value)
+        return Token(new_type, new_value, token.line, token.column)
+
     def _validate_indentation(self, raw_lines: list[str]):
         for i, line in enumerate(raw_lines):
             stripped = line.lstrip()
@@ -693,6 +738,11 @@ class Lexer:
 
         bracket_depth = 0
         continuation = False
+        customize_token = None
+        if self.enable_extensions:
+            _dispatcher = get_lexer_hook_dispatcher()
+            if _dispatcher is not None and _dispatcher.has_lexer_hooks():
+                customize_token = _dispatcher.customize_token
         i = 0
         while i < len(norm_lines):
             norm_line = norm_lines[i]
@@ -737,6 +787,11 @@ class Lexer:
 
             line_lexer = _LineLexer(norm_line, line_number)
             line_tokens = line_lexer.tokenize()
+
+            if customize_token is not None:
+                line_tokens = [
+                    self._apply_token_hook(t, customize_token) for t in line_tokens
+                ]
 
             for t in line_tokens:
                 if t.type in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.LBRACE):

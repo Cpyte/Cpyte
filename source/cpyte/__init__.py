@@ -38,9 +38,11 @@ def parse_and_analyze(
         workspace_root = mainpie._find_workspace_root(filepath)
     if enable_extensions:
         mainpie._load_package_manifests_from_source(workspace_root)
-    lex = lexar.Lexer(source, tab_size=tab_size, enable_extensions=enable_extensions)
-    tokens = lex.get_tokens()
     try:
+        lex = lexar.Lexer(
+            source, tab_size=tab_size, enable_extensions=enable_extensions
+        )
+        tokens = lex.get_tokens()
         parsed, _ = astparse.parse_file(tokens, enable_extensions=enable_extensions)
     except (lexar.LexerError, astparse.ParseError) as e:
         raise CpyteCompileError(f"parse error: {e}") from e

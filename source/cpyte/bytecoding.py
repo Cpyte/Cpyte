@@ -343,9 +343,7 @@ class LLVM:
             result = ir.DoubleType()
         elif t == "void":
             result = ir.VoidType()
-        elif t == "str":
-            result = ir.PointerType(ir.IntType(8))
-        elif t == "void*" or t == "big" or t == "ubig":
+        elif t == "str" or t == "void*" or t == "big" or t == "ubig":
             result = ir.PointerType(ir.IntType(8))
         elif t == "dynamic":
             # A runtime-typed value: (kind, data) tag pair. Mirrors DynValue.
@@ -4591,6 +4589,7 @@ class LLVM:
             if _is_const_zero(left_node) or _is_const_zero(right_node):
                 left_val = self.emit(left_node)
                 if isinstance(left_val.type, ir.IntType):
+                    self.emit(right_node)
                     return ir.Constant(left_val.type, 0)
             # ---- x * 1  /  1 * x  ->  x ----
             if _is_const_one(left_node):
@@ -5702,7 +5701,86 @@ class LLVM:
             isinstance(node.target, Attr)
             and (getattr(node.target, "meta", None) or {}).get("kind") == "prop_set"
         ):
+            if node.compound_op is not None:
+                target = node.target
+                meta = getattr(target, "meta", None) or {}
+                cls = meta.get("cls")
+                getter = self.functions.get(
+                    f"{cls}.{target.name}.get" if cls else None
+                )
+                setter = self.functions.get(
+                    f"{cls}.{target.name}.set" if cls else None
+                )
+                if getter is None or setter is None:
+                    raise Exception(
+                        f"property accessor for `{cls}.{target.name}` not compiled"
+                    )
+                receiver = self._method_receiver(
+                    target.obj, getter.function_type.args[0]
+                )
+                old_value = self.builder.call(getter, [receiver])
+                previous = self._emit_memo.get(id(target))
+                had_value = id(target) in self._emit_memo
+                self._emit_memo[id(target)] = old_value
+                try:
+                    value = self.emit(node.value)
+                finally:
+                    if had_value:
+                        self._emit_memo[id(target)] = previous
+                    else:
+                        self._emit_memo.pop(id(target), None)
+                if receiver.type != setter.function_type.args[0]:
+                    receiver = self.builder.bitcast(
+                        receiver, setter.function_type.args[0]
+                    )
+                value = self._coerce_call_arg(
+                    value,
+                    setter.function_type.args[1],
+                    getattr(node.value, "inferred_type", None),
+                )
+                return self.builder.call(setter, [receiver, value])
             return self._emit_prop_set(node)
+        if node.compound_op is not None and not (
+            isinstance(node.target, Attr)
+            and (getattr(node.target, "meta", None) or {}).get("kind") == "prop_set"
+        ):
+            if isinstance(node.target, Index) and not self.no_userspace:
+                obj_t = _bc_array_norm(
+                    getattr(node.target.obj, "inferred_type", None)
+                )
+                if (
+                    obj_t == "dynamic"
+                    or obj_t == "dynamic[]"
+                    or self._is_dynamic_expr(node.target.obj)
+                ):
+                    elem_ptr = self._emit_dyn_list_ptr(
+                        node.target.obj, node.target.index
+                    )
+                    old_value = self.builder.load(elem_ptr)
+                    value = self._emit_compound_value(node, old_value)
+                    if value.type != _DynValue:
+                        kind, bits = self._box_dyn(
+                            value,
+                            getattr(node.value, "inferred_type", None) or "int",
+                        )
+                        value = self.builder.insert_value(
+                            ir.Constant(_DynValue, ir.Undefined),
+                            ir.Constant(_i32, kind),
+                            0,
+                        )
+                        value = self.builder.insert_value(value, bits, 1)
+                    self.builder.store(value, elem_ptr)
+                    return None
+            target_ptr = self._emit_lvalue(node.target)
+            old_value = self.builder.load(target_ptr)
+            value = self._emit_compound_value(node, old_value)
+            pointee = self._pointee_type(target_ptr)
+            if pointee and value.type != pointee:
+                value = self._coerce_store(value, pointee)
+            self.builder.store(value, target_ptr)
+            if isinstance(pointee, ir.PointerType):
+                self._emit_write_barrier(target_ptr, value)
+            return None
         if (
             self._is_decorator_factory
             and isinstance(node.target, Variable)
@@ -5864,6 +5942,20 @@ class LLVM:
         if isinstance(pointee, ir.PointerType):
             self._emit_write_barrier(target_ptr, value)
         return None
+
+    def _emit_compound_value(self, node: Assign, old_value):
+        """Emit a lowered compound assignment while reusing its computed lvalue."""
+        target_key = id(node.target)
+        had_value = target_key in self._emit_memo
+        previous = self._emit_memo.get(target_key)
+        self._emit_memo[target_key] = old_value
+        try:
+            return self.emit(node.value)
+        finally:
+            if had_value:
+                self._emit_memo[target_key] = previous
+            else:
+                self._emit_memo.pop(target_key, None)
 
     def _method_receiver(self, obj_node, slot_this):
         """Resolve a class-method receiver (value / pointer / pointer-to-pointer)
@@ -7090,9 +7182,6 @@ class LLVM:
         start_val = pending_ivs.get(iv_name)
         if start_val is None:
             return False
-        n = _count_loop_iterations(start_val, stop, step, inclusive)
-        if n < 0 or n > 16:
-            return False
         # Guard: the body must not contain break/continue (we cannot
         # redistribute control-flow edges across the unrolled copies).
         for stmt in node.body:
@@ -7106,12 +7195,25 @@ class LLVM:
         if _loop_has_alias_risk(node.body):
             return False
 
+        if self.local_types.get(iv_name) not in ("int", "int32"):
+            return False
+
         iv_ptr = self.locals.get(iv_name)
+        iv_ty = self._pointee_type(iv_ptr) if iv_ptr is not None else _i32
+        iv_ty = iv_ty or _i32
+        width = iv_ty.width if isinstance(iv_ty, ir.IntType) else 32
+        start_val = _trunc_to_signed(start_val, width)
+        n = _count_loop_iterations(start_val, stop, step, inclusive)
+        if n < 0 or n > 16:
+            return False
+        signed_min = -(1 << (width - 1))
+        signed_max = (1 << (width - 1)) - 1
+        final_value = start_val + n * step
+        if not signed_min <= final_value <= signed_max:
+            return False
         if iv_ptr is None:
             iv_ptr = self._alloca(_i32, name=iv_name)
             self._declare_local(iv_name, iv_ptr, "int")
-        iv_ty = self._pointee_type(iv_ptr) or _i32
-        width = iv_ty.width if isinstance(iv_ty, ir.IntType) else 32
 
         def iv_const(v: int):
             # Wrap to the declared integer width (cpyte ints wrap like C).

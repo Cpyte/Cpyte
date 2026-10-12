@@ -1988,12 +1988,13 @@ def parse_import(tokens: list[Token], pos: int):
 
 
 class Assign(Node):
-    __slots__ = ("_token", "dynamic", "target", "value")
+    __slots__ = ("_token", "compound_op", "dynamic", "target", "value")
 
-    def __init__(self, target, value, token=None):
+    def __init__(self, target, value, token=None, compound_op=None):
         self.target = target
         self.value = value
         self._token = token
+        self.compound_op = compound_op
 
     def __repr__(self):
         return f"Assign({self.target}, {self.value})"
@@ -3517,6 +3518,9 @@ def parse_expr_stmt(tokens: list[Token], pos: int):
                 token=tok,
             ),
             token=tok,
+            compound_op=(
+                binop_op if not isinstance(target, Variable) else None
+            ),
         ), pos
 
     _expect_newline(tokens, pos, tok)

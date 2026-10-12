@@ -30,6 +30,7 @@ Extensions are ordinary Python packages loaded by HookLoader.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import os
 from abc import ABC
 from collections.abc import Callable
@@ -591,6 +592,97 @@ class HookRegistration(Generic[H]):
 
 
 # ============================================================================
+# Hook invocation (arity-compatible + error-attributing)
+# ============================================================================
+
+
+class HookInvocationError(Exception):
+    """Raised when a hook callback fails in strict mode."""
+
+
+class _HookFailed:
+    """Sentinel returned when a guarded hook method raised or is absent."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<HOOK_FAILED>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_HOOK_FAILED = _HookFailed()
+
+
+
+@dataclass(slots=True)
+class HookError:
+    """Records a hook callback/report failure for later diagnostics."""
+
+    stage: str
+    hook_name: str
+    package_name: str
+    method: str
+    exception: BaseException
+
+    def describe(self) -> str:
+        return (
+            f"{self.hook_name!r} (package {self.package_name!r}) failed in "
+            f"{self.method}(): {type(self.exception).__name__}: {self.exception}"
+        )
+
+
+def _positional_capacity(func: Callable[..., Any]) -> int | None:
+    """Number of positional arguments a (bound) callable accepts.
+
+    Returns ``None`` when the callable takes ``*args`` (unbounded). Used to
+    decide whether a hook method still accepts the trailing ``context``
+    argument, so pre-context hook signatures keep working.
+    """
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+
+    capacity = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            capacity += 1
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return None
+    return capacity
+
+
+def call_with_context(
+    func: Callable[..., Any],
+    context: CompilerContext,
+    *args: Any,
+) -> tuple[Any, bool]:
+    """Invoke a context-taking hook method, tolerating legacy signatures.
+
+    The documented signature appends ``context`` as the trailing positional
+    argument (e.g. ``get_runtime_code(self, context)``). Older packages
+    predate that argument (``get_runtime_code(self)``); such methods are
+    called without it and reported as ``used_legacy`` so the caller can emit
+    a one-time deprecation note.
+
+    Returns ``(result, used_legacy)``.
+    """
+    capacity = _positional_capacity(func)
+    if capacity is None or capacity >= len(args) + 1:
+        return func(*args, context), False
+    if capacity == len(args):
+        return func(*args), True
+    # Odd signature (e.g. fewer params than positional args). Call the
+    # documented form and let the resulting error surface with context.
+    return func(*args, context), False
+
+
+# ============================================================================
 # Registry
 # ============================================================================
 
@@ -603,6 +695,108 @@ class HookRegistry:
 
         self._by_name: dict[str, CompilerHook] = {}
         self._context: CompilerContext | None = None
+
+        # Failure policy: a hook callback that raises is recorded and skipped
+        # (warn) by default, or re-raised as a hard error when strict.
+        self.strict = False
+        self.errors: list[HookError] = []
+        self._legacy_reported: set[tuple[str, str]] = set()
+
+    # ------------------------------------------------------------------
+    # Failure policy
+    # ------------------------------------------------------------------
+
+    def set_strict(self, strict: bool) -> None:
+        self.strict = bool(strict)
+
+    def record_error(
+        self,
+        hook: CompilerHook,
+        method: str,
+        exc: BaseException,
+    ) -> None:
+        stage = hook.stage.value if hook.stage is not None else "unknown"
+        error = HookError(
+            stage=stage,
+            hook_name=hook.name,
+            package_name=hook.package_name,
+            method=method,
+            exception=exc,
+        )
+        if self.strict:
+            raise HookInvocationError(error.describe()) from exc
+        self.errors.append(error)
+
+    def record_legacy(self, hook: CompilerHook, method: str) -> None:
+        key = (hook.name, method)
+        if key in self._legacy_reported:
+            return
+        self._legacy_reported.add(key)
+        self.errors.append(
+            HookError(
+                stage=hook.stage.value if hook.stage is not None else "unknown",
+                hook_name=hook.name,
+                package_name=hook.package_name,
+                method=method,
+                exception=DeprecationWarning(
+                    f"{method}() has no `context` parameter; the legacy "
+                    "signature still works but is deprecated — add "
+                    "`context` as the trailing argument"
+                ),
+            )
+        )
+
+    def take_errors(self) -> list[HookError]:
+        errors, self.errors = self.errors, []
+        return errors
+
+    # ------------------------------------------------------------------
+    # Safe invocation
+    # ------------------------------------------------------------------
+
+    def invoke_plain(
+        self,
+        hook: CompilerHook,
+        method: str,
+        *args: Any,
+    ) -> Any:
+        """Call a hook method with no context argument, guarding failures.
+
+        Returns a sentinel ``_HOOK_FAILED`` when the hook raised (and strict
+        mode is off), so callers can fall back to their default.
+        """
+        func = getattr(hook, method, None)
+        if func is None or not callable(func):
+            return _HOOK_FAILED
+        try:
+            return func(*args)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad
+            self.record_error(hook, method, exc)
+            return _HOOK_FAILED
+
+    def invoke_context(
+        self,
+        hook: CompilerHook,
+        method: str,
+        context: CompilerContext,
+        *args: Any,
+    ) -> Any:
+        """Call a hook method documented to take a trailing ``context``.
+
+        Falls back to the legacy no-context signature for old packages and
+        returns ``_HOOK_FAILED`` when the hook raised (strict mode re-raises).
+        """
+        func = getattr(hook, method, None)
+        if func is None or not callable(func):
+            return _HOOK_FAILED
+        try:
+            result, used_legacy = call_with_context(func, context, *args)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad
+            self.record_error(hook, method, exc)
+            return _HOOK_FAILED
+        if used_legacy:
+            self.record_legacy(hook, method)
+        return result
 
     # ------------------------------------------------------------------
     # Context
@@ -759,6 +953,8 @@ class HookRegistry:
         self._hooks = {stage: [] for stage in HookStage}
         self._by_name.clear()
         self._context = None
+        self.errors.clear()
+        self._legacy_reported.clear()
 
 
 # ============================================================================
@@ -895,30 +1091,72 @@ class HookDispatcher:
     def __init__(self, registry: HookRegistry):
         self.registry = registry
 
+    def _hooks(self, stage: HookStage) -> list[CompilerHook]:
+        return self.registry.get(stage)
+
     # ------------------------------------------------------------------
     # Lexer
     # ------------------------------------------------------------------
 
+    def has_lexer_hooks(self) -> bool:
+        return any(
+            isinstance(hook, LexerHook) for hook in self._hooks(HookStage.LEXER)
+        )
+
     def additional_keywords(self) -> set[str]:
         result: set[str] = set()
 
-        for hook in self.registry.get(HookStage.LEXER):
-            if isinstance(hook, LexerHook):
-                result.update(hook.get_additional_keywords())
+        for hook in self._hooks(HookStage.LEXER):
+            if not isinstance(hook, LexerHook):
+                continue
+            for method in ("get_additional_keywords", "get_new_keywords"):
+                value = self.registry.invoke_plain(hook, method)
+                if value is not _HOOK_FAILED and value:
+                    result.update(value)
 
         return result
 
     def additional_operators(self) -> set[str]:
         result: set[str] = set()
 
-        for hook in self.registry.get(HookStage.LEXER):
-            if isinstance(hook, LexerHook):
-                result.update(hook.get_additional_operators())
+        for hook in self._hooks(HookStage.LEXER):
+            if not isinstance(hook, LexerHook):
+                continue
+            for method in ("get_additional_operators", "get_new_operators"):
+                value = self.registry.invoke_plain(hook, method)
+                if value is not _HOOK_FAILED and value:
+                    result.update(value)
 
         return result
 
+    def customize_token(
+        self,
+        token_type: str,
+        token_value: str,
+        line: int,
+        column: int,
+    ) -> dict[str, Any] | None:
+        """Give lexer hooks a chance to rewrite one token.
+
+        Returns the first non-None replacement dict (``{"type", "value"}``).
+        """
+        for hook in self._hooks(HookStage.LEXER):
+            if not isinstance(hook, LexerHook):
+                continue
+            should = self.registry.invoke_plain(
+                hook, "should_customize_token", token_type, token_value
+            )
+            if should is _HOOK_FAILED or not should:
+                continue
+            replacement = self.registry.invoke_plain(
+                hook, "customize_token", token_type, token_value, line, column
+            )
+            if replacement is not _HOOK_FAILED and replacement:
+                return replacement
+        return None
+
     # ------------------------------------------------------------------
-    # AST
+    # AST transformation
     # ------------------------------------------------------------------
 
     def transform_node(
@@ -927,17 +1165,36 @@ class HookDispatcher:
         context: CompilerContext,
     ) -> Any:
 
-        for hook in self.registry.get(HookStage.TRANSFORM):
+        for hook in self._hooks(HookStage.TRANSFORM):
             if not isinstance(hook, TransformHook):
                 continue
-
-            if hook.should_transform(node):
-                node = hook.transform_node(
-                    node,
-                    context,
-                )
+            should = self.registry.invoke_plain(hook, "should_transform", node)
+            if should is _HOOK_FAILED or not should:
+                continue
+            transformed = self.registry.invoke_context(
+                hook, "transform_node", context, node
+            )
+            if transformed is not _HOOK_FAILED:
+                node = transformed
 
         return node
+
+    def transform_module(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> Any:
+
+        for hook in self._hooks(HookStage.TRANSFORM):
+            if not isinstance(hook, TransformHook):
+                continue
+            transformed = self.registry.invoke_context(
+                hook, "transform_module", context, module
+            )
+            if transformed is not _HOOK_FAILED:
+                module = transformed
+
+        return module
 
     # ------------------------------------------------------------------
     # Semantic
@@ -951,17 +1208,102 @@ class HookDispatcher:
 
         diagnostics: list[Diagnostic] = []
 
-        for hook in self.registry.get(HookStage.SEMANTIC):
-            if isinstance(hook, SemanticHook):
-                if hook.should_visit_node(node):
-                    diagnostics.extend(
-                        hook.visit_node(
-                            node,
-                            context,
-                        )
-                    )
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SemanticHook):
+                continue
+            should = self.registry.invoke_plain(hook, "should_visit_node", node)
+            if should is _HOOK_FAILED or not should:
+                continue
+            produced = self.registry.invoke_context(
+                hook, "visit_node", context, node
+            )
+            if produced is not _HOOK_FAILED and produced:
+                diagnostics.extend(produced)
 
         return diagnostics
+
+    def can_convert(
+        self,
+        source_type: Any,
+        target_type: Any,
+        context: CompilerContext,
+    ) -> bool | None:
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SemanticHook):
+                continue
+            verdict = self.registry.invoke_context(
+                hook, "can_convert", context, source_type, target_type
+            )
+            if verdict is _HOOK_FAILED or verdict is None:
+                continue
+            return bool(verdict)
+        return None
+
+    def infer_type(
+        self,
+        node: Any,
+        context: CompilerContext,
+    ) -> Any | None:
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SemanticHook):
+                continue
+            inferred = self.registry.invoke_context(
+                hook, "infer_type", context, node
+            )
+            if inferred is _HOOK_FAILED or inferred is None:
+                continue
+            return inferred
+        return None
+
+    def custom_type_rules(self) -> dict[str, Callable[..., Any]]:
+        rules: dict[str, Callable[..., Any]] = {}
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SemanticHook):
+                continue
+            value = self.registry.invoke_plain(hook, "get_custom_type_rules")
+            if value is not _HOOK_FAILED and value:
+                rules.update(value)
+        return rules
+
+    # ------------------------------------------------------------------
+    # Symbol / import resolution
+    # ------------------------------------------------------------------
+
+    def resolve_import(
+        self,
+        name: str,
+        context: CompilerContext,
+    ) -> Any | None:
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SymbolResolverHook):
+                continue
+            can = self.registry.invoke_plain(hook, "can_resolve_import", name)
+            if can is _HOOK_FAILED or not can:
+                continue
+            resolved = self.registry.invoke_context(
+                hook, "resolve_import", context, name
+            )
+            if resolved is not _HOOK_FAILED and resolved is not None:
+                return resolved
+        return None
+
+    def resolve_symbol(
+        self,
+        name: str,
+        context: CompilerContext,
+    ) -> Any | None:
+        for hook in self._hooks(HookStage.SEMANTIC):
+            if not isinstance(hook, SymbolResolverHook):
+                continue
+            can = self.registry.invoke_plain(hook, "can_resolve_symbol", name)
+            if can is _HOOK_FAILED or not can:
+                continue
+            resolved = self.registry.invoke_context(
+                hook, "resolve_symbol", context, name
+            )
+            if resolved is not _HOOK_FAILED and resolved is not None:
+                return resolved
+        return None
 
     # ------------------------------------------------------------------
     # Codegen
@@ -974,18 +1316,60 @@ class HookDispatcher:
         context: CompilerContext,
     ) -> Any | None:
 
-        for hook in self.registry.get(HookStage.CODEGEN):
+        for hook in self._hooks(HookStage.CODEGEN):
             if not isinstance(hook, CodegenHook):
                 continue
-
-            if hook.should_emit_node(node):
-                return hook.emit_node(
-                    node,
-                    builder,
-                    context,
-                )
+            should = self.registry.invoke_plain(hook, "should_emit_node", node)
+            if should is _HOOK_FAILED or not should:
+                continue
+            emitted = self.registry.invoke_context(
+                hook, "emit_node", context, node, builder
+            )
+            if emitted is not _HOOK_FAILED:
+                return emitted
 
         return None
+
+    def before_codegen(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> None:
+        for hook in self._hooks(HookStage.CODEGEN):
+            if isinstance(hook, CodegenHook):
+                self.registry.invoke_context(
+                    hook, "before_codegen", context, module
+                )
+
+    def after_codegen(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> None:
+        for hook in self._hooks(HookStage.CODEGEN):
+            if isinstance(hook, CodegenHook):
+                self.registry.invoke_context(
+                    hook, "after_codegen", context, module
+                )
+
+    # ------------------------------------------------------------------
+    # Optimization
+    # ------------------------------------------------------------------
+
+    def optimize_module(
+        self,
+        module: Any,
+        context: CompilerContext,
+    ) -> Any:
+        for hook in self._hooks(HookStage.OPTIMIZE):
+            if not isinstance(hook, OptimizeHook):
+                continue
+            optimized = self.registry.invoke_context(
+                hook, "optimize_module", context, module
+            )
+            if optimized is not _HOOK_FAILED:
+                module = optimized
+        return module
 
     # ------------------------------------------------------------------
     # Build
@@ -996,21 +1380,28 @@ class HookDispatcher:
         context: CompilerContext,
     ) -> None:
 
-        for hook in self.registry.get(HookStage.LINK):
+        for hook in self._hooks(HookStage.LINK):
             if not isinstance(hook, BuildHook):
                 continue
 
-            context.include_paths.extend(hook.get_include_paths(context))
+            for method, target in (
+                ("get_include_paths", context.include_paths),
+                ("get_library_paths", context.library_paths),
+                ("get_libraries", context.libraries),
+                ("get_compiler_flags", context.compiler_flags),
+                ("get_linker_flags", context.linker_flags),
+            ):
+                value = self.registry.invoke_context(
+                    hook, method, context
+                )
+                if value is not _HOOK_FAILED and value:
+                    target.extend(value)
 
-            context.library_paths.extend(hook.get_library_paths(context))
-
-            context.libraries.extend(hook.get_libraries(context))
-
-            context.defines.update(hook.get_defines(context))
-
-            context.compiler_flags.extend(hook.get_compiler_flags(context))
-
-            context.linker_flags.extend(hook.get_linker_flags(context))
+            defines = self.registry.invoke_context(
+                hook, "get_defines", context
+            )
+            if defines is not _HOOK_FAILED and defines:
+                context.defines.update(defines)
 
     # ------------------------------------------------------------------
     # Runtime
@@ -1023,16 +1414,52 @@ class HookDispatcher:
 
         result: list[str] = []
 
-        for hook in self.registry.get(HookStage.RUNTIME):
+        for hook in self._hooks(HookStage.RUNTIME):
             if not isinstance(hook, RuntimeHook):
                 continue
 
-            code = hook.get_runtime_code(context)
+            code = self.registry.invoke_context(
+                hook, "get_runtime_code", context
+            )
 
-            if code:
+            if code is not _HOOK_FAILED and code:
                 result.append(code)
 
         return result
+
+    def runtime_libraries(
+        self,
+        context: CompilerContext,
+    ) -> list[str]:
+        result: list[str] = []
+        for hook in self._hooks(HookStage.RUNTIME):
+            if not isinstance(hook, RuntimeHook):
+                continue
+            value = self.registry.invoke_context(
+                hook, "get_runtime_libraries", context
+            )
+            if value is not _HOOK_FAILED and value:
+                result.extend(value)
+        return result
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def lifecycle_before(self, context: CompilerContext) -> None:
+        for hook in self._hooks(HookStage.LIFECYCLE):
+            if isinstance(hook, LifecycleHook):
+                self.registry.invoke_context(hook, "before_compile", context)
+
+    def lifecycle_after(self, context: CompilerContext) -> None:
+        for hook in self._hooks(HookStage.LIFECYCLE):
+            if isinstance(hook, LifecycleHook):
+                self.registry.invoke_context(hook, "after_compile", context)
+
+    def lifecycle_error(self, context: CompilerContext) -> None:
+        for hook in self._hooks(HookStage.LIFECYCLE):
+            if isinstance(hook, LifecycleHook):
+                self.registry.invoke_context(hook, "on_compile_error", context)
 
 
 # ============================================================================

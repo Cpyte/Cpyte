@@ -7,6 +7,7 @@ extension capabilities like keywords, operators, tags, and parser hooks.
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,8 +30,59 @@ class ExtensionHooks:
     lexer_hooks: list[str] = field(default_factory=list)
     parser_hooks: list[str] = field(default_factory=list)
     semantic_hooks: list[str] = field(default_factory=list)
+    transform_hooks: list[str] = field(default_factory=list)
     codegen_hooks: list[str] = field(default_factory=list)
+    optimize_hooks: list[str] = field(default_factory=list)
+    build_hooks: list[str] = field(default_factory=list)
+    symbol_hooks: list[str] = field(default_factory=list)
     runtime_hooks: list[str] = field(default_factory=list)
+
+    def all_hook_files(self) -> list[str]:
+        """Every declared hook file, de-duplicated, order preserved."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for group in (
+            self.lexer_hooks,
+            self.parser_hooks,
+            self.semantic_hooks,
+            self.transform_hooks,
+            self.codegen_hooks,
+            self.optimize_hooks,
+            self.build_hooks,
+            self.symbol_hooks,
+            self.runtime_hooks,
+        ):
+            for path in group:
+                if path not in seen:
+                    seen.add(path)
+                    result.append(path)
+        return result
+
+    def parser_phase_hooks(self) -> list[str]:
+        """Hook files that must be loaded before lexing/parsing."""
+        return _dedupe(self.lexer_hooks + self.parser_hooks)
+
+    def deferred_hooks(self) -> list[str]:
+        """Hook files installed when the package is imported."""
+        return _dedupe(
+            self.semantic_hooks
+            + self.transform_hooks
+            + self.codegen_hooks
+            + self.optimize_hooks
+            + self.build_hooks
+            + self.symbol_hooks
+            + self.runtime_hooks
+        )
+
+
+def _dedupe(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+    return result
 
 
 @dataclass
@@ -51,6 +103,32 @@ class PackageManifest:
 
 class ManifestError(Exception):
     """Raised when manifest parsing or validation fails."""
+
+
+_SEMVER_RE = re.compile(
+    r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def _cpm_version_key(version: str):
+    match = _SEMVER_RE.fullmatch(version)
+    if match is None:
+        return (0, 0, 0, 0, 0, (), version.lower())
+    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+    prerelease = match.group(4)
+    identifiers = ()
+    if prerelease:
+        identifiers = tuple(
+            (0, int(part)) if part.isdigit() else (1, part.lower())
+            for part in prerelease.split(".")
+        )
+    return (1, major, minor, patch, int(prerelease is None), identifiers, "")
+
+
+def sort_cpm_versions(versions: list[str]) -> list[str]:
+    """Sort installed CPM version directory names from newest to oldest."""
+    return sorted(versions, key=_cpm_version_key, reverse=True)
 
 
 class ManifestValidator:
@@ -205,14 +283,7 @@ class ManifestValidator:
 
         # Validate hook file paths exist if package_dir is provided
         if manifest.package_dir:
-            all_hooks = (
-                manifest.extensions.lexer_hooks
-                + manifest.extensions.parser_hooks
-                + manifest.extensions.semantic_hooks
-                + manifest.extensions.codegen_hooks
-                + manifest.extensions.runtime_hooks
-            )
-            for hook in all_hooks:
+            for hook in manifest.extensions.all_hook_files():
                 hook_path = os.path.join(manifest.package_dir, hook)
                 if not os.path.exists(hook_path):
                     errors.append(
@@ -308,7 +379,11 @@ class ManifestParser:
             lexer_hooks=extensions_data.get("lexer_hooks", []),
             parser_hooks=extensions_data.get("parser_hooks", []),
             semantic_hooks=extensions_data.get("semantic_hooks", []),
+            transform_hooks=extensions_data.get("transform_hooks", []),
             codegen_hooks=extensions_data.get("codegen_hooks", []),
+            optimize_hooks=extensions_data.get("optimize_hooks", []),
+            build_hooks=extensions_data.get("build_hooks", []),
+            symbol_hooks=extensions_data.get("symbol_hooks", []),
             runtime_hooks=extensions_data.get("runtime_hooks", []),
         )
 
@@ -499,13 +574,12 @@ def iter_cpm_version_dirs(cpm_root: str):
         return
 
     def _versions(entry_dir: str) -> list[str]:
-        return sorted(
-            (
+        return sort_cpm_versions(
+            [
                 d
                 for d in os.listdir(entry_dir)
                 if os.path.isdir(os.path.join(entry_dir, d))
-            ),
-            reverse=True,
+            ]
         )
 
     for top in sorted(os.listdir(cpm_root)):

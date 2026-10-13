@@ -1111,7 +1111,8 @@ class SemanticAnalyzer:
             elif isinstance(node, ClassDef):
                 if node.name and node.name not in self._forward_names:
                     if self.globals.lookup_local(node.name) is None:
-                        self.globals.define(node.name, Symbol("class", node.name, node))
+                        is_proto = getattr(node, "is_protocol", False) or type(node).__name__ in ("ProtocolDef","InterfaceDef")
+                        self.globals.define(node.name, Symbol("protocol" if is_proto else "class", node.name, node))
                         self._forward_names.add(node.name)
             elif isinstance(node, EnumDef):
                 if node.name and node.name not in self._forward_names:
@@ -4965,7 +4966,8 @@ class SemanticAnalyzer:
 
     def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals
-        class_sym = Symbol("class", node.name, node)
+        is_proto = getattr(node, "is_protocol", False) or type(node).__name__ in ("ProtocolDef","InterfaceDef")
+        class_sym = Symbol("protocol" if is_proto else "class", node.name, node)
         s.define(node.name, class_sym)
         class_scope = Scope(s)
 

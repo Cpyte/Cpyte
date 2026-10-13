@@ -2487,6 +2487,7 @@ class ClassDef(Node):
         "name",
         "properties",
         "sealed",
+        "is_protocol",
     )
 
     def __init__(
@@ -2499,6 +2500,7 @@ class ClassDef(Node):
         sealed: bool = False,
         dataclass: bool = False,
         properties: list | None = None,
+        is_protocol: bool = False,
         token=None,
     ):
         self.name = name
@@ -2509,6 +2511,7 @@ class ClassDef(Node):
         self.sealed = sealed
         self.dataclass = dataclass
         self.properties = properties or []
+        self.is_protocol = is_protocol
         self.module = None
         self._token = token
 
@@ -2516,6 +2519,38 @@ class ClassDef(Node):
         seal = "sealed " if self.sealed else ""
         dc = "dataclass " if self.dataclass else ""
         return f"ClassDef({seal}{dc}{self.name}, base={self.base}, fields={self.fields}, properties={self.properties}, methods={self.methods})"
+
+
+
+class ProtocolDef(Node):
+    __slots__ = ("_token", "base", "name", "methods", "properties", "fields", "generic_params", "sealed", "is_protocol")
+
+    def __init__(
+        self,
+        name: str,
+        base: str | None = None,
+        methods: list | None = None,
+        fields: list | None = None,
+        properties: list | None = None,
+        generic_params: list | None = None,
+        token=None,
+    ):
+        self.name = name
+        self.base = base
+        self.methods = methods or []
+        self.fields = fields or []
+        self.properties = properties or []
+        self.generic_params = generic_params or []
+        self.sealed = False
+        self.is_protocol = True
+        self._token = token
+
+    def __repr__(self):
+        return f"ProtocolDef({self.name}, base={self.base}, methods={self.methods})"
+
+
+# Alias
+InterfaceDef = ProtocolDef
 
 
 class PropertyDef(Node):

@@ -2394,6 +2394,8 @@ class LLVM:
         constant function bitcast is ever needed.
         """
         cls = node.name
+        if cls in self._vt_globals:
+            return
         slots = self._class_slot_list(cls)
         vt_ty = ir.LiteralStructType(
             [_i64]

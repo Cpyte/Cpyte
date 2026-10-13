@@ -105,6 +105,7 @@ from .astparse import (
     CastExpr,
     CCode,
     ClassDef,
+    ProtocolDef,
     Continue,
     DeferStmt,
     DelStmt,
@@ -4157,7 +4158,7 @@ class SemanticAnalyzer:
                 bsym = (self.current_scope or self.globals).lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -4858,7 +4859,7 @@ class SemanticAnalyzer:
                     bsym = self.globals.lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -4873,7 +4874,7 @@ class SemanticAnalyzer:
         sym = self.current_scope.lookup(base)
         if sym is None:
             sym = self.globals.lookup(base)
-        if sym is not None and sym.kind == "class" and isinstance(sym.node, ClassDef):
+        if sym is not None and sym.kind == "class" and isinstance(sym.node, (ClassDef, ProtocolDef)):
             return sym.node
         return None
 
@@ -4935,7 +4936,7 @@ class SemanticAnalyzer:
     def _collect_class_fields(self, cnode):
         """Base-first flattened field list for a class, including inherited
         fields (Attr resolution needs the same layout the codegen uses)."""
-        if cnode is None or not isinstance(cnode, ClassDef):
+        if cnode is None or not isinstance(cnode, (ClassDef, ProtocolDef)):
             return []
         chain = []
         seen = set()
@@ -4951,7 +4952,7 @@ class SemanticAnalyzer:
                     bsym = self.globals.lookup(cur.base)
                 cur = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -5185,7 +5186,7 @@ class SemanticAnalyzer:
                 bsym = (self.current_scope or self.globals).lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, ClassDef)
+                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:

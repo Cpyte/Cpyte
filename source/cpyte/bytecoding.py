@@ -6752,6 +6752,11 @@ class LLVM:
         kind = meta.get("kind")
         if kind == "is_const":
             return ir.Constant(_i1, 1 if meta.get("value") else 0)
+        if kind == "is_proto_runtime":
+            proto_name = meta.get("proto")
+            # For now, minimal stub: return false (protocol tables not fully wired yet)
+            # Later: build protocol->classid bitmask or check implementation set
+            return ir.Constant(_i1, 0)
         cls_name = meta.get("cls")
         self._emit_ancestor_grid()
         grid = self._ancestor_grid

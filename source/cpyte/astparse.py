@@ -1352,6 +1352,9 @@ def _parse_standard_statement(tokens: list[Token], pos: int):
     elif tok.type == TokenType.KEYWORD and tok.value == "dataclass":
         # `dataclass class X:` — auto-synthesized `__init__`/`__eq__`/`__str__`.
         node, pos = parse_dataclass_class(tokens, pos)
+    elif tok.type == TokenType.KEYWORD and tok.value in ("interface", "protocol"):
+        # `interface I:` or `protocol I:` (minimal)
+        node, pos = parse_protocol_class(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "class":
         node, pos = parse_class(tokens, pos)
     elif tok.type == TokenType.KEYWORD and tok.value == "struct":
@@ -1685,6 +1688,56 @@ def parse_dataclass_class(tokens: list[Token], pos: int):
             tokens[pos] if pos < len(tokens) else None,
         )
     return parse_class(tokens, pos, sealed=sealed, dataclass=True)
+
+
+
+def parse_protocol_class(tokens: list[Token], pos: int):
+    """Parse `interface I:` or `protocol I:` as a protocol definition."""
+    tok = tokens[pos]
+    pos += 1
+    if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+        raise ParseError(
+            "Expected interface/protocol name", tokens[pos] if pos < len(tokens) else None
+        )
+    name = tokens[pos].value
+    assert name is not None
+    pos += 1
+    generic_params, pos = parse_generic_params(tokens, pos)
+    base = None
+    if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
+            raise ParseError(
+                "Expected base protocol name", tokens[pos] if pos < len(tokens) else None
+            )
+        base = tokens[pos].value
+        pos += 1
+        if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
+            raise ParseError(
+                'Expected ")" after base protocol name',
+                tokens[pos] if pos < len(tokens) else None,
+            )
+        pos += 1
+    body, pos = parse_class_suite(tokens, pos)
+    fields = []
+    methods = []
+    properties = []
+    for stmt in body:
+        if isinstance(stmt, FuncDef):
+            methods.append(stmt)
+        elif isinstance(stmt, VarDecl):
+            fields.append(Field(stmt.name, stmt.var_type, token=stmt._token))
+        elif isinstance(stmt, PropertyDef):
+            properties.append(stmt)
+    return ProtocolDef(
+        name,
+        base=base,
+        fields=fields,
+        methods=methods,
+        properties=properties,
+        generic_params=generic_params,
+        token=tok,
+    ), pos
 
 
 def parse_property(tokens: list[Token], pos: int):

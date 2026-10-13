@@ -864,6 +864,12 @@ class LLVM:
         self._vt_slots = {}  # name -> {method_name: (slot_index, fnty)}
         self._class_ids = {}  # name -> int (O(1) RTTI for isinstance, stage 3)
         self._class_meta_globals = {}  # name -> ir.GlobalVariable
+        # Protocol interface (OOP B)
+        self._protocol_ids = {}  # proto_name -> int
+        self._protocol_nodes = {}  # proto_name -> ProtocolDef/InterfaceDef
+        self._protocol_lists = {}  # proto_name -> [method/property names] (minimal)
+        self._protocol_impl = {}  # class_name -> set(proto_name)
+        self._protocol_meta_globals = {}  # proto_name -> ir.GlobalVariable
         self._emit_depth = 0
         self._emit_memo = {}
         self._in_emit_iterative = False

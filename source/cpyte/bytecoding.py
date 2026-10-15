@@ -1549,28 +1549,19 @@ class LLVM:
 
         def _collect_nodes(nodes):
             for node in nodes:
-                # ProtocolDef lives in astparse; we can check by class name
                 ntype = type(node)
                 if ntype.__name__ in ("ProtocolDef", "InterfaceDef"):
-                    if node not in structs:  # not needed
-                        pass
-                    # track separately? collect into structs or track protocols
-                    pass
-                if isinstance(node, (StructDef, ClassDef)):
-                    structs.append(node)
-                # protocol
-                if ntype.__name__ in ("ProtocolDef", "InterfaceDef"):
                     self._protocol_nodes[node.name] = node
-                    # assign id
                     if node.name not in self._protocol_ids:
                         self._protocol_ids[node.name] = len(self._protocol_ids)
-                    # build list
                     lst = []
-                    for m in getattr(node,'methods',[]):
+                    for m in getattr(node, "methods", []):
                         lst.append(m.name)
-                    for pr in getattr(node,'properties',[]):
+                    for pr in getattr(node, "properties", []):
                         lst.append(pr.name)
                     self._protocol_lists[node.name] = lst
+                elif isinstance(node, (StructDef, ClassDef)):
+                    structs.append(node)
                 elif isinstance(node, Import):
                     imports.append(node)
                     if getattr(node, "sub_ast", None):

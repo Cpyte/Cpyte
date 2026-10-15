@@ -2357,10 +2357,15 @@ class AddrOf(Node):
 
 
 class SizeOf(Node):
-    __slots__ = ("_token", "type_expr")
+    __slots__ = ("_token", "type_expr", "resolved_type")
 
     def __init__(self, type_expr, token=None):
         self.type_expr = type_expr
+        # Semantic analysis fills this in: `sizeof(x)` where `x` names a
+        # declared value resolves to the type OF that value (C semantics),
+        # while `sizeof(T)` keeps the type name as written. Codegen sizes the
+        # resolved type; the formatter prints `type_expr` unchanged.
+        self.resolved_type = None
         self._token = token
 
     def __repr__(self):

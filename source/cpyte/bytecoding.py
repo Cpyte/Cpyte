@@ -2738,7 +2738,11 @@ class LLVM:
 
     @register_emitter(SizeOf)
     def emit_sizeof(self, node: SizeOf):
-        ty = self.llvm_type(node.type_expr)
+        # `resolved_type` carries the semantic resolution: `sizeof(x)` where
+        # `x` is a declared value sizes that value's type, while `sizeof(T)`
+        # sizes the type as written. Fall back to `type_expr` for nodes that
+        # never went through semantic analysis.
+        ty = self.llvm_type(getattr(node, "resolved_type", None) or node.type_expr)
         return self._sizeof_type(ty)
 
     @register_emitter(CastExpr)
@@ -4628,9 +4632,12 @@ class LLVM:
                     val = self.emit(right_node)
                     other = left_node
                 if isinstance(val.type, ir.IntType) and val.type.width >= 2:
-                    k = ir.Constant(val.type, shift_k)
-                    k = self._clamp_shift_amount(k, val.type.width)
-                    return self.builder.shl(val, k)
+                    if shift_k >= val.type.width:
+                        # The scalar type wraps at `width` bits, so 2**k is a
+                        # multiple of the modulus and the product is 0.  Do NOT
+                        # emit `shl` here: a shift >= width is poison.
+                        return ir.Constant(val.type, 0)
+                    return self.builder.shl(val, ir.Constant(val.type, shift_k))
             # ---- x * (2^k + 1)  ->  (x << k) + x ----
             left_v = _const_int_value(left_node)
             right_v = _const_int_value(right_node)
@@ -4638,28 +4645,28 @@ class LLVM:
                 # right_node * (left_v)  ->  (right << k) + right
                 k = _log2_floor(left_v - 1)
                 val = self.emit(right_node)
-                if isinstance(val.type, ir.IntType):
-                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
-                    return self.builder.add(shifted, val)
+                res = self._strength_reduce_shl_pm(val, k, add=True)
+                if res is not None:
+                    return res
             if right_v is not None and right_v > 2 and _is_power_of_2(right_v - 1):
                 k = _log2_floor(right_v - 1)
                 val = self.emit(left_node)
-                if isinstance(val.type, ir.IntType):
-                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
-                    return self.builder.add(shifted, val)
+                res = self._strength_reduce_shl_pm(val, k, add=True)
+                if res is not None:
+                    return res
             # ---- x * (2^k - 1)  ->  (x << k) - x ----
             if left_v is not None and left_v > 1 and _is_power_of_2(left_v + 1):
                 k = _log2_floor(left_v + 1)
                 val = self.emit(right_node)
-                if isinstance(val.type, ir.IntType):
-                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
-                    return self.builder.sub(shifted, val)
+                res = self._strength_reduce_shl_pm(val, k, add=False)
+                if res is not None:
+                    return res
             if right_v is not None and right_v > 1 and _is_power_of_2(right_v + 1):
                 k = _log2_floor(right_v + 1)
                 val = self.emit(left_node)
-                if isinstance(val.type, ir.IntType):
-                    shifted = self.builder.shl(val, ir.Constant(val.type, k))
-                    return self.builder.sub(shifted, val)
+                res = self._strength_reduce_shl_pm(val, k, add=False)
+                if res is not None:
+                    return res
 
         # ---- x + 0  /  0 + x  ->  x ----
         if op == TokenType.PLUS:
@@ -4769,6 +4776,24 @@ class LLVM:
                         return self._strength_reduce_mul10(var_node)
 
         return None
+
+    def _strength_reduce_shl_pm(self, val, k, add):
+        """Lower ``x * (2**k ± 1)`` to ``(x << k) ± x`` at the operand width.
+
+        Returns ``None`` when *val* is not an integer (caller falls through).
+        When ``k >= val.type.width`` the ``2**k`` term is ``0`` modulo the
+        width, so the product is exactly ``±x`` -- a raw ``shl`` by an
+        out-of-range amount would be a poison value, not a wrap."""
+        if not isinstance(val.type, ir.IntType):
+            return None
+        if k >= val.type.width:
+            if add:
+                return val
+            return self.builder.sub(ir.Constant(val.type, 0), val)
+        shifted = self.builder.shl(val, ir.Constant(val.type, k))
+        if add:
+            return self.builder.add(shifted, val)
+        return self.builder.sub(shifted, val)
 
     def _strength_reduce_mul3(self, var_node):
         val = self.emit(var_node)

@@ -1939,6 +1939,7 @@ class SemanticAnalyzer:
             return node.inferred_type
 
         if isinstance(node, SizeOf):
+            self._resolve_sizeof_arg(node)
             return "int"
 
         if isinstance(node, CastExpr):
@@ -2342,7 +2343,7 @@ class SemanticAnalyzer:
         ):
             self._infer_type(node)
         elif isinstance(node, SizeOf):
-            pass
+            self._infer_type(node)
         elif isinstance(node, InlineAsm):
             for _, var_expr in node.outputs:
                 if isinstance(var_expr, Variable):
@@ -5491,6 +5492,28 @@ class SemanticAnalyzer:
             self._visit(stmt, loop_scope)
         self._loop_depth -= 1
         self.locals = old_locals
+
+    def _resolve_sizeof_arg(self, node):
+        """`sizeof(x)` accepts a type name OR a value expression.
+
+        An identifier that names a declared value refers to that value's type
+        (C semantics: with `int x`, `sizeof(x)` is `sizeof(int)`). Anything
+        else stays a type name and is resolved through type aliases. Codegen
+        reads ``resolved_type`` (falling back to the raw ``type_expr``), while
+        the formatter keeps printing ``type_expr`` so `sizeof(x)` round-trips.
+        """
+        name = node.type_expr
+        node.resolved_type = None
+        if not isinstance(name, str) or not name:
+            return
+        sym = self.current_scope.lookup(name)
+        if sym is not None and sym.kind in ("variable", "const", "const_view"):
+            resolved = self._resolve_type_alias(sym.type)
+        else:
+            resolved = self._resolve_type_alias(name)
+        if resolved:
+            node.resolved_type = resolved
+            self._check_generic_type(resolved)
 
     def _resolve_type_alias(self, type_name):
         if type_name is None:

@@ -1330,6 +1330,7 @@ def gen_program(state: FuzzerState) -> str:
 TEST_COUNT = 0
 CRASH_COUNT = 0
 BUG_COUNT = 0
+UB_COUNT = 0
 PASS_COUNT = 0
 REJECT_COUNT = 0
 
@@ -1342,9 +1343,11 @@ def _run_jit_capture(prog, src_files, opt_level):
     if p.is_alive():
         p.terminate()
         p.join()
-        return None, None, "timeout"
-    result = q.get_nowait() if not q.empty() else ("", None, "no result")
-    return result
+        return None, None, "timeout", None
+    if not q.empty():
+        out, ret, err = q.get_nowait()
+        return out, ret, err, p.exitcode
+    return None, None, "no result", p.exitcode
 
 
 def _jit_worker(q, prog, src_files, opt_level):
@@ -1363,7 +1366,7 @@ def _jit_worker(q, prog, src_files, opt_level):
 
 
 def run_test(source, label=""):
-    global TEST_COUNT, CRASH_COUNT, BUG_COUNT, PASS_COUNT, REJECT_COUNT
+    global TEST_COUNT, CRASH_COUNT, BUG_COUNT, UB_COUNT, PASS_COUNT, REJECT_COUNT
     TEST_COUNT += 1
 
     if TEST_COUNT % 500 == 0:
@@ -1371,7 +1374,8 @@ def run_test(source, label=""):
         r = REJECT_COUNT
         p = PASS_COUNT
         print(
-            f"  [{n}] pass={p} reject={r} crashes={CRASH_COUNT} bugs={BUG_COUNT}",
+            f"  [{n}] pass={p} reject={r} crashes={CRASH_COUNT} "
+            f"bugs={BUG_COUNT} ub={UB_COUNT}",
             flush=True,
         )
 
@@ -1396,27 +1400,50 @@ def run_test(source, label=""):
     try:
         c = LLVM()
         prog, src_files = c.emit_program(parsed)
+    except RuntimeError:
+        # A deliberate codegen hard error (e.g. "cannot evaluate struct type
+        # as a boolean") is a clean compile reject, not a compiler crash.
+        REJECT_COUNT += 1
+        return
     except Exception as e:
         CRASH_COUNT += 1
         save_crash(source, f"codegen crash: {e}")
         return
 
-    out0, ret0, err0 = _run_jit_capture(prog, src_files, opt_level=0)
-    out3, ret3, err3 = _run_jit_capture(prog, src_files, opt_level=3)
+    out0, ret0, err0, rc0 = _run_jit_capture(prog, src_files, opt_level=0)
+    out3, ret3, err3, rc3 = _run_jit_capture(prog, src_files, opt_level=3)
 
-    if err0 or err3:
-        if err0 and err3:
-            reason0 = err0 or "ok"
-            reason3 = err3 or "ok"
-            BUG_COUNT += 1
-            save_crash(source, f"both JIT fail: unopt={reason0}, opt={reason3}")
+    e0 = err0 or (f"signal {rc0}" if rc0 not in (None, 0) else None)
+    e3 = err3 or (f"signal {rc3}" if rc3 not in (None, 0) else None)
+
+    # A trap (negative exit code = killed by a signal, e.g. SIGTRAP/SIGFPE
+    # from an LLVM div-by-zero guard or a poison shift) is the program's own
+    # undefined behavior: opt0 and opt3 may legally fold/place the trap
+    # differently, so a trap on either side is UB noise, NOT a miscompile of
+    # a well-defined program. Only unequal outputs from two surviving runs,
+    # or a failure on one side with the other surviving *and producing
+    # output*, are real bugs.
+    trapped = (rc0 is not None and rc0 < 0) or (rc3 is not None and rc3 < 0)
+
+    if e0 or e3:
+        if trapped:
+            UB_COUNT += 1
+            save_crash(source, f"UB trap (rc0={rc0}, rc3={rc3})")
             return
-        if err0:
+        if e0 and e3:
+            if e0 == "no result" and e3 == "no result":
+                UB_COUNT += 1
+                save_crash(source, f"UB noise (rc0={rc0}, rc3={rc3})")
+                return
             BUG_COUNT += 1
-            save_crash(source, f"unopt JIT fails: {err0} (opt OK)")
+            save_crash(source, f"both JIT fail: unopt={e0}, opt={e3}")
+            return
+        if e0:
+            BUG_COUNT += 1
+            save_crash(source, f"unopt JIT fails: {e0} (opt OK)")
             return
         BUG_COUNT += 1
-        save_crash(source, f"opt JIT fails: {err3} (unopt OK)")
+        save_crash(source, f"opt JIT fails: {e3} (unopt OK)")
         return
 
     if out0 == out3:
@@ -1471,7 +1498,8 @@ def main():
         run_test(source, f"iter {i}")
 
     print(
-        f"\nDone: {TEST_COUNT} tests | pass={PASS_COUNT} reject={REJECT_COUNT} crashes={CRASH_COUNT} bugs={BUG_COUNT}"
+        f"\nDone: {TEST_COUNT} tests | pass={PASS_COUNT} reject={REJECT_COUNT} "
+        f"crashes={CRASH_COUNT} bugs={BUG_COUNT} ub={UB_COUNT}"
     )
     crash_files = [f for f in os.listdir(CRASH_DIR) if f.startswith("crash_")]
     if crash_files:

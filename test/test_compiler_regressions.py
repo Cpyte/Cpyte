@@ -2,6 +2,7 @@
 """Regression checks for compiler API and pointer arithmetic semantics."""
 
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -134,6 +135,32 @@ def test_counted_loop_unrolling_preserves_integer_wraparound():
     )
     assert 'while.cond:' in ir
     assert 'while.body:' in ir
+
+
+def test_mul_power_of_two_strength_reduction_never_shifts_out_of_range():
+    # ``x * (2**k ± 1)`` and ``x * 2**k`` are lowered to shifts. When ``k``
+    # reaches the operand's bit width the shifted term is 0 modulo the type,
+    # so the reduction must fall back to ``±x`` / ``0`` instead of emitting
+    # ``shl iN %x, k`` with ``k >= N`` (an LLVM poison value). All the
+    # multipliers below used to hit that path.
+    ir = compile_program(
+        "def by_pow2(x: int) -> int:\n"
+        "    return x * 4294967296\n"  # 2**32 -> 0
+        "def by_minus1(x: int) -> int:\n"
+        "    return x * 4294967295\n"  # 2**32 - 1 -> -x
+        "def by_plus1(x: int) -> int:\n"
+        "    return x * 4294967297\n"  # 2**32 + 1 -> x
+        "def by_valid(x: int) -> int:\n"
+        "    return x * 2147483649\n"  # 2**31 + 1 -> valid shl by 31
+        "public main() -> int:\n"
+        "    return by_valid(3)\n"
+    )
+    for width, amount in re.findall(r"shl i(\d+) %[^,]+, (\d+)", ir):
+        assert int(amount) < int(width), f"out-of-range shl i{width} by {amount}"
+    # The k < width cases must still reduce to shifts, not be dropped.
+    assert re.search(r"shl i32 %[^,]+, 31", ir)
+    # 2**k - 1 becomes a plain negation at i32 width.
+    assert "sub i32 0, %" in ir
 
 
 def test_sef_checker_rejects_truncated_relocation_records():

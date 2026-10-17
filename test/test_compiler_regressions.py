@@ -163,6 +163,93 @@ def test_mul_power_of_two_strength_reduction_never_shifts_out_of_range():
     assert "sub i32 0, %" in ir
 
 
+def test_auto_type_inference_compiles():
+    # `auto` infers its type from the initializer / return value; semantic
+    # stamps the concrete type onto the AST before codegen, so these programs
+    # lower to valid IR (an unresolved `auto` would fail llvm_type).
+    ir = compile_program(
+        "struct P:\n"
+        "    int x\n"
+        "class C:\n"
+        "    int n\n"
+        "    def __init__(n: int):\n"
+        "        this.n = n\n"
+        "    def get() -> auto:\n"
+        "        return this.n\n"
+        "def add(a: int, b: int) -> auto:\n"
+        "    return a + b\n"
+        "public def main() -> int:\n"
+        "    auto i = 5\n"
+        "    auto d = 3.5\n"
+        "    auto s = \"hi\"\n"
+        "    auto p = new P\n"
+        "    auto c = new C(7)\n"
+        "    auto t = add(1, 2)\n"
+        "    print(i)\n"
+        "    print(d)\n"
+        "    print(s)\n"
+        "    print(p.x)\n"
+        "    print(c.get())\n"
+        "    print(t)\n"
+        "    return 0\n"
+    )
+    assert 'define i32 @"main"' in ir
+    assert 'define i32 @"C.get"' in ir
+
+
+def test_auto_inference_errors_are_diagnostics():
+    invalid_programs = (
+        (
+            "public def main() -> int:\n    auto y\n    return 0\n",
+            "needs an initializer",
+        ),
+        (
+            (
+                "def f(a: int) -> auto:\n"
+                "    if a:\n"
+                "        return 1\n"
+                "    return \"x\"\n"
+                "public def main() -> int:\n    return f(1)\n"
+            ),
+            "conflicting return types",
+        ),
+        (
+            "struct S:\n    auto x\npublic def main() -> int:\n    return 0\n",
+            "struct fields have no initializer",
+        ),
+        (
+            "class C:\n    auto n\npublic def main() -> int:\n    return 0\n",
+            "class fields have no initializer",
+        ),
+        (
+            (
+                "def f(x: auto) -> int:\n    return 0\n"
+                "public def main() -> int:\n    return 0\n"
+            ),
+            "parameters have no initializer",
+        ),
+        (
+            (
+                "def nothing() -> void:\n    return\n"
+                "public def main() -> int:\n"
+                "    auto z = nothing()\n    return 0\n"
+            ),
+            "has no concrete type",
+        ),
+        (
+            "public def main() -> int:\n    auto w = (auto)5\n    return 0\n",
+            "cannot be used as a cast target",
+        ),
+    )
+    for source, needle in invalid_programs:
+        try:
+            parse_and_analyze(source, enable_extensions=False)
+        except CpyteCompileError as exc:
+            assert needle in str(exc), f"{needle!r} not in:\n{exc}"
+            continue
+        raise AssertionError(f"invalid `auto` program was accepted:\n{source}")
+
+
 def test_sef_checker_rejects_truncated_relocation_records():
     data = bytearray(
         sef.pack_segments(
@@ -195,5 +282,8 @@ if __name__ == "__main__":
     test_compound_index_assignment_evaluates_index_once()
     test_zero_multiplication_preserves_call_side_effects()
     test_counted_loop_unrolling_preserves_integer_wraparound()
+    test_mul_power_of_two_strength_reduction_never_shifts_out_of_range()
+    test_auto_type_inference_compiles()
+    test_auto_inference_errors_are_diagnostics()
     test_sef_checker_rejects_truncated_relocation_records()
     print("Compiler regression tests passed.")

@@ -30,6 +30,7 @@ CPYTE = ROOT / "source" / "cpyte" / "__main__.py"
 CORPUS: tuple[str, ...] = (
     "examples/c_import_example.cpy",
     "examples/test2am9august.cpy",
+    "test/test_auto.cpy",
     "test/test_big.cpy",
     "test/test_big2.cpy",
     "test/test_big_hex.cpy",

@@ -1,5 +1,72 @@
 # Notes
 
+## Oct 2026: `auto` type inference (locals, globals, `-> auto` returns)
+
+`auto` is now a real inference keyword, implemented directly in
+`semantic_analasis.py`, plus a standalone AOT link fix discovered while
+verifying it (see next section).
+
+- **`auto x = <value>`**: the declaration type is inferred from the
+  initializer's `inferred_type` (locals AND globals — both go through
+  `_visit_vardecl`). Works for `int`/`int64`/`double`/`str`/`char*`/struct
+  pointers/class pointers/`dynamic` (an `auto` bound to a `dynamic` value
+  stays dynamic) and generic instantiations (the resolved type is passed
+  through `_check_generic_type`). `auto x` with NO initializer is a clean
+  E0001 error (`cannot infer the type of \`x\`: \`auto\` needs an initializer`);
+  a value with no concrete type (e.g. `auto z = nothing()` where `nothing`
+  returns void) is `cannot infer \`auto\` type of variable \`z\`: the value has
+  no concrete type`. `auto b = 4294967296` keeps the literal's int64 width
+  (no i32 truncation) — `auto` is strictly at least as precise as `int`.
+- **`def f(...) -> auto`**: the return type is resolved from the function's
+  `return <expr>` statements via a per-function stack
+  (`self._auto_ret_stack`). No value returns (none, or bare `return`) infer
+  `void`; one distinct value type is the return type; conflicting value types
+  are `cannot infer \`auto\` return type of \`f\`: conflicting return types
+  \`int\`, \`str\``. Distinctness is compared by `_array_family` (so `T` vs
+  `T*` vs `T[]` are different). Works for methods and for property getters
+  (`property p: get: return ...` — an `auto` getter resolves to its concrete
+  value type before `_visit_property` reads `_ptype`).
+- **Where `auto` is a clean error (E0001)**: a parameter (`parameters have no
+  initializer to infer from`), a struct field / class field (`... fields have
+  no initializer to infer from`), and a cast target (`(auto)x` →
+  ``\`auto\` cannot be used as a cast target``).
+- **Override-signature check ordering**: `_visit_class` used to compare each
+  method's signature against the base BEFORE `_visit_funcdef` injected `this`
+  / visited the body. That would have compared an `-> auto` override while its
+  rettype was still the literal `auto`. The check now runs AFTER the body is
+  visited (so `auto` has resolved to its concrete type); synthesized dataclass
+  dunders and `__init__` stay exempt as before.
+- **Harness**: `test/test_auto.cpy` (added to `ci_test.py` CORPUS, now 33/33)
+  self-checks auto locals (int/double/str/struct-ptr/class-ptr), a global
+  `auto`, an `-> auto` function, an `auto`-returning method, an `auto` override,
+  and a property `auto` getter. `test/test_compiler_regressions.py` gains
+  `test_auto_type_inference_compiles` (asserts the emitted IR has
+  `define i32 @"main"` and `define i32 @"C.get"`) and
+  `test_auto_inference_errors_are_diagnostics` (7 negative programs). Verified
+  identical output on JIT opt0/opt3 and native AOT; `ci_bomb.py` 2500/2500.
+
+## Oct 2026: AOT link now needs `-lmpfr` (every program, not just `big`)
+
+- **Symptom**: `cpyte build` / `run_aot` failed at link with
+  `ld: Undefined symbols for architecture arm64: "_mpfr_set_z", referenced
+  from: _bigint_to_mpfr`. AOT was broken at HEAD — unrelated to `auto`.
+- **Cause**: `bignum.c` `#include <mpfr.h>` and its `bigint_to_mpfr` helper
+  calls `mpfr_set_z`. The bignum IR is linked into EVERY program object (the
+  `_BIGNUM_KEEP` set retains `bigint_to_mpfr`), so every `.o` has an undefined
+  `_mpfr_set_z` even when the program never uses `big` (verified:
+  `nm hello.o` → `T _bigint_to_mpfr` + `U _mpfr_set_z`). The AOT link line was
+  `libraries=["m", "gmp"]` (and `["gmp"]` in `run_aot`) — no `mpfr`.
+- **Fix**: new `aot_link_libraries()` in `compiling.py` returns `["m", "gmp"]`
+  plus `["mpfr"]` **only when `_libmpfr is not None`** (libmpfr has to be
+  discovered by the existing probe to be usable, and a system without it cannot
+  build the MPFR-backed runtime anyway). Used in `compiling.py::run_aot` and
+  `mainpie.py::cmd_build`; `aot_link_libraries` is imported in BOTH
+  `mainpie.py` import blocks. `library_paths=_gmp_library_paths()` (Homebrew
+  keg `-L` paths) was already passed and is still required — a bare `-lmpfr`
+  fails `library 'mpfr' not found`. Confirmed: without `-L` paths the link
+  dies at `library 'gmp' not found`; with paths but no `-lmpfr` it dies at
+  `_mpfr_set_z`; with the fix it links and runs.
+
 ## v4.6.0 release (Oct 2026, module-namespaced struct/class identity)
 
 - **Problem**: cpyte had a single flat namespace for type names, so two CPM

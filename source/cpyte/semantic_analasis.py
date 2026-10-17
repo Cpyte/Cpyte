@@ -703,6 +703,7 @@ class SemanticAnalyzer:
         self._infer_memo: dict[int, str] = {}
         self._in_iterative = False
         self._in_decorator = False
+        self._auto_ret_stack: list[list[str]] = []
         self._lazy_imports: list[dict] = []
         self._lazy_header_cache: dict[tuple, tuple] = {}
         self._lazy_load_error: str | None = None
@@ -1945,6 +1946,14 @@ class SemanticAnalyzer:
         if isinstance(node, CastExpr):
             self._infer_type(node.expr)
             resolved = self._resolve_type_alias(node.type_expr)
+            if resolved == "auto":
+                self.error(
+                    "`auto` cannot be used as a cast target",
+                    node,
+                    code="E0001",
+                    note="cast to an explicit type, or drop the cast",
+                )
+                resolved = getattr(node.expr, "inferred_type", None) or "int"
             node.type_expr = resolved
             node.inferred_type = resolved
             return resolved
@@ -3064,6 +3073,10 @@ class SemanticAnalyzer:
         sym = Symbol("function", node.rettype or "void", node)
         s.define(node.name, sym)
 
+        is_auto_ret = node.rettype == "auto"
+        if is_auto_ret:
+            self._auto_ret_stack.append([])
+
         old_func = self.current_func
         self.current_func = node
         old_in_decorator = self._in_decorator
@@ -3073,6 +3086,14 @@ class SemanticAnalyzer:
 
         const_params = set(getattr(node, "const_params", None) or ())
         for param_name, param_type in node.params.items():
+            if param_type == "auto":
+                self.error(
+                    f"cannot infer the type of parameter `{param_name}`: "
+                    f"parameters have no initializer to infer from",
+                    node,
+                    code="E0001",
+                    note="declare an explicit parameter type",
+                )
             if param_name in const_params:
                 # Constant-view parameter: read-only inside the function, but the
                 # caller's value stays fully modifiable outside.
@@ -3087,6 +3108,10 @@ class SemanticAnalyzer:
 
         for stmt in node.body:
             self._visit(stmt, self.locals)
+
+        if is_auto_ret:
+            node.rettype = self._resolve_auto_return(node, self._auto_ret_stack.pop())
+            sym.type = node.rettype
 
         self._check_ownership(node.body, node)
         self._check_lints(node.body, node)
@@ -3697,9 +3722,59 @@ class SemanticAnalyzer:
                 self._visit(stmt, else_scope)
         self.locals = old_locals
 
+    def _infer_auto_type(self, inferred, node, what: str) -> str:
+        """Resolve `auto` to the concrete type of an initializer value.
+
+        `inferred` is the type inferred for the value. A value with no concrete
+        type (e.g. a `void` call) cannot constrain `auto` and is a clean error.
+        """
+        if inferred in (None, "", "void", "auto"):
+            self.error(
+                f"cannot infer `auto` type of {what}: the value has no concrete type",
+                node,
+                code="E0001",
+                note="declare an explicit type instead",
+            )
+            return "int"
+        resolved = self._resolve_type_alias(inferred) or inferred
+        self._check_generic_type(resolved)
+        return resolved
+
+    def _resolve_auto_return(self, node: FuncDef, ret_types: list) -> str:
+        """Resolve an `auto` return type from the function's return statements.
+
+        Every `return <expr>` contributes its inferred type. No value returns
+        (or only bare `return`) infer `void`; a single distinct value type is
+        the inferred return type; conflicting value types are a clean error.
+        """
+        uniq: list[str] = []
+        for t in ret_types:
+            if t in (None, "", "void", "auto"):
+                continue
+            if all(_array_family(t) != _array_family(u) for u in uniq):
+                uniq.append(t)
+        if not uniq:
+            return "void"
+        if len(uniq) > 1:
+            shown = ", ".join(f"`{t}`" for t in uniq)
+            self.error(
+                f"cannot infer `auto` return type of `{node.name}`: "
+                f"conflicting return types {shown}",
+                node,
+                code="E0001",
+                note="give the function an explicit return type",
+            )
+        return uniq[0]
+
     def _visit_return(self, node: Return):
         if node.value is not None:
             val_type = self._infer_type(node.value)
+            if (
+                self.current_func is not None
+                and self.current_func.rettype == "auto"
+                and self._auto_ret_stack
+            ):
+                self._auto_ret_stack[-1].append(val_type)
             if self.current_func:
                 expected = self.current_func.rettype
                 if (
@@ -4565,6 +4640,15 @@ class SemanticAnalyzer:
 
     def _visit_vardecl(self, node: VarDecl, scope: Scope | None = None):
         val_type = self._resolve_type_alias(node.var_type)
+        if val_type == "auto" and node.init is None:
+            # `auto` with no initializer has nothing to infer from.
+            self.error(
+                f"cannot infer the type of `{node.name}`: `auto` needs an initializer",
+                node,
+                code="E0001",
+                note=f"write `auto {node.name} = <value>` or declare an explicit type",
+            )
+            val_type = "int"
         node.var_type = val_type
         if val_type:
             self._check_generic_type(val_type)
@@ -4591,6 +4675,14 @@ class SemanticAnalyzer:
             )
         if node.init is not None:
             init_type = self._infer_type(node.init)
+            if val_type == "auto":
+                # `auto x = <value>` infers the declared type from the value.
+                val_type = self._infer_auto_type(
+                    init_type, node, f"variable `{node.name}`"
+                )
+                node.var_type = val_type
+                if val_type:
+                    self._check_generic_type(val_type)
             if val_type == "ubig":
                 self._check_ubig_no_negative(node.init, node, "declaration")
             if val_type == "dynamic":
@@ -5004,6 +5096,15 @@ class SemanticAnalyzer:
 
         # Register fields in class scope
         for f in node.fields:
+            if f.type_expr == "auto":
+                self.error(
+                    f"cannot infer the type of field `{f.name}`: "
+                    f"class fields have no initializer to infer from",
+                    f,
+                    code="E0001",
+                    note="declare an explicit field type",
+                )
+                f.type_expr = "int"
             existing = class_scope.lookup_local(f.name)
             if existing:
                 class_scope.undefine(f.name)
@@ -5045,28 +5146,31 @@ class SemanticAnalyzer:
                 if held is not None:
                     class_scope.undefine(m.name)
 
-                is_synth = (getattr(m, "meta", None) or {}).get("kind") == "synth"
-                if m.name != "__init__" and not is_synth:
-
-                    def _sig(f):
-                        return (
-                            tuple(
-                                sorted(
-                                    (k, v) for k, v in f.params.items() if k != "this"
-                                )
-                            ),
-                            f.rettype,
-                        )
-
-                    if _sig(m) != _sig(bm):
-                        self.error(
-                            f"method `{m.name}` overrides a base method with a "
-                            "different signature (parameters/return type must match)",
-                            m,
-                        )
             # Inject 'this' parameter implicitly
             m.params = {"this": node.name + "*", **m.params}
             self._visit_funcdef(m, class_scope)
+
+            # Signature check runs AFTER the body is visited so that an `auto`
+            # return type has been resolved to its concrete type (an explicit
+            # rettype is unchanged). Synthesized dataclass dunders are exempt:
+            # their signatures are regenerated per class on purpose.
+            if bm is not None and m.name != "__init__":
+                is_synth = (getattr(m, "meta", None) or {}).get("kind") == "synth"
+
+                def _sig(f):
+                    return (
+                        tuple(
+                            sorted((k, v) for k, v in f.params.items() if k != "this")
+                        ),
+                        f.rettype,
+                    )
+
+                if not is_synth and _sig(m) != _sig(bm):
+                    self.error(
+                        f"method `{m.name}` overrides a base method with a "
+                        "different signature (parameters/return type must match)",
+                        m,
+                    )
         # Property accessors: visiting the getter first lets the property's
         # value type (from its return) feed the setter's `value` parameter.
         for p in getattr(node, "properties", None) or ():
@@ -5246,6 +5350,15 @@ class SemanticAnalyzer:
         for param in node.generic_params:
             struct_scope.define(param, Symbol("type_param", None, node))
         for field in node.fields:
+            if field.type_expr == "auto":
+                self.error(
+                    f"cannot infer the type of field `{field.name}`: "
+                    f"struct fields have no initializer to infer from",
+                    field,
+                    code="E0001",
+                    note="declare an explicit field type",
+                )
+                field.type_expr = "int"
             struct_scope.define(field.name, Symbol("field", field.type_expr, node))
 
     def _visit_enum(self, node: EnumDef, scope: Scope | None = None):

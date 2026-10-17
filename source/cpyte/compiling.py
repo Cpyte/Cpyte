@@ -1135,6 +1135,21 @@ def _gmp_library_paths() -> list:
     return sorted(p for p in paths if p and os.path.isdir(p))
 
 
+def aot_link_libraries() -> list:
+    """System libraries the native AOT link needs.
+
+    `gmp` backs `big`/`ubig`; `mpfr` backs the bignum<->MPFR bridge
+    (`bigint_to_mpfr`), which the bignum runtime references unconditionally, so
+    both must be linked whenever they are available. Linking `mpfr` only when it
+    was actually discovered keeps the link working on systems without it (where
+    the MPFR-backed runtime cannot be built anyway).
+    """
+    libs = ["m", "gmp"]
+    if _libmpfr is not None:
+        libs.append("mpfr")
+    return libs
+
+
 def _cached_c_ir(
     llvm_cc,
     src_path,
@@ -1933,7 +1948,7 @@ def run_aot(
         opt_level=3,
         pic=pic,
         frameworks=frameworks,
-        libraries=["gmp"],
+        libraries=aot_link_libraries(),
         library_paths=_gmp_library_paths(),
     )
 

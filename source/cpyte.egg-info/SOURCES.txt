@@ -7,11 +7,13 @@ source/cpyte/_bignum_bc.py
 source/cpyte/_runtime_bc.py
 source/cpyte/astparse.py
 source/cpyte/bignum.c
+source/cpyte/bignum_protos.h
 source/cpyte/bytecoding.py
 source/cpyte/clib.py
 source/cpyte/compiling.py
 source/cpyte/elf2sef.py
 source/cpyte/extension_hooks.py
+source/cpyte/floats_runtime.c
 source/cpyte/formatter.py
 source/cpyte/gc_runtime.c
 source/cpyte/generate_bc.py

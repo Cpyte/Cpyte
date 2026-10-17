@@ -1,5 +1,20 @@
 # Notes
 
+## v4.6.1 release (Oct 2026, `auto` inference + AOT mpfr link fix)
+
+- Adds `auto` type inference (locals, globals, `-> auto` returns — see the
+  section below) and fixes the native AOT link to pull in `-lmpfr` (every
+  program object retains `bigint_to_mpfr`, whose `mpfr_set_z` was undefined).
+- Version single-sourced: `source/cpyte/__init__.py` = `4.6.1`; `pyproject.toml`
+  derives it via `dynamic = ["version"]`. `python3.14 -m build` regenerates
+  `source/cpyte.egg-info/`; verify with
+  `unzip -p dist/cpyte-4.6.1-*.whl cpyte/__init__.py` and
+  `unzip -p dist/cpyte-4.6.1-*.whl '*/METADATA' | grep ^Version`.
+- Published to PyPI (`--repository pypi`) + gitea registry
+  (`--repository gitea`) as whl + sdist; tagged `v4.6.1`; pushed to `github`
+  (github.com/Cpyte/Cpyte) and `origin`/gitea. CI corpus 33/33; `ci_bomb.py`
+  2500/2500.
+
 ## Oct 2026: `auto` type inference (locals, globals, `-> auto` returns)
 
 `auto` is now a real inference keyword, implemented directly in

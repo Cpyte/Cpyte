@@ -27,7 +27,11 @@ jobs:
 
           - os: macOS
             arch: x86_64
-            runner: macos-13
+            # GitHub retired the macos-13 (Intel) image on 2025-12-04; jobs
+            # still asking for it queue forever with no runner, which keeps the
+            # whole run "in progress" and blocks re-runs. macos-15-intel is the
+            # last native x86_64 image (Intel support on Actions ends Aug 2027).
+            runner: macos-15-intel
 
           - os: Windows
             arch: x86_64
@@ -58,10 +62,27 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install gmp mpfr
 
+      # vcpkg builds gmp/mpfr from source, which costs ~20 min on a cold runner.
+      # Persist its file-based binary cache across runs so later runs restore
+      # the prebuilt archives instead of recompiling. (The `x-gha` backend that
+      # used to write to the Actions cache directly was removed from vcpkg in
+      # 2025, so the directory has to be carried by actions/cache instead.)
+      # VCPKG_DEFAULT_BINARY_CACHE must point at the cached dir and exist
+      # before vcpkg runs, or it silently falls back to its default cache.
+      - name: Cache vcpkg binary packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-binary-cache
+          key: vcpkg-windows-x64-gmp-mpfr-v1
+
       - name: Install GMP/MPFR (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-binary-cache
         run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           vcpkg install gmp:x64-windows mpfr:x64-windows
           $prefix = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
           "CPYTE_GMP_INCLUDE=$prefix\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

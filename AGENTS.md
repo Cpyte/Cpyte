@@ -1,5 +1,51 @@
 # Notes
 
+## Oct 2026: CI is now green end-to-end (Windows probe bug + retired macos-13 runner)
+
+Follow-up to the GMP/MPFR install commit: after `9a2b040` went green on
+Ubuntu/macOS, Windows failed at `ci_test.py` even though vcpkg had installed
+everything. Two more causes, both fixed:
+
+- **`CPYTE_GMP_INCLUDE` was never read by the compiler** (commit `c747a87`).
+  The workflow exports it (vcpkg headers live in no default path), but only
+  `generate_bc.py`'s *argparse* default read it. The AOT path resolves
+  `_gmp_include_dir()` → `_find_gmp_include()` **with no argument**, so the
+  env override was invisible and `bignum.c` died on `gmp.h` exactly as before.
+  `_find_gmp_include()` now reads `os.environ["CPYTE_GMP_INCLUDE"]` itself —
+  its docstring already claimed that; only the code disagreed. (`_mpfr_include_dir`
+  always read `CPYTE_MPFR_INCLUDE`, which is why MPFR was fine.)
+- **`_gmp_library_paths()` returned `[]` on Windows** (same commit). Its
+  `if _libgmp is None: return []` guard fired because `ctypes.util.find_library`
+  cannot see vcpkg's `libgmp-10.dll` (no matching soname, no `gmp.dll` alias), so
+  the include-derived `-L` dirs — the ones that actually work — were discarded
+  precisely on the platform that needs them. The include-derived paths are now
+  computed unconditionally and only filtered by `isdir`; the `find_library`-derived
+  dir is added when available. **Windows is now CI-proven green** (full 33-program
+  `ci_test.py` corpus, native AOT link + run).
+- **`macos-13` was retired by GitHub on 2025-12-04** and jobs still asking for it
+  queue *forever* with no runner. That is why every run in the workflow's history
+  shows macOS/x86_64 as `queued` or `cancelled`, and why the **whole run never
+  reaches a terminal state** — which also makes the re-run APIs answer
+  `403 This workflow is already running`. Moved that leg to `macos-15-intel`
+  (the last native x86_64 image; Intel support on Actions ends Aug 2027).
+- **vcpkg binary cache**: `gmp`/`mpfr` cost ~20 min from source on a cold
+  runner, so the Windows step now caches the file-based binary cache directory
+  (`VCPKG_DEFAULT_BINARY_CACHE` + `actions/cache@v4`). Do NOT use
+  `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`: **vcpkg removed the `x-gha`
+  backend** (microsoft/vcpkg-tool#1662, ~Apr 2025) and it is now a silent no-op
+  with a warning; the directory must be carried by `actions/cache` instead.
+- Operational: while runs are stuck on a missing runner, cancel the stale ones
+  via `POST /repos/{owner}/{repo}/actions/runs/{id}/cancel` before the failed
+  jobs can be re-run. `POST .../rerun-failed-jobs` then restarts only the
+  non-successful jobs. The token from `printf 'protocol=https\nhost=github.com\n\n'
+  | git credential fill` works for this (run cancel returned 202).
+- CI history check worth repeating: `GET /actions/workflows/code_quality.yml/runs`
+  is public, as is per-run `jobs` — that is how the pre-existing state (red on
+  every push since 2026-09-13, Windows green at `8c988b1` before GMP went
+  unconditional) was established without log access. Job *logs* need admin
+  rights (403), so step conclusions + local reproduction are the available
+  evidence.
+
 ## Oct 2026: CI needed GMP/MPFR installed (all platforms were red) + `-lmpfr` keyed off the header probe
 
 `ci_test.py` compiles and links `bignum.c` (GMP) and `floats_runtime.c` (MPFR)
@@ -19,10 +65,9 @@ green runs were local macOS runs on a box that has `brew install gmp mpfr`.
   gmp:x64-windows mpfr:x64-windows` + `CPYTE_GMP_INCLUDE` /
   `CPYTE_MPFR_INCLUDE` in `GITHUB_ENV` + `$prefix\bin` on `GITHUB_PATH`.
   The `scorpion` job is untouched (riscv32 cross toolchain).
-- **Windows is the unverified leg** (macOS/Ubuntu were reasoned through, not
-  CI-proven). The Windows job targets the MSVC triple (MSVC env vars are set on
-  the runner → `_use_windows_gnu()` is False), so vcpkg's MSVC-built libs are
-  the right flavor; confirm on the first run.
+- **Windows needed two more fixes after this commit** (it failed on its first
+  run despite the packages being installed) — see the section above; it is now
+  CI-proven green. The MSVC-triple reasoning below turned out to be right.
 - **My earlier `-lmpfr` change was wrong in one way**: it keyed `-lmpfr` off
   `_libmpfr`, which `ctypes`-loads `libmpfr.so.6` — the *runtime* — and that can
   exist without the `libmpfr.so` link name, giving
@@ -105,9 +150,12 @@ verifying it (see next section).
   `ld: Undefined symbols for architecture arm64: "_mpfr_set_z", referenced
   from: _bigint_to_mpfr`. AOT was broken at HEAD — unrelated to `auto`.
 - **Cause**: `bignum.c` `#include <mpfr.h>` and its `bigint_to_mpfr` helper
-  calls `mpfr_set_z`. The bignum IR is linked into EVERY program object (the
-  `_BIGNUM_KEEP` set retains `bigint_to_mpfr`), so every `.o` has an undefined
-  `_mpfr_set_z` even when the program never uses `big` (verified:
+  calls `mpfr_set_z`. `floats_runtime.c` — which the runtime source list links
+  into EVERY program — calls `bigint_to_mpfr` (twice, at the bigint-backed
+  float conversions), and that reference is what keeps the helper alive through
+  GlobalDCE. (It is NOT in `_BIGNUM_KEEP`, which holds only `bigint_from_str`,
+  `bigint_from_int`, `bigint_print`, `bigint_to_str`.) So every `.o` has an
+  undefined `_mpfr_set_z` even when the program never uses `big` (verified:
   `nm hello.o` → `T _bigint_to_mpfr` + `U _mpfr_set_z`). The AOT link line was
   `libraries=["m", "gmp"]` (and `["gmp"]` in `run_aot`) — no `mpfr`.
 - **Fix**: new `aot_link_libraries()` in `compiling.py` returns `["m", "gmp"]`

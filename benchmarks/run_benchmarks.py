@@ -3,11 +3,11 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
-RUNTIME_C = os.path.join(HERE, "runtime.c")
 
 C_CC = "clang"
 C_CFLAGS = ["-O3", "-lm"]
@@ -45,27 +45,39 @@ def compile_c(name):
 
 
 def compile_cpy(name):
+    """Build `<name>.cpy` to a native executable in a throwaway temp dir.
+
+    `cpyte --aot <src>` writes `<src>.o` AND links `<src without extension>`
+    itself (compiling.run_aot: out_name = output.rsplit(".", 1)[0], then
+    linker.link with aot_link_libraries()), so there is no manual link step
+    here -- the old `clang program.o runtime.c` link broke when --aot stopped
+    hardcoding its object name to `program.o`. The temp dir keeps the tracked
+    benchmarks/*.o artifacts from being clobbered.
+
+    Returns (exe_path, build_dir) on success, (None, None) on failure.
+    """
     cpy_src = os.path.join(HERE, f"{name}.cpy")
+    build_dir = tempfile.mkdtemp(prefix=f"cpy_bench_{name}_")
+    src = os.path.join(build_dir, os.path.basename(cpy_src))
+    shutil.copy2(cpy_src, src)
     r = subprocess.run(
-        [*CPY_COMPILE, cpy_src],
+        [*CPY_COMPILE, src],
         capture_output=True,
         text=True,
-        cwd=HERE,
+        cwd=build_dir,
     )
     if r.returncode != 0:
-        print(f"    cpy compile failed: {r.stderr.strip()}")
-        return False
-    exe = os.path.join(HERE, f"{name}_cpy")
-    r2 = subprocess.run(
-        [C_CC, "program.o", RUNTIME_C, "-o", exe, "-lm"],
-        capture_output=True,
-        text=True,
-        cwd=HERE,
-    )
-    if r2.returncode != 0:
-        print(f"    cpy link failed: {r2.stderr.strip()}")
-        return False
-    return True
+        print(f"    cpy compile failed: {(r.stderr or r.stdout).strip()}")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        return None, None
+    exe = os.path.join(build_dir, name)
+    if not os.path.isfile(exe):
+        print(f"    cpy link failed: {exe} was not produced")
+        if (r.stderr or "").strip():
+            print(f"    {r.stderr.strip()}")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        return None, None
+    return exe, build_dir
 
 
 def run_and_time_ns(cmd, cwd=None):
@@ -89,17 +101,24 @@ def fmt_ns(ns):
     return f"{ns / 1_000_000_000:.6f}s"
 
 
+def cleanup(build_dirs):
+    for bm in ALL_BENCHMARKS:
+        for suffix in ("_c", "_cpy"):
+            exe = os.path.join(HERE, bm["name"] + suffix)
+            if os.path.exists(exe):
+                os.remove(exe)
+    for build_dir in build_dirs:
+        shutil.rmtree(build_dir, ignore_errors=True)
+
+
 def main():
     os.chdir(HERE)
-
-    src_runtime = os.path.join(PROJECT, "source", "runtime.c")
-    if os.path.exists(src_runtime):
-        shutil.copy2(src_runtime, RUNTIME_C)
 
     print(f"\n{'=' * 70}")
     print("  Compiling benchmarks...")
     print(f"{'=' * 70}\n")
 
+    build_dirs = []
     for bm in ALL_BENCHMARKS:
         name = bm["name"]
         print(f"  [{name}]")
@@ -108,14 +127,29 @@ def main():
         log("C OK")
 
         bm["cpy_ok"] = False
+        bm["cpy_exe"] = None
         if bm["has_cpy"]:
-            bm["cpy_ok"] = compile_cpy(name)
-            log("cpy OK" if bm["cpy_ok"] else "cpy SKIPPED")
+            exe, build_dir = compile_cpy(name)
+            if build_dir:
+                build_dirs.append(build_dir)
+            bm["cpy_exe"] = exe
+            bm["cpy_ok"] = exe is not None
+            log("cpy OK" if bm["cpy_ok"] else "cpy FAILED")
         else:
             log("cpy N/A")
 
         log("Python OK")
         print()
+
+    failed = [
+        bm["name"] for bm in ALL_BENCHMARKS if bm["has_cpy"] and not bm["cpy_ok"]
+    ]
+    if failed:
+        cleanup(build_dirs)
+        print(f"{'=' * 70}")
+        print(f"  cpy benchmark build FAILED: {', '.join(failed)}")
+        print(f"{'=' * 70}")
+        sys.exit(1)
 
     print(f"{'=' * 70}")
     print("  Running benchmarks (3 trials, no averaging)...")
@@ -149,7 +183,7 @@ def main():
 
         if bm.get("cpy_ok"):
             lang = "cpy"
-            cmd = [os.path.join(HERE, f"{name}_cpy")]
+            cmd = [bm["cpy_exe"]]
             trials = []
             out = None
             for trial in range(3):
@@ -219,14 +253,7 @@ def main():
     print()
 
     # Cleanup
-    for bm in ALL_BENCHMARKS:
-        for suffix in ("_c", "_cpy"):
-            exe = os.path.join(HERE, bm["name"] + suffix)
-            if os.path.exists(exe):
-                os.remove(exe)
-    obj = os.path.join(HERE, "program.o")
-    if os.path.exists(obj):
-        os.remove(obj)
+    cleanup(build_dirs)
 
 
 if __name__ == "__main__":

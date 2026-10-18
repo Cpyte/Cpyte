@@ -45,6 +45,29 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      # bignum.c (GMP) and floats_runtime.c (MPFR) are compiled and linked into
+      # every program, so the native AOT builds in ci_test.py need the dev
+      # headers/libs on every runner.
+      - name: Install GMP/MPFR (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev libmpfr-dev
+
+      - name: Install GMP/MPFR (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gmp mpfr
+
+      - name: Install GMP/MPFR (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install gmp:x64-windows mpfr:x64-windows
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "CPYTE_GMP_INCLUDE=$prefix\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CPYTE_MPFR_INCLUDE=$prefix\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Run compiler API regression tests
         run: python test/test_compiler_regressions.py
 
@@ -96,6 +119,11 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Install GMP/MPFR (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev libmpfr-dev
+
       - name: Compile every historical crash reproducer
         run: python ci_bomb.py
 
@@ -115,6 +143,11 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+
+      - name: Install GMP/MPFR (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev libmpfr-dev
 
       - name: Run benchmarks
         run: python benchmarks/run_benchmarks.py

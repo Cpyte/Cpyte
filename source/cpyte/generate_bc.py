@@ -61,7 +61,8 @@ def _find_gmp_include(explicit: str | None = None) -> str | None:
       1. explicit ``--gmp-include`` / ``CPYTE_GMP_INCLUDE``
       2. the ``gmp-*`` submodule checked out in the repository root
       3. Homebrew's ``gmp`` formula (``brew --prefix gmp``)
-      4. common prefixes (``/opt/homebrew/include``, ``/usr/local/include``)
+      4. common prefixes (``/opt/homebrew/include``, ``/usr/local/include``,
+         ``/usr/include``)
     """
     candidates: list[str] = []
     if explicit:
@@ -80,7 +81,7 @@ def _find_gmp_include(explicit: str | None = None) -> str | None:
             prefix = ""
         if prefix:
             candidates.append(os.path.join(prefix, "include"))
-    candidates.extend(["/opt/homebrew/include", "/usr/local/include"])
+    candidates.extend(["/opt/homebrew/include", "/usr/local/include", "/usr/include"])
     seen = set()
     for cand in candidates:
         if cand in seen:

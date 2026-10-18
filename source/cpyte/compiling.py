@@ -1120,18 +1120,19 @@ def _gmp_library_paths() -> list:
 
     Mirrors the include probe: the directory holding the shared library is
     derived from the same root that holds the headers (``<prefix>/lib`` next to
-    ``<prefix>/include``).
+    ``<prefix>/include``). GMP and MPFR may live under different prefixes
+    (Homebrew keeps both keg-only), so each include probe contributes its own
+    ``lib`` dir -- deriving only from GMP would leave ``-lmpfr`` unresolvable.
     """
     if _libgmp is None:
         return []
     paths = set()
     found = ctypes.util.find_library("gmp")
-    if found:
-        paths.add(os.path.dirname(found)) if os.path.isabs(found) else None
-    inc = _gmp_include_dir()
-    if inc:
-        libdir = os.path.join(os.path.dirname(inc), "lib")
-        paths.add(libdir)
+    if found and os.path.isabs(found):
+        paths.add(os.path.dirname(found))
+    for inc in (_gmp_include_dir(), _mpfr_include_dir()):
+        if inc:
+            paths.add(os.path.join(os.path.dirname(inc), "lib"))
     return sorted(p for p in paths if p and os.path.isdir(p))
 
 
@@ -1140,12 +1141,17 @@ def aot_link_libraries() -> list:
 
     `gmp` backs `big`/`ubig`; `mpfr` backs the bignum<->MPFR bridge
     (`bigint_to_mpfr`), which the bignum runtime references unconditionally, so
-    both must be linked whenever they are available. Linking `mpfr` only when it
-    was actually discovered keeps the link working on systems without it (where
-    the MPFR-backed runtime cannot be built anyway).
+    both must be linked whenever they are available.
+
+    `mpfr` is keyed off the *header* probe (`_mpfr_include_dir`), not off the
+    loadable shared library: a host can ship the `libmpfr.so.6` runtime without
+    the `libmpfr.so` link name, and passing `-lmpfr` there fails the link with
+    `library 'mpfr' not found`. The header probe is the same signal the bignum
+    compile uses to decide whether `bigint_to_mpfr` is built at all, so the link
+    and the compile stay in agreement.
     """
     libs = ["m", "gmp"]
-    if _libmpfr is not None:
+    if _mpfr_include_dir() is not None:
         libs.append("mpfr")
     return libs
 

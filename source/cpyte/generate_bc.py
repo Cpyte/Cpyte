@@ -67,6 +67,14 @@ def _find_gmp_include(explicit: str | None = None) -> str | None:
     candidates: list[str] = []
     if explicit:
         candidates.append(explicit)
+    # Honour the environment override even for library callers: the AOT
+    # include/lib probes (_gmp_include_dir -> _runtime_extra_flags) resolve
+    # through this function with no argument, so an explicit CI value
+    # (e.g. a vcpkg prefix on Windows, whose headers live in no default path)
+    # must be picked up here rather than only by generate_bc's argparse.
+    env_include = os.environ.get("CPYTE_GMP_INCLUDE")
+    if env_include:
+        candidates.append(env_include)
     root = _repo_root()
     if root.is_dir():
         for d in sorted(root.glob("gmp-*")):

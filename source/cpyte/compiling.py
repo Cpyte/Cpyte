@@ -1124,15 +1124,19 @@ def _gmp_library_paths() -> list:
     (Homebrew keeps both keg-only), so each include probe contributes its own
     ``lib`` dir -- deriving only from GMP would leave ``-lmpfr`` unresolvable.
     """
-    if _libgmp is None:
-        return []
     paths = set()
-    found = ctypes.util.find_library("gmp")
-    if found and os.path.isabs(found):
-        paths.add(os.path.dirname(found))
+    # The include-derived dirs come first and do NOT depend on _libgmp being
+    # loadable: ctypes cannot see a vcpkg `libgmp-10.dll` (no matching soname,
+    # and no `gmp.dll` alias), so on Windows _libgmp is None even though the
+    # headers and import libraries are installed -- bailing on _libgmp there
+    # left the link without any -L and failed with `library 'gmp' not found`.
     for inc in (_gmp_include_dir(), _mpfr_include_dir()):
         if inc:
             paths.add(os.path.join(os.path.dirname(inc), "lib"))
+    if _libgmp is not None:
+        found = ctypes.util.find_library("gmp")
+        if found and os.path.isabs(found):
+            paths.add(os.path.dirname(found))
     return sorted(p for p in paths if p and os.path.isdir(p))
 
 

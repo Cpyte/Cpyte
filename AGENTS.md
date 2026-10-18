@@ -1,5 +1,44 @@
 # Notes
 
+## Oct 2026: CI needed GMP/MPFR installed (all platforms were red) + `-lmpfr` keyed off the header probe
+
+`ci_test.py` compiles and links `bignum.c` (GMP) and `floats_runtime.c` (MPFR)
+into **every** program (`compiling.py` runtime source list), but no workflow job
+ever installed those packages — so every platform failed at the `bignum.c`
+compile: Ubuntu `fatal error: 'mpfr.h' file not found`, Windows
+`fatal error: 'gmp.h' file not found`. **This has been broken since `fd31528`**
+made the GMP/MPFR plumbing unconditional (verified: `fd31528` is an ancestor of
+the previously-pushed github HEAD `69ad389`, and `git log -S libmpfr -- .github/`
+is empty — the workflow NEVER installed them, and there is no `.gitea/workflows`).
+It is *not* a regression from the `auto` / `-lmpfr` commits. The maintainer's
+green runs were local macOS runs on a box that has `brew install gmp mpfr`.
+
+- **Fix (commit `9a2b040`)**: workflow steps in the `test` (all 3 OS),
+  `bomb` and `benchmarks` jobs — Ubuntu `apt-get install -y libgmp-dev
+  libmpfr-dev`, macOS `brew install gmp mpfr`, Windows `vcpkg install
+  gmp:x64-windows mpfr:x64-windows` + `CPYTE_GMP_INCLUDE` /
+  `CPYTE_MPFR_INCLUDE` in `GITHUB_ENV` + `$prefix\bin` on `GITHUB_PATH`.
+  The `scorpion` job is untouched (riscv32 cross toolchain).
+- **Windows is the unverified leg** (macOS/Ubuntu were reasoned through, not
+  CI-proven). The Windows job targets the MSVC triple (MSVC env vars are set on
+  the runner → `_use_windows_gnu()` is False), so vcpkg's MSVC-built libs are
+  the right flavor; confirm on the first run.
+- **My earlier `-lmpfr` change was wrong in one way**: it keyed `-lmpfr` off
+  `_libmpfr`, which `ctypes`-loads `libmpfr.so.6` — the *runtime* — and that can
+  exist without the `libmpfr.so` link name, giving
+  `ld: library 'mpfr' not found`. It now keys off the **header** probe
+  `_mpfr_include_dir() is not None`, the same signal the bignum compile uses to
+  decide whether `bigint_to_mpfr` is built, so compile and link agree.
+- `_gmp_library_paths()` also derives a `-L` dir from the **MPFR** include prefix
+  (it previously used only GMP's — under Homebrew `gmp` and `mpfr` are separate
+  kegs, so `-lmpfr` could not be resolved). `_find_gmp_include()` now also checks
+  `/usr/include`, matching what the MPFR probe already did.
+- **GMP/MPFR are genuinely required by the corpus**: 12 corpus programs use
+  `big`/`ubig`, and `test/most_complex.cpy:248` uses `float pi = 3.14159` (the
+  MPFR-backed type), so "make the deps optional" would have failed those tests.
+  `_find_gmp_include()` does already probe for a `gmp-*` submodule in the repo
+  root, which is the hook for a future vendored-gmp approach.
+
 ## v4.6.1 release (Oct 2026, `auto` inference + AOT mpfr link fix)
 
 - Adds `auto` type inference (locals, globals, `-> auto` returns — see the
@@ -72,15 +111,15 @@ verifying it (see next section).
   `nm hello.o` → `T _bigint_to_mpfr` + `U _mpfr_set_z`). The AOT link line was
   `libraries=["m", "gmp"]` (and `["gmp"]` in `run_aot`) — no `mpfr`.
 - **Fix**: new `aot_link_libraries()` in `compiling.py` returns `["m", "gmp"]`
-  plus `["mpfr"]` **only when `_libmpfr is not None`** (libmpfr has to be
-  discovered by the existing probe to be usable, and a system without it cannot
-  build the MPFR-backed runtime anyway). Used in `compiling.py::run_aot` and
-  `mainpie.py::cmd_build`; `aot_link_libraries` is imported in BOTH
-  `mainpie.py` import blocks. `library_paths=_gmp_library_paths()` (Homebrew
-  keg `-L` paths) was already passed and is still required — a bare `-lmpfr`
-  fails `library 'mpfr' not found`. Confirmed: without `-L` paths the link
-  dies at `library 'gmp' not found`; with paths but no `-lmpfr` it dies at
-  `_mpfr_set_z`; with the fix it links and runs.
+  plus `["mpfr"]` **only when the MPFR header probe succeeds** (see the top
+  section — the first cut keyed this off `_libmpfr`, which was wrong).
+  Used in `compiling.py::run_aot` and `mainpie.py::cmd_build`;
+  `aot_link_libraries` is imported in BOTH `mainpie.py` import blocks.
+  `library_paths=_gmp_library_paths()` (Homebrew keg `-L` paths) was already
+  passed and is still required — a bare `-lmpfr` fails `library 'mpfr' not
+  found`. Confirmed: without `-L` paths the link dies at `library 'gmp' not
+  found`; with paths but no `-lmpfr` it dies at `_mpfr_set_z`; with the fix
+  it links and runs.
 
 ## v4.6.0 release (Oct 2026, module-namespaced struct/class identity)
 

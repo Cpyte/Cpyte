@@ -25,13 +25,14 @@ jobs:
             arch: arm64
             runner: macos-14
 
-          - os: macOS
-            arch: x86_64
-            # GitHub retired the macos-13 (Intel) image on 2025-12-04; jobs
-            # still asking for it queue forever with no runner, which keeps the
-            # whole run "in progress" and blocks re-runs. macos-15-intel is the
-            # last native x86_64 image (Intel support on Actions ends Aug 2027).
-            runner: macos-15-intel
+          # Deliberately no macOS x86_64 leg. llvmlite has shipped no mac
+          # Intel wheel since 0.45.1 (and that one only up to Python 3.13), so
+          # `pip install -r requirements.txt` falls back to a source build and
+          # fails; pinning 0.45.1 (LLVM 20) instead is no better, because
+          # modern Apple clang emits LLVM-21-only IR attributes
+          # (nocreateundeforpoison) that LLVM 20 cannot parse, which kills the
+          # JIT. GitHub also retires the Intel images in Aug 2027. arm64 above
+          # is the supported macOS target.
 
           - os: Windows
             arch: x86_64

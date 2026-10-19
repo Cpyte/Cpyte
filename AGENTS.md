@@ -1,10 +1,42 @@
 # Notes
 
+## v4.6.2 release (Oct 2026, Windows GMP/MPFR discovery fixes + CI green)
+
+- **Why another patch release**: the fixes in `c747a87` touch *shipped* code
+  (`compiling.py`, `generate_bc.py`), so the v4.6.1 wheel on PyPI still has
+  both Windows bugs — `_find_gmp_include()` ignoring `CPYTE_GMP_INCLUDE` (the
+  AOT path calls it with no argument, so the workflow's env export was
+  invisible and `bignum.c` died on `gmp.h`) and `_gmp_library_paths()`
+  returning `[]` because `ctypes.util.find_library` cannot see vcpkg's
+  `libgmp-10.dll`, discarding the include-derived `-L` dirs that are the only
+  ones working on Windows. A vcpkg user AOT-linking on Windows is broken at
+  4.6.1; fixed here.
+- **Ships alongside**: the CI work that proved the fixes — GMP/MPFR installed
+  in every workflow job (`9a2b040`), the benchmark harness repair
+  (`--aot` outputs `<source>.o` since `9c958d5`, so the hardcoded `program.o`
+  link had been failing for all 8 cpy benchmarks while the job still reported
+  success because the script never exited non-zero), the retired `macos-13`
+  runner, and the macOS x86_64 leg dropped outright. Final CI run
+  `39148109111` = **7/7 green in ~3 min**, Windows 94 s with a vcpkg cache hit.
+- Release procedure (same as v4.6.1): version single-sourced in
+  `source/cpyte/__init__.py`; `python3.14 -m build` regenerates the tracked
+  `source/cpyte.egg-info/`; verify the wheel with
+  `unzip -p dist/cpyte-4.6.2-*.whl cpyte/__init__.py` and
+  `unzip -p dist/cpyte-4.6.2-*.whl '*/METADATA' | grep ^Version` (both must say
+  4.6.2); smoke-test the wheel in a fresh venv; `git tag -a v4.6.2`; push
+  `origin` + `github` (and the tag); `twine upload --repository pypi` then
+  `--repository gitea`.
+- Remember: the commit hook needs
+  `git -c commit.gpgsign=false commit --no-verify -F <file>` (never `-m` — zsh
+  command-substitutes backticks and mangled `fe5f17c`).
+
 ## Oct 2026: CI is now green end-to-end (Windows probe bug + retired macos-13 runner)
 
 Follow-up to the GMP/MPFR install commit: after `9a2b040` went green on
 Ubuntu/macOS, Windows failed at `ci_test.py` even though vcpkg had installed
-everything. Two more causes, both fixed:
+everything. Two more causes, both fixed. Then two more problems surfaced in
+the *other* legs (a retired runner and a silently-broken benchmark job), so
+this note covers the whole path to a fully green run.
 
 - **`CPYTE_GMP_INCLUDE` was never read by the compiler** (commit `c747a87`).
   The workflow exports it (vcpkg headers live in no default path), but only
@@ -28,6 +60,22 @@ everything. Two more causes, both fixed:
   reaches a terminal state** — which also makes the re-run APIs answer
   `403 This workflow is already running`. Moved that leg to `macos-15-intel`
   (the last native x86_64 image; Intel support on Actions ends Aug 2027).
+- **The benchmarks job had been silently measuring nothing** (commit `0fd7009`).
+  `run_benchmarks.py` linked a literal `program.o`, which stopped existing when
+  `9c958d5` changed `cpyte --aot`'s output from the hardcoded `program.o` to
+  `<source>.o` — so all 8 cpy benchmarks died with
+  `clang: error: no such file or directory: 'program.o'`, printed `N/A`, and the
+  job still reported **success** because the script never exited non-zero.
+  `compile_cpy` now builds in a temp dir and runs the executable `run_aot`
+  already links itself (it no longer hand-links `program.o` against
+  `benchmarks/runtime.c`, a never-refreshed stub — `source/runtime.c` no longer
+  exists); building in a temp dir keeps the tracked `benchmarks/*.o` from being
+  clobbered so local runs stay `git status`-clean. `main()` now `sys.exit(1)`s
+  if any cpy benchmark fails to build, so a green Benchmarks job *means*
+  something. Beware one number in that table: `fib_recursive cpy/c=0.00x` is
+  not a miscompile — `bytecoding.py` has had a deliberate `fib` special case
+  since `6402b5b` (v4.0.0) that swaps the canonical naive recursion for a
+  `.fib_table` lookup (n ≤ 70) plus iterative fast-doubling.
 - **vcpkg binary cache**: `gmp`/`mpfr` cost ~20 min from source on a cold
   runner, so the Windows step now caches the file-based binary cache directory
   (`VCPKG_DEFAULT_BINARY_CACHE` + `actions/cache@v4`). Do NOT use
@@ -44,7 +92,29 @@ everything. Two more causes, both fixed:
   every push since 2026-09-13, Windows green at `8c988b1` before GMP went
   unconditional) was established without log access. Job *logs* need admin
   rights (403), so step conclusions + local reproduction are the available
-  evidence.
+  evidence. `GET /actions/caches` also needs write perms (returns 0 entries
+  anonymously); a saved `actions/cache` is confirmed by its *Post* step
+  succeeding, and by the next run's timing.
+- **The macOS x86_64 leg was dropped entirely** (commit `05536c2`) after it
+  failed at `pip install -r requirements.txt` on the `macos-15-intel` runner.
+  Two independent blockers, so re-adding the label alone will never work:
+  **llvmlite has shipped no macOS x86_64 wheel since 0.45.1** (and that one only
+  up to Python 3.13 — 0.46+ is arm64-only on macOS), so `llvmlite>=0.45`
+  resolves to 0.50.0 and falls back to a failing source build; and pinning
+  `llvmlite==0.45.1` + Python 3.13 is no better, because 0.45.1 is **LLVM 20**
+  while modern Apple clang emits LLVM-21-only IR attributes
+  (`nocreateundeforpoison`) into the JIT runtime IR. Verified locally with a
+  `python3.13` venv: `cpy --version` and a native AOT build/run work, but the
+  JIT dies with `RuntimeError: LLVM IR parsing error ... unterminated attribute
+  group` from `binding.parse_assembly`. General sharp edge worth remembering:
+  the JIT needs the *runner's* clang LLVM major ≤ llvmlite's LLVM major (the
+  AOT path is immune — it never round-trips runtime IR through llvmlite).
+  Supported macOS target is arm64; GitHub retires the Intel images Aug 2027.
+- **Final state, run `39148109111` (`05536c2`): 7/7 green in ~3 min** — Ubuntu
+  x86_64 (49s) + arm64 (55s), macOS arm64 (35s), **Windows x86_64 (94s, with
+  `Install GMP/MPFR` down to 11s = vcpkg cache HIT)**, Bomb 2500 (131s),
+  Scorpion (23s), Benchmarks (132s). Matrix is `ubuntu-24.04`,
+  `ubuntu-24.04-arm`, `macos-14`, `windows-2025`.
 
 ## Oct 2026: CI needed GMP/MPFR installed (all platforms were red) + `-lmpfr` keyed off the header probe
 

@@ -1056,7 +1056,7 @@ pair.second = "answer"
 struct Point:
     int x
     int y
-    
+
     public def add(other: Point) -> Point:
         Point result
         result.x = self.x + other.x
@@ -1390,30 +1390,30 @@ public def create_list(n: int) -> ListNode*:
     ListNode* head = 0
     ListNode* current = 0
     int i = 0
-    
+
     while i < n:
         ListNode* node = new ListNode
         node.value = i * 10
         node.next = 0
-        
+
         if head == 0:
             head = node
         else:
             current.next = node
-        
+
         current = node
         i = i + 1
-    
+
     return head
 
 public def sum_list(head: ListNode*) -> int:
     int total = 0
     ListNode* current = head
-    
+
     while current != 0:
         total = total + current.value
         current = current.next
-    
+
     return total
 
 public def main() -> int:
@@ -1441,9 +1441,9 @@ public def create_matrix(rows: int, cols: int) -> Matrix:
 public def matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
     if a.cols != b.rows:
         return 0
-    
+
     Matrix result = create_matrix(a.rows, b.cols)
-    
+
     int i = 0
     while i < a.rows:
         int j = 0
@@ -1456,7 +1456,7 @@ public def matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
             result.data[i][j] = sum
             j = j + 1
         i = i + 1
-    
+
     return result
 ```
 
@@ -1467,12 +1467,12 @@ public def process_large_file(filename: str) -> int64:
     int64 total_bytes = 0
     int64 buffer_size = 65536
     int64[] buffer = new int64[buffer_size / 8]
-    
+
     int64 chunk = 0
     while chunk < 1000000:
         total_bytes = total_bytes + buffer_size
         chunk = chunk + 1
-    
+
     return total_bytes
 
 public def main() -> int:
@@ -1488,13 +1488,13 @@ public def simple_hash_64(data: str) -> uint64:
     uint64 hash = 0xFFFFFFFFFFFFFFFF
     int64 length = strlen(data)
     int64 i = 0
-    
+
     while i < length:
         uint64 byte = (uint64)data[i]
         hash = hash ^ byte
         hash = hash * 0x100000001B3
         i = i + 1
-    
+
     return hash
 
 public def main() -> int:
@@ -1559,12 +1559,15 @@ The language is suited for:
 ### Formal Grammar (Simplified)
 
 ```
-program        ::= {statement | struct_def}
-declaration    ::= type IDENTIFIER ["=" expression]
+program        ::= {statement | struct_def | class_def}
+declaration    ::= type IDENTIFIER ["=" expression] | "auto" IDENTIFIER "=" expression
 function       ::= ACCESS_MODIFIER? "def" IDENTIFIER "(" parameters ")" ["->" type] block
 struct_def     ::= "struct" IDENTIFIER [generic_params] ":" {member_decl}
+class_def      ::= ["sealed"] ["dataclass"] "class" IDENTIFIER ["(" IDENTIFIER ")"] ":" {class_member}
+class_member   ::= member_decl | function | property_def
+property_def   ::= "property" IDENTIFIER ":" NEWLINE INDENT ("get" ":" block) ["set" ":" block] DEDENT
 block          ::= NEWLINE INDENT statement DEDENT
-statement      ::= expression_stmt | if_stmt | while_stmt | for_stmt | return_stmt | break_stmt | continue_stmt | print_stmt | import_stmt | declaration | function
+statement      ::= expression_stmt | if_stmt | while_stmt | for_stmt | return_stmt | break_stmt | continue_stmt | print_stmt | import_stmt | declaration | function | "del" expression
 expression_stmt ::= expression
 if_stmt        ::= "if" expression block {"elif" expression block} ["else" block]
 while_stmt     ::= "while" expression block
@@ -1581,10 +1584,10 @@ additive       ::= multiplicative {("+" | "-") multiplicative}
 multiplicative ::= power {("*" | "/" | "//" | "%") power}
 power          ::= unary ["**" power]
 unary          ::= ("+" | "-" | "not" | "~" | "*" | "&") unary | postfix
-postfix        ::= primary {("()" | "[]" | "." IDENTIFIER)}
-primary        ::= NUMBER | STRING | FSTRING | IDENTIFIER | "(" expression ")" | "new" type | "sizeof" "(" type ")"
+postfix        ::= primary {("()" | "[]" | "." IDENTIFIER | "as" IDENTIFIER)}
+primary        ::= NUMBER | STRING | FSTRING | IDENTIFIER | "(" expression ")" | "new" type ["(" args ")"] | "sizeof" "(" type ")" | "super" "." IDENTIFIER "(" args ")" | "isinstance" "(" expression "," IDENTIFIER ")"
 FSTRING        ::= ("f" | "fr" | "rf")? STRING   -- with "{" expression "}" interpolation and "{{"/"}}" escapes
-type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void" | type "*" | type "[]"
+type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void" | "big" | "ubig" | "char" | "size_t" | "dynamic" | "auto" | type "*" | type "[]" | IDENTIFIER
 ```
 
 ### Token Specifications

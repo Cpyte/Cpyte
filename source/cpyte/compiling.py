@@ -40,6 +40,11 @@ if getattr(sys, "frozen", False):
 else:
     _WINJIT_STUB_C = os.path.join(os.path.dirname(__file__), "winjit_stubs.c")
 
+if getattr(sys, "frozen", False):
+    _RUNPY_RUNTIME_C = os.path.join(getattr(sys, "_MEIPASS", ""), "runpy_runtime.c")
+else:
+    _RUNPY_RUNTIME_C = os.path.join(os.path.dirname(__file__), "runpy_runtime.c")
+
 _llvm_cc_cache = None
 
 # llvmlite's binding is not thread-safe: parse_assembly / link_modules /
@@ -1362,7 +1367,13 @@ def run_jit(
                 jit_opt_level=opt_level,
                 extra_flags=_runtime_extra_flags(src),
             ): src
-            for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C, _FLOATS_RUNTIME_C)
+            for src in (
+                _RUNTIME_C,
+                _BIGNUM_C,
+                _GC_RUNTIME_C,
+                _FLOATS_RUNTIME_C,
+                _RUNPY_RUNTIME_C,
+            )
         }
         runtime_irs = {}
         for fut, src in futures.items():
@@ -1377,8 +1388,15 @@ def run_jit(
         _BIGNUM_C: _BIGNUM_KEEP,
         _GC_RUNTIME_C: frozenset(),
         _FLOATS_RUNTIME_C: frozenset(),
+        _RUNPY_RUNTIME_C: frozenset(),
     }
-    for src in (_RUNTIME_C, _BIGNUM_C, _GC_RUNTIME_C, _FLOATS_RUNTIME_C):
+    for src in (
+        _RUNTIME_C,
+        _BIGNUM_C,
+        _GC_RUNTIME_C,
+        _FLOATS_RUNTIME_C,
+        _RUNPY_RUNTIME_C,
+    ):
         with _llvm_binding_lock:
             m = binding.parse_assembly(_remove_probe_stack_ir(runtime_irs[src]))
             keep = internal_keep[src]
@@ -1677,8 +1695,7 @@ def run_jit(
     unresolved = _map_process_libc(engine, mod)
     if unresolved:
         print_err(
-            "error: unresolved external symbol(s): "
-            + ", ".join(sorted(unresolved))
+            "error: unresolved external symbol(s): " + ", ".join(sorted(unresolved))
         )
         print_err(
             "  a ccode:/llvm: block references a symbol that is not provided "
@@ -1812,7 +1829,7 @@ def _map_process_libc(engine, mod):
         # clang marks a handful of externals (poll/pthread_cond_init/fputs/
         # nanosleep) with LLVM's do-not-mangle prefix "\x01"; the runtime
         # process symbol is the bare trailing name, so strip it for lookup.
-        lookup = name[1:] if name.startswith("\x01") else name
+        lookup = name.removeprefix("\x01")
         for lib in libs:
             try:
                 sym = getattr(lib, lookup)
@@ -1933,6 +1950,7 @@ def run_aot(
     if not no_userspace:
         compile_jobs.append((_RUNTIME_C, output + ".runtime.o"))
     compile_jobs.append((_GC_RUNTIME_C, output + ".gc.o"))
+    compile_jobs.append((_RUNPY_RUNTIME_C, output + ".runpy.o"))
 
     def _linker_compile(src, out):
         linker.compile_c(
@@ -2020,10 +2038,12 @@ def _scorpion_tool(name):
 
 def _scorpion_cc_flags():
     import os
+
     triple = os.environ.get("CPYTE_SCORPION_TRIPLE", _SCORPION_DEFAULT_TRIPLE)
     arch = os.environ.get("CPYTE_SCORPION_ARCH", _SCORPION_DEFAULT_ARCH)
     abi = os.environ.get("CPYTE_SCORPION_ABI", _SCORPION_DEFAULT_ABI)
     return arch, abi, triple
+
 
 def run_scorpion(
     module,
@@ -2119,6 +2139,30 @@ def run_scorpion(
         print_err(f"error compiling runtime_scorpion.c: {format_cc_diag(r.stderr)}")
         raise SystemExit(1)
     objs.append(runtime_obj)
+
+    try:
+        runpy_obj = output.rsplit(".", 1)[0] + ".runpy.o"
+        cc = _find_scorpion_tool("gcc", _SCORPION_CC)
+        arch, abi, _tr = _scorpion_cc_flags()
+        cmd = [
+            cc,
+            "-c",
+            "-O3",
+            arch,
+            abi,
+            "-nostdlib",
+            "-ffreestanding",
+            "-o",
+            runpy_obj,
+            _RUNPY_RUNTIME_C,
+        ]
+        if pic:
+            cmd.append("-fPIC")
+        r2 = subprocess.run(cmd, capture_output=True, text=True)
+        if r2.returncode == 0:
+            objs.append(runpy_obj)
+    except Exception:
+        pass
 
     # Link into ELF using the GCC driver so libgcc (e.g. __fixdfsi) is resolved
     elf_base = output.rsplit(".", 1)[0]

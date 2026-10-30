@@ -79,7 +79,7 @@ class Node:
 
 class Number(Node):
     inferred_type: str | None
-    __slots__ = ("_token", "inferred_type", "value", "is_bool")
+    __slots__ = ("_token", "inferred_type", "is_bool", "value")
 
     def __init__(self, value: str, token=None, is_bool: bool = False):
         self.value = value
@@ -115,12 +115,12 @@ class FString(Node):
 
 class Variable(Node):
     __slots__ = (
+        "_dunder_via",
         "_token",
         "const_value",
         "dynamic",
         "inferred_type",
         "name",
-        "_dunder_via",
     )
 
     def __init__(self, name: str, token=None):
@@ -155,8 +155,8 @@ class Call(Node):
         "args",
         "callee",
         "inferred_type",
-        "param_types",
         "meta",
+        "param_types",
     )
 
     def __init__(self, callee, args: list, token=None):
@@ -267,7 +267,7 @@ class IfExp(Node):
     """
 
     inferred_type: str | None
-    __slots__ = ("_token", "inferred_type", "body", "cond", "orelse")
+    __slots__ = ("_token", "body", "cond", "inferred_type", "orelse")
 
     def __init__(self, body, cond, orelse, token=None):
         self.body = body
@@ -284,13 +284,13 @@ class CCode(Node):
     inferred_type: str | None
     __slots__ = (
         "_token",
+        "includes",
         "inferred_type",
+        "src_file",
+        "src_line",
         "symbols",
         "value",
         "var_names",
-        "includes",
-        "src_file",
-        "src_line",
     )
 
     def __init__(self, value: str, token=None):
@@ -1690,14 +1690,14 @@ def parse_dataclass_class(tokens: list[Token], pos: int):
     return parse_class(tokens, pos, sealed=sealed, dataclass=True)
 
 
-
 def parse_protocol_class(tokens: list[Token], pos: int):
     """Parse `interface I:` or `protocol I:` as a protocol definition."""
     tok = tokens[pos]
     pos += 1
     if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
         raise ParseError(
-            "Expected interface/protocol name", tokens[pos] if pos < len(tokens) else None
+            "Expected interface/protocol name",
+            tokens[pos] if pos < len(tokens) else None,
         )
     name = tokens[pos].value
     assert name is not None
@@ -1708,7 +1708,8 @@ def parse_protocol_class(tokens: list[Token], pos: int):
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError(
-                "Expected base protocol name", tokens[pos] if pos < len(tokens) else None
+                "Expected base protocol name",
+                tokens[pos] if pos < len(tokens) else None,
             )
         base = tokens[pos].value
         pos += 1
@@ -2315,7 +2316,7 @@ class Raise(Node):
 
 
 class NewExpr(Node):
-    __slots__ = ("_token", "size", "type_expr", "args", "inferred_type")
+    __slots__ = ("_token", "args", "inferred_type", "size", "type_expr")
 
     def __init__(self, type_expr, size=None, token=None, args=None):
         self.type_expr = type_expr
@@ -2333,7 +2334,7 @@ class NewExpr(Node):
 
 
 class Deref(Node):
-    __slots__ = ("_token", "operand", "inferred_type")
+    __slots__ = ("_token", "inferred_type", "operand")
 
     def __init__(self, operand, token=None):
         self.operand = operand
@@ -2345,7 +2346,7 @@ class Deref(Node):
 
 
 class AddrOf(Node):
-    __slots__ = ("_token", "operand", "inferred_type")
+    __slots__ = ("_token", "inferred_type", "operand")
 
     def __init__(self, operand, token=None):
         self.operand = operand
@@ -2357,7 +2358,7 @@ class AddrOf(Node):
 
 
 class SizeOf(Node):
-    __slots__ = ("_token", "type_expr", "resolved_type")
+    __slots__ = ("_token", "resolved_type", "type_expr")
 
     def __init__(self, type_expr, token=None):
         self.type_expr = type_expr
@@ -2373,7 +2374,7 @@ class SizeOf(Node):
 
 
 class CastExpr(Node):
-    __slots__ = ("_token", "inferred_type", "type_expr", "expr")
+    __slots__ = ("_token", "expr", "inferred_type", "type_expr")
 
     def __init__(self, type_expr: str, expr, token=None):
         self.type_expr = type_expr
@@ -2394,7 +2395,7 @@ class AsExpr(Node):
     `as` that fails yields null rather than silently re-typing the pointer.
     """
 
-    __slots__ = ("_token", "inferred_type", "type_expr", "expr", "meta")
+    __slots__ = ("_token", "expr", "inferred_type", "meta", "type_expr")
 
     def __init__(self, type_expr: str, expr, token=None):
         self.type_expr = type_expr
@@ -2414,7 +2415,7 @@ class BorrowExpr(Node):
     the semantic/ownership pass enforces borrow rules.
     """
 
-    __slots__ = ("_token", "operand", "mutable", "inferred_type")
+    __slots__ = ("_token", "inferred_type", "mutable", "operand")
 
     def __init__(self, operand, mutable: bool = False, token=None):
         self.operand = operand
@@ -2433,7 +2434,7 @@ class MoveExpr(Node):
     used afterward unless it is reassigned.
     """
 
-    __slots__ = ("_token", "operand", "inferred_type")
+    __slots__ = ("_token", "inferred_type", "operand")
 
     def __init__(self, operand, token=None):
         self.operand = operand
@@ -2471,7 +2472,7 @@ class DelStmt(Node):
     `del obj.field` / `del arr[i]` / `del *p` clear the addressed slot.
     """
 
-    __slots__ = ("_token", "target", "del_kind")
+    __slots__ = ("_token", "del_kind", "target")
 
     def __init__(self, target, token=None):
         self.target = target
@@ -2540,12 +2541,12 @@ class ClassDef(Node):
         "dataclass",
         "fields",
         "generic_params",
+        "is_protocol",
         "methods",
         "module",
         "name",
         "properties",
         "sealed",
-        "is_protocol",
     )
 
     def __init__(
@@ -2579,9 +2580,18 @@ class ClassDef(Node):
         return f"ClassDef({seal}{dc}{self.name}, base={self.base}, fields={self.fields}, properties={self.properties}, methods={self.methods})"
 
 
-
 class ProtocolDef(Node):
-    __slots__ = ("_token", "base", "name", "methods", "properties", "fields", "generic_params", "sealed", "is_protocol")
+    __slots__ = (
+        "_token",
+        "base",
+        "fields",
+        "generic_params",
+        "is_protocol",
+        "methods",
+        "name",
+        "properties",
+        "sealed",
+    )
 
     def __init__(
         self,
@@ -2614,7 +2624,7 @@ InterfaceDef = ProtocolDef
 class PropertyDef(Node):
     """A `property name:` block holding paired `get`/`set` accessor bodies."""
 
-    __slots__ = ("_token", "name", "get", "set", "_ptype")
+    __slots__ = ("_ptype", "_token", "get", "name", "set")
 
     def __init__(self, name: str, get, set=None, token=None):
         self.name = name
@@ -3611,9 +3621,7 @@ def parse_expr_stmt(tokens: list[Token], pos: int):
                 token=tok,
             ),
             token=tok,
-            compound_op=(
-                binop_op if not isinstance(target, Variable) else None
-            ),
+            compound_op=(binop_op if not isinstance(target, Variable) else None),
         ), pos
 
     _expect_newline(tokens, pos, tok)

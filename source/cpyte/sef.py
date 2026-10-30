@@ -181,7 +181,7 @@ def decode_imports(data, offset, size, versym=False):
         if versym:
             plt, ver_hash, flags, name_len = struct.unpack_from("<IIII", data, p + 8)
         else:
-            name_len, = struct.unpack_from("<I", data, p + 8)
+            (name_len,) = struct.unpack_from("<I", data, p + 8)
             plt = 0
             ver_hash = 0
             flags = 0
@@ -215,11 +215,11 @@ def decode_exports(data, offset, size, versym=False):
     while p < end:
         if p + hdr > end:
             raise SefError("truncated EXPORT record header")
-        value, = struct.unpack_from("<I", data, p)
+        (value,) = struct.unpack_from("<I", data, p)
         if versym:
             ver_hash, name_len = struct.unpack_from("<II", data, p + 4)
         else:
-            name_len, = struct.unpack_from("<I", data, p + 4)
+            (name_len,) = struct.unpack_from("<I", data, p + 4)
             ver_hash = 0
         record_size = hdr + _align4(name_len)
         if record_size > end - p:
@@ -267,7 +267,10 @@ def check(data):
     dynamic = bool(header["flags"] & SEF_FLAG_DYNAMIC)
     versym = bool(header["flags"] & SEF_FLAG_VERSYM)
     if dynamic:
-        record("pass", "flags 0x%04X -> dynamic SEF (RELOC/IMPORT/EXPORT)" % header["flags"])
+        record(
+            "pass",
+            "flags 0x%04X -> dynamic SEF (RELOC/IMPORT/EXPORT)" % header["flags"],
+        )
     else:
         record("pass", "flags 0x%04X -> static SEF" % header["flags"])
 
@@ -474,10 +477,15 @@ def format_digest(info, compact=False):
         )
 
     out = []
-    out.append("SEF digest (dynamic=%s versions=%s)" % (info["dynamic"], info["versions"]))
+    out.append(
+        "SEF digest (dynamic=%s versions=%s)" % (info["dynamic"], info["versions"])
+    )
     for e in info["exports"]:
         if e["ver_hash"]:
-            out.append("  export  0x%08X %s (ver 0x%X)" % (e["value"], e["name"], e["ver_hash"]))
+            out.append(
+                "  export  0x%08X %s (ver 0x%X)"
+                % (e["value"], e["name"], e["ver_hash"])
+            )
         else:
             out.append("  export  0x%08X %s" % (e["value"], e["name"]))
     for imp in info["imports"]:

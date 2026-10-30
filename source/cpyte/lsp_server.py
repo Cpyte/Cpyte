@@ -10,6 +10,7 @@ from lsprotocol import types as lsp
 from pygls.cli import start_server
 from pygls.lsp.server import LanguageServer
 
+from . import scorpion_abi
 from .astparse import (
     Call,
     ClassDef,
@@ -26,11 +27,10 @@ from .astparse import (
     While,
     parse_file,
 )
+from .clib import _BUILTIN_LIB_HEADERS
 from .formatter import format_source
 from .lexar import Lexer, LexerError, TokenType
 from .semantic_analasis import SemanticAnalyzer
-from . import scorpion_abi
-from .clib import _BUILTIN_LIB_HEADERS
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -92,6 +92,14 @@ _KEYWORDS = [
     "virtual",
     "override",
     "sealed",
+    "dataclass",
+    "property",
+    "get",
+    "set",
+    "super",
+    "isinstance",
+    "as",
+    "auto",
     "ccode",
     "llvm",
     "asm",
@@ -106,6 +114,12 @@ _KEYWORDS = [
     "input_str",
     "input_big",
     "free",
+    "del",
+    "has",
+    "get_attr",
+    "runpy",
+    "hotswap",
+    "redirect",
 ]
 
 _TYPES = [
@@ -119,8 +133,10 @@ _TYPES = [
     "void",
     "bool",
     "big",
+    "ubig",
     "size_t",
     "dynamic",
+    "auto",
 ]
 
 _KEYWORD_DESC = {
@@ -158,6 +174,14 @@ _KEYWORD_DESC = {
     "virtual": "Declare an overridable method",
     "override": "Override a parent class method",
     "sealed": "Declare a monomorphic class (static dispatch, no vtable)",
+    "dataclass": "Auto-generate __init__/__eq__/__str__ for a class",
+    "property": "Define a property with get/set accessors",
+    "get": "Property getter accessor",
+    "set": "Property setter accessor",
+    "super": "Call a method from the parent class",
+    "isinstance": "Check if an object is an instance of a class (RTTI)",
+    "as": "Safe runtime downcast operator",
+    "auto": "Type inference keyword",
     "ccode": "Embed raw C code block",
     "llvm": "Embed raw LLVM IR block",
     "asm": "Inline assembly block",
@@ -167,6 +191,12 @@ _KEYWORD_DESC = {
     "input_str": "Read a line of text from stdin and return it as a string",
     "input_big": "Read a line of text from stdin and return it as an arbitrary-precision big integer",
     "free": "Deallocate heap memory",
+    "del": "Delete/unbind a variable or clear a slot",
+    "has": "Check if a field/variable exists",
+    "get_attr": "Get attribute by name at runtime",
+    "runpy": "Dynamic class runtime",
+    "hotswap": "Hot swap class/table methods",
+    "redirect": "Redirect class to another class/table",
     "True": "Boolean literal representing truth",
     "False": "Boolean literal representing falsehood",
     "and": "Logical AND (both sides must be true)",
@@ -190,8 +220,10 @@ _TYPE_DESC = {
     "void": "Absence of a value (used as return type)",
     "bool": "Boolean (true or false)",
     "big": "Arbitrary-precision integer (unlimited size)",
+    "ubig": "Unsigned arbitrary-precision integer",
     "size_t": "Unsigned platform-dependent size type",
     "dynamic": "Dynamically-typed value (resolved at runtime)",
+    "auto": "Type inferred from initializer",
 }
 
 _BUILTIN_FUNCS = {
@@ -211,6 +243,10 @@ _BUILTIN_FUNCS = {
     "new": "new T(...) -> T*",
     "free": "free(ptr: any*) -> void",
     "code": "code() -> dynamic",
+    "has": "has(obj: any, name?: str) -> bool",
+    "get_attr": "get_attr(obj: any, name: str) -> any",
+    "isinstance": "isinstance(obj: any, cls: type) -> bool",
+    "gc_collect": "gc_collect() -> void",
 }
 
 _BUILTIN_FUNC_PARAMS = {
@@ -1084,7 +1120,11 @@ def did_close(ls: CpyLanguageServer, params: lsp.DidCloseTextDocumentParams):
 
 
 @server.feature(
-    lsp.TEXT_DOCUMENT_COMPLETION, lsp.CompletionOptions(trigger_characters=[".", " "])
+    lsp.TEXT_DOCUMENT_COMPLETION,
+    lsp.CompletionOptions(
+        trigger_characters=[".", " ", ":", "<", "(", ","],
+        resolve_provider=False,
+    ),
 )
 @server.thread()
 def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
@@ -1497,12 +1537,14 @@ def signature_help(ls: CpyLanguageServer, params: lsp.SignatureHelpParams):
                                 if t2.line == tok.line and t2.column < tok.column:
                                     if prev is None or t2.column > prev.column:
                                         prev = t2
-                            if prev and prev.type == TokenType.IDENTIFIER:
-                                func_name = prev.value
-                            elif (
+                            if (
                                 prev
-                                and prev.type == TokenType.KEYWORD
-                                and prev.value in _BUILTIN_FUNC_PARAMS
+                                and prev.type == TokenType.IDENTIFIER
+                                or (
+                                    prev
+                                    and prev.type == TokenType.KEYWORD
+                                    and prev.value in _BUILTIN_FUNC_PARAMS
+                                )
                             ):
                                 func_name = prev.value
                         break
@@ -1902,6 +1944,8 @@ def document_highlight(ls: CpyLanguageServer, params: lsp.DocumentHighlightParam
         if not tok or not tok.value:
             return []
         word = tok.value
+        if word in _KEYWORDS or word in _TYPES or word in _BUILTIN_FUNCS:
+            return []
         results = []
         for t_line, t_col, t_len in _walk_all_tokens(tokens, word, line, col):
             rng = lsp.Range(
@@ -2078,6 +2122,83 @@ def references(ls: CpyLanguageServer, params: lsp.ReferenceParams):
         return None
 
 
+@server.feature(lsp.TEXT_DOCUMENT_PREPARE_RENAME)
+@server.thread()
+def prepare_rename(ls: CpyLanguageServer, params: lsp.PrepareRenameParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, _, _, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value or tok.type != TokenType.IDENTIFIER:
+            return None
+        word = tok.value
+        if word in _KEYWORDS or word in _TYPES or word in _BUILTIN_FUNCS:
+            return None
+        return lsp.Range(
+            start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
+            end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(word)),
+        )
+    except Exception:
+        logger.error(f"prepare_rename error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_RENAME)
+@server.thread()
+def rename(ls: CpyLanguageServer, params: lsp.RenameParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        new_name = params.new_name
+        _, tokens, _, _, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value or tok.type != TokenType.IDENTIFIER:
+            return None
+        word = tok.value
+        if word in _KEYWORDS or word in _TYPES or word in _BUILTIN_FUNCS:
+            return None
+        edits = []
+        for t_line, t_col, t_len in _walk_all_tokens(tokens, word, line, col):
+            edits.append(
+                lsp.TextEdit(
+                    range=lsp.Range(
+                        start=lsp.Position(line=t_line, character=t_col),
+                        end=lsp.Position(line=t_line, character=t_col + t_len),
+                    ),
+                    new_text=new_name,
+                )
+            )
+        if not edits:
+            return None
+        return lsp.WorkspaceEdit(changes={uri: edits})
+    except Exception:
+        logger.error(f"rename error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_IMPLEMENTATION)
+@server.thread()
+def implementation(ls: CpyLanguageServer, params: lsp.ImplementationParams):
+    try:
+        return definition(ls, params)
+    except Exception:
+        logger.error(f"implementation error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_TYPE_DEFINITION)
+@server.thread()
+def type_definition(ls: CpyLanguageServer, params: lsp.TypeDefinitionParams):
+    try:
+        return definition(ls, params)
+    except Exception:
+        logger.error(f"type_definition error:\n{traceback.format_exc()}")
+        return None
+
+
 @server.feature(lsp.TEXT_DOCUMENT_FOLDING_RANGE)
 @server.thread()
 def folding_range(ls: CpyLanguageServer, params: lsp.FoldingRangeParams):
@@ -2209,7 +2330,12 @@ def _ranges_intersect(r1: lsp.Range, r2: lsp.Range) -> bool:
     )
 
 
-@server.feature(lsp.TEXT_DOCUMENT_CODE_ACTION, lsp.CodeActionOptions())
+@server.feature(
+    lsp.TEXT_DOCUMENT_CODE_ACTION,
+    lsp.CodeActionOptions(
+        code_action_kinds=[lsp.CodeActionKind.QuickFix, lsp.CodeActionKind.Refactor]
+    ),
+)
 @server.thread()
 def code_action(ls: CpyLanguageServer, params: lsp.CodeActionParams):
     try:

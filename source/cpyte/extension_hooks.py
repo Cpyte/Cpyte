@@ -615,7 +615,6 @@ class _HookFailed:
 _HOOK_FAILED = _HookFailed()
 
 
-
 @dataclass(slots=True)
 class HookError:
     """Records a hook callback/report failure for later diagnostics."""
@@ -818,7 +817,6 @@ class HookRegistry:
         *,
         priority: int | None = None,
     ) -> None:
-
         if hook.stage is None:
             raise ValueError(f"Hook {hook.name!r} does not define a compiler stage")
 
@@ -878,7 +876,6 @@ class HookRegistry:
         self,
         stage: HookStage,
     ) -> list[CompilerHook]:
-
         return [
             registration.hook
             for registration in self._hooks[stage]
@@ -908,7 +905,6 @@ class HookRegistry:
         self,
         hook_type: type[H],
     ) -> list[H]:
-
         return [
             registration.hook
             for registrations in self._hooks.values()
@@ -935,7 +931,6 @@ class HookRegistry:
         self,
         context: CompilerContext,
     ) -> None:
-
         self._context = context
 
         for hook in self.all():
@@ -945,7 +940,6 @@ class HookRegistry:
         self,
         context: CompilerContext,
     ) -> None:
-
         for hook in reversed(self.all()):
             hook.shutdown(context)
 
@@ -975,7 +969,6 @@ class HookLoader:
         registry: HookRegistry,
         context: CompilerContext,
     ) -> int:
-
         loaded = 0
 
         for relative_path in hook_files:
@@ -1010,7 +1003,6 @@ class HookLoader:
         hook_path: str,
         package_name: str,
     ) -> list[CompilerHook]:
-
         module_name = f"_cpyte_extension_{abs(hash((package_name, hook_path)))}"
 
         spec = importlib.util.spec_from_file_location(
@@ -1099,9 +1091,7 @@ class HookDispatcher:
     # ------------------------------------------------------------------
 
     def has_lexer_hooks(self) -> bool:
-        return any(
-            isinstance(hook, LexerHook) for hook in self._hooks(HookStage.LEXER)
-        )
+        return any(isinstance(hook, LexerHook) for hook in self._hooks(HookStage.LEXER))
 
     def additional_keywords(self) -> set[str]:
         result: set[str] = set()
@@ -1164,7 +1154,6 @@ class HookDispatcher:
         node: Any,
         context: CompilerContext,
     ) -> Any:
-
         for hook in self._hooks(HookStage.TRANSFORM):
             if not isinstance(hook, TransformHook):
                 continue
@@ -1184,7 +1173,6 @@ class HookDispatcher:
         module: Any,
         context: CompilerContext,
     ) -> Any:
-
         for hook in self._hooks(HookStage.TRANSFORM):
             if not isinstance(hook, TransformHook):
                 continue
@@ -1205,7 +1193,6 @@ class HookDispatcher:
         node: Any,
         context: CompilerContext,
     ) -> list[Diagnostic]:
-
         diagnostics: list[Diagnostic] = []
 
         for hook in self._hooks(HookStage.SEMANTIC):
@@ -1214,9 +1201,7 @@ class HookDispatcher:
             should = self.registry.invoke_plain(hook, "should_visit_node", node)
             if should is _HOOK_FAILED or not should:
                 continue
-            produced = self.registry.invoke_context(
-                hook, "visit_node", context, node
-            )
+            produced = self.registry.invoke_context(hook, "visit_node", context, node)
             if produced is not _HOOK_FAILED and produced:
                 diagnostics.extend(produced)
 
@@ -1247,9 +1232,7 @@ class HookDispatcher:
         for hook in self._hooks(HookStage.SEMANTIC):
             if not isinstance(hook, SemanticHook):
                 continue
-            inferred = self.registry.invoke_context(
-                hook, "infer_type", context, node
-            )
+            inferred = self.registry.invoke_context(hook, "infer_type", context, node)
             if inferred is _HOOK_FAILED or inferred is None:
                 continue
             return inferred
@@ -1315,7 +1298,6 @@ class HookDispatcher:
         builder: Any,
         context: CompilerContext,
     ) -> Any | None:
-
         for hook in self._hooks(HookStage.CODEGEN):
             if not isinstance(hook, CodegenHook):
                 continue
@@ -1337,9 +1319,7 @@ class HookDispatcher:
     ) -> None:
         for hook in self._hooks(HookStage.CODEGEN):
             if isinstance(hook, CodegenHook):
-                self.registry.invoke_context(
-                    hook, "before_codegen", context, module
-                )
+                self.registry.invoke_context(hook, "before_codegen", context, module)
 
     def after_codegen(
         self,
@@ -1348,9 +1328,7 @@ class HookDispatcher:
     ) -> None:
         for hook in self._hooks(HookStage.CODEGEN):
             if isinstance(hook, CodegenHook):
-                self.registry.invoke_context(
-                    hook, "after_codegen", context, module
-                )
+                self.registry.invoke_context(hook, "after_codegen", context, module)
 
     # ------------------------------------------------------------------
     # Optimization
@@ -1379,7 +1357,6 @@ class HookDispatcher:
         self,
         context: CompilerContext,
     ) -> None:
-
         for hook in self._hooks(HookStage.LINK):
             if not isinstance(hook, BuildHook):
                 continue
@@ -1391,15 +1368,11 @@ class HookDispatcher:
                 ("get_compiler_flags", context.compiler_flags),
                 ("get_linker_flags", context.linker_flags),
             ):
-                value = self.registry.invoke_context(
-                    hook, method, context
-                )
+                value = self.registry.invoke_context(hook, method, context)
                 if value is not _HOOK_FAILED and value:
                     target.extend(value)
 
-            defines = self.registry.invoke_context(
-                hook, "get_defines", context
-            )
+            defines = self.registry.invoke_context(hook, "get_defines", context)
             if defines is not _HOOK_FAILED and defines:
                 context.defines.update(defines)
 
@@ -1411,16 +1384,13 @@ class HookDispatcher:
         self,
         context: CompilerContext,
     ) -> list[str]:
-
         result: list[str] = []
 
         for hook in self._hooks(HookStage.RUNTIME):
             if not isinstance(hook, RuntimeHook):
                 continue
 
-            code = self.registry.invoke_context(
-                hook, "get_runtime_code", context
-            )
+            code = self.registry.invoke_context(hook, "get_runtime_code", context)
 
             if code is not _HOOK_FAILED and code:
                 result.append(code)
@@ -1435,9 +1405,7 @@ class HookDispatcher:
         for hook in self._hooks(HookStage.RUNTIME):
             if not isinstance(hook, RuntimeHook):
                 continue
-            value = self.registry.invoke_context(
-                hook, "get_runtime_libraries", context
-            )
+            value = self.registry.invoke_context(hook, "get_runtime_libraries", context)
             if value is not _HOOK_FAILED and value:
                 result.extend(value)
         return result

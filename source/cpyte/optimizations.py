@@ -192,7 +192,8 @@ def _flip_compare(op) -> TokenType:
         return TokenType.LESS_EQ
     return op
 
-#fix fibbonaci optimization bug
+
+# fix fibbonaci optimization bug
 def _is_fib_bound_cond(cond, param_name: str) -> bool:
     """True when *cond* is exactly ``n <= 1`` (or ``n < 2``), either operand
     order.
@@ -526,7 +527,7 @@ def _get_used_variables(entity) -> set[str]:
             continue
         if isinstance(obj, Variable):
             names.add(obj.name)
-        #Missing semantic information during annalysis
+        # Missing semantic information during annalysis
         elif isinstance(obj, Assign):
             stack.append(obj.value)
 

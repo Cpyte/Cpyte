@@ -370,7 +370,7 @@ def got_slot_of(elf, site):
 class Import:
     """One unresolved reference at one image offset."""
 
-    __slots__ = ("rtype", "site", "name", "ver_hash", "flags", "plt")
+    __slots__ = ("flags", "name", "plt", "rtype", "site", "ver_hash")
 
     def __init__(self, rtype, site, name):
         self.rtype = rtype
@@ -385,7 +385,7 @@ def main(argv):
     exports = []
     export_file = None
     weak = []
-    require = {}   # import name -> version
+    require = {}  # import name -> version
     verdefs = []
     scope = ""
     lazy = False
@@ -413,7 +413,7 @@ def main(argv):
             i += 2
         elif opt == "--require":
             if "=" not in args[i + 1]:
-                sys.exit(f"error: --require wants NAME=VERSION, got {args[i+1]!r}")
+                sys.exit(f"error: --require wants NAME=VERSION, got {args[i + 1]!r}")
             name, ver = args[i + 1].split("=", 1)
             require[name] = ver
             i += 2
@@ -489,7 +489,7 @@ def main(argv):
     ):
         if size and vaddr + size > len(flat):
             sys.exit(
-                f"error: {elf_path}: {label} [0x{vaddr:x},0x{vaddr+size:x}) "
+                f"error: {elf_path}: {label} [0x{vaddr:x},0x{vaddr + size:x}) "
                 f"is past the end of the linked image (0x{len(flat):x})"
             )
 
@@ -497,7 +497,7 @@ def main(argv):
 
     # --- process relocations ---
     reloc_records = []  # (type, offset, value)
-    imports = []        # one Import per relocation site
+    imports = []  # one Import per relocation site
     sym_by_index = elf["sym_by_index"]
     section_by_index = elf["section_by_index"]
     mapped = len(flat)
@@ -636,7 +636,8 @@ def main(argv):
             # reached. The import record alone now drives this site.
             stub_sites = {imp.site for imp, _, _ in stubs}
             reloc_records = [
-                rec for rec in reloc_records
+                rec
+                for rec in reloc_records
                 if not (rec[0] == SEF_R_CALL and rec[1] in stub_sites)
             ]
 
@@ -817,7 +818,9 @@ def main(argv):
         f"exports={len(export_records)}"
     )
     if plt_bytes:
-        print(f"  lazy PLT: {len(plt_bytes) // SEF_PLT_STUB_SIZE} stubs at 0x{plt_vaddr:x}")
+        print(
+            f"  lazy PLT: {len(plt_bytes) // SEF_PLT_STUB_SIZE} stubs at 0x{plt_vaddr:x}"
+        )
     if defined_vers:
         print(f"  version defs: {', '.join(defined_vers)}")
 

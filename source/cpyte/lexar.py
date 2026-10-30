@@ -117,8 +117,6 @@ _BASE_KEYWORDS = {
     "sealed",
     "interface",
     "protocol",
-    "interface",
-    "protocol",
     "dataclass",
     "as",
 }

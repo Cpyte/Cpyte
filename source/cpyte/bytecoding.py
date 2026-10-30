@@ -998,6 +998,57 @@ class LLVM:
             fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
             self.functions[name] = fn
 
+        # Runpy dynamic class/runtime
+        void_ptr = _i8ptr
+        table_ptr = ir.PointerType(ir.LiteralStructType([]))
+        class_ptr = _i8ptr
+        func_ptr = _i8ptr
+        runpy_fns = [
+            ("create_table", table_ptr, [_i64]),
+            ("hashmap_put", table_ptr, [table_ptr, void_ptr, void_ptr]),
+            ("hashmap_get", void_ptr, [table_ptr, void_ptr]),
+            ("hashmap_contains", _i32, [table_ptr, void_ptr]),
+            ("hashmap_erase", table_ptr, [table_ptr, void_ptr]),
+            ("hashmap_destroy", _void, [table_ptr]),
+            ("hashmap_is_valid", _i32, [table_ptr]),
+            ("hashmap_size", _i64, [table_ptr]),
+            ("hashmap_is_empty", _i32, [table_ptr]),
+            ("runpy_create_function", func_ptr, [_i32, void_ptr, void_ptr]),
+            ("runpy_create_tables", table_ptr, []),
+            ("runpy_create_class", class_ptr, [_i64]),
+            ("runpy_destroy_class", _void, [class_ptr]),
+            ("runpy_class_addfunc", class_ptr, [func_ptr, class_ptr]),
+            ("runpy_class_delfunc", class_ptr, [func_ptr, class_ptr]),
+            ("runpy_class_updfunc", class_ptr, [func_ptr, func_ptr, class_ptr]),
+            ("runpy_function_call", _void, [func_ptr, void_ptr]),
+            ("runpy_class_getfunc", func_ptr, [class_ptr, void_ptr]),
+            ("runpy_class_hasfunc", _i32, [class_ptr, void_ptr]),
+            ("runpy_class_replace_table", class_ptr, [class_ptr, table_ptr]),
+            ("runpy_class_get_table", table_ptr, [class_ptr]),
+            ("runpy_class_get_index", _i64, [class_ptr]),
+            ("runpy_class_set_index", _void, [class_ptr, _i64]),
+            ("runpy_function_get_impl", void_ptr, [func_ptr]),
+            ("runpy_function_set_impl", _void, [func_ptr, void_ptr]),
+            ("runpy_function_get_name", void_ptr, [func_ptr]),
+            ("runpy_function_get_signature", _i32, [func_ptr]),
+            ("runpy_function_get_generation", _i64, [func_ptr]),
+            ("runpy_table_clone", table_ptr, [table_ptr]),
+            ("runpy_table_merge", _i32, [table_ptr, table_ptr]),
+            ("runpy_class_hotswap", _i32, [class_ptr, table_ptr]),
+            ("runpy_class_redirect", _i32, [class_ptr, class_ptr]),
+            (
+                "runpy_class_lookup_or_inherit",
+                func_ptr,
+                [class_ptr, void_ptr, class_ptr],
+            ),
+        ]
+        for name, ret, args in runpy_fns:
+            try:
+                fn = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
+                self.functions[name] = fn
+            except Exception:
+                pass
+
         self.dyn_types = {}
 
         # Concurrent tri-color GC runtime functions (ugc-based)
@@ -5749,12 +5800,8 @@ class LLVM:
                 target = node.target
                 meta = getattr(target, "meta", None) or {}
                 cls = meta.get("cls")
-                getter = self.functions.get(
-                    f"{cls}.{target.name}.get" if cls else None
-                )
-                setter = self.functions.get(
-                    f"{cls}.{target.name}.set" if cls else None
-                )
+                getter = self.functions.get(f"{cls}.{target.name}.get" if cls else None)
+                setter = self.functions.get(f"{cls}.{target.name}.set" if cls else None)
                 if getter is None or setter is None:
                     raise Exception(
                         f"property accessor for `{cls}.{target.name}` not compiled"
@@ -5789,9 +5836,7 @@ class LLVM:
             and (getattr(node.target, "meta", None) or {}).get("kind") == "prop_set"
         ):
             if isinstance(node.target, Index) and not self.no_userspace:
-                obj_t = _bc_array_norm(
-                    getattr(node.target.obj, "inferred_type", None)
-                )
+                obj_t = _bc_array_norm(getattr(node.target.obj, "inferred_type", None))
                 if (
                     obj_t == "dynamic"
                     or obj_t == "dynamic[]"
@@ -6677,7 +6722,6 @@ class LLVM:
             f"L{node._token.line}:{node._token.column}"
         )
 
-
     def _emit_class_meta(self):
         if getattr(self, "_class_meta_emitted", False):
             return
@@ -6687,31 +6731,49 @@ class LLVM:
             return
         # Minimal struct: classid(i64), name(i8*), size_bytes(i64), is_virtual(i1), is_sealed(i1), is_dataclass(i1), vt_ptr(i8*)
         from llvmlite import ir
-        meta_ty = ir.LiteralStructType([
-            _i64,      # classid
-            _i8ptr,    # name
-            _i64,      # size_bytes
-            _i1,       # is_virtual
-            _i1,       # is_sealed
-            _i1,       # is_dataclass
-            _i8ptr,    # vt_ptr
-        ])
+
+        meta_ty = ir.LiteralStructType(
+            [
+                _i64,  # classid
+                _i8ptr,  # name
+                _i64,  # size_bytes
+                _i1,  # is_virtual
+                _i1,  # is_sealed
+                _i1,  # is_dataclass
+                _i8ptr,  # vt_ptr
+            ]
+        )
         for c in classes:
             cid = self._class_ids.get(c, -1)
             node = self._struct_nodes.get(c)
             name_cstr = self._const_string(c)
             # size: sizeof identified struct (approx) - use LLVM type
-            cls_ty = self.structs.get(c) or (self._module_structs.get((self._cur_module, c)) if self._cur_module else None)
+            cls_ty = self.structs.get(c) or (
+                self._module_structs.get((self._cur_module, c))
+                if self._cur_module
+                else None
+            )
             if cls_ty is None:
                 cls_ty = self._module_structs.get((None, c))
-            size = ir.Constant(_i64, cls_ty.get_abi_size(self.target_data)) if hasattr(cls_ty, 'get_abi_size') else ir.Constant(_i64, 0)
+            size = (
+                ir.Constant(_i64, cls_ty.get_abi_size(self.target_data))
+                if hasattr(cls_ty, "get_abi_size")
+                else ir.Constant(_i64, 0)
+            )
             is_v = ir.Constant(_i1, 1 if self._class_virtual.get(c) else 0)
-            is_s = ir.Constant(_i1, 1 if getattr(node, 'sealed', False) else 0)
-            is_d = ir.Constant(_i1, 1 if getattr(node, 'dataclass', False) else 0)
+            is_s = ir.Constant(_i1, 1 if getattr(node, "sealed", False) else 0)
+            is_d = ir.Constant(_i1, 1 if getattr(node, "dataclass", False) else 0)
             vt_g = self._vt_globals.get(c)
-            vt_ptr = self.builder.bitcast(vt_g, _i8ptr) if vt_g is not None else ir.Constant(_i8ptr, None)
+            vt_ptr = (
+                self.builder.bitcast(vt_g, _i8ptr)
+                if vt_g is not None
+                else ir.Constant(_i8ptr, None)
+            )
             g = ir.GlobalVariable(self.module, meta_ty, name=f"cm.meta.{c}")
-            g.initializer = ir.Constant(meta_ty, [ir.Constant(_i64, cid), name_cstr, size, is_v, is_s, is_d, vt_ptr])
+            g.initializer = ir.Constant(
+                meta_ty,
+                [ir.Constant(_i64, cid), name_cstr, size, is_v, is_s, is_d, vt_ptr],
+            )
             self._class_meta_globals[c] = g
 
     def _emit_ancestor_grid(self):

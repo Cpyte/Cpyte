@@ -105,7 +105,6 @@ from .astparse import (
     CastExpr,
     CCode,
     ClassDef,
-    ProtocolDef,
     Continue,
     DeferStmt,
     DelStmt,
@@ -130,6 +129,7 @@ from .astparse import (
     Number,
     ParseError,
     Print,
+    ProtocolDef,
     Raise,
     Return,
     Signed67,
@@ -1112,8 +1112,15 @@ class SemanticAnalyzer:
             elif isinstance(node, ClassDef):
                 if node.name and node.name not in self._forward_names:
                     if self.globals.lookup_local(node.name) is None:
-                        is_proto = getattr(node, "is_protocol", False) or type(node).__name__ in ("ProtocolDef","InterfaceDef")
-                        self.globals.define(node.name, Symbol("protocol" if is_proto else "class", node.name, node))
+                        is_proto = getattr(node, "is_protocol", False) or type(
+                            node
+                        ).__name__ in ("ProtocolDef", "InterfaceDef")
+                        self.globals.define(
+                            node.name,
+                            Symbol(
+                                "protocol" if is_proto else "class", node.name, node
+                            ),
+                        )
                         self._forward_names.add(node.name)
             elif isinstance(node, EnumDef):
                 if node.name and node.name not in self._forward_names:
@@ -2349,9 +2356,7 @@ class SemanticAnalyzer:
             isinstance(node, Deref)
             or isinstance(node, AddrOf)
             or isinstance(node, NewExpr)
-        ):
-            self._infer_type(node)
-        elif isinstance(node, SizeOf):
+        ) or isinstance(node, SizeOf):
             self._infer_type(node)
         elif isinstance(node, InlineAsm):
             for _, var_expr in node.outputs:
@@ -4055,7 +4060,7 @@ class SemanticAnalyzer:
             self.error(
                 "get_attr() expects 2 arguments",
                 node,
-                note='get_attr(obj, "field") reads a struct/class field ' "by name",
+                note='get_attr(obj, "field") reads a struct/class field by name',
             )
             return None
         obj, name_arg = node.args[:2]
@@ -4196,7 +4201,7 @@ class SemanticAnalyzer:
                 )
                 return None
             self.error(
-                f'has(obj, "field") requires a struct/class object, got ' f"`{obj_t}`",
+                f'has(obj, "field") requires a struct/class object, got `{obj_t}`',
                 obj,
             )
             return None
@@ -4235,7 +4240,8 @@ class SemanticAnalyzer:
                 bsym = (self.current_scope or self.globals).lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
+                    if bsym is not None
+                    and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -4266,8 +4272,7 @@ class SemanticAnalyzer:
             self.error(
                 "isinstance() class argument must be a class name",
                 cls_arg,
-                note="pass the class identifier directly, e.g. "
-                "`isinstance(x, Animal)`",
+                note="pass the class identifier directly, e.g. `isinstance(x, Animal)`",
             )
             return None
         cls_name = cls_arg.name
@@ -4276,7 +4281,7 @@ class SemanticAnalyzer:
         )
         if not (obj_sym and obj_sym.kind == "class"):
             self.error(
-                "isinstance() requires a class object/pointer as its first " "argument",
+                "isinstance() requires a class object/pointer as its first argument",
                 obj,
                 note=f"got `{obj_t}`",
             )
@@ -4953,7 +4958,8 @@ class SemanticAnalyzer:
                     bsym = self.globals.lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
+                    if bsym is not None
+                    and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -4968,7 +4974,11 @@ class SemanticAnalyzer:
         sym = self.current_scope.lookup(base)
         if sym is None:
             sym = self.globals.lookup(base)
-        if sym is not None and sym.kind == "class" and isinstance(sym.node, (ClassDef, ProtocolDef)):
+        if (
+            sym is not None
+            and sym.kind == "class"
+            and isinstance(sym.node, (ClassDef, ProtocolDef))
+        ):
             return sym.node
         return None
 
@@ -5046,7 +5056,8 @@ class SemanticAnalyzer:
                     bsym = self.globals.lookup(cur.base)
                 cur = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
+                    if bsym is not None
+                    and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:
@@ -5059,7 +5070,10 @@ class SemanticAnalyzer:
 
     def _visit_class(self, node: ClassDef, scope: Scope | None = None):
         s = scope or self.globals
-        is_proto = getattr(node, "is_protocol", False) or type(node).__name__ in ("ProtocolDef","InterfaceDef")
+        is_proto = getattr(node, "is_protocol", False) or type(node).__name__ in (
+            "ProtocolDef",
+            "InterfaceDef",
+        )
         class_sym = Symbol("protocol" if is_proto else "class", node.name, node)
         s.define(node.name, class_sym)
         class_scope = Scope(s)
@@ -5293,7 +5307,8 @@ class SemanticAnalyzer:
                 bsym = (self.current_scope or self.globals).lookup(cnode.base)
                 cnode = (
                     bsym.node
-                    if bsym is not None and isinstance(bsym.node, (ClassDef, ProtocolDef))
+                    if bsym is not None
+                    and isinstance(bsym.node, (ClassDef, ProtocolDef))
                     else None
                 )
             else:

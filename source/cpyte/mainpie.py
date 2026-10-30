@@ -3,12 +3,13 @@ import subprocess
 import sys
 
 if __package__:
-    from . import __version__, ui
+    from . import __version__, scorpion_abi, ui
     from .astparse import FuncDef, Import, ParseError, parse_file
     from .bytecoding import LLVM
     from .compiling import (
         _BIGNUM_C,
         _GC_RUNTIME_C,
+        _RUNPY_RUNTIME_C,
         _RUNTIME_C,
         _find_llvm_cc,
         _gmp_library_paths,
@@ -43,13 +44,12 @@ if __package__:
         get_global_registry,
         iter_cpm_version_dirs,
     )
-    from . import scorpion_abi
     from .sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from .semantic_analasis import analyze
     from .update_check import report_update, start_check
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from cpyte import __version__, ui
+    from cpyte import __version__, scorpion_abi, ui
     from cpyte.astparse import FuncDef, Import, ParseError, parse_file
     from cpyte.bytecoding import LLVM
     from cpyte.compiling import (
@@ -89,7 +89,6 @@ else:
         get_global_registry,
         iter_cpm_version_dirs,
     )
-    from cpyte import scorpion_abi
     from cpyte.sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from cpyte.semantic_analasis import analyze
     from cpyte.update_check import report_update, start_check
@@ -1002,6 +1001,17 @@ def cmd_build(
             pic=pic,
         )
         objs.append(gc_obj)
+
+    runpy_obj = out_base + ".runpy.o"
+    linker.compile_c(
+        _RUNPY_RUNTIME_C,
+        output=runpy_obj,
+        opt_level=opt,
+        opt_size=opt_size,
+        debug=debug,
+        pic=pic,
+    )
+    objs.append(runpy_obj)
 
     executable = output or out_base
     linker.link(

@@ -22,3 +22,9 @@ The suite currently covers recursive and iterative Fibonacci, primality,
 matrix multiplication, virtual/function-pointer calls, quicksort, string
 concatenation, allocation/free, array traversal, branch-heavy integer work,
 integer arithmetic, bitwise work, floating-point arithmetic, and loop throughput.
+
+The GitHub Actions benchmark job uses the dedicated
+`cpyte-official-runner-1` self-hosted runner. On successful pushes to `main`,
+it updates the separate **CI Benchmark Results** table in the root `readme.md`
+and pushes that README update back to the branch. This latest-run table is
+distinct from historical benchmark measurements.

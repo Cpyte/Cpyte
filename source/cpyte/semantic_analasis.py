@@ -532,12 +532,25 @@ def _coerce_assign_ok(src_t, dst_t):
     if src_t == "str" and (dst_t.endswith("*") or dst_t == "char"):
         return True
     # big/ubig compatibility
-    if (src_t, dst_t) in (("big", "int"), ("big", "int64"), ("big", "uint64"), 
-                            ("int", "big"), ("int64", "big"), ("uint64", "big"),
-                            ("ubig", "big"), ("big", "ubig")):
+    if (src_t, dst_t) in (
+        ("big", "int"),
+        ("big", "int64"),
+        ("big", "uint64"),
+        ("int", "big"),
+        ("int64", "big"),
+        ("uint64", "big"),
+        ("ubig", "big"),
+        ("big", "ubig"),
+    ):
         return True
-    if (src_t, dst_t) in (("ubig", "int"), ("ubig", "int64"), ("ubig", "uint64"),
-                            ("int", "ubig"), ("int64", "ubig"), ("uint64", "ubig")):
+    if (src_t, dst_t) in (
+        ("ubig", "int"),
+        ("ubig", "int64"),
+        ("ubig", "uint64"),
+        ("int", "ubig"),
+        ("int64", "ubig"),
+        ("uint64", "ubig"),
+    ):
         return True
     return (src_t, dst_t) in (
         ("int", "int64"),

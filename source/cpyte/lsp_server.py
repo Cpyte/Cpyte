@@ -2442,7 +2442,9 @@ if __name__ == "__main__":
 
 @server.feature(lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY)
 @server.thread()
-def prepare_call_hierarchy(ls: CpyLanguageServer, params: lsp.CallHierarchyPrepareParams):
+def prepare_call_hierarchy(
+    ls: CpyLanguageServer, params: lsp.CallHierarchyPrepareParams
+):
     try:
         uri = params.text_document.uri
         line = params.position.line
@@ -2456,8 +2458,13 @@ def prepare_call_hierarchy(ls: CpyLanguageServer, params: lsp.CallHierarchyPrepa
             if isinstance(node, FuncDef) and node.name == word:
                 tok_node = getattr(node, "_token", None) or tok
                 rng = lsp.Range(
-                    start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
-                    end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                    start=lsp.Position(
+                        line=tok_node.line - 1, character=tok_node.column - 1
+                    ),
+                    end=lsp.Position(
+                        line=tok_node.line - 1,
+                        character=tok_node.column - 1 + len(tok_node.value or ""),
+                    ),
                 )
                 return [
                     lsp.CallHierarchyItem(
@@ -2485,16 +2492,33 @@ def incoming_calls(ls: CpyLanguageServer, params: lsp.CallHierarchyIncomingCalls
         for node in parsed:
             if isinstance(node, FuncDef):
                 for call in _iter_calls_in_stmt(node):
-                    if isinstance(call.callee, Variable) and call.callee.name == func_name:
+                    if (
+                        isinstance(call.callee, Variable)
+                        and call.callee.name == func_name
+                    ):
                         tok = getattr(call.callee, "_token", None)
                         if tok:
                             rng = lsp.Range(
-                                start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
-                                end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                                start=lsp.Position(
+                                    line=tok.line - 1, character=tok.column - 1
+                                ),
+                                end=lsp.Position(
+                                    line=tok.line - 1,
+                                    character=tok.column - 1 + len(tok.value or ""),
+                                ),
                             )
                             ntrng = lsp.Range(
-                                start=lsp.Position(line=(getattr(node, "_token") or tok).line - 1, character=(getattr(node, "_token") or tok).column - 1),
-                                end=lsp.Position(line=(getattr(node, "_token") or tok).line - 1, character=(getattr(node, "_token") or tok).column - 1 + len(node.name)),
+                                start=lsp.Position(
+                                    line=(getattr(node, "_token") or tok).line - 1,
+                                    character=(getattr(node, "_token") or tok).column
+                                    - 1,
+                                ),
+                                end=lsp.Position(
+                                    line=(getattr(node, "_token") or tok).line - 1,
+                                    character=(getattr(node, "_token") or tok).column
+                                    - 1
+                                    + len(node.name),
+                                ),
                             )
                             results.append(
                                 lsp.CallHierarchyIncomingCall(
@@ -2529,8 +2553,13 @@ def outgoing_calls(ls: CpyLanguageServer, params: lsp.CallHierarchyOutgoingCalls
                         tok = getattr(call.callee, "_token", None)
                         if tok:
                             rng = lsp.Range(
-                                start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
-                                end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                                start=lsp.Position(
+                                    line=tok.line - 1, character=tok.column - 1
+                                ),
+                                end=lsp.Position(
+                                    line=tok.line - 1,
+                                    character=tok.column - 1 + len(tok.value or ""),
+                                ),
                             )
                             results.append(
                                 lsp.CallHierarchyOutgoingCall(
@@ -2552,7 +2581,9 @@ def outgoing_calls(ls: CpyLanguageServer, params: lsp.CallHierarchyOutgoingCalls
 
 @server.feature(lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY)
 @server.thread()
-def prepare_type_hierarchy(ls: CpyLanguageServer, params: lsp.TypeHierarchyPrepareParams):
+def prepare_type_hierarchy(
+    ls: CpyLanguageServer, params: lsp.TypeHierarchyPrepareParams
+):
     try:
         uri = params.text_document.uri
         line = params.position.line
@@ -2566,8 +2597,13 @@ def prepare_type_hierarchy(ls: CpyLanguageServer, params: lsp.TypeHierarchyPrepa
             if isinstance(node, ClassDef) and node.name == word:
                 tok_node = getattr(node, "_token", None) or tok
                 rng = lsp.Range(
-                    start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
-                    end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                    start=lsp.Position(
+                        line=tok_node.line - 1, character=tok_node.column - 1
+                    ),
+                    end=lsp.Position(
+                        line=tok_node.line - 1,
+                        character=tok_node.column - 1 + len(tok_node.value or ""),
+                    ),
                 )
                 return [
                     lsp.TypeHierarchyItem(
@@ -2593,15 +2629,24 @@ def supertypes(ls: CpyLanguageServer, params: lsp.TypeHierarchySupertypesParams)
         _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
         results = []
         for node in parsed:
-            if isinstance(node, ClassDef) and node.name == class_name and getattr(node, "base", None):
+            if (
+                isinstance(node, ClassDef)
+                and node.name == class_name
+                and getattr(node, "base", None)
+            ):
                 base_name = node.base
                 for bnode in parsed:
                     if isinstance(bnode, ClassDef) and bnode.name == base_name:
                         btok = getattr(bnode, "_token", None)
                         if btok:
                             rng = lsp.Range(
-                                start=lsp.Position(line=btok.line - 1, character=btok.column - 1),
-                                end=lsp.Position(line=btok.line - 1, character=btok.column - 1 + len(btok.value or "")),
+                                start=lsp.Position(
+                                    line=btok.line - 1, character=btok.column - 1
+                                ),
+                                end=lsp.Position(
+                                    line=btok.line - 1,
+                                    character=btok.column - 1 + len(btok.value or ""),
+                                ),
                             )
                             results.append(
                                 lsp.TypeHierarchyItem(
@@ -2631,8 +2676,13 @@ def subtypes(ls: CpyLanguageServer, params: lsp.TypeHierarchySubtypesParams):
                 tok_node = getattr(node, "_token", None)
                 if tok_node:
                     rng = lsp.Range(
-                        start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
-                        end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                        start=lsp.Position(
+                            line=tok_node.line - 1, character=tok_node.column - 1
+                        ),
+                        end=lsp.Position(
+                            line=tok_node.line - 1,
+                            character=tok_node.column - 1 + len(tok_node.value or ""),
+                        ),
                     )
                     results.append(
                         lsp.TypeHierarchyItem(
@@ -2682,8 +2732,16 @@ def workspace_symbol(ls: CpyLanguageServer, params: lsp.WorkspaceSymbolParams):
                                     location=lsp.Location(
                                         uri=uri,
                                         range=lsp.Range(
-                                            start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
-                                            end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                                            start=lsp.Position(
+                                                line=tok.line - 1,
+                                                character=tok.column - 1,
+                                            ),
+                                            end=lsp.Position(
+                                                line=tok.line - 1,
+                                                character=tok.column
+                                                - 1
+                                                + len(tok.value or ""),
+                                            ),
                                         ),
                                     ),
                                 )

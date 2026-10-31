@@ -96,5 +96,24 @@ measurement from any historical benchmark results and is collected on the
 dedicated benchmark runner.
 
 <!-- CPYTE_CI_BENCHMARKS_START -->
-Benchmark results will appear here after the next successful benchmark CI run.
+Latest run: [c840d618fbaf](https://github.com/Cpyte/Cpyte/actions/runs/41209544274) · updated 2026-10-31 14:23 UTC
+
+| Benchmark | C | Cpy | Python | Cpy/C | Python/C |
+|---|---:|---:|---:|---:|---:|
+| `array_sum` | 6.79ms | 6.77ms | 249.80ms | 1.00x | 36.77x |
+| `bitwise_mix` | 2.87ms | 3.00ms | 681.37ms | 1.05x | 237.59x |
+| `branch_mix` | 4.38ms | 5.88ms | 438.32ms | 1.34x | 100.08x |
+| `call_overhead` | 2.87ms | 2.99ms | 341.99ms | 1.04x | 119.34x |
+| `fib_iterative` | 16.73ms | 16.96ms | 11.059s | 1.01x | 661.21x |
+| `fib_recursive` | 161.87ms | 1.13ms | 7.278s | 0.01x | 44.96x |
+| `float_math` | 6.02ms | 6.15ms | 253.87ms | 1.02x | 42.15x |
+| `integer_mix` | 3.47ms | 3.45ms | 387.15ms | 0.99x | 111.46x |
+| `loop_sum` | 968.71us | 1.04ms | 2.933s | 1.07x | 3027.80x |
+| `matrix_mult` | 4.08ms | 4.11ms | 1.741s | 1.01x | 426.44x |
+| `mem_alloc` | 960.98us | 1.00ms | 17.47ms | 1.04x | 18.18x |
+| `prime_count` | 66.94ms | 79.57ms | 1.827s | 1.19x | 27.29x |
+| `quicksort` | 3.69ms | 2.60ms | 29.43ms | 0.70x | 7.98x |
+| `string_concat` | 19.51ms | 156.87ms | 25.83ms | 8.04x | 1.32x |
+
+Process wall time includes startup. These are measurements from the dedicated `cpyte-official-runner-1`, not the historical benchmark figures elsewhere in this README; results can vary with host load and software versions.
 <!-- CPYTE_CI_BENCHMARKS_END -->

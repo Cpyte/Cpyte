@@ -501,10 +501,11 @@ _HEAP_ALLOC_FNS = ("malloc", "calloc", "realloc")
 
 
 def _coerce_assign_ok(src_t, dst_t):
-    """Permissive assignment-type check used by property setters: exact matches,
-    dynamic, pointer-interchange, str/char, and the numeric widening pairs the
-    compiler already lowers for struct-field stores."""
+    """Assignment/type compatibility check - permissive for existing code,
+    with stricter rules for pointer/type safety."""
     if src_t is None or dst_t is None or src_t == dst_t:
+        return True
+    if src_t == "auto" or dst_t == "auto":
         return True
     if src_t == "dynamic" or dst_t == "dynamic":
         return True
@@ -513,12 +514,30 @@ def _coerce_assign_ok(src_t, dst_t):
     if src_t == "void*" and dst_t.endswith("*"):
         return True
     if src_t.endswith("*") and dst_t.endswith("*"):
-        return True
+        # Be more strict - different pointer types usually incompatible
+        # But allow class hierarchies and void* style conversions
+        if src_t == dst_t:
+            return True
+        if src_t == "void*" or dst_t == "void*":
+            return True
+        # Allow struct/class pointer conversions in some cases
+        if src_t.startswith("struct ") or src_t.startswith("class "):
+            if dst_t.startswith("struct ") or dst_t.startswith("class "):
+                return True
+        return src_t == dst_t
     if dst_t in ("str", "char") and src_t in ("str", "char"):
         return True
     if dst_t == "str" and (src_t.endswith("*") or src_t == "char"):
         return True
     if src_t == "str" and (dst_t.endswith("*") or dst_t == "char"):
+        return True
+    # big/ubig compatibility
+    if (src_t, dst_t) in (("big", "int"), ("big", "int64"), ("big", "uint64"), 
+                            ("int", "big"), ("int64", "big"), ("uint64", "big"),
+                            ("ubig", "big"), ("big", "ubig")):
+        return True
+    if (src_t, dst_t) in (("ubig", "int"), ("ubig", "int64"), ("ubig", "uint64"),
+                            ("int", "ubig"), ("int64", "ubig"), ("uint64", "ubig")):
         return True
     return (src_t, dst_t) in (
         ("int", "int64"),
@@ -558,8 +577,7 @@ def _coerce_assign_ok(src_t, dst_t):
         ("uintptr_t", "size_t"),
         ("float", "double"),
         ("double", "float"),
-        # Narrow unsigned words (the widths the ABI structs expose) convert
-        # freely with `int` in both directions; they are all <= 32 bits.
+        # Narrow unsigned words
         ("int", "uint8"),
         ("int", "uint16"),
         ("int", "uint32"),
@@ -669,7 +687,7 @@ class SemanticAnalyzer:
         source: str,
         filepath: str | None = None,
         workspace_root: str | None = None,
-        strict: bool = False,
+        strict: bool = True,
         enable_extensions: bool = True,
         no_gc: bool = False,
         scorpion: bool = False,
@@ -957,10 +975,14 @@ class SemanticAnalyzer:
     def _strict_error(self, message: str, node=None, note: str | None = None):
         if self.strict:
             self.reporter.strict_error(message, self._tok(node), note)
+        else:
+            self.reporter.error(message, self._tok(node), note)
 
     def _strict_warning(self, message: str, node=None, note: str | None = None):
         if self.strict:
             self.reporter.strict_warning(message, self._tok(node), note)
+        else:
+            self.reporter.warning(message, self._tok(node), note)
 
     _NUMERIC_TYPES = (
         "int",

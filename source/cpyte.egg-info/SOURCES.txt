@@ -24,6 +24,7 @@ source/cpyte/mainpie.py
 source/cpyte/mksef.py
 source/cpyte/optimizations.py
 source/cpyte/package_manifest.py
+source/cpyte/runpy_runtime.c
 source/cpyte/runtime.c
 source/cpyte/runtime_scorpion.c
 source/cpyte/scorpion_abi.py

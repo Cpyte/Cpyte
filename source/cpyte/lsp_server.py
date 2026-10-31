@@ -2333,7 +2333,13 @@ def _ranges_intersect(r1: lsp.Range, r2: lsp.Range) -> bool:
 @server.feature(
     lsp.TEXT_DOCUMENT_CODE_ACTION,
     lsp.CodeActionOptions(
-        code_action_kinds=[lsp.CodeActionKind.QuickFix, lsp.CodeActionKind.Refactor]
+        code_action_kinds=[
+            lsp.CodeActionKind.QuickFix,
+            lsp.CodeActionKind.Refactor,
+            lsp.CodeActionKind.RefactorExtract,
+            lsp.CodeActionKind.RefactorInline,
+            lsp.CodeActionKind.SourceOrganizeImports,
+        ]
     ),
 )
 @server.thread()
@@ -2432,3 +2438,259 @@ def code_action(ls: CpyLanguageServer, params: lsp.CodeActionParams):
 
 if __name__ == "__main__":
     start_server(server)
+
+
+@server.feature(lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY)
+@server.thread()
+def prepare_call_hierarchy(ls: CpyLanguageServer, params: lsp.CallHierarchyPrepareParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value or tok.type != TokenType.IDENTIFIER:
+            return None
+        word = tok.value
+        for node in parsed:
+            if isinstance(node, FuncDef) and node.name == word:
+                tok_node = getattr(node, "_token", None) or tok
+                rng = lsp.Range(
+                    start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
+                    end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                )
+                return [
+                    lsp.CallHierarchyItem(
+                        name=node.name,
+                        kind=lsp.SymbolKind.Function,
+                        uri=uri,
+                        range=rng,
+                        selection_range=rng,
+                    )
+                ]
+        return None
+    except Exception:
+        logger.error(f"prepare_call_hierarchy error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.CALL_HIERARCHY_INCOMING_CALLS)
+@server.thread()
+def incoming_calls(ls: CpyLanguageServer, params: lsp.CallHierarchyIncomingCallsParams):
+    try:
+        uri = params.item.uri
+        func_name = params.item.name
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        results = []
+        for node in parsed:
+            if isinstance(node, FuncDef):
+                for call in _iter_calls_in_stmt(node):
+                    if isinstance(call.callee, Variable) and call.callee.name == func_name:
+                        tok = getattr(call.callee, "_token", None)
+                        if tok:
+                            rng = lsp.Range(
+                                start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
+                                end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                            )
+                            ntrng = lsp.Range(
+                                start=lsp.Position(line=(getattr(node, "_token") or tok).line - 1, character=(getattr(node, "_token") or tok).column - 1),
+                                end=lsp.Position(line=(getattr(node, "_token") or tok).line - 1, character=(getattr(node, "_token") or tok).column - 1 + len(node.name)),
+                            )
+                            results.append(
+                                lsp.CallHierarchyIncomingCall(
+                                    from_=lsp.CallHierarchyItem(
+                                        name=node.name,
+                                        kind=lsp.SymbolKind.Function,
+                                        uri=uri,
+                                        range=ntrng,
+                                        selection_range=ntrng,
+                                    ),
+                                    from_ranges=[rng],
+                                )
+                            )
+        return results or None
+    except Exception:
+        logger.error(f"incoming_calls error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.CALL_HIERARCHY_OUTGOING_CALLS)
+@server.thread()
+def outgoing_calls(ls: CpyLanguageServer, params: lsp.CallHierarchyOutgoingCallsParams):
+    try:
+        uri = params.item.uri
+        func_name = params.item.name
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        results = []
+        for node in parsed:
+            if isinstance(node, FuncDef) and node.name == func_name:
+                for call in _iter_calls_in_stmt(node):
+                    if isinstance(call.callee, Variable):
+                        tok = getattr(call.callee, "_token", None)
+                        if tok:
+                            rng = lsp.Range(
+                                start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
+                                end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                            )
+                            results.append(
+                                lsp.CallHierarchyOutgoingCall(
+                                    to=lsp.CallHierarchyItem(
+                                        name=call.callee.name,
+                                        kind=lsp.SymbolKind.Function,
+                                        uri=uri,
+                                        range=rng,
+                                        selection_range=rng,
+                                    ),
+                                    from_ranges=[rng],
+                                )
+                            )
+        return results or None
+    except Exception:
+        logger.error(f"outgoing_calls error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY)
+@server.thread()
+def prepare_type_hierarchy(ls: CpyLanguageServer, params: lsp.TypeHierarchyPrepareParams):
+    try:
+        uri = params.text_document.uri
+        line = params.position.line
+        col = params.position.character
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        tok = _find_token_at(tokens, line, col)
+        if not tok or not tok.value or tok.type != TokenType.IDENTIFIER:
+            return None
+        word = tok.value
+        for node in parsed:
+            if isinstance(node, ClassDef) and node.name == word:
+                tok_node = getattr(node, "_token", None) or tok
+                rng = lsp.Range(
+                    start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
+                    end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                )
+                return [
+                    lsp.TypeHierarchyItem(
+                        name=node.name,
+                        kind=lsp.SymbolKind.Class,
+                        uri=uri,
+                        range=rng,
+                        selection_range=rng,
+                    )
+                ]
+        return None
+    except Exception:
+        logger.error(f"prepare_type_hierarchy error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TYPE_HIERARCHY_SUPERTYPES)
+@server.thread()
+def supertypes(ls: CpyLanguageServer, params: lsp.TypeHierarchySupertypesParams):
+    try:
+        uri = params.item.uri
+        class_name = params.item.name
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        results = []
+        for node in parsed:
+            if isinstance(node, ClassDef) and node.name == class_name and getattr(node, "base", None):
+                base_name = node.base
+                for bnode in parsed:
+                    if isinstance(bnode, ClassDef) and bnode.name == base_name:
+                        btok = getattr(bnode, "_token", None)
+                        if btok:
+                            rng = lsp.Range(
+                                start=lsp.Position(line=btok.line - 1, character=btok.column - 1),
+                                end=lsp.Position(line=btok.line - 1, character=btok.column - 1 + len(btok.value or "")),
+                            )
+                            results.append(
+                                lsp.TypeHierarchyItem(
+                                    name=bnode.name,
+                                    kind=lsp.SymbolKind.Class,
+                                    uri=uri,
+                                    range=rng,
+                                    selection_range=rng,
+                                )
+                            )
+        return results or None
+    except Exception:
+        logger.error(f"supertypes error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.TYPE_HIERARCHY_SUBTYPES)
+@server.thread()
+def subtypes(ls: CpyLanguageServer, params: lsp.TypeHierarchySubtypesParams):
+    try:
+        uri = params.item.uri
+        class_name = params.item.name
+        _, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
+        results = []
+        for node in parsed:
+            if isinstance(node, ClassDef) and getattr(node, "base", None) == class_name:
+                tok_node = getattr(node, "_token", None)
+                if tok_node:
+                    rng = lsp.Range(
+                        start=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1),
+                        end=lsp.Position(line=tok_node.line - 1, character=tok_node.column - 1 + len(tok_node.value or "")),
+                    )
+                    results.append(
+                        lsp.TypeHierarchyItem(
+                            name=node.name,
+                            kind=lsp.SymbolKind.Class,
+                            uri=uri,
+                            range=rng,
+                            selection_range=rng,
+                        )
+                    )
+        return results or None
+    except Exception:
+        logger.error(f"subtypes error:\n{traceback.format_exc()}")
+        return None
+
+
+@server.feature(lsp.WORKSPACE_SYMBOL)
+@server.thread()
+def workspace_symbol(ls: CpyLanguageServer, params: lsp.WorkspaceSymbolParams):
+    try:
+        query = (params.query or "").lower()
+        results = []
+        for uri, bundle in getattr(ls, "_analysis_cache", {}).items():
+            try:
+                _, tokens, parsed, analyzer, _, _ = bundle
+                for node in parsed:
+                    if isinstance(node, (FuncDef, ClassDef, StructDef, EnumDef)):
+                        name = node.name
+                        if query and query not in name.lower():
+                            continue
+                        tok = getattr(node, "_token", None)
+                        if tok:
+                            if isinstance(node, FuncDef):
+                                kind = lsp.SymbolKind.Function
+                            elif isinstance(node, ClassDef):
+                                kind = lsp.SymbolKind.Class
+                            elif isinstance(node, StructDef):
+                                kind = lsp.SymbolKind.Struct
+                            elif isinstance(node, EnumDef):
+                                kind = lsp.SymbolKind.Enum
+                            else:
+                                kind = lsp.SymbolKind.Variable
+                            results.append(
+                                lsp.WorkspaceSymbol(
+                                    name=name,
+                                    kind=kind,
+                                    location=lsp.Location(
+                                        uri=uri,
+                                        range=lsp.Range(
+                                            start=lsp.Position(line=tok.line - 1, character=tok.column - 1),
+                                            end=lsp.Position(line=tok.line - 1, character=tok.column - 1 + len(tok.value or "")),
+                                        ),
+                                    ),
+                                )
+                            )
+            except Exception:
+                continue
+        return results or None
+    except Exception:
+        logger.error(f"workspace_symbol error:\n{traceback.format_exc()}")
+        return None

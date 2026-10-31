@@ -175,10 +175,10 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Install GMP/MPFR (Linux)
+      - name: Install GMP/MPFR/CLANG (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgmp-dev libmpfr-dev
+          sudo apt-get install -y libgmp-dev libmpfr-dev clang
 
       - name: Run benchmarks
         run: python benchmarks/run_benchmarks.py --json "${{ runner.temp }}/benchmark-results.json"

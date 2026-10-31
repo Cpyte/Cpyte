@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
+"""Build and compare matching C, Cpy, and Python benchmark programs."""
+
+import argparse
+import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -8,253 +13,213 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
-
-C_CC = "clang"
-C_CFLAGS = ["-O3", "-lm"]
-CPY_COMPILE = [
-    sys.executable,
-    os.path.join(PROJECT, "source", "cpyte", "mainpie.py"),
-    "--aot",
-]
+COMPILER = os.path.join(PROJECT, "source", "cpyte", "mainpie.py")
 
 
-ALL_BENCHMARKS = [
-    {"name": "fib_recursive", "has_cpy": True},
-    {"name": "fib_iterative", "has_cpy": True},
-    {"name": "prime_count", "has_cpy": True},
-    {"name": "matrix_mult", "has_cpy": True},
-    {"name": "call_overhead", "has_cpy": True},
-    {"name": "quicksort", "has_cpy": True},
-    {"name": "string_concat", "has_cpy": True},
-    {"name": "mem_alloc", "has_cpy": True},
-]
-
-
-def log(msg):
-    print(f"  {msg}", flush=True)
-
-
-def compile_c(name):
-    src = os.path.join(HERE, f"{name}.c")
-    out = os.path.join(HERE, f"{name}_c")
-    subprocess.run(
-        [C_CC, *C_CFLAGS, "-o", out, src],
-        capture_output=True,
-        text=True,
+def discover_benchmarks():
+    names = sorted(
+        name[:-4]
+        for name in os.listdir(HERE)
+        if name.endswith(".cpy")
+        and all(os.path.isfile(os.path.join(HERE, name[:-4] + ext))
+                for ext in (".c", ".py"))
     )
+    return names
 
 
-def compile_cpy(name):
-    """Build `<name>.cpy` to a native executable in a throwaway temp dir.
+def run_process(command, cwd, timeout):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout:g}s"
+    if result.returncode:
+        details = (result.stderr or result.stdout).strip()
+        return None, f"process exited {result.returncode}: {details}"
+    return result.stdout.strip(), None
 
-    `cpyte --aot <src>` writes `<src>.o` AND links `<src without extension>`
-    itself (compiling.run_aot: out_name = output.rsplit(".", 1)[0], then
-    linker.link with aot_link_libraries()), so there is no manual link step
-    here -- the old `clang program.o runtime.c` link broke when --aot stopped
-    hardcoding its object name to `program.o`. The temp dir keeps the tracked
-    benchmarks/*.o artifacts from being clobbered.
 
-    Returns (exe_path, build_dir) on success, (None, None) on failure.
-    """
-    cpy_src = os.path.join(HERE, f"{name}.cpy")
-    build_dir = tempfile.mkdtemp(prefix=f"cpy_bench_{name}_")
-    src = os.path.join(build_dir, os.path.basename(cpy_src))
-    shutil.copy2(cpy_src, src)
-    r = subprocess.run(
-        [*CPY_COMPILE, src],
-        capture_output=True,
-        text=True,
-        cwd=build_dir,
+def compile_benchmark(name, build_dir):
+    paths = {}
+    c_path = os.path.join(build_dir, name + "_c")
+    c_out, error = run_process(
+        ["clang", "-O3", "-o", c_path, os.path.join(HERE, name + ".c"), "-lm"],
+        build_dir,
+        60,
     )
-    if r.returncode != 0:
-        print(f"    cpy compile failed: {(r.stderr or r.stdout).strip()}")
-        shutil.rmtree(build_dir, ignore_errors=True)
-        return None, None
-    exe = os.path.join(build_dir, name)
-    if not os.path.isfile(exe):
-        print(f"    cpy link failed: {exe} was not produced")
-        if (r.stderr or "").strip():
-            print(f"    {r.stderr.strip()}")
-        shutil.rmtree(build_dir, ignore_errors=True)
-        return None, None
-    return exe, build_dir
+    if error:
+        return None, f"C compile failed: {error}"
+    paths["C"] = [c_path]
+    paths["Python"] = [sys.executable, os.path.join(HERE, name + ".py")]
+
+    cpy_source = os.path.join(build_dir, name + ".cpy")
+    shutil.copy2(os.path.join(HERE, name + ".cpy"), cpy_source)
+    _, error = run_process([sys.executable, COMPILER, "--aot", cpy_source],
+                           build_dir, 180)
+    if error:
+        return None, f"Cpy compile failed: {error}"
+    cpy_path = os.path.join(build_dir, name)
+    if not os.path.isfile(cpy_path):
+        return None, f"Cpy compiler did not produce {cpy_path}"
+    paths["Cpy"] = [cpy_path]
+    return paths, None
 
 
-def run_and_time_ns(cmd, cwd=None):
+def execute_once(command, cwd, timeout):
     start = time.perf_counter_ns()
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd or HERE)
-    elapsed_ns = time.perf_counter_ns() - start
-    output = (r.stdout or "").strip()
-    if r.returncode != 0:
-        print(f"      exit code {r.returncode}: {(r.stderr or '').strip()}")
-        return None, None
-    return elapsed_ns, output
+    output, error = run_process(command, cwd, timeout)
+    elapsed = time.perf_counter_ns() - start
+    return elapsed, output, error
 
 
-def fmt_ns(ns):
-    if ns < 1000:
+def benchmark_group(commands, cwd, warmups, trials, timeout):
+    results = {
+        language: {"samples_ns": [], "output": None}
+        for language in ("C", "Cpy", "Python")
+    }
+    for language in results:
+        for _ in range(warmups):
+            _, output, error = execute_once(commands[language], cwd, timeout)
+            if error:
+                results[language] = {"error": error}
+                break
+            previous = results[language]["output"]
+            if previous is not None and previous != output:
+                results[language]["error"] = (
+                    f"output changed between runs: {output!r}"
+                )
+                break
+            results[language]["output"] = output
+
+    for trial in range(trials):
+        active = [lang for lang in results if "error" not in results[lang]]
+        if not active:
+            break
+        order = active[trial % len(active):] + active[:trial % len(active)]
+        for language in order:
+            elapsed, output, error = execute_once(
+                commands[language], cwd, timeout
+            )
+            result = results[language]
+            if error:
+                result["error"] = error
+                continue
+            if result["output"] is None:
+                result["output"] = output
+            elif result["output"] != output:
+                result["error"] = f"output changed between runs: {output!r}"
+                continue
+            result["samples_ns"].append(elapsed)
+
+    for result in results.values():
+        if "error" not in result:
+            result["median_ns"] = int(statistics.median(result["samples_ns"]))
+    return results
+
+
+def format_time(ns):
+    if ns < 1_000:
         return f"{ns}ns"
     if ns < 1_000_000:
-        return f"{ns / 1_000:.3f}us"
+        return f"{ns / 1_000:.2f}us"
     if ns < 1_000_000_000:
-        return f"{ns / 1_000_000:.3f}ms"
-    return f"{ns / 1_000_000_000:.6f}s"
-
-
-def cleanup(build_dirs):
-    for bm in ALL_BENCHMARKS:
-        for suffix in ("_c", "_cpy"):
-            exe = os.path.join(HERE, bm["name"] + suffix)
-            if os.path.exists(exe):
-                os.remove(exe)
-    for build_dir in build_dirs:
-        shutil.rmtree(build_dir, ignore_errors=True)
+        return f"{ns / 1_000_000:.2f}ms"
+    return f"{ns / 1_000_000_000:.3f}s"
 
 
 def main():
-    os.chdir(HERE)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trials", type=int, default=7,
+                        help="measured runs per language (default: 7)")
+    parser.add_argument("--warmups", type=int, default=1,
+                        help="unmeasured runs per language (default: 1)")
+    parser.add_argument("--filter", help="run names containing this substring")
+    parser.add_argument("--timeout", type=float, default=60,
+                        help="per-run timeout in seconds (default: 60)")
+    parser.add_argument("--json", dest="json_path",
+                        help="write raw results to this JSON file")
+    args = parser.parse_args()
+    if args.trials < 1 or args.warmups < 0 or args.timeout <= 0:
+        parser.error("--trials must be positive; warmups nonnegative; timeout positive")
 
-    print(f"\n{'=' * 70}")
-    print("  Compiling benchmarks...")
-    print(f"{'=' * 70}\n")
-
-    build_dirs = []
-    for bm in ALL_BENCHMARKS:
-        name = bm["name"]
-        print(f"  [{name}]")
-
-        compile_c(name)
-        log("C OK")
-
-        bm["cpy_ok"] = False
-        bm["cpy_exe"] = None
-        if bm["has_cpy"]:
-            exe, build_dir = compile_cpy(name)
-            if build_dir:
-                build_dirs.append(build_dir)
-            bm["cpy_exe"] = exe
-            bm["cpy_ok"] = exe is not None
-            log("cpy OK" if bm["cpy_ok"] else "cpy FAILED")
-        else:
-            log("cpy N/A")
-
-        log("Python OK")
-        print()
-
-    failed = [
-        bm["name"] for bm in ALL_BENCHMARKS if bm["has_cpy"] and not bm["cpy_ok"]
-    ]
-    if failed:
-        cleanup(build_dirs)
-        print(f"{'=' * 70}")
-        print(f"  cpy benchmark build FAILED: {', '.join(failed)}")
-        print(f"{'=' * 70}")
-        sys.exit(1)
-
-    print(f"{'=' * 70}")
-    print("  Running benchmarks (3 trials, no averaging)...")
-    print(f"{'=' * 70}\n")
+    names = discover_benchmarks()
+    if args.filter:
+        names = [name for name in names if args.filter in name]
+    if not names:
+        parser.error("no complete C/Cpy/Python benchmark triplets found")
 
     results = {}
+    with tempfile.TemporaryDirectory(prefix="cpy_bench_") as build_dir:
+        for name in names:
+            print(f"\n[{name}] compiling...", flush=True)
+            commands, error = compile_benchmark(name, build_dir)
+            if error:
+                results[name] = {"error": error}
+                print(f"  ERROR: {error}")
+                continue
 
-    for bm in ALL_BENCHMARKS:
-        name = bm["name"]
-        print(f"  [{name}]")
-
-        for lang, cmd, key in [
-            ("C", [os.path.join(HERE, f"{name}_c")], "C"),
-            ("Python", [sys.executable, os.path.join(HERE, f"{name}.py")], "Python"),
-        ]:
-            trials = []
-            out = None
-            for trial in range(3):
-                t, o = run_and_time_ns(cmd)
-                if t is None:
-                    trials.append(None)
+            timings = benchmark_group(
+                commands, HERE, args.warmups, args.trials, args.timeout
+            )
+            for language, result in timings.items():
+                if "error" in result:
+                    print(f"  {language:6s} ERROR: {result['error']}")
                 else:
-                    trials.append(t)
-                    out = o
-            results[(name, key)] = (trials, out)
-            if trials[0] is None:
-                log(f"{lang:8s} FAILED")
-            else:
-                parts = ", ".join(fmt_ns(t) for t in trials)
-                log(f"{lang:8s} {parts}  [{out}]")
+                    print(
+                        f"  {language:6s} median {format_time(result['median_ns'])}"
+                        f"  output={result['output']!r}"
+                    )
 
-        if bm.get("cpy_ok"):
-            lang = "cpy"
-            cmd = [bm["cpy_exe"]]
-            trials = []
-            out = None
-            for trial in range(3):
-                t, o = run_and_time_ns(cmd)
-                if t is None:
-                    trials.append(None)
-                else:
-                    trials.append(t)
-                    out = o
-            results[(name, "cpy")] = (trials, out)
-            if trials[0] is None:
-                log(f"{lang:8s} FAILED")
-            else:
-                parts = ", ".join(fmt_ns(t) for t in trials)
-                log(f"{lang:8s} {parts}  [{out}]")
+            valid = [timings[lang] for lang in ("C", "Cpy", "Python")
+                     if "error" not in timings[lang]]
+            if len(valid) == 3 and len({run["output"] for run in valid}) != 1:
+                message = "language outputs differ; timings are not comparable"
+                for language in timings:
+                    timings[language]["comparison_error"] = message
+                print(f"  ERROR: {message}")
+                results[name] = {"error": message, **timings}
+                continue
+            results[name] = timings
 
-        print()
-
-    print(f"{'=' * 70}")
-    print("  Results (raw ns per trial, no averaging)")
-    print(f"{'=' * 70}\n")
-
-    rows = []
-    for bm in ALL_BENCHMARKS:
-        name = bm["name"]
-
-        def best(trials):
-            if not trials:
-                return None
-            valid = [t for t in trials if t is not None]
-            return min(valid) if valid else None
-
-        c_trials, _ = results.get((name, "C"), (None, ""))
-        py_trials, _ = results.get((name, "Python"), (None, ""))
-        cpy_trials, _ = results.get((name, "cpy"), (None, ""))
-
-        def fmt(trials):
-            if not trials or trials[0] is None:
-                return "FAIL"
-            return ", ".join(fmt_ns(t) for t in trials)
-
-        c_s = fmt(c_trials)
-        py_s = fmt(py_trials)
-        cpy_s = (
-            fmt(cpy_trials)
-            if bm.get("cpy_ok") and cpy_trials and cpy_trials[0] is not None
-            else "N/A"
+    print("\nMedian wall time per process run (includes process startup)")
+    print(f"{'Benchmark':<22} {'C':>12} {'Cpy':>12} {'Python':>12}"
+          f" {'Cpy/C':>10} {'Py/C':>10}")
+    print("-" * 82)
+    for name in names:
+        row = results[name]
+        if "error" in row:
+            print(f"{name:<22} ERROR: {row['error']}")
+            continue
+        values = [row[lang].get("median_ns") for lang in ("C", "Cpy", "Python")]
+        show = lambda value: format_time(value) if value is not None else "FAIL"
+        cpy_ratio = values[1] / values[0] if values[0] and values[1] else None
+        py_ratio = values[2] / values[0] if values[0] and values[2] else None
+        print(
+            f"{name:<22} {show(values[0]):>12} {show(values[1]):>12}"
+            f" {show(values[2]):>12}"
+            f" {f'{cpy_ratio:.2f}x' if cpy_ratio else 'n/a':>10}"
+            f" {f'{py_ratio:.2f}x' if py_ratio else 'n/a':>10}"
         )
 
-        r = ""
-        c_best = best(c_trials)
-        py_best = best(py_trials)
-        cpy_best = best(cpy_trials)
-        if c_best and py_best:
-            r += f"py/c={py_best / c_best:.1f}x"
-            if cpy_best:
-                r += f" cpy/c={cpy_best / c_best:.1f}x"
-        rows.append((name, c_s, py_s, cpy_s, r))
+    if args.json_path:
+        with open(args.json_path, "w", encoding="utf-8") as result_file:
+            json.dump(results, result_file, indent=2)
+            result_file.write("\n")
 
-    w = max(len(r[0]) for r in rows) + 2
-    print(f"{'Benchmark':<{w}} {'C':<42} {'Python':<42} {'cpy':<42}")
-    print("-" * (w + 126))
-    for name, c_s, py_s, cpy_s, ratio in rows:
-        print(f"{name:<{w}} {c_s:<42} {py_s:<42} {cpy_s:<42}")
-        if ratio:
-            print(f"{'':>{w}} {ratio}")
-    print()
-
-    # Cleanup
-    cleanup(build_dirs)
+    if any(
+        "error" in result
+        or any("error" in lang_result for lang_result in result.values())
+        for result in results.values()
+    ):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

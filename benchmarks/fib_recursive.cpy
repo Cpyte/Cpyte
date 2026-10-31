@@ -4,5 +4,5 @@ public fib(n: int) -> int:
     return fib(n - 1) + fib(n - 2)
 
 public main() -> int:
-    print(fib(42))
+    print(fib(38))
     return 0

@@ -1,1602 +1,876 @@
-# Cpy Language Reference
+# Cpyte Language Reference
 
-## Status Notice
+This reference describes the language accepted by the Cpyte compiler in this
+repository. Cpyte is a statically analyzed, LLVM-backed compiled language with
+Python-like indentation and explicit low-level facilities. It is not a Python
+implementation: similar-looking syntax does not imply Python-compatible
+semantics or standard-library behavior.
 
-**This documentation describes the implemented features of the Cpy language compiler.**
+The parser accepts more syntax than every backend can necessarily lower.
+Sections below distinguish syntax from semantic restrictions where that
+distinction matters. Compiler diagnostics and tests for the active target are
+authoritative for backend-specific details.
 
-## Overview
+## Contents
 
-Cpy is a compiled programming language that combines Python-like syntax with systems-level capabilities. It features static typing, automatic memory management (concurrent tri-color GC), direct C interoperability, and compilation to native machine code via LLVM.
+- [Quick start](#quick-start)
+- [Source form and lexical rules](#source-form-and-lexical-rules)
+- [Types and declarations](#types-and-declarations)
+- [Expressions and operators](#expressions-and-operators)
+- [Statements and control flow](#statements-and-control-flow)
+- [Functions and calls](#functions-and-calls)
+- [Arrays and built-ins](#arrays-and-built-ins)
+- [Structs, classes, protocols, and enums](#structs-classes-protocols-and-enums)
+- [Pointers, allocation, and ownership operations](#pointers-allocation-and-ownership-operations)
+- [Errors and deferred statements](#errors-and-deferred-statements)
+- [Imports and native interoperation](#imports-and-native-interoperation)
+- [Compiler and command-line use](#compiler-and-command-line-use)
+- [Unsupported or restricted constructs](#unsupported-or-restricted-constructs)
+- [Grammar summary](#grammar-summary)
 
-## Table of Contents
-
-1. [Language Overview](#language-overview)
-2. [Lexical Structure](#lexical-structure)
-3. [Type System](#type-system)
-4. [64-bit Support](#64-bit-support)
-5. [Expressions and Operators](#expressions-and-operators)
-6. [Statements and Control Flow](#statements-and-control-flow)
-7. [Functions](#functions)
-8. [Structures and User-Defined Types](#structures-and-user-defined-types)
-9. [Memory Management](#memory-management)
-10. [C Interoperability](#c-interoperability)
-11. [Compilation Model](#compilation-model)
-12. [Standard Library](#standard-library)
-
----
-
-## Language Overview
-
-Cpy combines high-level language syntax with low-level system programming capabilities. The language targets developers who need:
-
-- **Performance**: Native compilation via LLVM with optimization levels
-- **Control**: Automatic memory management (concurrent tri-color GC) with pointer operations
-- **Interoperability**: C library integration
-- **Safety**: Static type checking with semantic analysis
-- **Productivity**: Python-inspired syntax
-
-### Design Philosophy
-
-The language follows these core principles:
-
-1. **Explicit is better than implicit**: Memory operations and type conversions are explicit
-2. **Systems programming first**: Designed for scenarios where C would traditionally be used
-3. **Modern syntax**: Uses Python-like patterns while maintaining systems semantics
-4. **Zero-cost abstractions**: High-level features compile to efficient machine code
-
----
-
-## Lexical Structure
-
-### Source Code Representation
-
-Cpy source files use the `.cpy` extension and are represented as UTF-8 encoded text files. The language uses significant whitespace (indentation) for block structure, similar to Python.
-
-### Comments
+## Quick start
 
 ```cpy
-# Single-line comments extend to the end of the line
-# There are no multi-line comment delimiters
+def main() -> int:
+    print("Hello, Cpyte")
+    return 0
 ```
 
-### Identifiers
+Save as `hello.cpy` and run `cpy hello.cpy` to compile and run it using the
+default JIT mode. Use `cpy --aot hello.cpy` to request a native executable.
+`cpy --help` prints the options available in the installed compiler.
 
-Identifiers follow these rules:
-- Must start with a letter (a-z, A-Z) or underscore (_)
-- Subsequent characters can be letters, digits, or underscores
-- Case-sensitive
-- No length limit
+Blocks are introduced by a colon, newline, and increased indentation. Four
+spaces are the default indentation convention. Tabs can be normalized using
+the compiler's `--tab-size` option; mixing tabs and spaces within indentation
+is rejected.
 
-```cpy
-variable_name = 42
-_private_var = "internal"
-CONSTANT_VALUE = 3.14
-```
+## Source form and lexical rules
+
+### Comments, names, and line continuation
+
+`#` begins a comment that extends to the end of the line. There is no
+multiline-comment delimiter. Identifiers start with a letter or `_`, then
+contain letters, digits, or `_`; names are case-sensitive. A backslash at
+the end of a physical line continues the logical line.
 
 ### Keywords
 
-The following reserved words cannot be used as identifiers:
+Core reserved words include:
 
-**Control Flow:**
-- `if`, `else`, `elif`, `while`, `for`, `in`, `break`, `continue`
-- `switch`, `case`, `default`
-
-**Declarations:**
-- `def`, `class`, `return`, `struct`
-
-**Access Modifiers:**
-- `public`, `private`, `static`, `virtual`, `override`
-
-**Memory and Types:**
-- `new`, `sizeof`, `ref`, `int64`, `uint64`
-
-**Literals and Constants:**
-- `true`, `false`, `null`
-
-**Operators:**
-- `and`, `or`, `not`
-
-**I/O:**
-- `print`, `input`
-
-**Modules:**
-- `import`
-
-### Literals
-
-#### Numeric Literals
-
-```cpy
-# Integer literals
-42
--17
-0
-
-# 64-bit integer literals
-9223372036854775807
--9223372036854775808
-18446744073709551615
-
-# Hexadecimal literals (useful for 64-bit values)
-0x7FFFFFFFFFFFFFFF  # Maximum int64
-0xFFFFFFFFFFFFFFFF  # Maximum uint64
-
-# Floating-point literals
-3.14
--0.001
-2.0e10  # Scientific notation
+```text
+and as assert borrow break case ccode class continue dataclass def default
+defer del elif else enum except false for if import in input input_big
+input_str interface int64 let llvm move mut new not null or override private
+print protocol public raise ref return sealed sizeof static struct switch
+true try type uint64 unsafe virtual while
 ```
 
-#### String Literals
+`True` and `False` are also recognized as boolean literals. The userspace
+extension system can register additional keywords and operators, so the list
+may be extended in a configured compiler environment. `ref` is reserved, but
+the documented borrow expression forms are `borrow value` and `borrow mut
+value`; do not infer Python or C++ reference semantics from the keyword.
+
+### Literals and strings
+
+- Integer literals are decimal or hexadecimal (`0x` / `0X` followed by at
+  least one hexadecimal digit).
+- Decimal floating-point literals may have a fractional part and/or an
+  exponent, for example `1.25`, `2e6`, and `1.5e-3`.
+- `true`, `false`, `True`, `False`, and `null` are literals.
+- Single- and double-quoted strings are supported. Recognized escapes include
+  newline, tab, carriage return, backslash, quotes, NUL, `\xNN`, and
+  four-hex-digit `\uNNNN` escapes.
+- Raw strings use `r"..."` or `r'...'`; raw f-strings use `fr"..."`,
+  `rf"..."`, `fr'...'`, or `rf'...'`.
+- F-strings interpolate expressions in braces. Double braces spell literal
+  braces: `f"{{value}}"`.
+- Supported string values can be concatenated with `+`; use `str(value)` to
+  request string conversion where supported.
+
+Strings are single-line in the lexer; triple-quoted multiline strings are not
+part of the current lexical syntax.
 
 ```cpy
-"Hello, World!"
-'Single quotes also work'
-"Escaped characters: \n\t\r\\\""
+name = "Ada"
+raw_path = r"C:\tmp\file"
+greeting = f"hello, {name}"
 ```
 
-##### Escape Sequences
+## Types and declarations
+
+### Built-in type names
+
+The parser recognizes these built-in names:
+
+| Type | Notes |
+|---|---|
+| `int`, `int64`, `uint64` | Integer types; the fixed-width types are useful at native interfaces. |
+| `float`, `double` | Distinct floating-point types; `float` is not an alias for `double`. |
+| `bool` | Boolean type; literals are `true`/`false` (also `True`/`False`). |
+| `str`, `string` | String type names. |
+| `char` | Character/C interoperation type. |
+| `void` | No-value return type; use `void*` for a pointer to void. |
+| `big`, `ubig` | Signed and unsigned arbitrary-precision integer runtime types. |
+| `dynamic` | Dynamically represented value; available only where the selected compilation mode supports the userspace runtime. |
+| `size_t`, `ssize_t`, `ptrdiff_t`, `intptr_t`, `uintptr_t` | Platform/C-oriented integer type names. |
+| `signed`, `unsigned`, `short`, `long` | Accepted type spellings for C-oriented declarations; exact layout follows compiler mapping and target. |
+
+User-defined struct, class, protocol, enum, and alias names can also be used as
+types. A spelling being accepted by the parser does not guarantee that each
+target backend supports every operation on that type.
+
+### Type forms
+
+Type syntax supports pointer and reference suffixes, arrays, and generic
+arguments:
 
 ```cpy
-"\n"    # newline
-"\t"    # tab
-"\r"    # carriage return
-"\x41"  # hex escape: 'A'
-"\u00e9" # unicode escape: 'é'
-"\\"    # backslash
-"\""    # double quote
+int* pointer
+int** pointer_to_pointer
+int& reference_type
+int[] growable_array
+int[8] fixed_array
+Box<int> box
 ```
 
-##### Raw Strings
+`T[]` denotes a registered/growable array form; `T[N]` is a fixed-size array
+type with a numeric literal size. Pointer (`*`, `**`), reference (`&`), and
+array suffixes can be composed where the compiler supports the resulting
+operation. Generic type arguments use angle brackets, such as `Box<int>`.
+
+### Variable declarations and inference
+
+Use a type followed by a name, optionally initialized:
 
 ```cpy
-r"C:\path\to\file\n"   # backslashes kept verbatim: C:\path\to\file\n
+int count = 3
+str title = "reference"
+int result
 ```
 
-##### F-Strings (String Interpolation)
-
-`f"..."` interpolates expressions inside `{...}`. Literal text is kept as-is and
-each embedded expression is evaluated and converted to its string form
-(numbers as decimal, hex literals as hex, pointers as `0x...`, big integers as
-decimal). Use `{{` and `}}` to emit literal braces.
+`auto` requests inference from an initializer and therefore requires one:
 
 ```cpy
-name = "World"
-print(f"hello {name}!")              # hello World!
-x = 42
-print(f"{x} + {x} = {x + x}")        # 42 + 42 = 84
-print(f"hex = {0xdeadbeef}")         # hex = 0xdeadbeef
-print(f"{{braces}}")                 # {braces}
+auto answer = 42
 ```
 
-Raw f-strings combine both: `fr"..."` / `rf"..."` keep backslashes verbatim in
-literal runs while still interpolating expressions.
+Variables can also be explicitly declared `dynamic`. In ordinary semantic
+analysis, reassigning a variable a value of an incompatible type can promote
+that variable to a runtime-typed dynamic value; operations on it then follow
+dynamic/runtime rules rather than the original static type.
+
+`let name = expression` is accepted as an assignment/declaration-style
+statement form, but does not make Cpyte dynamically typed or immutable.
+Typed constants use a type and a parenthesized name:
 
 ```cpy
-print(fr"path {name}\n")   # path World\n  (backslash kept, expression expanded)
+int (MAX_ITEMS) = 100
 ```
 
-Expressions may nest string literals and call functions:
+Constants are immutable. Functions may also declare a parameter as a
+constant-view parameter using `(parameter)` in the parameter list; this makes
+the parameter read-only within that function.
+
+### Type aliases
 
 ```cpy
-print(f"Hello, {name + "!"}")        # Hello, World!
+type Index = uint64
 ```
 
-#### Boolean and Null Literals
+An alias names a type; it does not introduce a new runtime representation.
+Top-level functions and type declarations are predeclared during semantic
+analysis, so supported functions/types can be referenced before their textual
+definitions. This does not imply that local variables are forward-declared.
+
+### Conversions
+
+The compiler supports C-style casts `(Type) expression` for built-in or
+declared types, including pointer/array suffixes, and recognizes `sizeof(Type)`.
+The `as` expression is a separate class downcast operation (see
+[class casts](#structs-classes-protocols-and-enums)), not a general-purpose
+numeric cast. Conversion availability and overflow behavior depend on the
+source and destination types; do not assume implicit conversions preserve
+range or precision.
+
+## Expressions and operators
+
+### Atoms and postfix expressions
+
+Expressions include numeric and string literals, names, booleans, `null`,
+parenthesized expressions, list literals (`[a, b]`), calls, indexing, member
+access (`value.field`), and the operators below. Calls may be chained with
+indexing and member access. A trailing comma is accepted in a list literal.
+
+### Operator precedence
+
+From highest to lowest (operators on the same row share precedence):
+
+| Operators | Meaning |
+|---|---|
+| `(...)`, `[...]`, `.`, `as` | Grouping, call, indexing, member access, class cast |
+| unary `+`, `-`, `not`, `~`, `*`, `**`, `&`, `--` | Unary operations; pointer dereference/address forms are type-dependent |
+| `**` | Exponentiation |
+| `*`, `/`, `//`, `%` | Multiplicative |
+| `+`, `-` | Additive |
+| `<<`, `>>` | Shifts |
+| `<`, `<=`, `>`, `>=`, `==`, `!=`, `in` | Comparisons and membership |
+| `&` | Bitwise AND |
+| `^` | Bitwise XOR |
+| `|` | Bitwise OR |
+| `and` | Logical AND |
+| `or` | Logical OR |
+| `value if condition else other` | Conditional expression |
+
+Parentheses should be used when an expression's grouping might be unclear.
+The conditional expression has the form `value if condition else other`;
+chained conditional expressions associate to the right. `in` is a membership
+operation for supported array/list values, not a general protocol-based
+iteration hook.
+
+### Assignment
+
+Assignment targets are names, fields, array indexes, and dereferenced values.
+Supported assignment spellings are:
 
 ```cpy
-is_valid = true
-is_error = false
-empty_value = null
+value = 1
+value += 2
+value -= 2
+value *= 3
+value /= 2
+value //= 2
 ```
 
-### Operators and Punctuation
+The parser tokenizes `:=`, but it is not a standard assignment statement.
+There is no general tuple unpacking or chained-assignment form.
 
-#### Arithmetic Operators
-- `+` (addition), `-` (subtraction)
-- `*` (multiplication), `/` (division)
-- `//` (integer division), `%` (modulo)
-- `**` (exponentiation)
+### Pointer operations and allocation expressions
 
-#### Comparison Operators
-- `==` (equality), `!=` (inequality)
-- `<` (less than), `>` (greater than)
-- `<=` (less than or equal), `>=` (greater than or equal)
+Address-of (`&value`), dereference (`*pointer`), `new Type`, `new Type[count]`,
+and `sizeof(Type)` are parsed expressions. Their valid uses depend on type
+checking, target support, and runtime configuration; see
+[pointers and allocation](#pointers-allocation-and-ownership-operations).
 
-#### Logical Operators
-- `and` (logical AND), `or` (logical OR), `not` (logical NOT)
+## Statements and control flow
 
-#### Bitwise Operators
-- `&` (bitwise AND), `|` (bitwise OR), `^` (bitwise XOR)
-- `~` (bitwise NOT)
-- `<<` (left shift), `>>` (right shift)
+Every compound statement uses a colon and an indented suite. A one-line suite
+is not the standard form.
 
-#### Assignment Operators
-- `=` (simple assignment)
-- `+=`, `-=`, `*=`, `/=`, `//=` (compound assignment)
+### Declarations and simple statements
 
-#### Memory Operators
-- `*` (dereference), `&` (address-of)
-- `--` (decrement)
+The parser supports variable declarations, assignment, expression statements,
+`print`, `return`, `assert`, `break`, `continue`, `del`, `defer`, and
+declarations of functions, classes, structs, enums, aliases, and imports.
+`print expression` and `print(expression, ...)` are accepted. `print` is a
+statement, not a general expression returning a value.
 
-#### Other Operators
-- `->` (return type annotation)
-- `.` (member access), `[]` (array indexing)
-- `()` (function call), `,` (comma separator)
-
----
-
-## Type System
-
-Cpy employs a static type system with type inference and explicit type annotations. The type system catches errors at compile time while maintaining flexibility.
-
-### Primitive Types
-
-#### Integer Types
-
-Cpy supports multiple integer types with different bit widths and signedness:
-
-**32-bit Integers:**
-```cpy
-int x = 42
-int negative = -17
-```
-
-**64-bit Integers:**
-```cpy
-int64 large_number = 9223372036854775807
-int64 negative_large = -9223372036854775808
-```
-
-**Unsigned 64-bit Integers:**
-```cpy
-uint64 unsigned_large = 18446744073709551615
-uint64 hex_value = 0xFFFFFFFFFFFFFFFF
-```
-
-**Integer Type Summary:**
-- `int`: 32-bit signed integer (range: -2,147,483,648 to 2,147,483,647)
-- `int64`: 64-bit signed integer (range: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807)
-- `uint64`: 64-bit unsigned integer (range: 0 to 18,446,744,073,709,551,615)
-
-#### Floating-Point Type
-```cpy
-float pi = 3.14159
-float precision = 0.0001
-```
-
-#### String Type
-```cpy
-str name = "Cpy Programming"
-str empty = ""
-```
-
-#### Boolean Type
-```cpy
-bool is_valid = true
-bool is_error = false
-```
-
-### Pointer Types
-
-Cpy supports pointers with automatic garbage collection:
+### Branching
 
 ```cpy
-int* ptr           # Pointer to integer
-int** ptr_to_ptr   # Pointer to pointer
-void* generic_ptr  # Generic pointer
-```
-
-**64-bit Address Space:**
-- All pointers are 64-bit on 64-bit platforms
-- Supports addressing up to 2^64 bytes of memory
-- Compatible with modern 64-bit operating systems and hardware
-
-**Additional Pointer Types:**
-```cpy
-int64* large_ptr   # Pointer to 64-bit integer
-uint64* uint64_ptr  # Pointer to unsigned 64-bit integer
-```
-
-### Array Types
-
-Arrays are dynamically allocated with explicit size; all array values are
-growable, and a `len()` builtin reports the current element count:
-
-```cpy
-int[] numbers      # Array of integers
-str[] strings      # Array of strings
-Point[] points     # Array of Point structures
-```
-
-#### Growth: `append(arr, x)` and `len(arr)`
-
-Every array produced by `new T[n]`, `range()`, a list literal or `str_split()`
-is backed by a registered heap buffer whose length can grow. `append(arr, x)`
-appends `x` to `arr` (returning the possibly-relocated array pointer), and
-`len(arr)` returns the current element count as `int64`:
-
-```cpy
-int[] a = new int[2]
-append(a, 10)
-append(a, 20)
-len(a)               # → 2
-print(a[0], a[1])    # 10 20
-```
-
-Both `append` and `len` may be shadowed by user-defined functions of the same
-name, exactly like `range` and `str_split`.
-
-Note: fixed-size array locals (`int[5]`) and raw C buffers are not
-registered and cannot be grown or queried with `append`/`len`.
-
-### Type Annotations
-
-Type annotations use the `->` syntax for functions and `:` syntax for variables:
-
-```cpy
-public def function_name(param1: int, param2: str) -> int:
-    # Function body
-    return 0
-
-int x = 42
-str name = "example"
-```
-
-### Type Inference
-
-The compiler can infer types in many contexts:
-
-```cpy
-# Type inferred from literal
-x = 42  # Inferred as int
-y = 3.14  # Inferred as float
-
-# Large literals automatically inferred as 64-bit
-large = 9223372036854775807  # Inferred as int64
-hex_val = 0xFFFFFFFFFFFFFFFF  # Inferred as uint64
-
-# Type inferred from expression
-result = x + y  # Type inferred based on operation
-```
-
----
-
-## 64-bit Support
-
-Cpy provides 64-bit support for modern computing platforms, enabling developers to work with large datasets, high-precision calculations, and memory-intensive applications.
-
-### Platform Architecture
-
-Cpy supports 64-bit computing environments with the following capabilities:
-
-- **64-bit address space**: Support for up to 2^64 bytes of addressable memory
-- **64-bit integer arithmetic**: Native support for 64-bit signed and unsigned integers
-- **64-bit pointers**: All pointer types are 64-bit on supported platforms
-- **LLVM backend**: Leverages LLVM's 64-bit optimization capabilities
-
-### 64-bit Integer Types
-
-#### Signed 64-bit Integers (int64)
-
-The `int64` type provides a 64-bit signed integer with the following characteristics:
-
-- **Range**: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807
-- **Size**: 8 bytes (64 bits)
-- **Use cases**: Large counters, timestamps, file sizes, database keys
-
-```cpy
-# 64-bit signed integer usage
-int64 file_size = 9223372036854775807
-int64 timestamp = 1699999999999
-int64 database_id = 1234567890123456789
-
-# Arithmetic operations
-int64 result = file_size + 1024
-int64 multiplied = timestamp * 2
-```
-
-#### Unsigned 64-bit Integers (uint64)
-
-The `uint64` type provides a 64-bit unsigned integer with the following characteristics:
-
-- **Range**: 0 to 18,446,744,073,709,551,615
-- **Size**: 8 bytes (64 bits)
-- **Use cases**: Memory addresses, bit masks, unsigned counters, hashes
-
-```cpy
-# 64-bit unsigned integer usage
-uint64 memory_address = 0xFFFFFFFFFFFFFFFF
-uint64 bit_mask = 0x123456789ABCDEF0
-uint64 hash_value = 18446744073709551615
-
-# Bitwise operations
-uint64 masked = memory_address & 0x00000000FFFFFFFF
-uint64 shifted = hash_value >> 16
-```
-
-### Type Conversions
-
-#### Type Conversions
-
-```cpy
-# 32-bit to 64-bit conversion
-int x = 42
-int64 large_x = x  # Automatic promotion
-
-# 64-bit to 32-bit conversion
-int64 large_value = 9223372036854775807
-int reduced = (int)large_value  # Explicit cast required
-```
-
-#### Type Promotion
-
-The compiler promotes types in mixed expressions:
-
-```cpy
-# int to int64 promotion
-int small = 42
-int64 large = 1000000000000
-int64 result = small + large  # small is automatically promoted to int64
-
-# int64 to uint64 conversion
-int64 signed_val = -100
-uint64 unsigned_val = signed_val  # Implicit conversion
-```
-
-#### Overflow
-
-```cpy
-# 64-bit arithmetic overflow
-int64 max_int64 = 9223372036854775807
-int64 overflow_result = max_int64 + 1  # Implementation-defined behavior
-
-# Unsigned overflow
-uint64 max_uint64 = 18446744073709551615
-uint64 wrapped = max_uint64 + 1  # Wraps to 0
-```
-
-### Memory Operations
-
-#### 64-bit Pointers
-
-```cpy
-int64* ptr_to_large = new int64
-*ptr_to_large = 9223372036854775807
-
-uint64* ptr_to_unsigned = new uint64
-*ptr_to_unsigned = 0xFFFFFFFFFFFFFFFF
-
-# Pointer arithmetic
-int64* array_start = new int64[1000]
-int64* fifth_element = array_start + 4
-```
-
-#### 64-bit Array Allocation
-
-```cpy
-int64[] large_array = new int64[1000000]
-uint64[] huge_array = new uint64[10000000]
-
-# 64-bit array indexing
-int64 index = 500000000
-int64 value = large_array[index]
-```
-
-### Platform-Specific Considerations
-
-#### Data Model
-
-Cpy follows the LP64 data model on 64-bit platforms:
-
-- `int`: 32 bits
-- `pointer`: 64 bits
-- `int64`: 64 bits
-- `uint64`: 64 bits
-
-#### Endianness
-
-Cpy supports both little-endian and big-endian architectures:
-
-```cpy
-uint64 value = 0x123456789ABCDEF0
-# Compiler handles endianness conversion
-```
-
-### Performance Considerations
-
-#### Native 64-bit Operations
-
-Modern 64-bit processors provide native support for 64-bit operations:
-
-```cpy
-int64 a = 9223372036854775807
-int64 b = 1000000000
-int64 result = a + b  # Single instruction on 64-bit CPUs
-```
-
-#### Memory Bandwidth
-
-64-bit types improve memory bandwidth utilization:
-
-```cpy
-int64[] data = new int64[1000]
-# Each memory operation transfers 8 bytes
-```
-
-### Use Cases for 64-bit Types
-
-#### File System Operations
-
-```cpy
-# Large file handling
-int64 file_size = get_file_size("large_file.dat")
-int64 position = seek_file(file_handle, 9223372036854775807)
-```
-
-#### Database Operations
-
-```cpy
-# 64-bit primary keys
-int64 user_id = 1234567890123456789
-int64 transaction_id = generate_unique_id()
-```
-
-#### Cryptographic Operations
-
-```cpy
-# 64-bit blocks for cryptographic operations
-uint64 block = 0x123456789ABCDEF0
-uint64 encrypted = encrypt_block(block)
-```
-
-#### High-Precision Timestamps
-
-```cpy
-# Nanosecond precision timestamps
-int64 timestamp_ns = get_current_time_ns()
-int64 elapsed = timestamp_ns - start_time
-```
-
-#### Memory Addressing
-
-```cpy
-# Direct memory addressing
-uint64 address = 0x123456789ABC
-uint64* memory_ptr = (uint64*)address
-uint64 value = *memory_ptr
-```
-
-### Compatibility and Portability
-
-#### Cross-Platform 64-bit Support
-
-Cpy's 64-bit support is consistent across platforms:
-
-- **Linux x86_64**: Full 64-bit support
-- **macOS ARM64/x86_64**: Full 64-bit support
-- **Windows x64**: Full 64-bit support
-
-#### ABI Compatibility
-
-Cpy maintains ABI compatibility with C 64-bit types:
-
-```cpy
-import "c_library.c"
-int64 result = c_function_64bit(9223372036854775807)
-```
-
-### Best Practices for 64-bit Programming
-
-#### Type Selection Guidelines
-
-1. **Use `int` for general-purpose arithmetic** when values fit in 32-bit range
-2. **Use `int64` for large values** that may exceed 32-bit limits
-3. **Use `uint64` for unsigned operations** and bit manipulation
-4. **Avoid mixing signed/unsigned** without explicit conversions
-
-#### Overflow Prevention
-
-```cpy
-public def safe_add_64(a: int64, b: int64) -> int64:
-    if a > 0 and b > (9223372036854775807 - a):
-        print("Overflow detected")
-        return 0
-    return a + b
-```
-
-#### Memory Alignment
-
-```cpy
-struct AlignedData:
-    int32 small_value
-    int32 padding  # Ensure 64-bit alignment
-    int64 large_value
-```
-
-### 64-bit Literal Syntax
-
-#### Decimal Literals
-
-```cpy
-int64 large_decimal = 9223372036854775807
-uint64 unsigned_decimal = 18446744073709551615
-```
-
-#### Hexadecimal Literals
-
-```cpy
-int64 hex_max = 0x7FFFFFFFFFFFFFFF
-uint64 hex_unsigned_max = 0xFFFFFFFFFFFFFFFF
-int64 hex_value = 0x123456789ABCDEF0
-```
-
-### 64-bit in Standard Library
-
-#### 64-bit I/O Operations
-
-```cpy
-# Print 64-bit values
-print(9223372036854775807)  # Handles 64-bit integers automatically
-print(0xFFFFFFFFFFFFFFFF)  # Handles 64-bit hexadecimal
-```
-
-#### 64-bit Math Functions
-
-```cpy
-# 64-bit mathematical operations
-int64 absolute = abs_64(-9223372036854775807)
-int64 minimum = min_64(a, b)
-int64 maximum = max_64(a, b)
-```
-
-### Debugging 64-bit Code
-
-#### Common Issues
-
-1. **Silent overflow**: 64-bit overflow may not be immediately apparent
-2. **Sign extension**: Accidental sign extension in mixed-type operations
-3. **Endianness issues**: When working with binary data
-4. **Alignment problems**: Misaligned 64-bit accesses on some platforms
-
-#### Debugging Techniques
-
-```cpy
-int64 value = 9223372036854775807
-print(value)
-
-# Boundary testing
-int64 test_max = 9223372036854775807
-int64 test_min = -9223372036854775808
-print(test_max)
-print(test_min)
-```
-
----
-
-## Expressions and Operators
-
-### Operator Precedence
-
-Operators are evaluated in the following order (highest to lowest):
-
-1. **Primary expressions**: literals, identifiers, parenthesized expressions
-2. **Postfix operators**: `()`, `[]`, `.`, `->`
-3. **Unary operators**: `*`, `&`, `+`, `-`, `~`, `not`
-4. **Exponentiation**: `**`
-5. **Multiplicative**: `*`, `/`, `//`, `%`
-6. **Additive**: `+`, `-`
-7. **Shift**: `<<`, `>>`
-8. **Relational**: `<`, `>`, `<=`, `>=`
-9. **Equality**: `==`, `!=`
-10. **Bitwise AND**: `&`
-11. **Bitwise XOR**: `^`
-12. **Bitwise OR**: `|`
-13. **Logical AND**: `and`
-14. **Logical OR**: `or`
-
-### Arithmetic Expressions
-
-```cpy
-# Basic arithmetic
-result = 10 + 5 * 2        # 20 (multiplication has higher precedence)
-division = 20 / 4          # 5.0 (float division)
-int_div = 20 // 4          # 5 (integer division)
-modulo = 17 % 5            # 2
-power = 2 ** 10            # 1024
-
-# Compound assignment
-x += 5    # x = x + 5
-x -= 3    # x = x - 3
-x *= 2    # x = x * 2
-x /= 4    # x = x / 4
-```
-
-### Comparison Expressions
-
-```cpy
-# Equality and inequality
-if x == y:
-    print("equal")
-if x != y:
-    print("not equal")
-
-# Relational comparisons
-if x < y:
-    print("less than")
-if x <= y:
-    print("less than or equal")
-if x > y:
-    print("greater than")
-if x >= y:
-    print("greater than or equal")
-```
-
-### Logical Expressions
-
-```cpy
-# Logical operators
-if condition1 and condition2:
-    print("both true")
-
-if condition1 or condition2:
-    print("at least one true")
-
-if not condition:
-    print("condition is false")
-```
-
-### Bitwise Expressions
-
-```cpy
-# Bitwise operations
-a = 10   # 0b1010
-b = 12   # 0b1100
-
-result = a & b   # Bitwise AND: 8  (0b1000)
-result = a | b   # Bitwise OR:  14 (0b1110)
-result = a ^ b   # Bitwise XOR: 6  (0b0110)
-result = ~a      # Bitwise NOT: -11
-result = a << 2  # Left shift: 40  (0b101000)
-result = a >> 1  # Right shift: 5  (0b101)
-```
-
-### Memory Operations
-
-```cpy
-# Address-of operator
-int x = 42
-int* ptr = &x    # ptr now holds the address of x
-
-# Dereference operator
-print(*ptr)      # Prints 42 (value at address stored in ptr)
-*ptr = 99        # Sets x to 99 through pointer
-
-# Pointer-to-pointer
-int** pptr = &ptr
-print(**pptr)    # Prints 99
-```
-
-### String Operations
-
-```cpy
-str greeting = "Hello"
-str target = "World"
-str message = greeting + ", " + target
-
-# String indexing
-first_char = message[0]  # 'H'
-```
-
-### Sizeof Operator
-
-```cpy
-int_size = sizeof(int)
-struct_size = sizeof(Point)
-```
-
-### New Expression (Memory Allocation)
-
-```cpy
-int* ptr = new int
-Point* p = new Point
-
-int[] arr = new int[10]
-Point[] points = new Point[5]
-```
-
----
-
-## Statements and Control Flow
-
-### Expression Statements
-
-Any expression can be a statement:
-
-```cpy
-x = 42
-print(x)
-function_call(arg1, arg2)
-```
-
-### Variable Declarations
-
-```cpy
-# Simple declaration
-int x
-str name
-
-# Declaration with initialization
-int age = 25
-str city = "New York"
-
-# Multiple declarations
-int a, b, c
-```
-
-### Assignment Statements
-
-```cpy
-# Simple assignment
-x = 10
-
-# Assignment with compound operators
-x += 5
-x *= 2
-
-# Member assignment
-point.x = 15
-point.y = 20
-
-# Array element assignment
-arr[0] = 42
-arr[5] = 100
-```
-
-### Conditional Statements
-
-#### If-Else Statement
-
-```cpy
-if condition:
-    print("condition is true")
-elif other_condition:
-    print("other condition is true")
+if count > 0:
+    print("positive")
+elif count == 0:
+    print("zero")
 else:
-    print("no condition matched")
+    print("negative")
 ```
 
-#### Switch Statement
+`switch expression:` accepts `case expression:` and `default:` arms. Each
+arm may contain a single same-line statement or an indented body. Do not rely
+on implicit fallthrough; use explicit control flow within a case.
+
+### Loops
 
 ```cpy
-switch value:
-    case 1:
-        print("one")
-    case 2:
-        print("two")
-    default:
-        print("other")
-```
+while count > 0:
+    count -= 1
 
-### Loop Statements
-
-#### While Loop
-
-```cpy
-while condition:
-    print("loop body")
-    # Update condition to avoid infinite loop
-```
-
-#### For Loop
-
-```cpy
-for item in collection:
+for item in items:
     print(item)
 ```
 
-### Jump Statements
+`for` binds one loop variable to a string, array, or supported dynamic
+iterable. Iterating a string yields `char` values; iterating an array yields
+its element type. `break` and `continue` are loop-control statements.
+`range(...)` is available for counted loops; see
+[built-ins](#arrays-and-built-ins).
 
-#### Break Statement
+### Assertions and return
+
+`assert condition` checks a condition. An optional assertion message is
+accepted by the parser as an expression after a comma.
+
+`return` may be used without a value in a void-returning function, or with an
+expression matching the function's return type. The compiler checks
+return-type compatibility.
+
+## Functions and calls
+
+### Function definitions
 
 ```cpy
-while true:
-    if condition:
-        break
+def add(left: int, right: int) -> int:
+    return left + right
 ```
 
-#### Continue Statement
+The parser also accepts the type-before-name parameter form (`int left`) and
+omitted parameter types (which default to `int`). Return annotations use
+`-> Type`; an omitted annotation is inferred/treated as `auto` by semantic
+analysis. Prefer explicit parameter and return types in public APIs.
+
+Generic parameter names may follow the function name, for example
+`def identity<T>(value: T) -> T:`. Generic syntax is implemented through the
+compiler's generic instantiation machinery and may be subject to type and
+backend restrictions; it is not Python-style runtime generics.
+
+### Defaults, keyword arguments, and calls
 
 ```cpy
-for i in range(10):
-    if i % 2 == 0:
-        continue
-    print(i)
+def repeat(value: int, times: int = 2) -> int:
+    return value * times
+
+answer = repeat(value=4)
+other = repeat(4, 3)
 ```
 
-#### Return Statement
+Once a parameter has a default, every following parameter must also have a
+default. Calls support positional and named arguments; an argument cannot be
+supplied twice. Variadic parameters (`*args`, `**kwargs`) are not supported.
+
+### Method modifiers and decorators
+
+The parser recognizes method/function modifiers including `public`,
+`private`, `static`, `virtual`, and `override` in modifier-prefixed
+declarations. Both `public def name(...):` and the modifier-prefixed
+`public name(...):` form are parsed. Their effect depends on declaration
+context and backend.
+
+Cpyte decorators use a wrapper function whose return type is `decorated`.
+`code()` invokes the original function, and `result` is the wrapper's result
+slot:
 
 ```cpy
-public def calculate(x: int, y: int) -> int:
-    return x + y
-```
+def add_offset(offset int) -> decorated:
+    code()
+    result = result + offset
 
-### Block Statements
-
-Blocks are defined by indentation:
-
-```cpy
-public def example():
-    int x = 10
-    # This is a block
-    if x > 5:
-        int y = 20
-        # Nested block
-        print(x + y)
-```
-
----
-
-## Functions
-
-### Function Declaration
-
-Functions are declared using the `def` keyword with optional access modifiers:
-
-```cpy
-public def function_name(param1: int, param2: str) -> int:
-    # Function body
-    return 0
-```
-
-### Access Modifiers
-
-```cpy
-# Public function (can be called from outside)
-public def public_function() -> int:
+@add_offset(10)
+def value() -> int:
     return 42
 
-# Private function (internal use only)
-private def helper_function() -> int:
+public def main() -> int:
+    print(value())
     return 0
-
-# Static function (class-level)
-static def static_function() -> int:
-    return 1
 ```
 
-### Function Parameters
+This program prints `52`.
+
+In a decorator factory, `args` exposes the decorated function's arguments as
+dynamic values, `func_name` is its name, and assigning `skip = true` skips the
+original call and returns the default value. A decorator factory returning
+`decorated` must call `code()` somewhere in its body; it may conditionally skip
+that call by setting `skip`. `code()`, `result`, `args`, `func_name`, and
+`skip` have this special meaning only in decorator factories, not in ordinary
+functions. Multiple decorators do not follow Python's chaining rule: each
+invokes the original function through the trampoline, and the last decorator's
+result wins.
 
 ```cpy
-public def process_numbers(a: int, b: int, c: float) -> float:
-    return a + b + c
+def guard(pad int) -> decorated:
+    if pad >= 0:
+        code()
+        int first = args[0]
+        int second = args[1]
+        result = result + first + second
+        print(func_name)
+    else:
+        skip = true
 
-public def greet(name: str = "World") -> str:
-    return "Hello, " + name
+@guard(5)
+def add(a int, b int) -> int:
+    return a * 10 + b
+
+@guard(-1)
+def skipped() -> int:
+    return 999
+
+public def main() -> int:
+    print(add(2, 3))
+    print(skipped())
+    return 0
 ```
 
-### Return Types
+This prints `add`, `28`, and `0`, in that order. `args[index]` is dynamic;
+declare a local with the required static type to unbox an argument.
 
-```cpy
-public def add(a: int, b: int) -> int:
-    return a + b
+### Input and conversion built-ins
 
-public def print_message(msg: str):
-    print(msg)
-```
+The language recognizes `input()`, `input_str()`, and `input_big()` as
+input-expression forms returning `int`, `str`, and `big`, respectively.
+Conversion/runtime names include `int`, `float`, `double`, and `str`; each
+conversion takes exactly one argument. `free` is available when GC is
+disabled. Exact supported conversions are type- and runtime-dependent.
 
-### Function Calls
+## Arrays and built-ins
 
-```cpy
-result = add(10, 20)
-result = process_numbers(a=5, b=10, c=2.5)
-object.method(arg1, arg2)
-```
+### Array creation and indexing
 
-### Recursive Functions
+`new T[count]` allocates an array-sized region. A list literal such as
+`[1, 2, 3]` creates a runtime list/array value. Indexing uses
+`array[index]`. Fixed-size arrays use the `T[N]` type form and do not have the
+registered growable-array behavior.
 
-```cpy
-public def factorial(n: int) -> int:
-    if n <= 1:
-        return 1
-    return n * factorial(n - 1)
-```
+Array lifetime depends on how the array was created and whether automatic GC
+is enabled. Raw C buffers and fixed-size arrays should not be assumed to have
+the same metadata or helpers as registered arrays.
 
----
+### Array and object helpers
 
-## Structures and User-Defined Types
+| Built-in | Supported form and behavior |
+|---|---|
+| `len(value)` | One argument. Returns the registered element count for supported arrays, the string length for `str`, or invokes a class `__len__` method when supported. Fixed-size arrays and raw C buffers do not have registered array lengths. |
+| `append(array, value)` | Two arguments. Mutates a growable/registered array lvalue and returns the array value. It does not grow fixed-size arrays or raw C buffers. |
+| `range(stop)`, `range(start, stop)`, `range(start, stop, step)` | Produces an `int64[]` sequence for `for`; a user-defined function named `range` shadows this built-in. |
+| `str_split(string[, separator])` | Accepts one or two arguments and produces a `dynamic[]`; a user-defined function named `str_split` shadows this built-in. |
+| `has(name)` | Tests whether a name/value is present under the supported static/dynamic rules. |
+| `has(object, "field")` | Tests whether a statically known struct/class has a field; a runtime string field name is also supported where fields can be resolved. |
+| `get_attr(object, "field")` | Reads a statically typed struct/class field by name. A dynamic field-name string is only valid when the candidate fields have compatible types. |
+| `isinstance(object, Class)` | Tests whether a class object's runtime type is the named class or a descendant, subject to sealed/virtual hierarchy rules. |
 
-### Structure Definition
+`has` and `get_attr` are compiler-special forms rather than unrestricted
+reflection over arbitrary values.
 
-Structures are defined using the `struct` keyword:
+## Structs, classes, protocols, and enums
 
-```cpy
-struct Point:
-    int x
-    int y
-```
+### Structs
 
-### Structure Instantiation
-
-```cpy
-Point p
-p.x = 10
-p.y = 20
-```
-
-### Nested Structures
-
-```cpy
-struct Line:
-    Point start
-    Point end
-
-Line line
-line.start.x = 0
-line.start.y = 0
-line.end.x = 100
-line.end.y = 100
-```
-
-### Generic Structures
-
-```cpy
-struct Pair<T, U>:
-    T first
-    U second
-
-Pair<int, str> pair
-pair.first = 42
-pair.second = "answer"
-```
-
-### Structure Methods
+Struct bodies contain typed field declarations; methods are not declared in a
+struct body.
 
 ```cpy
 struct Point:
     int x
     int y
 
-    public def add(other: Point) -> Point:
-        Point result
-        result.x = self.x + other.x
-        result.y = self.y + other.y
-        return result
+Point* point = new Point
+point.x = 2
 ```
 
-### Self-Referential Structures
+Structs can declare generic parameters, for example `struct Box<T>:`. Fields
+need explicit types; a field type cannot be inferred from an initializer
+because struct fields are declarations, not initialized statements.
+
+### Classes, inheritance, and methods
 
 ```cpy
-struct ListNode:
+class Animal:
+    str name
+
+    def speak() -> str:
+        return this.name
+
+class Dog(Animal):
+    def speak() -> str:
+        return "woof"
+```
+
+Class methods receive an implicit `this` parameter. A class may have one
+declared base class. An override must match the base method's parameter and
+return signature (except constructors, `__init__`). `super.method(...)` calls
+the nearest base implementation from within a class method.
+
+`new ClassName(...)` allocates the class and invokes its constructor with the
+provided arguments when one is available. `new ClassName` supplies no explicit
+constructor arguments; the compiler checks whether the available constructor
+can be called that way. Class fields require explicit types.
+Use constructors to initialize class fields; field initializer expressions are
+not a supported field-initialization mechanism.
+
+Classes may be marked `sealed`; sealed class hierarchies are monomorphic and
+do not provide runtime subtype information. Ordinary virtual class hierarchies
+use runtime class information for supported casts and `isinstance`.
+
+### Dataclasses
+
+`dataclass class Name:` synthesizes missing `__init__`, `__eq__`, and `__str__`
+methods from the class fields. A user-defined method with one of those names
+prevents that corresponding synthesized method. `sealed dataclass class Name:`
+combines the modifiers.
+
+### Properties
+
+Properties are class-only blocks with a required `get` accessor and optional
+`set` accessor:
+
+```cpy
+class Counter:
     int value
-    ListNode* next
+
+    property count:
+        get:
+            return this.value
+        set:
+            this.value = value
 ```
 
----
+The getter's return type determines the property type. The setter uses a
+parameter named `value`. A property name cannot conflict with a class field or
+method.
 
-## Memory Management
+### Protocols and interfaces
 
-### Stack Allocation
+`protocol Name:` and `interface Name:` declare the same protocol-like form.
+The body can declare typed fields, methods, and properties; a protocol may
+name one base protocol. This syntax does not imply a general structural
+conformance or dynamic-dispatch system beyond what semantic analysis and the
+selected backend support.
 
-Regular variables are allocated on the stack:
+### Enums
 
 ```cpy
-int x = 42        # Stack allocation
-Point p           # Stack allocation
-p.x = 10
-p.y = 20
+enum Color:
+    Red
+    Green = 4
+    Blue
 ```
 
-### Heap Allocation
+Each member may omit its value or provide an expression. The parser does not
+accept methods or typed fields inside an enum body. Use the compiler's
+supported enum operations rather than assuming a Python `Enum` object model.
+Members are qualified by the enum name (`Color.Red`). Implicit values start at
+zero and increment; an explicit constant value sets the next implicit value
+to one more than that value.
+
+### Class type tests and casts
+
+`isinstance(value, ClassName)` requires a class object or pointer and a class
+name. `value as ClassName` is a checked class downcast; its result has pointer
+type `ClassName*` and is null when the runtime type is incompatible. Upcasts
+within a class hierarchy are statically successful. A sealed hierarchy has
+no runtime subtype check.
+
+### Operator and special-method hooks
+
+Semantic analysis maps binary operators to these class methods:
+`+`/`__add__`, `-`/`__sub__`, `*`/`__mul__`, `/`/`__truediv__`,
+`//`/`__floordiv__`, `%`/`__mod__`, `**`/`__pow__`, `<`/`__lt__`,
+`<=`/`__le__`, `>`/`__gt__`, `>=`/`__ge__`, `==`/`__eq__`, and
+`!=`/`__ne__`. Additional recognized hooks include `__getitem__`,
+`__len__`, `__call__`, and `__str__` in their corresponding contexts. This
+is a finite compiler-supported set, not Python's complete data model.
+
+## Pointers, allocation, and ownership operations
+
+### Allocation and raw pointers
+
+`new T` and `new T[count]` are explicit allocation expressions. Pointer
+declarations use `T*`; dereference and address-of use `*pointer` and `&value`.
+`sizeof(T)` returns the target representation's size for supported types.
+Bounds checks, null checks, and lifetime guarantees should not be assumed for
+raw pointers.
+
+The default compiler mode enables automatic memory management through the
+userspace runtime. `--nogc` disables automatic GC and exposes `free()`; the
+caller then owns allocation lifetime. Do not manually free GC-managed
+allocations. `--no-userspace` removes userspace runtime support and restricts
+features that depend on it.
+
+### Borrow and move expressions
+
+The parser accepts:
 
 ```cpy
-int* ptr = new int
-*ptr = 42
-
-int[] arr = new int[10]
-arr[0] = 1
-arr[9] = 10
+borrow value
+borrow mut value
+move value
 ```
 
-### Memory Operations
+These are explicit ownership/borrowing expressions with semantic checks. They
+are not a replacement for a complete Rust-style ownership system, and the
+actual allowed operations depend on the value's type and compiler analysis.
+
+### Deletion
+
+`del expression` is a statement whose effect depends on the target:
+
+- A statically bound local name is unbound in the current function; later
+  references are invalid.
+- A `dynamic` value is cleared to the runtime's empty value.
+- A GC-managed `new` allocation is unbound and left for the collector; `del`
+  must not manually free a GC interior pointer.
+- A manually managed heap allocation can be released by `del`; an addressable
+  slot can be cleared to its zero/null value.
+
+Use `free(pointer)` for explicit manual release where applicable, not as a
+general replacement for `del`. Do not free a GC-managed `new` allocation.
+
+## Errors and deferred statements
+
+### Assertions
+
+`assert condition[, message]` checks a condition and accepts an optional
+message expression.
+
+### Try, except, and raise
 
 ```cpy
-int x = 42
-int* ptr = &x
-
-print(*ptr)
-*ptr = 99
-
-int* arr = new int[10]
-int* second = arr + 1
+try:
+    work()
+except:
+    recover()
 ```
 
-### Memory Safety Considerations
-
-Cpy uses a concurrent tri-color garbage collector for automatic memory management:
-
-- **No manual free needed**: Objects allocated with `new` are automatically collected
-- **Dangling pointers**: Still possible if pointers outlive collected objects
-- **Buffer overflows**: Ensure array accesses are within bounds
-- **Null pointer dereferences**: Check pointers before dereferencing
-- **Note**: The collector adds a small runtime overhead compared to manual `malloc/free`
-
----
-
-## C Interoperability
-
-### Importing Cpy Module Files
-
-Cpy files can import other `.cpy` files:
+An `except` clause may name an exception type:
 
 ```cpy
-import "math_utils.cpy"
-import "data_structs.cpy"
+try:
+    work()
+except Error:
+    recover()
 ```
 
-Only functions marked with the `public` keyword are exported. Imported functions and structs are inlined into the same LLVM module.
+A `try` requires at least one `except`; there is no parsed `finally` clause or
+exception-binding (`except Error as e`) syntax. Raising uses a named exception
+class and a parenthesized message:
 
 ```cpy
-# math_utils.cpy
-public def add(a int, b int) -> int:
-    return a + b
-
-private def helper():
-    pass
+raise Error("operation failed")
 ```
+
+Do not assume Python's built-in exception classes, traceback behavior, or
+exception propagation semantics. Those depend on the runtime/compiler
+implementation.
+
+### Defer
+
+Within a function suite, `defer statement` registers a statement for deferred
+execution when the function exits. Deferred statements execute in reverse
+registration order on explicit returns and at the implicit function end. For
+example:
 
 ```cpy
-# main.cpy
-import "math_utils.cpy"
-
-def main():
-    int result = add(3, 4)    # calls public function from math_utils.cpy
-    print(result)
+def use_resource() -> void:
+    defer close_resource()
 ```
 
-### Importing C Libraries
+Defers are not Python context managers; use them only for the compiler's
+supported scope-exit behavior.
 
-Cpy can import C libraries directly:
+## Imports and native interoperation
+
+### Imports
+
+The parser accepts a module name, a quoted path/header, an SDK-qualified
+module, or a package path:
 
 ```cpy
-import "math_library.c"
-import "string_operations.c"
+import module_name
+import "path/to/header.h"
+import platform sdk("/path/to/sdk")
+import @vendor/package
 ```
 
-### Calling C Functions
+Import resolution and whether a form loads Cpy source, a C header, a package,
+or a platform SDK are handled by the compiler's userspace/import system.
+Package and SDK availability is environment-specific.
+
+### C declarations and embedded source
+
+Quoted-path and SDK imports are used for C/native declarations. A `ccode:`
+block embeds an indented raw C source block:
 
 ```cpy
-result = c_function(arg1, arg2)
+ccode:
+    /* C source supplied to the native compilation path */
 ```
 
-### C Type Mapping
+The embedded text is passed to the native compilation machinery; it is not
+type-checked as Cpyte. Include declarations and linkage requirements needed by
+the surrounding code.
 
-Cpy types map to C types as follows:
+### LLVM IR and inline assembly
 
-- `int` → `int` (32-bit signed)
-- `int64` → `long long` or `int64_t`
-- `uint64` → `unsigned long long` or `uint64_t`
-- `float` → `double`
-- `str` → `char*`
-- `int*` → `int*`
-- `int64*` → `long long*` or `int64_t*`
-- `uint64*` → `unsigned long long*` or `uint64_t*`
-- `void*` → `void*`
+`llvm:` embeds an indented raw LLVM IR block. `unsafe llvm:` marks the
+corresponding unsafe form. Inline assembly has the form `asm("template")`,
+with optional operand/clobber clauses accepted by the parser. These constructs
+are target-specific, bypass ordinary high-level safety/type guarantees, and
+require valid syntax for the selected target/backend.
 
-### Example: C Library Integration
+## Compiler and command-line use
 
-```cpy
-import "test_import.c"
+Typical commands:
 
-def main():
-    int x
-    x = my_add(3, 4)    # Call C function
-    print(x)
-    x = my_double(10)   # Call another C function
-    print(x)
+```text
+cpy [options] program.cpy            # JIT mode is the default
+cpy --aot program.cpy                 # AOT executable
+cpy build [build-options] program.cpy # AOT build command
+cpy format [--write|--check] file.cpy # formatter
+cpy sef <subcommand> ...              # SEF tooling
 ```
 
----
+Useful global options include:
 
-## Compilation Model
+| Option | Effect |
+|---|---|
+| `--help`, `--version` | Print help or compiler version. |
+| `--strict` | Enable strict semantic analysis. |
+| `--nogc` | Disable automatic GC and enable `free()`. |
+| `--no-userspace` | Compile without the userspace runtime. |
+| `--jit`, `--aot`, `--scorpion` | Select JIT, AOT, or Scorpion/SEF compilation mode. |
+| `--ast`, `--emit-llvm` | Print the parsed AST or generated LLVM IR. |
+| `--tab-size N` | Set indentation tab size. |
+| `--cpu CPU` / `--march CPU`, `--mattr FEATURES` | Set LLVM target CPU/features. |
+| `--pic`, `--lto` | Request position-independent output or link-time optimization. |
+| `--opt N` | Set the optimization level where supported. |
+| `--export NAME` | Export a symbol in dynamic SEF output; repeatable. `SYMBOL=WIRE_NAME` selects a published name. |
+| `--no-auto-export` | Disable automatic export of public functions for Scorpion/SEF output. |
+| `--require NAME=VER`, `--scope S`, `--weak NAME` | Configure dynamic SEF import requirements, export scope, and weak imports; repeatable. |
+| `--lazy`, `--no-lazy` | Enable or disable lazy dynamic SEF call-site binding. |
+| `--versym`, `--no-versym` | Select wide v2.1 or legacy v2.0 dynamic SEF records. |
 
-### Compilation Pipeline
+The `build` command accepts output/debug/optimization and linking options;
+`format` supports write/check modes; `sef` provides SEF pack, dump, check, size,
+and digest tools. Run `cpy --help` for the exact options of the installed
+version.
 
-Cpy source code goes through several compilation stages:
+Two source directives are recognized at the beginning of a source file:
 
-1. **Lexical Analysis**: Source code is tokenized
-2. **Syntax Analysis**: Tokens are parsed into an Abstract Syntax Tree (AST)
-3. **Semantic Analysis**: Type checking and scope validation
-4. **LLVM IR Generation**: AST is converted to LLVM Intermediate Representation
-5. **Optimization**: LLVM optimization passes improve performance
-6. **Code Generation**: Native machine code is generated
+- `#nogc` disables automatic GC, equivalent to `--nogc`.
+- `#scorpion` selects the Scorpion ABI build mode.
 
-### Compiler Invocation
+The compiler strips these directives before lexing. Other `#` lines are
+ordinary comments.
 
-The Cpy compiler can be invoked with different optimization levels:
+## Unsupported or restricted constructs
 
-```bash
-# Compile with default optimization
-./program source.cpy
+The following are not part of the standard language grammar or should not be
+assumed to work as their Python/C++ analogues:
 
-# Compile with specific optimization level
-./program source.cpy -O2
+- Triple-quoted strings and multiline-comment delimiters.
+- Lambdas, comprehensions, generators, dictionaries, sets, tuple literals,
+  unpacking, array/string slices, and variadic function parameters.
+- Python exception binding, `finally`, context managers, and general
+  `with`/`match` statements.
+- Struct methods (methods belong to classes), multiple inheritance, and
+  arbitrary runtime reflection.
+- Generalized operator overloading or the full Python special-method model.
+- General array resizing through `append` for fixed-size arrays or raw C
+  buffers; `len` for unregistered fixed-size/raw buffers.
+- Automatic safety guarantees for pointer arithmetic, bounds, nullness,
+  ownership, or memory lifetime.
+- A `pass` statement, public/private variable declarations, standalone
+  `static` variables, or `->` member access.
+- The `:=` assignment statement, despite the token being recognized.
+
+Some syntax such as decorators, generic declarations, protocols, exceptions,
+and inline native blocks has front-end support whose exact semantics or
+availability can vary by target and runtime. A successful parse alone is not
+proof that a feature is supported in every compilation mode.
+
+## Grammar summary
+
+This is a compact grammar of the standard parser forms, not a replacement for
+the semantic checks described above. `suite` means `:` followed by a newline
+and an indented block.
+
+```ebnf
+program          = { statement } ;
+suite            = ":" NEWLINE INDENT { statement } DEDENT ;
+
+statement        = declaration | assignment | expression NEWLINE
+                 | "print" ( expression | "(" [ expression { "," expression } ] ")" )
+                 | "let" expression [ assignment_operator expression ]
+                 | "return" [ expression ]
+                 | "assert" expression [ "," expression ]
+                 | "break" | "continue" | "del" expression
+                 | "if" expression suite
+                     { "elif" expression suite } [ "else" suite ]
+                 | "while" expression suite
+                 | "for" identifier "in" expression suite
+                 | "switch" expression ":" NEWLINE INDENT
+                     { "case" expression case_body | "default" case_body } DEDENT
+                 | "try" suite { "except" [ identifier ] suite }
+                 | "raise" identifier "(" expression ")"
+                 | "ccode" ":" NEWLINE INDENT STRING DEDENT
+                 | "llvm" ":" NEWLINE INDENT STRING DEDENT
+                 | "unsafe" "llvm" ":" NEWLINE INDENT STRING DEDENT
+                 | "defer" statement ;
+
+declaration      = variable_decl | function_decl | class_decl | struct_decl
+                 | protocol_decl | enum_decl | type_alias | import_decl ;
+variable_decl    = type identifier [ "=" expression ]
+                 | type "(" identifier ")" "=" expression
+                 | "auto" identifier "=" expression ;
+assignment       = lvalue assignment_operator expression ;
+lvalue           = identifier | expression "." identifier
+                 | expression "[" expression "]" | "*" expression ;
+function_decl    = { decorator } "def" identifier [ generic_params ]
+                   "(" [ parameter { "," parameter } ] ")"
+                   [ "->" type ] suite
+                 | [ modifier ] "def" identifier
+                   "(" [ parameter { "," parameter } ] ")" [ "->" type ] suite
+                 | [ modifier ] identifier
+                   "(" [ parameter { "," parameter } ] ")"
+                   [ "->" type ] suite ;
+parameter        = identifier [ ":" type | type ] [ "=" expression ]
+                 | "(" identifier ")" [ ":" type ] [ "=" expression ]
+                 | type identifier [ "=" expression ] ;
+modifier         = "public" | "private" | "static" | "virtual" | "override" ;
+decorator        = "@" expression NEWLINE ;
+class_decl       = class_head | "sealed" [ "dataclass" ] class_head
+                 | "dataclass" [ "sealed" ] class_head ;
+class_head       = "class" identifier [ generic_params ]
+                   [ "(" identifier ")" ] class_suite ;
+class_suite      = ":" NEWLINE INDENT
+                   { field_decl | function_decl | property_decl } DEDENT ;
+property_decl    = "property" identifier ":" NEWLINE INDENT
+                   "get" suite [ "set" suite ] DEDENT ;
+struct_decl      = "struct" identifier [ generic_params ] struct_suite ;
+protocol_decl    = ( "protocol" | "interface" ) identifier
+                   [ generic_params ] [ "(" identifier ")" ] class_suite ;
+enum_decl        = "enum" identifier ":" NEWLINE INDENT
+                   { identifier [ "=" expression ] NEWLINE } DEDENT ;
+type_alias       = "type" identifier "=" type ;
+import_decl      = "import" ( identifier | STRING )
+                   [ "sdk" "(" STRING ")" ]
+                 | "import" "@" package_path ;
+
+type             = identifier { "*" | "**" | "&" | "[]" | "[" NUMBER "]"
+                               | "<" type { "," type } ">" } ;
+expression       = conditional ;
+conditional      = binary [ "if" binary "else" conditional ] ;
+binary           = unary { binary_operator unary } ;
+binary_operator  = "**" | "*" | "/" | "//" | "%"
+                 | "+" | "-" | "<<" | ">>"
+                 | "<" | "<=" | ">" | ">=" | "==" | "!=" | "in"
+                 | "&" | "^" | "|" | "and" | "or" ;
+unary            = { "+" | "-" | "not" | "~" | "*" | "&" | "--" } postfix ;
+postfix          = atom { "(" [ arguments ] ")" | "[" expression "]"
+                        | "." identifier | "as" identifier } ;
+atom             = NUMBER | STRING | FSTRING | identifier | boolean | "null"
+                 | "input" "(" ")" | "input_str" "(" ")" | "input_big" "(" ")"
+                 | "(" expression ")" | "[" [ expression { "," expression } ] "]"
+                 | "new" type [ "[" expression "]" ] [ "(" [ arguments ] ")" ]
+                 | "sizeof" "(" type ")" | asm_expr | "borrow" [ "mut" ] expression
+                 | "move" expression | cast_expr ;
+cast_expr        = "(" type ")" unary ;
+asm_expr         = "asm" [ "volatile" ] "(" STRING
+                   [ ":" [ STRING "(" expression ")" { "," STRING "(" expression ")" } ]
+                     [ ":" [ STRING "(" expression ")" { "," STRING "(" expression ")" } ]
+                       [ ":" STRING { "," STRING } ] ] ] ")" ;
+field_decl       = type identifier NEWLINE ;
+struct_suite     = ":" NEWLINE INDENT { field_decl } DEDENT ;
+case_body        = ":" ( statement | NEWLINE INDENT { statement } DEDENT ) ;
+arguments        = argument { "," argument } ;
+argument         = [ identifier "=" ] expression ;
+assignment_operator = "=" | "+=" | "-=" | "*=" | "/=" | "//=" ;
+generic_params   = "<" identifier { "," identifier } ">" ;
+package_path     = identifier { "." identifier | "/" identifier } ;
+boolean          = "true" | "false" | "True" | "False" ;
 ```
 
-### JIT Compilation
-
-Cpy supports Just-In-Time compilation for rapid development:
-
-```python
-# Python example of JIT execution
-from source.compiling import run_jit
-
-run_jit(module, opt_level=3)
-```
-
-### AOT Compilation
-
-Ahead-Of-Time compilation produces optimized native binaries:
-
-```python
-# Python example of AOT compilation
-from source.compiling import run_aot
-
-run_aot(module, output="program.o", opt_level=3)
-```
-
-### Optimization Levels
-
-- `-O0`: No optimization
-- `-O1`: Basic optimization
-- `-O2`: Standard optimization
-- `-O3`: Aggressive optimization
-
----
-
-## Standard Library
-
-### I/O Operations
-
-#### Print Function
-
-```cpy
-print(42)
-print(3.14)
-print("Hello")
-print(x + y)
-```
-
-#### Input Function
-
-```cpy
-int value = input()
-str line = input_str()
-big huge = input_big()
-```
-
-- `input()` reads a line from stdin and returns it as a 32-bit `int`.
-- `input_str()` reads a line from stdin and returns it as a `str`.
-- `input_big()` reads a line from stdin and returns it as an arbitrary-precision `big` integer (no 32-bit truncation).
-
-### Mathematical Operations
-
-The language supports basic mathematical operations through operators.
-
-### String Operations
-
-```cpy
-str result = "Hello" + " " + "World"
-int len = strlen(string_ptr)
-```
-
----
-
-## Advanced Features
-
-### Access Control
-
-```cpy
-public public_var = 42
-private private_var = 10
-```
-
-### Static Members
-
-```cpy
-static class_variable = 100
-```
-
-### Virtual Functions
-
-```cpy
-virtual override def function_name() -> int:
-    return 0
-```
-
-### References
-
-```cpy
-def process(ref value: int):
-    value = 42
-```
-
----
-
-## Best Practices
-
-### Memory Management
-
-1. **Always initialize pointers**
-2. **Free allocated memory**
-3. **Check for null**
-4. **Use stack allocation when possible**
-
-### Type Safety
-
-1. **Use type annotations**
-2. **Enable strict type checking**
-3. **Avoid implicit conversions**
-
-### Performance
-
-1. **Prefer stack allocation**
-2. **Use appropriate optimization levels**
-3. **Minimize pointer indirection**
-4. **Leverage 64-bit operations**
-5. **Consider alignment**
-
-### Code Organization
-
-1. **Use meaningful names**
-2. **Keep functions small**
-3. **Organize structures logically**
-4. **Document complex logic**
-
----
-
-## Example Programs
-
-### Hello World
-
-```cpy
-public def main() -> int:
-    print("Hello, World!")
-    return 0
-```
-
-### Factorial Calculation
-
-```cpy
-public def factorial(n: int) -> int:
-    if n <= 1:
-        return 1
-    return n * factorial(n - 1)
-
-public def main() -> int:
-    int result = factorial(5)
-    print(result)  # 120
-    return 0
-```
-
-### Linked List Implementation
-
-```cpy
-struct ListNode:
-    int value
-    ListNode* next
-
-public def create_list(n: int) -> ListNode*:
-    ListNode* head = 0
-    ListNode* current = 0
-    int i = 0
-
-    while i < n:
-        ListNode* node = new ListNode
-        node.value = i * 10
-        node.next = 0
-
-        if head == 0:
-            head = node
-        else:
-            current.next = node
-
-        current = node
-        i = i + 1
-
-    return head
-
-public def sum_list(head: ListNode*) -> int:
-    int total = 0
-    ListNode* current = head
-
-    while current != 0:
-        total = total + current.value
-        current = current.next
-
-    return total
-
-public def main() -> int:
-    ListNode* list = create_list(5)
-    int total = sum_list(list)
-    print(total)
-    return 0
-```
-
-### Matrix Operations
-
-```cpy
-struct Matrix:
-    int[][] data
-    int rows
-    int cols
-
-public def create_matrix(rows: int, cols: int) -> Matrix:
-    Matrix m
-    m.rows = rows
-    m.cols = cols
-    m.data = new int[rows][cols]
-    return m
-
-public def matrix_multiply(a: Matrix, b: Matrix) -> Matrix:
-    if a.cols != b.rows:
-        return 0
-
-    Matrix result = create_matrix(a.rows, b.cols)
-
-    int i = 0
-    while i < a.rows:
-        int j = 0
-        while j < b.cols:
-            int sum = 0
-            int k = 0
-            while k < a.cols:
-                sum = sum + a.data[i][k] * b.data[k][j]
-                k = k + 1
-            result.data[i][j] = sum
-            j = j + 1
-        i = i + 1
-
-    return result
-```
-
-### 64-bit File Processing
-
-```cpy
-public def process_large_file(filename: str) -> int64:
-    int64 total_bytes = 0
-    int64 buffer_size = 65536
-    int64[] buffer = new int64[buffer_size / 8]
-
-    int64 chunk = 0
-    while chunk < 1000000:
-        total_bytes = total_bytes + buffer_size
-        chunk = chunk + 1
-
-    return total_bytes
-
-public def main() -> int:
-    int64 file_size = process_large_file("large_file.dat")
-    print(file_size)
-    return 0
-```
-
-### 64-bit Cryptographic Hash Example
-
-```cpy
-public def simple_hash_64(data: str) -> uint64:
-    uint64 hash = 0xFFFFFFFFFFFFFFFF
-    int64 length = strlen(data)
-    int64 i = 0
-
-    while i < length:
-        uint64 byte = (uint64)data[i]
-        hash = hash ^ byte
-        hash = hash * 0x100000001B3
-        i = i + 1
-
-    return hash
-
-public def main() -> int:
-    str message = "Hello, World!"
-    uint64 hash_value = simple_hash_64(message)
-    print(hash_value)
-    return 0
-```
-
-### 64-bit Timestamp Processing
-
-```cpy
-public def timestamp_to_days(timestamp_ns: int64) -> int64:
-    int64 ns_per_day = 86400000000000
-    return timestamp_ns / ns_per_day
-
-public def main() -> int:
-    int64 current_time = 1699999999999999999
-    int64 days = timestamp_to_days(current_time)
-    print(days)
-    return 0
-```
-
----
-
-## Language Limitations and Future Directions
-
-### Current Limitations
-
-1. **Limited standard library**: Basic I/O and mathematical operations
-2. **GC overhead**: Automatic garbage collection adds small runtime overhead
-3. **Limited exception handling**: Basic `try`/`except` support
-4. **Limited generics**: Basic generic type support
-
-### Potential Future Enhancements
-
-1. **Enhanced standard library**: More comprehensive built-in functions
-2. **Generational GC**: Optimize garbage collection for better performance
-3. **Exception handling**: Structured error handling mechanism
-4. **Advanced generics**: More sophisticated generic programming
-5. **Module system**: Better code organization and reuse
-6. **Concurrency primitives**: Threads, async/await, etc.
-7. **Standard library containers**: Lists, dictionaries, sets, etc.
-
----
-
-## Conclusion
-
-Cpy balances high-level language syntax with low-level system control. Its Python-inspired syntax makes it accessible to developers familiar with modern scripting languages, while its C-like capabilities provide the performance and control needed for systems programming.
-
-The language is suited for:
-
-- **Systems programming**: Operating systems, drivers, embedded systems
-- **Performance-critical applications**: Game engines, scientific computing
-- **C library integration**: Wrapping existing C libraries with modern syntax
-- **Education**: Teaching systems programming concepts with approachable syntax
-
----
-
-## Appendix: Complete Grammar Reference
-
-### Formal Grammar (Simplified)
-
-```
-program        ::= {statement | struct_def | class_def}
-declaration    ::= type IDENTIFIER ["=" expression] | "auto" IDENTIFIER "=" expression
-function       ::= ACCESS_MODIFIER? "def" IDENTIFIER "(" parameters ")" ["->" type] block
-struct_def     ::= "struct" IDENTIFIER [generic_params] ":" {member_decl}
-class_def      ::= ["sealed"] ["dataclass"] "class" IDENTIFIER ["(" IDENTIFIER ")"] ":" {class_member}
-class_member   ::= member_decl | function | property_def
-property_def   ::= "property" IDENTIFIER ":" NEWLINE INDENT ("get" ":" block) ["set" ":" block] DEDENT
-block          ::= NEWLINE INDENT statement DEDENT
-statement      ::= expression_stmt | if_stmt | while_stmt | for_stmt | return_stmt | break_stmt | continue_stmt | print_stmt | import_stmt | declaration | function | "del" expression
-expression_stmt ::= expression
-if_stmt        ::= "if" expression block {"elif" expression block} ["else" block]
-while_stmt     ::= "while" expression block
-for_stmt       ::= "for" IDENTIFIER "in" expression block
-return_stmt    ::= "return" [expression]
-expression     ::= assignment
-assignment     ::= logical_or (ASSIGN_OP assignment)?
-logical_or     ::= logical_and {"or" logical_and}
-logical_and    ::= equality {"and" equality}
-equality       ::= relational {("==" | "!=") relational}
-relational     ::= shift {("<" | ">" | "<=" | ">=") shift}
-shift          ::= additive {("<<" | ">>") additive}
-additive       ::= multiplicative {("+" | "-") multiplicative}
-multiplicative ::= power {("*" | "/" | "//" | "%") power}
-power          ::= unary ["**" power]
-unary          ::= ("+" | "-" | "not" | "~" | "*" | "&") unary | postfix
-postfix        ::= primary {("()" | "[]" | "." IDENTIFIER | "as" IDENTIFIER)}
-primary        ::= NUMBER | STRING | FSTRING | IDENTIFIER | "(" expression ")" | "new" type ["(" args ")"] | "sizeof" "(" type ")" | "super" "." IDENTIFIER "(" args ")" | "isinstance" "(" expression "," IDENTIFIER ")"
-FSTRING        ::= ("f" | "fr" | "rf")? STRING   -- with "{" expression "}" interpolation and "{{"/"}}" escapes
-type           ::= "int" | "int64" | "uint64" | "float" | "str" | "bool" | "void" | "big" | "ubig" | "char" | "size_t" | "dynamic" | "auto" | type "*" | type "[]" | IDENTIFIER
-```
-
-### Token Specifications
-
-```python
-NUMBER         ::= [0-9]+ ("." [0-9]+)? ([eE][+-]?[0-9]+)?
-HEX_NUMBER     ::= "0x" [0-9A-Fa-f]+
-STRING         ::= '"' ([^"\\] | "\\" .)* '"'
-RAW_STRING     ::= ("r" | "fr" | "rf") STRING   -- backslash sequences kept verbatim
-FSTRING_LIT    ::= ("f" | "fr" | "rf") '"' ([^"\\{] | "{" expression "}" | "{{" | "}}")* '"'
-IDENTIFIER     ::= [a-zA-Z_] [a-zA-Z0-9_]*
-```
+The grammar deliberately omits error recovery, extension-provided tokens, and
+semantic restrictions. In particular, declarations that parse may still be
+rejected by type analysis or unsupported by the selected backend.

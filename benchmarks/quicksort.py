@@ -1,6 +1,5 @@
-import random
-
 n = 100000
-arr = [random.randint(0, 2**31 - 1) for _ in range(n)]
+arr = [i * 12345 + 67890 for i in range(n)]
 arr.sort()
-print(arr[0], arr[-1])
+print(arr[0])
+print(arr[-1])

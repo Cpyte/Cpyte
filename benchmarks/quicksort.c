@@ -9,9 +9,9 @@ int main(void) {
     int n = 100000;
     int *arr = malloc(n * sizeof(int));
     for (int i = 0; i < n; i++)
-        arr[i] = rand();
+        arr[i] = i * 12345 + 67890;
     qsort(arr, n, sizeof(int), cmp);
-    printf("%d %d\n", arr[0], arr[n - 1]);
+    printf("%d\n%d\n", arr[0], arr[n - 1]);
     free(arr);
     return 0;
 }

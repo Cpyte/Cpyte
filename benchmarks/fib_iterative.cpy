@@ -9,7 +9,7 @@ public fib(n: int) -> int:
     return a
 
 public main() -> int:
-    int total = 0
+    int64 total = 0
     int n = 0
     while n < 10000:
         total = total + fib(n)

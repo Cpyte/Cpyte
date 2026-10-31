@@ -825,6 +825,7 @@ class LLVM:
         self._malloc_fn = None
         self._free_fn = None
         self._gc_alloc_fn = None
+        self._gc_uninit_alloc_fn = None
         self._gc_write_barrier_fn = None
         self._sizeof_cache = {}
         self._llvm_type_cache = {}  # (module tag, type name) -> ir.Type
@@ -1824,13 +1825,17 @@ class LLVM:
     def _concat_strings(self, left, right):
         """Concatenate two heap strings (i8*), returning a new heap string."""
         strlen_fn = self._get_strlen_fn()
-        malloc_fn = self._get_malloc_fn()
+        alloc_fn = (
+            self._get_malloc_fn()
+            if self.no_gc
+            else self._get_gc_uninit_alloc_fn()
+        )
         memcpy_fn = self._get_memcpy_fn()
         left_len = self.builder.call(strlen_fn, [left])
         right_len = self.builder.call(strlen_fn, [right])
         total_len = self.builder.add(left_len, right_len)
         plus_one = self.builder.add(total_len, ir.Constant(total_len.type, 1))
-        new_str = self.builder.call(malloc_fn, [self.builder.zext(plus_one, _i64)])
+        new_str = self.builder.call(alloc_fn, [self.builder.zext(plus_one, _i64)])
         self.builder.call(memcpy_fn, [new_str, left, left_len])
         dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
         self.builder.call(memcpy_fn, [dest_plus, right, right_len])
@@ -2682,6 +2687,19 @@ class LLVM:
         fnty = ir.FunctionType(_i8ptr, [_i64])
         fn = ir.Function(self.module, fnty, "gc_malloc")
         self._gc_alloc_fn = fn
+        return fn
+
+    def _get_gc_uninit_alloc_fn(self):
+        fn = self._gc_uninit_alloc_fn
+        if fn is not None:
+            return fn
+        for f in self.module.functions:
+            if f.name == "gc_malloc_uninit":
+                self._gc_uninit_alloc_fn = f
+                return f
+        fnty = ir.FunctionType(_i8ptr, [_i64])
+        fn = ir.Function(self.module, fnty, "gc_malloc_uninit")
+        self._gc_uninit_alloc_fn = fn
         return fn
 
     def _get_write_barrier_fn(self):

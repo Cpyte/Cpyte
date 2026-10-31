@@ -1,15 +1,14 @@
-import ctypes
-
-
 def fib(n):
-    a = ctypes.c_int32(0)
-    b = ctypes.c_int32(1)
+    a = 0
+    b = 1
     while n > 0:
-        t = ctypes.c_int32(a.value + b.value)
+        t = (a + b) & 0xFFFFFFFF
+        if t >= 0x80000000:
+            t -= 0x100000000
         a = b
         b = t
         n -= 1
-    return a.value
+    return a
 
 
 total = 0

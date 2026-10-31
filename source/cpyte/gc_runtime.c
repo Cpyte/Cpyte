@@ -106,6 +106,7 @@ void gc_trace(const char* what, size_t v) {
 
 #define TLAB_SIZE (64 * 1024)  /* 64 KB per TLAB */
 #define TLAB_MAX_ALLOC (2 * 1024)  /* Max size for TLAB fast path */
+#define TLAB_STRING_SIZE (256 * 1024)
 
 typedef struct {
     char *start;   /* Start of current TLAB */
@@ -143,13 +144,17 @@ static tlab_t* tlab_get(void) {
 #  define TLAB_GET() tlab_get()
 #endif
 
-static void* tlab_alloc(size_t size) {
+static void* tlab_alloc(size_t size, size_t min_block_size) {
+    if (size > SIZE_MAX - (sizeof(void*) - 1)) {
+        return NULL;
+    }
     /* Round up to pointer alignment */
     size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
 
-    if (TLAB_GET()->start == NULL || TLAB_GET()->current + size > TLAB_GET()->end) {
+    if (TLAB_GET()->start == NULL ||
+            (size_t)(TLAB_GET()->end - TLAB_GET()->current) < size) {
         /* TLAB exhausted or not initialized: allocate new block from global heap */
-        size_t block_size = (size > TLAB_SIZE) ? size : TLAB_SIZE;
+        size_t block_size = (size > min_block_size) ? size : min_block_size;
 
         gc_lock_init();
         CPY_MUTEX_LOCK(&gc_lock_);
@@ -396,7 +401,7 @@ void gc_init(void) {
 void* gc_malloc(size_t size) {
     /* Try TLAB first for small allocations (fast path, lock-free) */
     if (size <= TLAB_MAX_ALLOC) {
-        void *ptr = tlab_alloc(size);
+        void *ptr = tlab_alloc(size, TLAB_SIZE);
         if (ptr != NULL) {
             gc_alloc_bytes += size;
             if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
@@ -440,6 +445,32 @@ void* gc_malloc(size_t size) {
     }
 
     return TO_USER(obj);
+}
+
+/*
+ * Allocate a buffer whose caller initializes every byte. String concatenation
+ * uses this path so larger results can share a thread-local arena instead of
+ * requiring a tracked GC object and global-lock acquisition per result.
+ */
+void* gc_malloc_uninit(size_t size) {
+    if (size == 0) {
+        size = 1;
+    }
+
+    if (size <= TLAB_STRING_SIZE) {
+        size_t block_size = size <= TLAB_MAX_ALLOC
+            ? TLAB_SIZE
+            : TLAB_STRING_SIZE;
+        void* ptr = tlab_alloc(size, block_size);
+        if (ptr != NULL) {
+            gc_alloc_bytes += size;
+            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
+                gc_collect();
+            }
+            return ptr;
+        }
+    }
+    return gc_malloc(size);
 }
 
 /* Write barrier: call on every pointer store between heap objects.

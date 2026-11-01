@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cpyte
-Version: 4.6.4
+Version: 4.6.5
 Summary: The Cpyte programming language compiler
 Author: Hoang Duy Tung
 License: MIT
@@ -100,3 +100,13 @@ The compiler auto-discovers a C compiler (`clang` → `cc` → `gcc`) and system
 ## Continuous Integration
 
 GitHub Actions (see `.github/workflows/code_quality.yml`) builds and runs a curated, cross-platform regression corpus on Ubuntu (x86_64 + arm64), macOS (x86_64 + arm64), and Windows. `ci_test.py` AOT-compiles each program with the system linker and executes the result to exercise the full pipeline — lexer, parser, semantic analysis, LLVM codegen, the C and GC runtimes, and linking.
+
+## CI Benchmark Results
+
+The table below is updated by the benchmark CI job on `main`. It is a separate
+measurement from any historical benchmark results and is collected on the
+dedicated benchmark runner.
+
+<!-- CPYTE_CI_BENCHMARKS_START -->
+Benchmark results will appear here after the next successful benchmark CI run.
+<!-- CPYTE_CI_BENCHMARKS_END -->

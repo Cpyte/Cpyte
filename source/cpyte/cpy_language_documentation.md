@@ -423,8 +423,10 @@ disabled. Exact supported conversions are type- and runtime-dependent.
 registered growable-array behavior.
 
 Array lifetime depends on how the array was created and whether automatic GC
-is enabled. Raw C buffers and fixed-size arrays should not be assumed to have
-the same metadata or helpers as registered arrays.
+is enabled. In the default GC mode, compiler-generated `new T[n]` arrays, list
+literals, and `range()` results are automatically registered as GC objects,
+including when `append()` replaces their backing storage. Raw C buffers and
+fixed-size arrays remain outside automatic management.
 
 ### Array and object helpers
 

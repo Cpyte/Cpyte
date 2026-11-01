@@ -20,6 +20,8 @@
 #define UGC_IMPLEMENTATION
 #define UGC_USE_TAGGED_POINTER 0
 #include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
 extern void gc_trace(const char* what, size_t v);
 #include "ugc.h"
 
@@ -64,7 +66,6 @@ typedef struct {
 #define HDR(cpyte_ptr) ((cpyte_obj_t*)(cpyte_ptr))
 #define PAYLOAD(hdr)   ((char*)(hdr) + sizeof(cpyte_obj_t))
 #define TO_USER(hdr)   ((void*)PAYLOAD(hdr))
-#define TO_HDR(user)   ((cpyte_obj_t*)((char*)(user) - sizeof(cpyte_obj_t)))
 
 /* Forward declarations for functions used by TLAB */
 static void obj_track(void* hdr);
@@ -72,6 +73,7 @@ static void obj_track(void* hdr);
 /* Forward declaration: collection is triggered from gc_malloc (foreground,
  * on the mutator thread) once the allocation threshold is crossed. */
 void gc_collect(void);
+void* gc_malloc(size_t size);
 
 /* ── Global GC state ────────────────────────────────────────────── */
 
@@ -80,6 +82,10 @@ static cpy_mutex_t   gc_lock_;
 static volatile int  gc_lock_init_once = 0;
 static cpy_thread_t  gc_thread;
 static volatile int  gc_running   = 0;
+/* Barriers are on the pointer-store hot path.  They only need to enter the
+ * collector when a mark/sweep cycle is active, so keep that state atomic and
+ * make the overwhelmingly common idle path lock-free. */
+static atomic_int     gc_marking = 0;
 
 static void gc_lock_init(void) {
     if (gc_lock_init_once) return;
@@ -190,12 +196,16 @@ static void* tlab_alloc(size_t size, size_t min_block_size) {
 typedef struct obj_entry_s {
     cpyte_obj_t*        hdr;    /* block header */
     size_t              size;   /* payload size (for interior-pointer containment) */
+    uintptr_t            begin;  /* payload start, as an integer for safe range tests */
+    uintptr_t            end;    /* exclusive end, saturated on overflow */
     struct obj_entry_s* next;   /* hash bucket chain */
     struct obj_entry_s* all;    /* containment list chain */
+    struct obj_entry_s* all_prev;
 } obj_entry_t;
 
 static obj_entry_t* obj_table[OBJ_TABLE_SIZE];
 static obj_entry_t* obj_list = NULL;  /* all tracked blocks, for containment search */
+static obj_entry_t* obj_last_lookup = NULL;
 
 static unsigned long hash_ptr(const void* p) {
     unsigned long v = (unsigned long)p;
@@ -204,14 +214,29 @@ static unsigned long hash_ptr(const void* p) {
 }
 
 static void obj_track(void* hdr) {
+    cpyte_obj_t* obj = (cpyte_obj_t*)hdr;
     unsigned long h = hash_ptr(hdr);
     obj_entry_t* e = (obj_entry_t*)malloc(sizeof(obj_entry_t));
+    if (e == NULL) {
+        fprintf(stderr, "gc: out of memory tracking object\n");
+        abort();
+    }
     e->hdr = (cpyte_obj_t*)hdr;
-    e->size = ((cpyte_obj_t*)hdr)->size;
+    e->size = obj->size;
+    e->begin = (uintptr_t)PAYLOAD(obj);
+    e->end = e->begin;
+    if (e->size > UINTPTR_MAX - e->begin) {
+        e->end = UINTPTR_MAX;
+    } else {
+        e->end += e->size;
+    }
     e->next = obj_table[h];
     obj_table[h] = e;
     e->all = obj_list;
+    e->all_prev = NULL;
+    if (obj_list != NULL) obj_list->all_prev = e;
     obj_list = e;
+    obj_last_lookup = NULL;
 }
 
 static void obj_untrack(void* hdr) {
@@ -222,14 +247,10 @@ static void obj_untrack(void* hdr) {
             obj_entry_t* tmp = *pp;
             *pp = tmp->next;
             /* also remove from the containment list */
-            obj_entry_t** q = &obj_list;
-            while (*q) {
-                if ((*q)->hdr == hdr) {
-                    *q = (*q)->all;
-                    break;
-                }
-                q = &(*q)->all;
-            }
+            if (tmp->all_prev != NULL) tmp->all_prev->all = tmp->all;
+            else obj_list = tmp->all;
+            if (tmp->all != NULL) tmp->all->all_prev = tmp->all_prev;
+            if (obj_last_lookup == tmp) obj_last_lookup = NULL;
             free(tmp);
             return;
         }
@@ -251,11 +272,16 @@ static int obj_is_tracked(const void* hdr) {
  * pointer. Conservative scans may produce pointers that land anywhere inside
  * an allocation, so an exact header match is not enough. */
 static cpyte_obj_t* obj_find_containing(const void* user) {
-    const char* u = (const char*)user;
+    uintptr_t u = (uintptr_t)user;
     obj_entry_t* e;
-    for (e = obj_list; e; e = e->next) {
-        const char* payload = (const char*)e->hdr + sizeof(cpyte_obj_t);
-        if (e->size > 0 && u >= payload && u < payload + e->size) {
+    if (user == NULL) return NULL;
+    e = obj_last_lookup;
+    if (e != NULL && u >= e->begin && u < e->end) {
+        return e->hdr;
+    }
+    for (e = obj_list; e; e = e->all) {
+        if (e->size > 0 && u >= e->begin && u < e->end) {
+            obj_last_lookup = e;
             return e->hdr;
         }
     }
@@ -334,12 +360,70 @@ static void scan_stack(void) {
 
 /* Array length registry (defined in runtime.c). */
 extern void cpyte_array_unregister(void* arr);
-extern void* cpyte_array_reserve(void *arr, size_t elem_size, size_t increment);
+typedef void *(*cpyte_array_alloc_hook_t)(size_t elem_size, size_t count);
+typedef void *(*cpyte_array_reserve_hook_t)(void *arr, size_t elem_size,
+                                            size_t increment);
+extern void cpyte_array_set_gc_hooks(cpyte_array_alloc_hook_t alloc_hook,
+                                     cpyte_array_reserve_hook_t reserve_hook);
 
-/* GC wrapper: same logic as cpyte_array_reserve (malloc/free/memcpy).
- * cpyte_array_alloc uses malloc, so realloc/free is safe for the header. */
+typedef struct {
+    size_t length;
+    size_t capacity;
+    unsigned char data[];
+} cpyte_gc_array_header_t;
+
+/* GC arrays live inside normal GC objects.  The user-visible pointer still
+ * points just past the length/capacity header, preserving the existing ABI,
+ * while the surrounding cpyte_obj_t makes the entire allocation visible to
+ * conservative scanning and automatic collection. */
+void* gc_array_alloc(size_t elem_size, size_t count) {
+    if (count != 0 && elem_size >
+            (SIZE_MAX - sizeof(cpyte_gc_array_header_t)) / count) {
+        return NULL;
+    }
+    size_t total = sizeof(cpyte_gc_array_header_t) + elem_size * count;
+    cpyte_gc_array_header_t *header =
+        (cpyte_gc_array_header_t*)gc_malloc(total);
+    if (header == NULL) return NULL;
+    header->length = count;
+    header->capacity = count;
+    return header->data;
+}
+
+/* GC growth allocates a replacement object instead of calling realloc, which
+ * would move memory outside the collector's object set.  The old object stays
+ * tracked until it becomes unreachable and is then reclaimed normally. */
 void* gc_array_reserve(void *arr, size_t elem_size, size_t increment) {
-    return cpyte_array_reserve(arr, elem_size, increment);
+    if (arr == NULL || elem_size == 0) return arr;
+    cpyte_gc_array_header_t *header =
+        (cpyte_gc_array_header_t*)((char*)arr - sizeof(cpyte_gc_array_header_t));
+    if (increment > SIZE_MAX - header->length) return arr;
+    size_t want = header->length + increment;
+    if (want <= header->capacity) return arr;
+
+    size_t ncap = header->capacity;
+    if (ncap < 4) ncap = 4;
+    while (ncap < want) {
+        if (ncap > SIZE_MAX / 2) {
+            ncap = want;
+            break;
+        }
+        ncap *= 2;
+    }
+    if (ncap > (SIZE_MAX - sizeof(cpyte_gc_array_header_t)) / elem_size)
+        return arr;
+    if (header->length != 0 && header->length > SIZE_MAX / elem_size)
+        return arr;
+    size_t total = sizeof(cpyte_gc_array_header_t) + elem_size * ncap;
+    cpyte_gc_array_header_t *nu =
+        (cpyte_gc_array_header_t*)gc_malloc(total);
+    if (nu == NULL) return arr;
+    nu->length = header->length;
+    nu->capacity = ncap;
+    if (header->length != 0) {
+        memcpy(nu->data, header->data, header->length * elem_size);
+    }
+    return nu->data;
 }
 
 static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
@@ -362,7 +446,7 @@ static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
         if ((unsigned long)candidate & (sizeof(void*) - 1)) continue;
 
         cpyte_obj_t* child = obj_find_containing(candidate);
-        if (child && obj_is_tracked(child)) {
+        if (child) {
             ugc_visit(g, &child->base);
         }
     }
@@ -382,6 +466,7 @@ void gc_init(void) {
     gc_lock_init();
     memset(obj_table, 0, sizeof(obj_table));
     ugc_init(&gc, gc_scan_cb, gc_release_cb);
+    cpyte_array_set_gc_hooks(gc_array_alloc, gc_array_reserve);
     gc_alloc_bytes = 0;
     gc_running = 1;
     {
@@ -416,6 +501,10 @@ void* gc_malloc(size_t size) {
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
 
+    if (size > SIZE_MAX - sizeof(cpyte_obj_t)) {
+        fprintf(stderr, "gc_malloc: allocation size overflow (%zu bytes)\n", size);
+        abort();
+    }
     cpyte_obj_t* obj = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + size);
     if (!obj) {
         /* Emergency: force a full collect and retry */
@@ -440,7 +529,10 @@ void* gc_malloc(size_t size) {
         /* The object has not hit the mutator stack yet (it is about to be
          * returned in a register), so grey it explicitly to survive the
          * foreground collection. */
+        gc_lock_init();
+        CPY_MUTEX_LOCK(&gc_lock_);
         ugc_visit(&gc, &obj->base);
+        CPY_MUTEX_UNLOCK(&gc_lock_);
         gc_collect();
     }
 
@@ -478,21 +570,32 @@ void* gc_malloc_uninit(size_t size) {
 void gc_write_barrier(void* parent_ptr, void* child_ptr) {
     if (!parent_ptr || !child_ptr) return;
 
-    cpyte_obj_t* parent = TO_HDR(parent_ptr);
-    cpyte_obj_t* child  = TO_HDR(child_ptr);
-
-    /* quick validity check */
-    if (!obj_is_tracked(parent) || !obj_is_tracked(child)) return;
+    /* In the idle state the tri-color invariant is not being maintained, so
+     * no object lookup or mutex acquisition is necessary. */
+    if (!atomic_load_explicit(&gc_marking, memory_order_acquire)) return;
 
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
-    ugc_write_barrier(&gc, UGC_BARRIER_FORWARD, &parent->base, &child->base);
+    if (!atomic_load_explicit(&gc_marking, memory_order_relaxed)) {
+        CPY_MUTEX_UNLOCK(&gc_lock_);
+        return;
+    }
+    /* The compiler passes the address of the destination slot, not
+     * necessarily the beginning of its object.  Resolve interior pointers so
+     * array elements and struct fields participate in the barrier too. */
+    cpyte_obj_t* parent = obj_find_containing(parent_ptr);
+    cpyte_obj_t* child  = obj_find_containing(child_ptr);
+    if (parent != NULL && child != NULL) {
+        ugc_write_barrier(&gc, UGC_BARRIER_FORWARD,
+                          &parent->base, &child->base);
+    }
     CPY_MUTEX_UNLOCK(&gc_lock_);
 }
 
 void gc_collect(void) {
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
+    atomic_store_explicit(&gc_marking, 1, memory_order_release);
     /* Protect the current TLAB block: its interior objects are live because
      * the mutator is executing; interior-pointer scan alone cannot see a block
      * that is only referenced through a bump-pointer interior alias. */
@@ -504,6 +607,7 @@ void gc_collect(void) {
     }
     ugc_collect(&gc);
     gc_alloc_bytes = 0;
+    atomic_store_explicit(&gc_marking, 0, memory_order_release);
     CPY_MUTEX_UNLOCK(&gc_lock_);
 }
 
@@ -525,7 +629,11 @@ static void* gc_thread_fn(void* arg) {
          * because its own stack holds none of the mutator's roots. */
         CPY_MUTEX_LOCK(&gc_lock_);
         if (gc.state != UGC_IDLE) {
+            atomic_store_explicit(&gc_marking, 1, memory_order_release);
             ugc_step(&gc);
+            if (gc.state == UGC_IDLE) {
+                atomic_store_explicit(&gc_marking, 0, memory_order_release);
+            }
         }
         CPY_MUTEX_UNLOCK(&gc_lock_);
 
@@ -557,6 +665,7 @@ void gc_stop_thread(void) {
 
 void gc_shutdown(void) {
     gc_stop_thread();
+    cpyte_array_set_gc_hooks(NULL, NULL);
     CPY_MUTEX_LOCK(&gc_lock_);
     ugc_release_all(&gc);
     CPY_MUTEX_UNLOCK(&gc_lock_);
@@ -576,4 +685,30 @@ void gc_shutdown(void) {
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
     TLAB_GET()->current = NULL;
+}
+
+
+// GC version of optimized string concat
+char *
+str_concat_const_gc(const char *left, const char *right, size_t right_len) {
+    size_t left_len = strlen(left);
+    size_t total_len = left_len + right_len;
+    char *result = gc_malloc_uninit(total_len + 1);
+    if (!result) return NULL;
+    memcpy(result, left, left_len);
+    memcpy(result + left_len, right, right_len);
+    result[total_len] = '\0';
+    return result;
+}
+
+
+char *
+str_concat_const_both_gc(const char *left, const char *right, size_t left_len, size_t right_len) {
+    size_t total_len = left_len + right_len;
+    char *result = gc_malloc_uninit(total_len + 1);
+    if (!result) return NULL;
+    memcpy(result, left, left_len);
+    memcpy(result + left_len, right, right_len);
+    result[total_len] = '\0';
+    return result;
 }

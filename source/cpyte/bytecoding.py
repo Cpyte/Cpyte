@@ -1057,6 +1057,7 @@ class LLVM:
             gc_fns = [
                 ("gc_init", _void, []),
                 ("gc_malloc", _i8ptr, [_i64]),
+                ("gc_array_alloc", _i8ptr, [_i64, _i64]),
                 ("gc_write_barrier", _void, [_i8ptr, _i8ptr]),
                 ("gc_collect", _void, []),
                 ("gc_array_reserve", _i8ptr, [_i8ptr, _i64, _i64]),
@@ -1822,23 +1823,52 @@ class LLVM:
         as_i64 = self.builder.ptrtoint(val, _i64)
         return self.builder.call(self.functions["str_of_ptr"], [as_i64])
 
-    def _concat_strings(self, left, right):
-        """Concatenate two heap strings (i8*), returning a new heap string."""
+    def _get_const_strlen(self, node):
+        """Return the native byte length of a string literal, if known.
+
+        Runtime strings are UTF-8 C strings, so Python's character count is
+        not sufficient for non-ASCII literals.  Match ``strlen`` by stopping
+        at an embedded NUL as well.
+        """
+        if isinstance(node, String):
+            return len(node.value.encode("utf-8").split(b"\0", 1)[0])
+        return None
+
+    def _concat_strings(self, left, right, left_len_const=None, right_len_const=None):
+        """Concatenate two heap strings (i8*), returning a new heap string.
+        If left_len_const or right_len_const are provided (as integers), they are
+        compile-time known lengths that avoid runtime strlen calls.  The copies
+        use LLVM's memcpy intrinsic so LLVM can lower them directly to the
+        target's native memory operation.
+        """
         strlen_fn = self._get_strlen_fn()
         alloc_fn = (
-            self._get_malloc_fn()
-            if self.no_gc
-            else self._get_gc_uninit_alloc_fn()
+            self._get_malloc_fn() if self.no_gc else self._get_gc_uninit_alloc_fn()
         )
         memcpy_fn = self._get_memcpy_fn()
-        left_len = self.builder.call(strlen_fn, [left])
-        right_len = self.builder.call(strlen_fn, [right])
+
+        # Use compile-time known lengths if available, otherwise call strlen
+        if left_len_const is not None:
+            left_len = ir.Constant(_i64, left_len_const)
+        else:
+            left_len = self.builder.call(strlen_fn, [left])
+        if right_len_const is not None:
+            right_len = ir.Constant(_i64, right_len_const)
+        else:
+            right_len = self.builder.call(strlen_fn, [right])
+
         total_len = self.builder.add(left_len, right_len)
         plus_one = self.builder.add(total_len, ir.Constant(total_len.type, 1))
         new_str = self.builder.call(alloc_fn, [self.builder.zext(plus_one, _i64)])
-        self.builder.call(memcpy_fn, [new_str, left, left_len])
+        self.builder.call(
+            memcpy_fn,
+            [new_str, left, left_len, ir.Constant(_i1, 0)],
+        )
         dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
-        self.builder.call(memcpy_fn, [dest_plus, right, right_len])
+        self.builder.call(
+            memcpy_fn,
+            [dest_plus, right, right_len, ir.Constant(_i1, 0)],
+        )
         null_byte = self.builder.gep(new_str, [total_len], inbounds=True)
         self.builder.store(ir.Constant(_i8, 0), null_byte)
         return new_str
@@ -2105,7 +2135,10 @@ class LLVM:
 
     def _emit_and_or_step(self, op, node, lhs):
         """One short-circuit step, mirroring emit_binop's AND/OR branches."""
-        lhs_true = self._truthy_expr(node.left)
+        # `lhs` is already the value emitted by the preceding step.  Re-emitting
+        # node.left here would duplicate calls, allocations, and other effects
+        # when the iterative deep-expression fallback is active.
+        lhs_true = lhs
         entry_bb = self.builder.block
         suffix = "and" if op == TokenType.AND else "or"
         rhs_bb = self.builder.append_basic_block(f"{suffix}.rhs")
@@ -2567,9 +2600,11 @@ class LLVM:
 
         # Use length-prefixed header allocation for arrays to avoid hash table lookups
         if node.size is not None:
-            alloc_fn = self.functions.get("cpyte_array_alloc")
+            alloc_name = "gc_array_alloc" if not self.no_gc else "cpyte_array_alloc"
+            alloc_fn = self.functions.get(alloc_name)
             if alloc_fn is not None and not self.no_userspace:
-                # Call cpyte_array_alloc(elem_size, count)
+                # Call the active length-prefixed allocator. GC builds use an
+                # object-backed variant so arrays are collector-managed too.
                 if elem_size.type != _i64:
                     elem_size = self.builder.zext(elem_size, _i64)
                 ptr = self.builder.call(alloc_fn, [elem_size, count])
@@ -2618,7 +2653,8 @@ class LLVM:
         count = ir.Constant(_i64, n)
 
         # Use length-prefixed header allocation for arrays to avoid hash table lookups
-        alloc_fn = self.functions.get("cpyte_array_alloc")
+        alloc_name = "gc_array_alloc" if not self.no_gc else "cpyte_array_alloc"
+        alloc_fn = self.functions.get(alloc_name)
         if alloc_fn is not None and not self.no_userspace:
             if elem_size.type != _i64:
                 elem_size = self.builder.zext(elem_size, _i64)
@@ -5106,6 +5142,35 @@ class LLVM:
         ):
             return self._emit_dyn_binop(node)
 
+        # Fold the control-flow shape of logical operators when one operand is
+        # already known.  The unknown operand is still emitted when it can have
+        # effects; only the unreachable RHS of a known short-circuit is omitted.
+        if node.op in (TokenType.AND, TokenType.OR):
+            left_const = _const_int_value(node.left)
+            if (
+                left_const is None
+                and isinstance(node.left, Variable)
+                and self._is_const_var(node.left.name)
+            ):
+                left_const = self._const_var_value(node.left.name)
+            right_const = _const_int_value(node.right)
+            if node.op == TokenType.AND:
+                if left_const is not None and left_const == 0:
+                    return ir.Constant(_i1, 0)
+                if left_const is not None and left_const != 0:
+                    return self._truthy_expr(node.right)
+                if right_const is not None and right_const == 0:
+                    self._truthy_expr(node.left)
+                    return ir.Constant(_i1, 0)
+            else:
+                if left_const is not None and left_const != 0:
+                    return ir.Constant(_i1, 1)
+                if left_const is not None and left_const == 0:
+                    return self._truthy_expr(node.right)
+                if right_const is not None and right_const != 0:
+                    self._truthy_expr(node.left)
+                    return ir.Constant(_i1, 1)
+
         match node.op:
             case TokenType.AND:
                 lhs_true = self._truthy_expr(node.left)
@@ -5532,9 +5597,17 @@ class LLVM:
         return self.builder.load(out_ptr)
 
     def _emit_string_concat(self, node):
+        # Keep operands in source order and emit each one exactly once.
+        right_len = self._get_const_strlen(node.right)
+        left_len = self._get_const_strlen(node.left)
+
         left = self.emit(node.left)
-        right = self.emit(node.right)
-        return self._concat_strings(left, right)
+        right = (
+            self._string_const(node.right.value)
+            if isinstance(node.right, String)
+            else self.emit(node.right)
+        )
+        return self._concat_strings(left, right, left_len, right_len)
 
     def _get_strlen_fn(self):
         fn = self._strlen_fn
@@ -5554,13 +5627,10 @@ class LLVM:
         fn = self._memcpy_fn
         if fn is not None:
             return fn
-        for f in self.module.functions:
-            if f.name == "memcpy":
-                self._memcpy_fn = f
-                return f
-        # n is size_t (i64 on every cpyte target).
-        fnty = ir.FunctionType(_i8ptr, [_i8ptr, _i8ptr, _i64])
-        fn = ir.Function(self.module, fnty, "memcpy")
+        # These are compiler-owned copies.  Use LLVM's intrinsic instead of
+        # calling a user-space wrapper or libc symbol so the backend can inline
+        # and vectorize them for the selected CPU.
+        fn = self.module.declare_intrinsic("llvm.memcpy", [_i8ptr, _i8ptr, _i64])
         self._memcpy_fn = fn
         return fn
 
@@ -6554,7 +6624,8 @@ class LLVM:
 
         malloc_fn = self._get_malloc_fn()
         eight = ir.Constant(_i64, 8)
-        alloc_fn = self.functions.get("cpyte_array_alloc")
+        alloc_name = "gc_array_alloc" if not self.no_gc else "cpyte_array_alloc"
+        alloc_fn = self.functions.get(alloc_name)
         if alloc_fn is not None and not self.no_userspace:
             buf = self.builder.call(alloc_fn, [eight, count])
         else:
@@ -6934,6 +7005,11 @@ class LLVM:
             with self.builder.if_then(moved):
                 inner_dv = self.builder.insert_value(cur, new_data, 1)
                 self.builder.store(inner_dv, slot)
+                if not self.no_gc:
+                    self._emit_write_barrier(
+                        self.builder.bitcast(slot, _i8ptr),
+                        self.builder.bitcast(new_ptr, _i8ptr),
+                    )
             value_rv = self.emit(value)
             if value_rv.type == _DynValue:
                 elem = value_rv
@@ -6995,6 +7071,11 @@ class LLVM:
         with self.builder.if_then(moved):
             slot_elem_ty = slot.type.pointee
             self.builder.store(self.builder.bitcast(new_ptr, slot_elem_ty), slot)
+            if not self.no_gc:
+                self._emit_write_barrier(
+                    self.builder.bitcast(slot, _i8ptr),
+                    self.builder.bitcast(new_ptr, _i8ptr),
+                )
         value_rv = self.emit(value)
         if elem_llvm == _DynValue and value_rv.type != _DynValue:
             kind, bits = self._box_dyn(value_rv, getattr(value, "inferred_type", None))
@@ -7709,8 +7790,9 @@ class LLVM:
     def _string_const(self, val: str):
         val = val + "\0"
         if val not in self.string_pool:
-            arr_ty = ir.ArrayType(ir.IntType(8), len(val))
-            init = ir.Constant(arr_ty, bytearray(val.encode("utf-8")))
+            encoded = val.encode("utf-8")
+            arr_ty = ir.ArrayType(ir.IntType(8), len(encoded))
+            init = ir.Constant(arr_ty, bytearray(encoded))
             name = f".str.{self.string_id}"
             self.string_id += 1
             gv = ir.GlobalVariable(self.module, arr_ty, name=name)

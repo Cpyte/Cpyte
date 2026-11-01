@@ -144,6 +144,20 @@ str_of_double(double d) {
     return _cpy_dupstr(buf);
 }
 
+// Optimized string concatenation: concatenate `left` with a constant string `right`
+// where `right_len` is the known compile-time length of `right`
+char *
+str_concat_const(const char *left, const char *right, size_t right_len) {
+    size_t left_len = strlen(left);
+    size_t total_len = left_len + right_len;
+    char *result = malloc(total_len + 1);
+    if (!result) return NULL;
+    memcpy(result, left, left_len);
+    memcpy(result + left_len, right, right_len);
+    result[total_len] = '\0';
+    return result;
+}
+
 int
 input_int(void) {
     char buf[128];
@@ -533,7 +547,7 @@ static const char *intern_string(const char *s) {
     if (s == NULL) return NULL;
     uint32_t h = intern_hash(s);
     size_t idx = h & (INTERN_POOL_SIZE - 1);
-    
+
     // Check if already interned
     intern_entry_t *e = intern_pool[idx];
     while (e) {
@@ -541,21 +555,21 @@ static const char *intern_string(const char *s) {
             return e->str;
         e = e->next;
     }
-    
+
     // Not interned, add to pool
     char *dup = cpyte_strdup(s);
     if (dup == NULL) return s;  // Fallback on allocation failure
-    
+
     intern_entry_t *new_entry = malloc(sizeof(intern_entry_t));
     if (new_entry == NULL) {
         free(dup);
         return s;
     }
-    
+
     new_entry->str = dup;
     new_entry->next = intern_pool[idx];
     intern_pool[idx] = new_entry;
-    
+
     return dup;
 }
 
@@ -599,8 +613,10 @@ dyn_grow(void) {
 
 static Dynamic *
 dyn_lookup(const char *name) {
-    // Performance: table always initialized on first use, skip null check
-    // For safety in debug builds, we can add: assert(dyn_table != NULL);
+    /* Missing names are a normal path for truthiness and `del`; short-circuit
+     * before hashing or touching the zero-capacity table. */
+    if (name == NULL || dyn_table == NULL || dyn_capacity == 0)
+        return NULL;
     uint32_t h = dyn_hash(name);
     size_t idx = h & (dyn_capacity - 1);
     for (;;) {
@@ -615,6 +631,8 @@ dyn_lookup(const char *name) {
 }
 
 void assign(const char *name, int kind, uint64_t data) {
+    if (name == NULL)
+        return;
     uint32_t h = dyn_hash(name);
 
     for (;;) {
@@ -797,8 +815,29 @@ typedef struct {
     uint8_t data[]; // Flexible array member
 } CpyArrayHeader;
 
+typedef void *(*cpyte_array_alloc_hook_t)(size_t elem_size, size_t count);
+typedef void *(*cpyte_array_reserve_hook_t)(void *arr, size_t elem_size,
+                                            size_t increment);
+static cpyte_array_alloc_hook_t cpyte_gc_array_alloc_hook;
+static cpyte_array_reserve_hook_t cpyte_gc_array_reserve_hook;
+
+/* Installed internally by gc_runtime.c during gc_init.  Keeping the hook in
+ * this runtime lets C helpers such as str_split() and dynamic-list repetition
+ * become GC-managed without changing their public ABI or the --nogc path. */
+void
+cpyte_array_set_gc_hooks(cpyte_array_alloc_hook_t alloc_hook,
+                         cpyte_array_reserve_hook_t reserve_hook) {
+    cpyte_gc_array_alloc_hook = alloc_hook;
+    cpyte_gc_array_reserve_hook = reserve_hook;
+}
+
 void*
 cpyte_array_alloc(size_t elem_size, size_t count) {
+    if (cpyte_gc_array_alloc_hook != NULL) {
+        return cpyte_gc_array_alloc_hook(elem_size, count);
+    }
+    if (count != 0 && elem_size > (SIZE_MAX - sizeof(CpyArrayHeader)) / count)
+        return NULL;
     size_t total_size = sizeof(CpyArrayHeader) + elem_size * count;
     CpyArrayHeader *header = (CpyArrayHeader*)malloc(total_size);
     if (header == NULL) {
@@ -841,12 +880,18 @@ cpyte_array_register(void *arr, int64_t n) {
 
 /* Grow an array's capacity so that (length + increment) elements fit.
  * Returns the (possibly moved) data pointer.  When growing is needed a new
- * header + buffer is malloc'd, data is copied and the old block freed, which
- * is safe because the caller holds the only pointer. */
+ * header + buffer is realloc'd (which can often grow in-place), which
+ * is more efficient than malloc+memcpy+free. */
 void*
 cpyte_array_reserve(void *arr, size_t elem_size, size_t increment) {
+    if (cpyte_gc_array_reserve_hook != NULL) {
+        return cpyte_gc_array_reserve_hook(arr, elem_size, increment);
+    }
     if (arr == NULL) return arr;
+    if (elem_size == 0) return arr;
     CpyArrayHeader *header = (CpyArrayHeader*)((char*)arr - sizeof(CpyArrayHeader));
+    if (increment > SIZE_MAX - header->length)
+        return arr;
     size_t want = header->length + increment;
     if (want <= header->capacity) {
         return arr;  /* enough room – no realloc */
@@ -854,14 +899,21 @@ cpyte_array_reserve(void *arr, size_t elem_size, size_t increment) {
     /* Double until we have room, minimum 4 */
     size_t ncap = header->capacity;
     if (ncap < 4) ncap = 4;
-    while (ncap < want) ncap *= 2;
+    while (ncap < want) {
+        if (ncap > SIZE_MAX / 2)
+            ncap = want;
+        else
+            ncap *= 2;
+    }
+    if (ncap > (SIZE_MAX - sizeof(CpyArrayHeader)) / elem_size)
+        return arr;
     size_t bytes = sizeof(CpyArrayHeader) + elem_size * ncap;
-    CpyArrayHeader *nu = (CpyArrayHeader*)malloc(bytes);
+    /* Use realloc instead of malloc+memcpy+free for better performance */
+    size_t old_length = header->length;
+    CpyArrayHeader *nu = (CpyArrayHeader*)realloc(header, bytes);
     if (nu == NULL) return arr;  /* OOM – caller gets old pointer */
-    memcpy(nu->data, arr, header->length * elem_size);
-    nu->length = header->length;
+    nu->length = old_length;
     nu->capacity = ncap;
-    free(header);
     return nu->data;
 }
 
@@ -892,7 +944,7 @@ dyn_arena_ensure_capacity(size_t required_slot) {
     if (required_slot < dyn_arena_capacity) {
         return 0;  /* Already have capacity */
     }
-    
+
     if (dyn_arena_capacity == 0) {
         /* First allocation */
         dyn_arena_capacity = DYN_ARENA_INITIAL_SLOTS;
@@ -909,33 +961,33 @@ dyn_arena_ensure_capacity(size_t required_slot) {
         }
         return 0;
     }
-    
+
     /* Expand capacity (double until we have enough room) */
     while (dyn_arena_capacity <= required_slot) {
         size_t new_capacity = dyn_arena_capacity * 2;
         if (new_capacity > DYN_ARENA_MAX_SLOTS) {
-            fprintf(stderr, "dyn_arena: exceeds maximum capacity (%zu slots)\n", 
+            fprintf(stderr, "dyn_arena: exceeds maximum capacity (%zu slots)\n",
                     (size_t)DYN_ARENA_MAX_SLOTS);
             return -1;
         }
-        
+
         DynValue *new_arena = (DynValue*)realloc(dyn_arena, new_capacity * sizeof(DynValue));
         if (new_arena == NULL) {
             fprintf(stderr, "dyn_arena: expansion failed (from %zu to %zu slots)\n",
                     dyn_arena_capacity, new_capacity);
             return -1;
         }
-        
+
         // PERFORMANCE: Only initialize the new portion we'll actually use
         for (size_t i = dyn_arena_capacity; i < new_capacity && i <= required_slot; i++) {
             new_arena[i].kind = DYN_NONE;
             new_arena[i].data = 0;
         }
-        
+
         dyn_arena = new_arena;
         dyn_arena_capacity = new_capacity;
     }
-    
+
     return 0;
 }
 
@@ -945,16 +997,16 @@ dyn_slot_ptr(int slot) {
         fprintf(stderr, "dyn_slot_ptr: invalid slot %d\n", slot);
         abort();
     }
-    
+
     if (dyn_arena_ensure_capacity((size_t)slot) != 0) {
         fprintf(stderr, "dyn_slot_ptr: failed to ensure capacity for slot %d\n", slot);
         abort();
     }
-    
+
     if ((size_t)slot >= dyn_arena_slots_used) {
         dyn_arena_slots_used = (size_t)slot + 1;
     }
-    
+
     return &dyn_arena[slot];
 }
 
@@ -978,7 +1030,7 @@ dyn_get(int slot, int want_kind) {
     if (slot < 0 || (size_t)slot >= dyn_arena_slots_used) {
         return 0;
     }
-    
+
     int k = dyn_arena[slot].kind;
     uint64_t data = dyn_arena[slot].data;
     if (k == want_kind)
@@ -1378,17 +1430,33 @@ dyn_list_repeat(uint64_t list_bits, int64_t n) {
         abort();
     }
     int64_t len = cpyte_array_len(src);
+    if (len < 0 || (len != 0 && n > INT64_MAX / len)) {
+        fprintf(stderr, "dynamic list repeat: size overflow\n");
+        abort();
+    }
     int64_t total = len * n;
+    if ((uint64_t)total > SIZE_MAX / sizeof(DynValue)) {
+        fprintf(stderr, "dynamic list repeat: allocation too large\n");
+        abort();
+    }
     DynValue *arr = (DynValue *)cpyte_array_alloc(
         sizeof(DynValue), total > 0 ? (size_t)total : 1);
     if (arr == NULL) {
         fprintf(stderr, "dynamic list repeat: allocation failed\n");
         abort();
     }
-    int64_t out_i = 0;
-    for (int64_t r = 0; r < n; r++) {
-        for (int64_t i = 0; i < len; i++) {
-            arr[out_i++] = src[i];
+    if (len > 0 && n > 0) {
+        size_t chunk = (size_t)len * sizeof(DynValue);
+        size_t filled = chunk;
+        memcpy(arr, src, chunk);
+        /* Copy already-filled chunks.  This keeps the operation native and
+         * reduces the loop to O(log n) memcpy calls instead of one interpreted
+         * element loop per repetition. */
+        while (filled < (size_t)total * sizeof(DynValue)) {
+            size_t remaining = (size_t)total * sizeof(DynValue) - filled;
+            size_t copy_size = filled < remaining ? filled : remaining;
+            memcpy((char *)arr + filled, arr, copy_size);
+            filled += copy_size;
         }
     }
     if (total == 0) {
@@ -1415,10 +1483,17 @@ dyn_list_contains(uint64_t list_bits, int want_kind, uint64_t want_bits) {
     return 0;
 }
 
+static const char *
+cpyte_find_separator(const char *text, const char *sep, size_t sep_len) {
+    /* strchr is materially cheaper than strstr for the common one-byte
+     * separator case; both implementations remain native libc operations. */
+    return sep_len == 1 ? strchr(text, sep[0]) : strstr(text, sep);
+}
+
 /* str_split(str, sep) — split a string by a separator into a DynValue list.
- * Returns a malloc'd DynValue[] array of DYN_STR elements, registered in the
- * array-length table so `for x in list` works.  The empty string yields a
- * single-element list containing "". */
+ * The first pass counts parts so the result array is allocated at its exact
+ * size.  The second pass copies each part with memcpy; no Python-side or
+ * grow-and-shrink bookkeeping is involved. */
 DynValue *
 str_split(const char *str, const char *sep) {
     if (str == NULL) {
@@ -1431,22 +1506,29 @@ str_split(const char *str, const char *sep) {
     }
 
     size_t sep_len = strlen(sep);
-    size_t str_len = strlen(str);
+    size_t parts = 1;
+    const char *start = str;
+    const char *hit;
+    while ((hit = cpyte_find_separator(start, sep, sep_len)) != NULL) {
+        (void)hit;
+        if (parts == SIZE_MAX) {
+            fprintf(stderr, "split: too many parts\n");
+            abort();
+        }
+        parts++;
+        start = hit + sep_len;
+    }
 
-    /* PERFORMANCE: Conservative single allocation estimate (max parts = str_len + 1)
-     * We'll shrink to actual size if needed, but most real-world cases won't need it */
-    size_t max_parts = str_len + 1;
-    DynValue *arr = (DynValue *)cpyte_array_alloc(sizeof(DynValue), max_parts);
+    DynValue *arr = (DynValue *)cpyte_array_alloc(sizeof(DynValue), parts);
     if (arr == NULL) {
         fprintf(stderr, "split: allocation failed\n");
         abort();
     }
 
-    /* Single pass: fill elements and count actual parts */
+    /* Fill the exact-size array. */
     size_t idx = 0;
-    const char *start = str;
     while (1) {
-        const char *hit = strstr(start, sep);
+        hit = cpyte_find_separator(start, sep, sep_len);
         size_t part_len;
         if (hit == NULL) {
             part_len = strlen(start);
@@ -1466,18 +1548,6 @@ str_split(const char *str, const char *sep) {
         if (hit == NULL) break;
         start = hit + sep_len;
     }
-
-    /* PERFORMANCE: If we over-allocated significantly, shrink the array
-     * (only if we saved > 50% of the space) */
-    if (idx < max_parts / 2) {
-        DynValue *shrunk = (DynValue *)cpyte_array_alloc(sizeof(DynValue), idx);
-        if (shrunk != NULL) {
-            memcpy(shrunk, arr, idx * sizeof(DynValue));
-            free(arr);
-            return shrunk;
-        }
-    }
-
     return arr;
 }
 
@@ -1555,4 +1625,36 @@ glob_match(const char *pat, const char *str) {
         pat++;
     }
     return *pat == '\0';
+}
+
+
+// Efficient concatenation for growing strings with small constant appends
+// Used by compiler optimization for patterns like s = s + "const"
+char *
+str_concat_grow_const(const char *left, const char *right, size_t right_len, size_t *left_len_out) {
+    size_t left_len = strlen(left);
+    size_t total_len = left_len + right_len;
+    char *result = malloc(total_len + 1);
+    if (!result) return NULL;
+    // Use memcpy for both parts
+    memcpy(result, left, left_len);
+    memcpy(result + left_len, right, right_len);
+    result[total_len] = '\0';
+    if (left_len_out) *left_len_out = left_len;
+    return result;
+}
+
+// Optimized version using realloc when left buffer might be extended
+// But we need to track - better to just use this for now and also optimize allocation
+
+
+char *
+str_concat_const_both(const char *left, const char *right, size_t left_len, size_t right_len) {
+    size_t total_len = left_len + right_len;
+    char *result = malloc(total_len + 1);
+    if (!result) return NULL;
+    memcpy(result, left, left_len);
+    memcpy(result + left_len, right, right_len);
+    result[total_len] = '\0';
+    return result;
 }

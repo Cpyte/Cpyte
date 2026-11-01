@@ -125,6 +125,44 @@ def test_zero_multiplication_preserves_call_side_effects():
     assert ir.count('call i32 @"side"()') == 1
 
 
+def test_logical_constants_short_circuit_without_duplicate_calls():
+    ir = compile_program(
+        "def side() -> int:\n"
+        "    return 1\n"
+        "public main() -> int:\n"
+        "    print(0 and side())\n"
+        "    print(1 and side())\n"
+        "    print(1 or side())\n"
+        "    print(0 or side())\n"
+        "    return 0\n"
+    )
+    # Only the two reachable RHS expressions should remain in the IR.
+    assert ir.count('call i32 @"side"()') == 2
+
+
+def test_string_concat_uses_native_memcpy_intrinsic():
+    ir = compile_program(
+        "def prefix(s: str) -> str:\n"
+        '    return "prefix" + s\n'
+        "public main() -> int:\n"
+        '    print(prefix("x"))\n'
+        "    return 0\n"
+    )
+    assert "llvm.memcpy" in ir
+    assert "str_concat_const_gc" not in ir
+
+
+def test_gc_manages_compiler_generated_arrays():
+    ir = compile_program(
+        "public main() -> int:\n"
+        "    int[] values = new int[4]\n"
+        "    append(values, 9)\n"
+        "    return values[0]\n"
+    )
+    assert 'call i8* @"gc_array_alloc"' in ir
+    assert 'call i8* @"gc_array_reserve"' in ir
+
+
 def test_counted_loop_unrolling_preserves_integer_wraparound():
     ir = compile_program(
         "public main() -> int:\n"
@@ -133,8 +171,8 @@ def test_counted_loop_unrolling_preserves_integer_wraparound():
         "        i = i + 1\n"
         "    return i\n"
     )
-    assert 'while.cond:' in ir
-    assert 'while.body:' in ir
+    assert "while.cond:" in ir
+    assert "while.body:" in ir
 
 
 def test_mul_power_of_two_strength_reduction_never_shifts_out_of_range():
@@ -181,7 +219,7 @@ def test_auto_type_inference_compiles():
         "public def main() -> int:\n"
         "    auto i = 5\n"
         "    auto d = 3.5\n"
-        "    auto s = \"hi\"\n"
+        '    auto s = "hi"\n'
         "    auto p = new P\n"
         "    auto c = new C(7)\n"
         "    auto t = add(1, 2)\n"
@@ -208,7 +246,7 @@ def test_auto_inference_errors_are_diagnostics():
                 "def f(a: int) -> auto:\n"
                 "    if a:\n"
                 "        return 1\n"
-                "    return \"x\"\n"
+                '    return "x"\n'
                 "public def main() -> int:\n    return f(1)\n"
             ),
             "conflicting return types",

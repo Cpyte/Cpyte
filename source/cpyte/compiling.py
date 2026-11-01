@@ -900,7 +900,9 @@ def optimize(mod, opt_level=3, opt_size=False):
     if effective >= 2:
         pto.slp_vectorization = True
     if heavy:
-        pto.inlining_threshold = 450 if extra_heavy else 275
+        # MAXIMUM SPEED: Aggressive inlining and loop optimizations
+        # Increased from 275/450 to 600/900 for better inlining
+        pto.inlining_threshold = 900 if extra_heavy else 600
         pto.loop_unrolling = True
         pto.loop_vectorization = True
         pto.loop_interleaving = True
@@ -981,6 +983,33 @@ def optimize(mod, opt_level=3, opt_size=False):
 
     # Default module pipeline (includes inliner, GVN, DCE, loop and vectorization opts)
     npm = pb.getModulePassManager()
+
+    # Add aggressive optimization passes for maximum speed
+    if heavy:
+        # Aggressive loop optimizations
+        npm.add_loop_unroll_pass()
+        npm.add_loop_vectorize_pass()
+        npm.add_slp_vectorize_pass()
+        # Interprocedural optimizations
+        npm.add_function_inlining_pass()
+        npm.add_argument_promotion_pass()
+        # Dead code elimination
+        npm.add_global_dce_pass()
+        npm.add_dead_code_elimination_pass()
+        # Constant propagation
+        npm.add_constant_propagation_pass()
+        # Strength reduction
+        npm.add_instruction_combining_pass()
+        # Aggressive GVN
+        npm.add_gvn_pass()
+        # LICM (Loop Invariant Code Motion)
+        npm.add_licm_pass()
+        # Additional aggressive passes
+        npm.add_reassociate_pass()  # Reassociate expressions for better optimization
+        npm.add_licm_pass()  # Run LICM again after reassociation
+        npm.add_gvn_pass()  # Run GVN again for maximum redundancy elimination
+        npm.add_memcpy_optimize_pass()  # Optimize memcpy calls
+        npm.add_tail_call_elimination_pass()  # Eliminate tail calls
 
     # Let extension hooks add their own passes
     try:

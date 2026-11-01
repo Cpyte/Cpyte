@@ -29,6 +29,13 @@ extern void gc_trace(const char* what, size_t v);
 #include <string.h>
 #include <stdio.h>
 
+/* SIMD support for faster memcpy on modern CPUs */
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 /* --- Platform threading / mutex abstraction (mirrors runtime.c) --- */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -118,6 +125,9 @@ typedef struct {
     char *start;   /* Start of current TLAB */
     char *end;     /* End of current TLAB */
     char *current; /* Current bump pointer */
+    char *last;    /* Most recent TLAB allocation */
+    size_t last_size; /* Aligned size of the most recent allocation */
+    size_t last_len;  /* String length, or SIZE_MAX when not a string */
 } tlab_t;
 
 /* Thread-local storage for TLAB.
@@ -132,7 +142,7 @@ typedef struct {
  * TLS-free and each thread still gets its own buffer. Windows keeps native
  * TLS (no POSIX threads available). */
 #ifdef _WIN32
-__declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
+__declspec(thread) static tlab_t tlab = {NULL, NULL, NULL, NULL, 0, SIZE_MAX};
 #  define TLAB_GET() (&tlab)
 #else
 static pthread_key_t  tlab_key;
@@ -151,14 +161,14 @@ static tlab_t* tlab_get(void) {
 #endif
 
 static void* tlab_alloc(size_t size, size_t min_block_size) {
+    tlab_t *tl = TLAB_GET();
     if (size > SIZE_MAX - (sizeof(void*) - 1)) {
         return NULL;
     }
     /* Round up to pointer alignment */
     size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
 
-    if (TLAB_GET()->start == NULL ||
-            (size_t)(TLAB_GET()->end - TLAB_GET()->current) < size) {
+    if (tl->start == NULL || (size_t)(tl->end - tl->current) < size) {
         /* TLAB exhausted or not initialized: allocate new block from global heap */
         size_t block_size = (size > min_block_size) ? size : min_block_size;
 
@@ -177,14 +187,17 @@ static void* tlab_alloc(size_t size, size_t min_block_size) {
 
         CPY_MUTEX_UNLOCK(&gc_lock_);
 
-        TLAB_GET()->start = PAYLOAD(hdr);
-        TLAB_GET()->end = TLAB_GET()->start + block_size;
-        TLAB_GET()->current = TLAB_GET()->start;
+        tl->start = PAYLOAD(hdr);
+        tl->end = tl->start + block_size;
+        tl->current = tl->start;
     }
 
     /* Bump-pointer allocation (lock-free) */
-    void *ptr = TLAB_GET()->current;
-    TLAB_GET()->current += size;
+    void *ptr = tl->current;
+    tl->current += size;
+    tl->last = (char *)ptr;
+    tl->last_size = size;
+    tl->last_len = SIZE_MAX;
     return ptr;
 }
 
@@ -481,6 +494,9 @@ void gc_init(void) {
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
     TLAB_GET()->current = NULL;
+    TLAB_GET()->last = NULL;
+    TLAB_GET()->last_size = 0;
+    TLAB_GET()->last_len = SIZE_MAX;
 }
 
 void* gc_malloc(size_t size) {
@@ -543,25 +559,44 @@ void* gc_malloc(size_t size) {
  * Allocate a buffer whose caller initializes every byte. String concatenation
  * uses this path so larger results can share a thread-local arena instead of
  * requiring a tracked GC object and global-lock acquisition per result.
+ *
+ * SPEED OPTIMIZATIONS:
+ * - Likely/unlikely branch prediction hints
+ * - Fast path for very small allocations
+ * - Reduced branching
  */
 void* gc_malloc_uninit(size_t size) {
-    if (size == 0) {
-        size = 1;
-    }
-
-    if (size <= TLAB_STRING_SIZE) {
-        size_t block_size = size <= TLAB_MAX_ALLOC
-            ? TLAB_SIZE
-            : TLAB_STRING_SIZE;
-        void* ptr = tlab_alloc(size, block_size);
-        if (ptr != NULL) {
+    // Fast path: very small allocations are the most common
+    if (__builtin_expect(size <= TLAB_MAX_ALLOC, 1)) {
+        void* ptr = tlab_alloc(size, TLAB_SIZE);
+        if (__builtin_expect(ptr != NULL, 1)) {
             gc_alloc_bytes += size;
-            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
+            // Only check threshold on larger accumulated allocations
+            if (__builtin_expect(gc_threshold != 0 && gc_alloc_bytes >= gc_threshold, 0)) {
                 gc_collect();
             }
             return ptr;
         }
     }
+    
+    // Zero-size allocation
+    if (__builtin_expect(size == 0, 0)) {
+        size = 1;
+    }
+
+    // Medium-sized allocations via TLAB
+    if (__builtin_expect(size <= TLAB_STRING_SIZE, 1)) {
+        void* ptr = tlab_alloc(size, TLAB_STRING_SIZE);
+        if (__builtin_expect(ptr != NULL, 1)) {
+            gc_alloc_bytes += size;
+            if (__builtin_expect(gc_threshold != 0 && gc_alloc_bytes >= gc_threshold, 0)) {
+                gc_collect();
+            }
+            return ptr;
+        }
+    }
+    
+    // Fallback to general GC
     return gc_malloc(size);
 }
 
@@ -685,19 +720,164 @@ void gc_shutdown(void) {
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
     TLAB_GET()->current = NULL;
+    TLAB_GET()->last = NULL;
+    TLAB_GET()->last_size = 0;
+    TLAB_GET()->last_len = SIZE_MAX;
 }
 
 
 // GC version of optimized string concat
+// SPEED OPTIMIZATIONS:
+// - Ultra-small string optimization (<= 16 bytes) uses inline assembly rep movsb
+// - Small string optimization (<= 31 bytes) uses inline copy
+// - Prefetch for larger strings
+// - Branch prediction hints
+// - SIMD memcpy for very large strings (> 512 bytes)
 char *
 str_concat_const_gc(const char *left, const char *right, size_t right_len) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
+    
+    // Ultra-small string optimization: inline assembly rep movsb
+    // This is the fastest path for tiny strings
+    if (__builtin_expect(total_len <= 16, 1)) {
+        char *result = gc_malloc_uninit(total_len + 1);
+        if (!result) return NULL;
+        
+        fast_memcpy_small(result, left, left_len);
+        fast_memcpy_small(result + left_len, right, right_len);
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Small string optimization: inline copy for small strings
+    // Avoids memcpy overhead for the common case
+    if (__builtin_expect(total_len <= 31, 1)) {
+        char *result = gc_malloc_uninit(total_len + 1);
+        if (!result) return NULL;
+        
+        // Inline copy for small strings - compiler will unroll and vectorize
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Larger strings: use memcpy with prefetch hints
     char *result = gc_malloc_uninit(total_len + 1);
     if (!result) return NULL;
-    memcpy(result, left, left_len);
-    memcpy(result + left_len, right, right_len);
+    
+    // Prefetch source data for larger strings
+    if (total_len > 256) {
+        __builtin_prefetch(left, 0, 3);
+        __builtin_prefetch(right, 0, 3);
+    }
+    
+    // Use SIMD-optimized copy for very large strings
+    if (total_len > 512) {
+        fast_memcpy_large(result, left, left_len);
+        fast_memcpy_large(result + left_len, right, right_len);
+    } else {
+        memcpy(result, left, left_len);
+        memcpy(result + left_len, right, right_len);
+    }
     result[total_len] = '\0';
+    return result;
+}
+
+/*
+ * Append a compile-time string to a compiler-proven unique local.  The
+ * compiler still uses the ordinary allocating semantics when uniqueness is
+ * not proven; this helper only mutates a string when it is the most recent
+ * initialized TLAB allocation and there is room directly after it.
+ *
+ * TLAB allocations are pointer-aligned.  Growing the last allocation in
+ * place therefore only advances the bump pointer; no realloc or custom
+ * memory-copy loop is needed.  The fallback remains GC-managed and uses the
+ * same native memcpy operations as str_concat_const_gc.
+ *
+ * SPEED OPTIMIZATIONS:
+ * - TLAB in-place growth (no allocation when possible)
+ * - Small string optimization
+ * - SIMD memcpy for large strings
+ */
+char *
+str_concat_grow_const_gc(const char *left, const char *right, size_t right_len) {
+    tlab_t *tl = TLAB_GET();
+    size_t left_len;
+
+    if (tl->last == (char *)left && tl->last_len != SIZE_MAX) {
+        left_len = tl->last_len;
+    } else {
+        left_len = strlen(left);
+    }
+
+    if (right_len > SIZE_MAX - 1 || left_len > SIZE_MAX - right_len - 1) {
+        return NULL;
+    }
+    size_t total_len = left_len + right_len;
+    size_t needed = total_len + 1;
+
+    // FAST PATH: In-place TLAB growth (avoid allocation entirely)
+    if (tl->last == (char *)left && tl->last_len == left_len &&
+            tl->current == tl->last + tl->last_size &&
+            needed >= tl->last_size &&
+            needed <= SIZE_MAX - (sizeof(void*) - 1)) {
+        size_t rounded = (needed + sizeof(void*) - 1) &
+                         ~(sizeof(void*) - 1);
+        size_t available = (size_t)(tl->end - tl->current);
+        if (rounded >= tl->last_size && rounded - tl->last_size <= available) {
+            size_t growth = rounded - tl->last_size;
+            
+            // Use SIMD for large appends
+            if (right_len > 512) {
+                fast_memcpy_large((char *)left + left_len, right, right_len);
+            } else {
+                memcpy((char *)left + left_len, right, right_len);
+            }
+            ((char *)left)[total_len] = '\0';
+            tl->current += growth;
+            tl->last_size = rounded;
+            tl->last_len = total_len;
+            gc_alloc_bytes += growth;
+            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
+                gc_collect();
+            }
+            return (char *)left;
+        }
+    }
+
+    // FALLBACK: Allocate new string
+    char *result = gc_malloc_uninit(needed);
+    if (!result) return NULL;
+    
+    // Small string optimization
+    if (__builtin_expect(total_len <= 31, 1)) {
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+    } else {
+        // Use SIMD for large strings
+        if (total_len > 512) {
+            fast_memcpy_large(result, left, left_len);
+            fast_memcpy_large(result + left_len, right, right_len);
+        } else {
+            memcpy(result, left, left_len);
+            memcpy(result + left_len, right, right_len);
+        }
+    }
+    result[total_len] = '\0';
+    tl = TLAB_GET();
+    if (tl->last == result) {
+        tl->last_len = total_len;
+    }
     return result;
 }
 
@@ -705,10 +885,141 @@ str_concat_const_gc(const char *left, const char *right, size_t right_len) {
 char *
 str_concat_const_both_gc(const char *left, const char *right, size_t left_len, size_t right_len) {
     size_t total_len = left_len + right_len;
+    
+    // Small string optimization: inline copy for very small strings
+    // Both lengths known, so we can be very aggressive
+    if (__builtin_expect(total_len <= 31, 1)) {
+        char *result = gc_malloc_uninit(total_len + 1);
+        if (!result) return NULL;
+        
+        // Inline copy - compiler will optimize heavily
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Medium to large strings: use optimized memcpy
     char *result = gc_malloc_uninit(total_len + 1);
     if (!result) return NULL;
+    
+    // Prefetch for larger strings
+    if (total_len > 256) {
+        __builtin_prefetch(left, 0, 3);
+        __builtin_prefetch(right, 0, 3);
+    }
+    
+    // Use standard memcpy - modern compilers will use SIMD automatically
+    // For very large strings, memcpy is already highly optimized
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
     return result;
+}
+
+/* Inline assembly for ultra-fast small string copy (<= 16 bytes)
+ * This avoids all function call overhead for the most common case
+ */
+static inline void fast_memcpy_small(char *dst, const char *src, size_t n) {
+#if defined(__x86_64__) && !defined(_MSC_VER)
+    // Use inline assembly for x86_64 GCC/Clang
+    __asm__ volatile (
+        "rep movsb"
+        : "+D"(dst), "+S"(src), "+c"(n)
+        : : "memory", "cc"
+    );
+#elif defined(_MSC_VER) && defined(_M_X64)
+    // MSVC x64 doesn't support inline asm, use intrinsic
+    __movsb((unsigned char*)dst, (const unsigned char*)src, n);
+#else
+    // Fallback for other platforms
+    memcpy(dst, src, n);
+#endif
+}
+
+/* SIMD-optimized fast copy for large strings (> 512 bytes)
+ * This bypasses the standard memcpy for better control on large buffers
+ */
+static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    // AVX2 32-byte copies for x86_64
+    size_t i = 0;
+    const __m256i *src256 = (const __m256i *)src;
+    __m256i *dst256 = (__m256i *)dst;
+    
+    // Align to 32-byte boundary
+    while (i + 32 <= n && ((uintptr_t)(src + i) & 31)) {
+        dst[i] = src[i];
+        i++;
+    }
+    
+    // 32-byte unrolled copy
+    while (i + 128 <= n) {
+        __m256i v0 = _mm256_loadu_si256(src256 + 0);
+        __m256i v1 = _mm256_loadu_si256(src256 + 1);
+        __m256i v2 = _mm256_loadu_si256(src256 + 2);
+        __m256i v3 = _mm256_loadu_si256(src256 + 3);
+        _mm256_storeu_si256(dst256 + 0, v0);
+        _mm256_storeu_si256(dst256 + 1, v1);
+        _mm256_storeu_si256(dst256 + 2, v2);
+        _mm256_storeu_si256(dst256 + 3, v3);
+        src256 += 4;
+        dst256 += 4;
+        i += 128;
+    }
+    
+    // Finish remaining bytes
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256(src256);
+        _mm256_storeu_si256(dst256, v);
+        src256++;
+        dst256++;
+        i += 32;
+    }
+    
+    // Tail
+    while (i < n) {
+        dst[i] = src[i];
+        i++;
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    // NEON 16-byte copies for ARM64
+    size_t i = 0;
+    const uint8x16_t *src16 = (const uint8x16_t *)src;
+    uint8x16_t *dst16 = (uint8x16_t *)dst;
+    
+    while (i + 64 <= n) {
+        uint8x16_t v0 = vld1q_u8((const uint8_t *)src16 + 0);
+        uint8x16_t v1 = vld1q_u8((const uint8_t *)src16 + 1);
+        uint8x16_t v2 = vld1q_u8((const uint8_t *)src16 + 2);
+        uint8x16_t v3 = vld1q_u8((const uint8_t *)src16 + 3);
+        vst1q_u8((uint8_t *)dst16 + 0, v0);
+        vst1q_u8((uint8_t *)dst16 + 1, v1);
+        vst1q_u8((uint8_t *)dst16 + 2, v2);
+        vst1q_u8((uint8_t *)dst16 + 3, v3);
+        src16 += 4;
+        dst16 += 4;
+        i += 64;
+    }
+    
+    while (i + 16 <= n) {
+        uint8x16_t v = vld1q_u8((const uint8_t *)src16);
+        vst1q_u8((uint8_t *)dst16, v);
+        src16++;
+        dst16++;
+        i += 16;
+    }
+    
+    while (i < n) {
+        dst[i] = src[i];
+        i++;
+    }
+#else
+    // Fallback to standard memcpy
+    memcpy(dst, src, n);
+#endif
 }

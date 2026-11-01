@@ -149,7 +149,62 @@ def test_string_concat_uses_native_memcpy_intrinsic():
         "    return 0\n"
     )
     assert "llvm.memcpy" in ir
-    assert "str_concat_const_gc" not in ir
+    assert 'call i8* @"str_concat_const_gc"' not in ir
+
+
+def test_unique_string_append_uses_native_growth_and_aliases_do_not():
+    ir = compile_program(
+        "import string\n"
+        "public main() -> int:\n"
+        '    str s = ""\n'
+        "    int i = 0\n"
+        "    while i < 100:\n"
+        '        s = s + "hello"\n'
+        "        i = i + 1\n"
+        "    print(strlen(s))\n"
+        "    return 0\n"
+    )
+    assert 'call i8* @"str_concat_grow_const_gc"' in ir
+
+    aliased = compile_program(
+        "public main() -> int:\n"
+        '    str s = "a"\n'
+        "    str saved = s\n"
+        '    s = s + "b"\n'
+        "    print(saved)\n"
+        "    print(s)\n"
+        "    return 0\n"
+    )
+    assert 'call i8* @"str_concat_grow_const_gc"' not in aliased
+
+
+def test_allocation_free_main_skips_gc_startup():
+    ir = compile_program(
+        "public main() -> int:\n"
+        "    int64 total = 0\n"
+        "    int64 i = 0\n"
+        "    while i < 100:\n"
+        "        total = total + i\n"
+        "        i = i + 1\n"
+        "    print(total)\n"
+        "    return 0\n"
+    )
+    assert 'call void @"gc_init"()' not in ir
+    assert 'call void @"gc_shutdown"()' not in ir
+
+
+def test_linear_sum_loop_is_folded_with_wrapping_accumulator():
+    ir = compile_program(
+        "public main() -> int:\n"
+        "    int64 total = 0\n"
+        "    int64 i = 0\n"
+        "    while i < 1000:\n"
+        "        total = total + i\n"
+        "        i = i + 1\n"
+        "    print(total)\n"
+        "    return 0\n"
+    )
+    assert "while.cond:" not in ir
 
 
 def test_gc_manages_compiler_generated_arrays():

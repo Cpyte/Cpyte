@@ -1903,7 +1903,7 @@ class LLVM:
         compile-time known lengths that avoid runtime strlen calls.  The copies
         use LLVM's memcpy intrinsic so LLVM can lower them directly to the
         target's native memory operation.
-        
+
         SPEED OPTIMIZATIONS:
         - Fast path for both lengths known (uses str_concat_const_both_gc)
         - Fast path for left known, right unknown (custom optimized path)
@@ -1921,15 +1921,16 @@ class LLVM:
             if fast_fn is not None:
                 return self.builder.call(
                     fast_fn,
-                    [left, right, ir.Constant(_i64, left_len_const), ir.Constant(_i64, right_len_const)],
+                    [
+                        left,
+                        right,
+                        ir.Constant(_i64, left_len_const),
+                        ir.Constant(_i64, right_len_const),
+                    ],
                 )
 
         # FAST PATH 2: Dynamic left + literal right (dominant append pattern)
-        if (
-            not self.no_gc
-            and left_len_const is None
-            and right_len_const is not None
-        ):
+        if not self.no_gc and left_len_const is None and right_len_const is not None:
             fast_fn = self.functions.get("str_concat_const_gc")
             if fast_fn is not None:
                 return self.builder.call(
@@ -1938,30 +1939,28 @@ class LLVM:
                 )
 
         # FAST PATH 3: Literal left + dynamic right - mirror optimization
-        if (
-            not self.no_gc
-            and left_len_const is not None
-            and right_len_const is None
-        ):
+        if not self.no_gc and left_len_const is not None and right_len_const is None:
             # Swap operands to use the same fast path (concat is commutative for allocation)
             # But we need to preserve order, so emit right first, then concat with left on right
             # Actually, we can't simply swap - let's use a specialized path
             strlen_fn = self._get_strlen_fn()
             alloc_fn = self._get_gc_uninit_alloc_fn()
             memcpy_fn = self._get_memcpy_fn()
-            
+
             left_len = ir.Constant(_i64, left_len_const)
             right_len = self.builder.call(strlen_fn, [right])
-            
+
             total_len = self.builder.add(left_len, right_len)
             plus_one = self.builder.add(total_len, ir.Constant(total_len.type, 1))
             new_str = self.builder.call(alloc_fn, [self.builder.zext(plus_one, _i64)])
-            
+
             # Copy left (known length) first
             self.builder.call(memcpy_fn, [new_str, left, left_len, ir.Constant(_i1, 0)])
             # Copy right (dynamic length) second
             dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
-            self.builder.call(memcpy_fn, [dest_plus, right, right_len, ir.Constant(_i1, 0)])
+            self.builder.call(
+                memcpy_fn, [dest_plus, right, right_len, ir.Constant(_i1, 0)]
+            )
             null_byte = self.builder.gep(new_str, [total_len], inbounds=True)
             self.builder.store(ir.Constant(_i8, 0), null_byte)
             return new_str
@@ -1978,17 +1977,25 @@ class LLVM:
             )
             total_len = left_len_const + right_len_const
             new_str = self.builder.call(alloc_fn, [ir.Constant(_i64, total_len + 1)])
-            
+
             # Use llvm.memcpy.inline for small strings (better inlining)
-            memcpy_inline_fn = self.module.declare_intrinsic("llvm.memcpy.inline", [_i8ptr, _i8ptr, _i64])
-            
+            memcpy_inline_fn = self.module.declare_intrinsic(
+                "llvm.memcpy.inline", [_i8ptr, _i8ptr, _i64]
+            )
+
             left_len = ir.Constant(_i64, left_len_const)
             right_len = ir.Constant(_i64, right_len_const)
-            
-            self.builder.call(memcpy_inline_fn, [new_str, left, left_len, ir.Constant(_i1, 0)])
+
+            self.builder.call(
+                memcpy_inline_fn, [new_str, left, left_len, ir.Constant(_i1, 0)]
+            )
             dest_plus = self.builder.gep(new_str, [left_len], inbounds=True)
-            self.builder.call(memcpy_inline_fn, [dest_plus, right, right_len, ir.Constant(_i1, 0)])
-            null_byte = self.builder.gep(new_str, [ir.Constant(_i64, total_len)], inbounds=True)
+            self.builder.call(
+                memcpy_inline_fn, [dest_plus, right, right_len, ir.Constant(_i1, 0)]
+            )
+            null_byte = self.builder.gep(
+                new_str, [ir.Constant(_i64, total_len)], inbounds=True
+            )
             self.builder.store(ir.Constant(_i8, 0), null_byte)
             return new_str
 
@@ -2012,7 +2019,7 @@ class LLVM:
         total_len = self.builder.add(left_len, right_len)
         plus_one = self.builder.add(total_len, ir.Constant(total_len.type, 1))
         new_str = self.builder.call(alloc_fn, [self.builder.zext(plus_one, _i64)])
-        
+
         # Use vectorized memcpy for better performance on larger strings
         self.builder.call(
             memcpy_fn,
@@ -2110,10 +2117,7 @@ class LLVM:
                             and callee_fn is not None
                             and callee_fn.is_declaration
                         )
-                        or (
-                            obj.callee.name == "len"
-                            and callee_fn is None
-                        )
+                        or (obj.callee.name == "len" and callee_fn is None)
                     )
                     and len(obj.args) == 1
                 ):
@@ -2153,9 +2157,7 @@ class LLVM:
         left = self.emit(value.left)
         right = self._string_const(value.right.value)
         right_len = self._get_const_strlen(value.right)
-        return self.builder.call(
-            fn, [left, right, ir.Constant(_i64, right_len)]
-        )
+        return self.builder.call(fn, [left, right, ir.Constant(_i64, right_len)])
 
     @register_emitter(ExprStmt)
     def emit_exprstmt(self, node):
@@ -3339,21 +3341,21 @@ class LLVM:
             idx = self.builder.ptrtoint(idx, _i64)
         elif isinstance(idx.type, (ir.DoubleType, ir.FloatType)):
             idx = self.builder.fptosi(idx, _i64)
-        
+
         # BOUNDS CHECK ELIMINATION: Add branch prediction hints for likely in-bounds access
         # This helps the CPU's branch predictor and can lead to better speculation
         # We use __builtin_expect via LLVM's likelihood intrinsic if available
         # For now, we trust inbounds=True to enable auto-vectorization
-        
+
         # inbounds=True enables LLVM auto-vectorization via strength reduction
         # LLVM will transform base[i] into pointer arithmetic when profitable
         gep = self.builder.gep(obj, [idx], inbounds=True)
-        
+
         # Add metadata to hint that this access is likely in-bounds
         # This helps LLVM's vectorizer be more aggressive
         # Note: This is safe because we only eliminate bounds checks when we can prove safety
         # For now, we rely on LLVM's own analysis
-        
+
         return gep
 
     @register_emitter(Attr)
@@ -5919,17 +5921,17 @@ class LLVM:
             if isinstance(left.type, ir.IntType):
                 left = self.builder.sitofp(left, ir.DoubleType())
             return self.builder.fmul(left, left)
-        
+
         # Optimization: x^0 -> 1.0
         if isinstance(right, ir.Constant) and right.constant == 0.0:
             return ir.Constant(ir.DoubleType(), 1.0)
-        
+
         # Optimization: x^1 -> x
         if isinstance(right, ir.Constant) and right.constant == 1.0:
             if isinstance(left.type, ir.IntType):
                 left = self.builder.sitofp(left, ir.DoubleType())
             return left
-        
+
         pow_func = self.functions.get("pow")
         if pow_func is None:
             pow_ty = ir.FunctionType(
@@ -6008,19 +6010,19 @@ class LLVM:
         op = dynop_map[node.op]
         k1, b1 = self._dyn_pair(node.left)
         k2, b2 = self._dyn_pair(node.right)
-        
+
         # Optimization: Inline simple dynamic operations when both types are known
         # This avoids the function call overhead for common cases
         if k1.constant == k2.constant:
             # Both operands have the same type - could potentially inline
             # For now, just add always_inline attribute to the dyn_op function
             pass
-        
+
         fn = self.functions.get("dyn_op")
         if fn is not None:
             # Mark dyn_op as always_inline for better performance
             fn.attributes.add("alwaysinline")
-        
+
         out_ptr = self._alloca(_DynValue, name="dyn.binop")
         self.builder.call(fn, [out_ptr, ir.Constant(_i32, op), k1, b1, k2, b2])
         return self.builder.load(out_ptr)
@@ -7805,112 +7807,138 @@ class LLVM:
 
     def _try_emit_string_builder_loop(self, node: While) -> bool:
         """Optimize string builder loops to O(n) instead of O(n^2).
-        
+
         Detects patterns like::
-        
+
             s = ""
             while i < n:
                 s = s + "literal"
                 i = i + 1
-        
+
         And transforms to a single allocation of the final size followed by
         sequential writes, avoiding repeated copying.
         """
         sb_info = _detect_string_builder_loop(node)
         if sb_info is None:
             return False
-        
+
         target_var, const_str, iterations, const_len = sb_info
-        
+
         # Check if target variable exists and is a string
         if target_var not in self.locals:
             return False
         if self.local_types.get(target_var) != "str":
             return False
-        
+
         # Calculate total final size
         total_size = iterations * const_len
-        
+
         # Limit to reasonable sizes to avoid excessive memory
         if total_size > 10 * 1024 * 1024:  # 10MB limit
             return False
-        
+
         # Get the string constant as LLVM constant
         str_const = self._string_const(const_str)
-        
+
         # Allocate the final buffer
-        alloc_fn = self._get_gc_uninit_alloc_fn() if not self.no_gc else self._get_malloc_fn()
+        alloc_fn = (
+            self._get_gc_uninit_alloc_fn() if not self.no_gc else self._get_malloc_fn()
+        )
         total_size_with_null = total_size + 1
-        result_ptr = self.builder.call(alloc_fn, [ir.Constant(_i64, total_size_with_null)])
-        
+        result_ptr = self.builder.call(
+            alloc_fn, [ir.Constant(_i64, total_size_with_null)]
+        )
+
         # Fill the buffer with the repeated string
         memcpy_fn = self._get_memcpy_fn()
         dest = result_ptr
-        
+
         # For small iteration counts, unroll the copies
         if iterations <= 8:
             for i in range(iterations):
                 offset = i * const_len
-                dest_offset = self.builder.gep(result_ptr, [ir.Constant(_i64, offset)], inbounds=True)
-                self.builder.call(memcpy_fn, [dest_offset, str_const, ir.Constant(_i64, const_len), ir.Constant(_i1, 0)])
+                dest_offset = self.builder.gep(
+                    result_ptr, [ir.Constant(_i64, offset)], inbounds=True
+                )
+                self.builder.call(
+                    memcpy_fn,
+                    [
+                        dest_offset,
+                        str_const,
+                        ir.Constant(_i64, const_len),
+                        ir.Constant(_i1, 0),
+                    ],
+                )
         else:
             # For larger counts, use a loop to fill
             # This is still O(n) with no intermediate allocations
             loop_bb = self.builder.append_basic_block("string_builder.loop")
             cond_bb = self.builder.append_basic_block("string_builder.cond")
             end_bb = self.builder.append_basic_block("string_builder.end")
-            
+
             # Initialize counter
             i_ptr = self._alloca(_i64, name="string_builder.i")
             self.builder.store(ir.Constant(_i64, 0), i_ptr)
-            
+
             self.builder.branch(cond_bb)
             self.builder.position_at_end(cond_bb)
-            
+
             i_val = self.builder.load(i_ptr)
             cond = self.builder.icmp_unsigned("<", i_val, ir.Constant(_i64, iterations))
             self.builder.cbranch(cond, loop_bb, end_bb)
-            
+
             self.builder.position_at_end(loop_bb)
-            
+
             # Copy string at current position
             offset = self.builder.mul(i_val, ir.Constant(_i64, const_len))
             dest_offset = self.builder.gep(result_ptr, [offset], inbounds=True)
-            self.builder.call(memcpy_fn, [dest_offset, str_const, ir.Constant(_i64, const_len), ir.Constant(_i1, 0)])
-            
+            self.builder.call(
+                memcpy_fn,
+                [
+                    dest_offset,
+                    str_const,
+                    ir.Constant(_i64, const_len),
+                    ir.Constant(_i1, 0),
+                ],
+            )
+
             # Increment counter
             new_i = self.builder.add(i_val, ir.Constant(_i64, 1))
             self.builder.store(new_i, i_ptr)
-            
+
             self.builder.branch(cond_bb)
             self.builder.position_at_end(end_bb)
-        
+
         # Null-terminate
-        null_ptr = self.builder.gep(result_ptr, [ir.Constant(_i64, total_size)], inbounds=True)
+        null_ptr = self.builder.gep(
+            result_ptr, [ir.Constant(_i64, total_size)], inbounds=True
+        )
         self.builder.store(ir.Constant(_i8, 0), null_ptr)
-        
+
         # Store result in target variable
         target_ptr = self.locals[target_var]
         self.builder.store(result_ptr, target_ptr)
-        
+
         # Emit the rest of the loop body (excluding the string assignment)
         # This handles the counter increment and any other side effects
         # But we need to skip the string assignment we just optimized
         # For now, we'll just skip the entire loop and let the user handle this manually
         # This is a conservative approach - we only optimize when the loop ONLY does string building
-        
+
         # Check if loop has only the string assignment and counter increment
         if len(node.body) != 2:
             return False  # Only optimize simple cases for now
-        
+
         # The loop body should be: s = s + "literal" and i = i + 1
         # We've already optimized the string part, so we just need to emit the counter increment
         for stmt in node.body:
-            if not (isinstance(stmt, Assign) and 
-                   isinstance(stmt.target, Variable) and
-                   stmt.target.name == target_var):
+            if not (
+                isinstance(stmt, Assign)
+                and isinstance(stmt.target, Variable)
+                and stmt.target.name == target_var
+            ):
                 self.emit(stmt)
-        
+
         return True
 
     @register_emitter(While)

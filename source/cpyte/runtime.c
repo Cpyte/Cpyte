@@ -157,7 +157,7 @@ _fast_itoa(int64_t n) {
         }
         return p; // Return pointer to start of string
     }
-    
+
     // Fallback to snprintf for larger numbers
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)n);
@@ -213,12 +213,12 @@ char *
 str_concat_const(const char *left, const char *right, size_t right_len) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
-    
+
     // Ultra-small string optimization: inline assembly
     if (__builtin_expect(total_len <= 16, 1)) {
         char *result = malloc(total_len + 1);
         if (!result) return NULL;
-        
+
 #if defined(__x86_64__) && !defined(_MSC_VER)
         __asm__ volatile (
             "rep movsb"
@@ -240,12 +240,12 @@ str_concat_const(const char *left, const char *right, size_t right_len) {
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Small string optimization: inline copy for very small strings
     if (__builtin_expect(total_len <= 31, 1)) {
         char *result = malloc(total_len + 1);
         if (!result) return NULL;
-        
+
         // Inline copy - compiler will unroll and vectorize
         for (size_t i = 0; i < left_len; i++) {
             result[i] = left[i];
@@ -256,17 +256,17 @@ str_concat_const(const char *left, const char *right, size_t right_len) {
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Larger strings: use memcpy with prefetch hints
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
-    
+
     // Prefetch source data for larger strings
     if (total_len > 256) {
         __builtin_prefetch(left, 0, 3);
         __builtin_prefetch(right, 0, 3);
     }
-    
+
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
@@ -1752,12 +1752,12 @@ char *
 str_concat_grow_const(const char *left, const char *right, size_t right_len, size_t *left_len_out) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
-    
+
     // Small string optimization
     if (__builtin_expect(total_len <= 31, 1)) {
         char *result = malloc(total_len + 1);
         if (!result) return NULL;
-        
+
         for (size_t i = 0; i < left_len; i++) {
             result[i] = left[i];
         }
@@ -1768,16 +1768,16 @@ str_concat_grow_const(const char *left, const char *right, size_t right_len, siz
         if (left_len_out) *left_len_out = left_len;
         return result;
     }
-    
+
     // Larger strings: use memcpy with prefetch
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
-    
+
     if (total_len > 256) {
         __builtin_prefetch(left, 0, 3);
         __builtin_prefetch(right, 0, 3);
     }
-    
+
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
@@ -1792,12 +1792,12 @@ str_concat_grow_const(const char *left, const char *right, size_t right_len, siz
 char *
 str_concat_const_both(const char *left, const char *right, size_t left_len, size_t right_len) {
     size_t total_len = left_len + right_len;
-    
+
     // Small string optimization
     if (__builtin_expect(total_len <= 31, 1)) {
         char *result = malloc(total_len + 1);
         if (!result) return NULL;
-        
+
         for (size_t i = 0; i < left_len; i++) {
             result[i] = left[i];
         }
@@ -1807,16 +1807,16 @@ str_concat_const_both(const char *left, const char *right, size_t left_len, size
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Larger strings: use memcpy with prefetch
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
-    
+
     if (total_len > 256) {
         __builtin_prefetch(left, 0, 3);
         __builtin_prefetch(right, 0, 3);
     }
-    
+
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';

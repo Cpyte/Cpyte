@@ -3,6 +3,7 @@ import subprocess
 import time
 import statistics
 
+
 def run_benchmark(cmd, iterations=10):
     times = []
     for _ in range(iterations):
@@ -11,6 +12,7 @@ def run_benchmark(cmd, iterations=10):
         end = time.perf_counter()
         times.append((end - start) * 1000)  # Convert to ms
     return statistics.median(times)
+
 
 print("String Concatenation Benchmark")
 print("=" * 50)

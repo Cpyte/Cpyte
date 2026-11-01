@@ -578,7 +578,7 @@ void* gc_malloc_uninit(size_t size) {
             return ptr;
         }
     }
-    
+
     // Zero-size allocation
     if (__builtin_expect(size == 0, 0)) {
         size = 1;
@@ -595,7 +595,7 @@ void* gc_malloc_uninit(size_t size) {
             return ptr;
         }
     }
-    
+
     // Fallback to general GC
     return gc_malloc(size);
 }
@@ -737,25 +737,25 @@ char *
 str_concat_const_gc(const char *left, const char *right, size_t right_len) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
-    
+
     // Ultra-small string optimization: inline assembly rep movsb
     // This is the fastest path for tiny strings
     if (__builtin_expect(total_len <= 16, 1)) {
         char *result = gc_malloc_uninit(total_len + 1);
         if (!result) return NULL;
-        
+
         fast_memcpy_small(result, left, left_len);
         fast_memcpy_small(result + left_len, right, right_len);
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Small string optimization: inline copy for small strings
     // Avoids memcpy overhead for the common case
     if (__builtin_expect(total_len <= 31, 1)) {
         char *result = gc_malloc_uninit(total_len + 1);
         if (!result) return NULL;
-        
+
         // Inline copy for small strings - compiler will unroll and vectorize
         for (size_t i = 0; i < left_len; i++) {
             result[i] = left[i];
@@ -766,17 +766,17 @@ str_concat_const_gc(const char *left, const char *right, size_t right_len) {
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Larger strings: use memcpy with prefetch hints
     char *result = gc_malloc_uninit(total_len + 1);
     if (!result) return NULL;
-    
+
     // Prefetch source data for larger strings
     if (total_len > 256) {
         __builtin_prefetch(left, 0, 3);
         __builtin_prefetch(right, 0, 3);
     }
-    
+
     // Use SIMD-optimized copy for very large strings
     if (total_len > 512) {
         fast_memcpy_large(result, left, left_len);
@@ -832,7 +832,7 @@ str_concat_grow_const_gc(const char *left, const char *right, size_t right_len) 
         size_t available = (size_t)(tl->end - tl->current);
         if (rounded >= tl->last_size && rounded - tl->last_size <= available) {
             size_t growth = rounded - tl->last_size;
-            
+
             // Use SIMD for large appends
             if (right_len > 512) {
                 fast_memcpy_large((char *)left + left_len, right, right_len);
@@ -854,7 +854,7 @@ str_concat_grow_const_gc(const char *left, const char *right, size_t right_len) 
     // FALLBACK: Allocate new string
     char *result = gc_malloc_uninit(needed);
     if (!result) return NULL;
-    
+
     // Small string optimization
     if (__builtin_expect(total_len <= 31, 1)) {
         for (size_t i = 0; i < left_len; i++) {
@@ -885,13 +885,13 @@ str_concat_grow_const_gc(const char *left, const char *right, size_t right_len) 
 char *
 str_concat_const_both_gc(const char *left, const char *right, size_t left_len, size_t right_len) {
     size_t total_len = left_len + right_len;
-    
+
     // Small string optimization: inline copy for very small strings
     // Both lengths known, so we can be very aggressive
     if (__builtin_expect(total_len <= 31, 1)) {
         char *result = gc_malloc_uninit(total_len + 1);
         if (!result) return NULL;
-        
+
         // Inline copy - compiler will optimize heavily
         for (size_t i = 0; i < left_len; i++) {
             result[i] = left[i];
@@ -902,17 +902,17 @@ str_concat_const_both_gc(const char *left, const char *right, size_t left_len, s
         result[total_len] = '\0';
         return result;
     }
-    
+
     // Medium to large strings: use optimized memcpy
     char *result = gc_malloc_uninit(total_len + 1);
     if (!result) return NULL;
-    
+
     // Prefetch for larger strings
     if (total_len > 256) {
         __builtin_prefetch(left, 0, 3);
         __builtin_prefetch(right, 0, 3);
     }
-    
+
     // Use standard memcpy - modern compilers will use SIMD automatically
     // For very large strings, memcpy is already highly optimized
     memcpy(result, left, left_len);
@@ -950,13 +950,13 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
     size_t i = 0;
     const __m256i *src256 = (const __m256i *)src;
     __m256i *dst256 = (__m256i *)dst;
-    
+
     // Align to 32-byte boundary
     while (i + 32 <= n && ((uintptr_t)(src + i) & 31)) {
         dst[i] = src[i];
         i++;
     }
-    
+
     // 32-byte unrolled copy
     while (i + 128 <= n) {
         __m256i v0 = _mm256_loadu_si256(src256 + 0);
@@ -971,7 +971,7 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
         dst256 += 4;
         i += 128;
     }
-    
+
     // Finish remaining bytes
     while (i + 32 <= n) {
         __m256i v = _mm256_loadu_si256(src256);
@@ -980,7 +980,7 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
         dst256++;
         i += 32;
     }
-    
+
     // Tail
     while (i < n) {
         dst[i] = src[i];
@@ -991,7 +991,7 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
     size_t i = 0;
     const uint8x16_t *src16 = (const uint8x16_t *)src;
     uint8x16_t *dst16 = (uint8x16_t *)dst;
-    
+
     while (i + 64 <= n) {
         uint8x16_t v0 = vld1q_u8((const uint8_t *)src16 + 0);
         uint8x16_t v1 = vld1q_u8((const uint8_t *)src16 + 1);
@@ -1005,7 +1005,7 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
         dst16 += 4;
         i += 64;
     }
-    
+
     while (i + 16 <= n) {
         uint8x16_t v = vld1q_u8((const uint8_t *)src16);
         vst1q_u8((uint8_t *)dst16, v);
@@ -1013,7 +1013,7 @@ static inline void fast_memcpy_large(char *dst, const char *src, size_t n) {
         dst16++;
         i += 16;
     }
-    
+
     while (i < n) {
         dst[i] = src[i];
         i++;

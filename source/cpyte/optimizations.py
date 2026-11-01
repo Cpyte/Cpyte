@@ -26,6 +26,7 @@ from .astparse import (
     NewExpr,
     Number,
     Return,
+    String,
     VarDecl,
     Variable,
     While,
@@ -615,6 +616,70 @@ def _const_int_value(node) -> int | None:
         except (ValueError, TypeError):
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# String builder pattern detection for loops
+# ---------------------------------------------------------------------------
+
+
+def _detect_string_builder_loop(node: While) -> tuple[str, str, int, int] | None:
+    """Detect a string builder loop pattern and return (target_var, const_str, 
+    iterations, const_len) or None.
+    
+    Detects patterns like::
+    
+        s = ""
+        while i < n:
+            s = s + "literal"
+            i = i + 1
+    
+    This can be optimized to pre-allocate the final string size and build
+    it in place, avoiding O(n^2) copying.
+    """
+    if not isinstance(node, While):
+        return None
+    
+    # Check if this is a simple counted loop
+    loop_info = _is_simple_counted_loop(node)
+    if loop_info is None:
+        return None
+    counter_name, stop, step, inclusive = loop_info
+    
+    # Find string builder pattern in the loop body
+    body = node.body
+    target_var = None
+    const_str = None
+    const_len = None
+    
+    for stmt in body:
+        if isinstance(stmt, Assign):
+            # Look for s = s + "literal" pattern
+            if isinstance(stmt.target, Variable):
+                var_name = stmt.target.name
+                if isinstance(stmt.value, BinOp) and stmt.value.op == TokenType.PLUS:
+                    left = stmt.value.left
+                    right = stmt.value.right
+                    
+                    # Check if it's self-assignment with string literal
+                    if (isinstance(left, Variable) and left.name == var_name and
+                        isinstance(right, String)):
+                        target_var = var_name
+                        const_str = right.value
+                        const_len = len(right.value.encode("utf-8"))
+                        break
+    
+    if target_var is None or const_str is None:
+        return None
+    
+    # Calculate total iterations
+    # We need the initial value of the counter, which should be set before the loop
+    # For now, we'll return the info and let the caller figure out the initial value
+    iterations = _count_loop_iterations(0, stop, step, inclusive)
+    if iterations <= 0 or iterations > 10000:  # Limit to reasonable sizes
+        return None
+    
+    return (target_var, const_str, iterations, const_len)
 
 
 def _const_fp_value(node) -> float | None:

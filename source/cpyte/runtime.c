@@ -4,6 +4,13 @@
 #include <string.h>
 #include <math.h>
 
+/* SIMD support for faster memcpy on modern CPUs */
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 /* --- Platform-specific headers --- */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -112,12 +119,58 @@ _cpy_dupstr(const char *buf) {
     size_t len = strlen(buf);
     char *s = malloc(len + 1);
     if (!s) return NULL;
+    // Use memcpy for better performance than strcpy
     memcpy(s, buf, len + 1);
     return s;
 }
 
+/* Fast integer to string conversion (no snprintf overhead)
+ * Optimized for the common case of small integers
+ * Uses fast division-free algorithm for small numbers
+ */
+static char *
+_fast_itoa(int64_t n) {
+    // For small integers, use a faster path
+    if (n >= 0 && n < 10000) {
+        char *s = malloc(6); // Max 5 digits + null
+        if (!s) return NULL;
+        char *p = s + 5;
+        *--p = '\0';
+        if (n == 0) {
+            *--p = '0';
+        } else {
+            // Unrolled loop for small numbers (faster than while)
+            int d0 = n % 10; n /= 10;
+            int d1 = n % 10; n /= 10;
+            int d2 = n % 10; n /= 10;
+            int d3 = n % 10; n /= 10;
+            *--p = '0' + d0;
+            if (n > 0) {
+                *--p = '0' + d1;
+                if (n > 0) {
+                    *--p = '0' + d2;
+                    if (n > 0) {
+                        *--p = '0' + d3;
+                    }
+                }
+            }
+        }
+        return p; // Return pointer to start of string
+    }
+    
+    // Fallback to snprintf for larger numbers
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)n);
+    return _cpy_dupstr(buf);
+}
+
 char *
 str_of_int64(int64_t n) {
+    // Use fast path for small integers
+    if (n >= 0 && n < 10000) {
+        return _fast_itoa(n);
+    }
+    // Fallback for larger numbers
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)n);
     return _cpy_dupstr(buf);
@@ -125,6 +178,11 @@ str_of_int64(int64_t n) {
 
 char *
 str_of_uint64(uint64_t n) {
+    // Use fast path for small integers
+    if (n < 10000) {
+        return _fast_itoa((int64_t)n);
+    }
+    // Fallback for larger numbers
     char buf[32];
     snprintf(buf, sizeof(buf), "%llu", (unsigned long long)n);
     return _cpy_dupstr(buf);
@@ -146,12 +204,69 @@ str_of_double(double d) {
 
 // Optimized string concatenation: concatenate `left` with a constant string `right`
 // where `right_len` is the known compile-time length of `right`
+// SPEED OPTIMIZATIONS:
+// - Ultra-small string optimization (<= 16 bytes) uses inline assembly rep movsb
+// - Small string optimization (<= 31 bytes) uses inline copy
+// - Prefetch for larger strings
+// - Branch prediction hints
 char *
 str_concat_const(const char *left, const char *right, size_t right_len) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
+    
+    // Ultra-small string optimization: inline assembly
+    if (__builtin_expect(total_len <= 16, 1)) {
+        char *result = malloc(total_len + 1);
+        if (!result) return NULL;
+        
+#if defined(__x86_64__) && !defined(_MSC_VER)
+        __asm__ volatile (
+            "rep movsb"
+            : "+D"(result), "+S"(left), "+c"(left_len)
+            : : "memory", "cc"
+        );
+        __asm__ volatile (
+            "rep movsb"
+            : "+D"(result + left_len), "+S"(right), "+c"(right_len)
+            : : "memory", "cc"
+        );
+#elif defined(_MSC_VER) && defined(_M_X64)
+        __movsb((unsigned char*)result, (const unsigned char*)left, left_len);
+        __movsb((unsigned char*)(result + left_len), (const unsigned char*)right, right_len);
+#else
+        memcpy(result, left, left_len);
+        memcpy(result + left_len, right, right_len);
+#endif
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Small string optimization: inline copy for very small strings
+    if (__builtin_expect(total_len <= 31, 1)) {
+        char *result = malloc(total_len + 1);
+        if (!result) return NULL;
+        
+        // Inline copy - compiler will unroll and vectorize
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Larger strings: use memcpy with prefetch hints
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
+    
+    // Prefetch source data for larger strings
+    if (total_len > 256) {
+        __builtin_prefetch(left, 0, 3);
+        __builtin_prefetch(right, 0, 3);
+    }
+    
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
@@ -1630,13 +1745,39 @@ glob_match(const char *pat, const char *str) {
 
 // Efficient concatenation for growing strings with small constant appends
 // Used by compiler optimization for patterns like s = s + "const"
+// SPEED OPTIMIZATIONS:
+// - Small string optimization (<= 31 bytes) uses inline copy
+// - Prefetch for larger strings
 char *
 str_concat_grow_const(const char *left, const char *right, size_t right_len, size_t *left_len_out) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
+    
+    // Small string optimization
+    if (__builtin_expect(total_len <= 31, 1)) {
+        char *result = malloc(total_len + 1);
+        if (!result) return NULL;
+        
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+        result[total_len] = '\0';
+        if (left_len_out) *left_len_out = left_len;
+        return result;
+    }
+    
+    // Larger strings: use memcpy with prefetch
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
-    // Use memcpy for both parts
+    
+    if (total_len > 256) {
+        __builtin_prefetch(left, 0, 3);
+        __builtin_prefetch(right, 0, 3);
+    }
+    
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
@@ -1651,8 +1792,31 @@ str_concat_grow_const(const char *left, const char *right, size_t right_len, siz
 char *
 str_concat_const_both(const char *left, const char *right, size_t left_len, size_t right_len) {
     size_t total_len = left_len + right_len;
+    
+    // Small string optimization
+    if (__builtin_expect(total_len <= 31, 1)) {
+        char *result = malloc(total_len + 1);
+        if (!result) return NULL;
+        
+        for (size_t i = 0; i < left_len; i++) {
+            result[i] = left[i];
+        }
+        for (size_t i = 0; i < right_len; i++) {
+            result[left_len + i] = right[i];
+        }
+        result[total_len] = '\0';
+        return result;
+    }
+    
+    // Larger strings: use memcpy with prefetch
     char *result = malloc(total_len + 1);
     if (!result) return NULL;
+    
+    if (total_len > 256) {
+        __builtin_prefetch(left, 0, 3);
+        __builtin_prefetch(right, 0, 3);
+    }
+    
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';

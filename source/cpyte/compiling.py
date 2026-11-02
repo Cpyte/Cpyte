@@ -417,7 +417,7 @@ def host_cpu_features():
     return cpu, features
 
 
-def make_target_machine(pic=False, cpu=None, features=None, codemodel=None):
+def make_target_machine(pic=False, cpu=None, features=None, codemodel=None, opt=3):
     """Build a :class:`llvmlite.binding.TargetMachine` for the host (or an
     explicit cpu/features override) with SIMD enabled.
 
@@ -457,6 +457,8 @@ def make_target_machine(pic=False, cpu=None, features=None, codemodel=None):
         kwargs["features"] = features
     if codemodel:
         kwargs["codemodel"] = codemodel
+    if opt is not None:
+        kwargs["opt"] = opt
     return target.create_target_machine(**kwargs)
 
 
@@ -876,7 +878,7 @@ def optimize(mod, opt_level=3, opt_size=False):
     binding.initialize_native_asmprinter()
     if opt_level <= 0 and not opt_size:
         return
-    target_machine = make_target_machine()
+    target_machine = make_target_machine(opt=0 if opt_level <= 0 else opt_level)
 
     if opt_size:
         # -OSize: optimize purely for code size, completely ignoring speed.
@@ -961,13 +963,25 @@ def optimize(mod, opt_level=3, opt_size=False):
         mpm.add_constant_merge_pass()
         mpm.add_global_dead_code_eliminate_pass()
         mpm.add_dead_arg_elimination_pass()
+        mpm.add_always_inliner_pass()
+        mpm.add_partial_inliner_pass()
         if extra_heavy:
             mpm.add_post_order_function_attributes_pass()
             mpm.add_aggressive_instcombine_pass()
-            mpm.add_always_inliner_pass()
-            mpm.add_partial_inliner_pass()
             mpm.add_merge_functions_pass()
         mpm.run(mod, pb)
+
+        # Cleanup SSA & dead code after inlining
+        fpm_post = pb.getFunctionPassManager()
+        fpm_post.add_sroa_pass()
+        fpm_post.add_instruction_combine_pass()
+        fpm_post.add_simplify_cfg_pass()
+        fpm_post.add_new_gvn_pass()
+        fpm_post.add_dead_store_elimination_pass()
+        fpm_post.add_aggressive_dce_pass()
+        for fn in mod.functions:
+            if not fn.is_declaration:
+                fpm_post.run(fn, pb)
     elif opt_size:
         # Size-oriented module phase: coalesce constants, eliminate dead globals
         # and arguments, merge identical function bodies, drop unused prototypes.
@@ -1930,7 +1944,7 @@ def run_aot(
     optimize(mod, opt_level)
     mod.verify()
 
-    target_machine = make_target_machine(pic=pic, codemodel="small")
+    target_machine = make_target_machine(pic=pic, codemodel="small", opt=opt_level)
 
     obj = target_machine.emit_object(mod)
 

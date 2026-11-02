@@ -1658,3 +1658,51 @@ str_concat_const_both(const char *left, const char *right, size_t left_len, size
     result[total_len] = '\0';
     return result;
 }
+
+#define CPY_STRBUF_MAGIC 0x43505953U
+
+typedef struct {
+    uint32_t magic;
+    uint32_t capacity;
+    uint32_t length;
+    uint32_t flags;
+} cpy_strbuf_t;
+
+char *
+cpy_str_grow(char *s, const char *suffix, size_t suffix_len) {
+    if (!suffix) suffix = "";
+    if (s && ((cpy_strbuf_t*)s - 1)->magic == CPY_STRBUF_MAGIC) {
+        cpy_strbuf_t *buf = ((cpy_strbuf_t*)s - 1);
+        size_t need = (size_t)buf->length + suffix_len + 1;
+        if (need <= (size_t)buf->capacity) {
+            memcpy(s + buf->length, suffix, suffix_len);
+            buf->length += (uint32_t)suffix_len;
+            s[buf->length] = ' ';
+            return s;
+        }
+        size_t new_cap = (size_t)buf->capacity * 2;
+        if (new_cap < need + 64) new_cap = need + 64;
+        cpy_strbuf_t *new_buf = (cpy_strbuf_t*)realloc(buf, sizeof(cpy_strbuf_t) + new_cap);
+        if (!new_buf) return s;
+        new_buf->capacity = (uint32_t)new_cap;
+        char *new_s = (char*)(new_buf + 1);
+        memcpy(new_s + new_buf->length, suffix, suffix_len);
+        new_buf->length += (uint32_t)suffix_len;
+        new_s[new_buf->length] = ' ';
+        return new_s;
+    }
+    size_t left_len = s ? strlen(s) : 0;
+    size_t cap = left_len + suffix_len + 64;
+    if (cap < 128) cap = 128;
+    cpy_strbuf_t *buf = (cpy_strbuf_t*)malloc(sizeof(cpy_strbuf_t) + cap);
+    if (!buf) return s;
+    buf->magic = CPY_STRBUF_MAGIC;
+    buf->capacity = (uint32_t)cap;
+    buf->length = (uint32_t)(left_len + suffix_len);
+    buf->flags = 0;
+    char *new_s = (char*)(buf + 1);
+    if (left_len > 0) memcpy(new_s, s, left_len);
+    if (suffix_len > 0) memcpy(new_s + left_len, suffix, suffix_len);
+    new_s[buf->length] = ' ';
+    return new_s;
+}

@@ -16,6 +16,7 @@ source/cpyte/extension_hooks.py
 source/cpyte/floats_runtime.c
 source/cpyte/formatter.py
 source/cpyte/gc_runtime.c
+source/cpyte/gc_runtime_addition.c
 source/cpyte/generate_bc.py
 source/cpyte/lexar.py
 source/cpyte/linker.py

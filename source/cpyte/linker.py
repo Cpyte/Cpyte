@@ -147,6 +147,7 @@ class Linker:
             cmd.append("-Oz")
         elif opt_level is not None:
             cmd.append(f"-O{opt_level}")
+        cmd.extend(["-ffunction-sections", "-fdata-sections"])
         cmd.extend(extra_flags)
         cmd.extend(["-o", output, src])
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -196,7 +197,10 @@ class Linker:
         # cannot be resolved in a PIE binary -> "can not be used when making a
         # PIE object". Disable PIE on every executable link; it is a harmless
         # no-op when the objects are already PIC (arm64/--cpu PIC builds).
-        if sys.platform not in ("darwin", "win32") and not shared:
+        if sys.platform == "darwin" and not shared:
+            cmd.append("-Wl,-dead_strip")
+        elif sys.platform not in ("darwin", "win32") and not shared:
+            cmd.append("-Wl,--gc-sections")
             cmd.append("-no-pie")
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:

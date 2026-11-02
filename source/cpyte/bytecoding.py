@@ -579,25 +579,10 @@ class LLVM:
                         neg_q = self.builder.neg(q)
                         return neg_q
                 elif is_pow2 and is_rem:
-                    # Power-of-two signed remainder: x - (q * d)
-                    k = _log2_floor(abs(d_raw))
                     if isinstance(left, ir.Constant):
                         l = self._norm_signed(left.constant, width)
                         return ir.Constant(left.type, l % d_raw)
-                    k_const = ir.Constant(left.type, k)
-                    sign_bit = self.builder.ashr(
-                        left, ir.Constant(left.type, width - 1)
-                    )
-                    bias = self.builder.and_(
-                        sign_bit, ir.Constant(left.type, (1 << k) - 1)
-                    )
-                    adj = self.builder.add(left, bias)
-                    q = self.builder.ashr(adj, k_const)
-                    if d_raw < 0:
-                        q = self.builder.neg(q)
-                    d_val = ir.Constant(left.type, abs(d_raw))
-                    prod = self.builder.mul(q, d_val)
-                    return self.builder.sub(left, prod)
+                    return self.builder.srem(left, right)
                 else:
                     # Non-power-of-two constant divisor: plain sdiv/srem. The
                     # custom magic-number lowering (`_compute_signed_magic`)
@@ -644,34 +629,26 @@ class LLVM:
 
         is_zero = self.builder.icmp_signed("==", right, ir.Constant(right.type, 0))
         trap_bb = self.builder.append_basic_block("div.trap")
-        guard_bb = self.builder.append_basic_block("div.guard")
-        self.builder.cbranch(is_zero, trap_bb, guard_bb)
+        normal_bb = self.builder.append_basic_block("div.normal")
+        self.builder.cbranch(is_zero, trap_bb, normal_bb)
         self.builder.position_at_end(trap_bb)
         self.builder.call(self._get_trap_fn(), [])
         self.builder.unreachable()
 
-        self.builder.position_at_end(guard_bb)
+        self.builder.position_at_end(normal_bb)
         is_min = self.builder.icmp_signed("==", left, ir.Constant(left.type, int_min))
         is_neg1 = self.builder.icmp_signed("==", right, ir.Constant(right.type, -1))
         overflow = self.builder.and_(is_min, is_neg1)
-        overflow_bb = self.builder.append_basic_block("div.overflow")
-        normal_bb = self.builder.append_basic_block("div.normal")
-        end_bb = self.builder.append_basic_block("div.end")
-        self.builder.cbranch(overflow, overflow_bb, normal_bb)
-
-        self.builder.position_at_end(overflow_bb)
-        self.builder.branch(end_bb)
-        self.builder.position_at_end(normal_bb)
-        if is_rem:
-            normal_val = self.builder.srem(left, right)
-        else:
-            normal_val = self.builder.sdiv(left, right)
-        self.builder.branch(end_bb)
-        self.builder.position_at_end(end_bb)
-        phi = self.builder.phi(left.type)
-        phi.add_incoming(ir.Constant(left.type, 0 if is_rem else int_min), overflow_bb)
-        phi.add_incoming(normal_val, normal_bb)
-        return phi
+        safe_left = self.builder.select(overflow, ir.Constant(left.type, 1), left)
+        safe_right = self.builder.select(overflow, ir.Constant(right.type, 1), right)
+        normal_val = (
+            self.builder.srem(safe_left, safe_right)
+            if is_rem
+            else self.builder.sdiv(safe_left, safe_right)
+        )
+        return self.builder.select(
+            overflow, ir.Constant(left.type, 0 if is_rem else int_min), normal_val
+        )
 
     def _emit_floor_div(self, left, right):
         q = self._emit_int_divmod(left, right, is_rem=False)
@@ -698,6 +675,13 @@ class LLVM:
         return fn
 
     def _clamp_shift_amount(self, val, bitwidth):
+        if isinstance(val, ir.Constant):
+            try:
+                c = int(val.constant)
+                if 0 <= c < bitwidth:
+                    return val
+            except (ValueError, TypeError):
+                pass
         zero = ir.Constant(val.type, 0)
         max_shift = ir.Constant(val.type, bitwidth - 1)
         lt_zero = self.builder.icmp_signed("<", val, zero)
@@ -5418,13 +5402,21 @@ class LLVM:
         if is_float:
             match node.op:
                 case TokenType.PLUS:
-                    return self.builder.fadd(left, right)
+                    res = self.builder.fadd(left, right)
+                    res.flags.append("contract")
+                    return res
                 case TokenType.MINUS:
-                    return self.builder.fsub(left, right)
+                    res = self.builder.fsub(left, right)
+                    res.flags.append("contract")
+                    return res
                 case TokenType.STAR:
-                    return self.builder.fmul(left, right)
+                    res = self.builder.fmul(left, right)
+                    res.flags.append("contract")
+                    return res
                 case TokenType.SLASH:
-                    return self.builder.fdiv(left, right)
+                    res = self.builder.fdiv(left, right)
+                    res.flags.append("contract")
+                    return res
                 case TokenType.SLASH_SLASH:
                     div = self.builder.fdiv(left, right)
                     return self.builder.call(self._get_floor_fn(), [div])
@@ -5633,6 +5625,14 @@ class LLVM:
         fn = self.module.declare_intrinsic("llvm.memcpy", [_i8ptr, _i8ptr, _i64])
         self._memcpy_fn = fn
         return fn
+
+    def _get_str_grow_fn(self):
+        fn_name = "cpy_str_grow" if self.no_gc else "cpy_str_grow_gc"
+        for f in self.module.functions:
+            if f.name == fn_name:
+                return f
+        fnty = ir.FunctionType(_i8ptr, [_i8ptr, _i8ptr, _i64])
+        return ir.Function(self.module, fnty, fn_name)
 
     @register_emitter(UnaryOp)
     def emit_unaryop(self, node: UnaryOp):
@@ -6010,6 +6010,31 @@ class LLVM:
 
             ptr = self.locals.get(name)
             if ptr is not None:
+                if (
+                    (self.local_types.get(name) == "str" or getattr(node.target, "inferred_type", None) == "str")
+                    and isinstance(node.value, BinOp)
+                    and node.value.op == TokenType.PLUS
+                    and isinstance(node.value.left, Variable)
+                    and node.value.left.name == name
+                ):
+                    s_val = self.builder.load(ptr)
+                    right_node = node.value.right
+                    right_const_len = self._get_const_strlen(right_node)
+                    right_val = (
+                        self._string_const(right_node.value)
+                        if isinstance(right_node, String)
+                        else self.emit(right_node)
+                    )
+                    if right_val.type != _i8ptr:
+                        right_val = self.builder.bitcast(right_val, _i8ptr)
+                    if right_const_len is not None:
+                        right_len_val = ir.Constant(_i64, right_const_len)
+                    else:
+                        right_len_val = self.builder.call(self._get_strlen_fn(), [right_val])
+                    grow_fn = self._get_str_grow_fn()
+                    new_str = self.builder.call(grow_fn, [s_val, right_val, right_len_val])
+                    self.builder.store(new_str, ptr)
+                    return None
                 if self._is_dynamic_expr(node.value):
                     value = self._unbox_dyn_to(
                         node.value, self.local_types.get(name) or "int"

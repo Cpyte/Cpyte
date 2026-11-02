@@ -58,9 +58,12 @@ typedef pthread_t cpy_thread_t;
 
 /* ── Extended header ────────────────────────────────────────────── */
 
-typedef struct {
+typedef struct cpyte_obj_s {
     ugc_header_t base;
     size_t       size;   /* payload size for conservative scanning */
+    struct cpyte_obj_s* next;
+    struct cpyte_obj_s* all;
+    struct cpyte_obj_s* all_prev;
 } cpyte_obj_t;
 
 #define HDR(cpyte_ptr) ((cpyte_obj_t*)(cpyte_ptr))
@@ -110,9 +113,9 @@ void gc_trace(const char* what, size_t v) {
  * 3. TLAB blocks are registered with GC for conservative scanning
  * ─────────────────────────────────────────────────────────────────── */
 
-#define TLAB_SIZE (64 * 1024)  /* 64 KB per TLAB */
-#define TLAB_MAX_ALLOC (2 * 1024)  /* Max size for TLAB fast path */
-#define TLAB_STRING_SIZE (256 * 1024)
+#define TLAB_SIZE (128 * 1024)  /* 128 KB per TLAB */
+#define TLAB_MAX_ALLOC (16 * 1024)  /* Max size for TLAB fast path */
+#define TLAB_STRING_SIZE (1024 * 1024)
 
 typedef struct {
     char *start;   /* Start of current TLAB */
@@ -166,11 +169,12 @@ static void* tlab_alloc(size_t size, size_t min_block_size) {
         CPY_MUTEX_LOCK(&gc_lock_);
 
         /* Allocate the TLAB block through the normal GC path */
-        cpyte_obj_t* hdr = (cpyte_obj_t*)calloc(1, sizeof(cpyte_obj_t) + block_size);
+        cpyte_obj_t* hdr = (cpyte_obj_t*)malloc(sizeof(cpyte_obj_t) + block_size);
         if (hdr == NULL) {
             CPY_MUTEX_UNLOCK(&gc_lock_);
             return NULL;
         }
+        memset(hdr, 0, sizeof(cpyte_obj_t));
         hdr->size = block_size;
         ugc_register(&gc, &hdr->base);
         obj_track(hdr);
@@ -193,19 +197,9 @@ static void* tlab_alloc(size_t size, size_t min_block_size) {
 #define OBJ_TABLE_BITS 12
 #define OBJ_TABLE_SIZE (1 << OBJ_TABLE_BITS)
 
-typedef struct obj_entry_s {
-    cpyte_obj_t*        hdr;    /* block header */
-    size_t              size;   /* payload size (for interior-pointer containment) */
-    uintptr_t            begin;  /* payload start, as an integer for safe range tests */
-    uintptr_t            end;    /* exclusive end, saturated on overflow */
-    struct obj_entry_s* next;   /* hash bucket chain */
-    struct obj_entry_s* all;    /* containment list chain */
-    struct obj_entry_s* all_prev;
-} obj_entry_t;
-
-static obj_entry_t* obj_table[OBJ_TABLE_SIZE];
-static obj_entry_t* obj_list = NULL;  /* all tracked blocks, for containment search */
-static obj_entry_t* obj_last_lookup = NULL;
+static cpyte_obj_t* obj_table[OBJ_TABLE_SIZE];
+static cpyte_obj_t* obj_list = NULL;  /* all tracked blocks, for containment search */
+static cpyte_obj_t* obj_last_lookup = NULL;
 
 static unsigned long hash_ptr(const void* p) {
     unsigned long v = (unsigned long)p;
@@ -216,42 +210,27 @@ static unsigned long hash_ptr(const void* p) {
 static void obj_track(void* hdr) {
     cpyte_obj_t* obj = (cpyte_obj_t*)hdr;
     unsigned long h = hash_ptr(hdr);
-    obj_entry_t* e = (obj_entry_t*)malloc(sizeof(obj_entry_t));
-    if (e == NULL) {
-        fprintf(stderr, "gc: out of memory tracking object\n");
-        abort();
-    }
-    e->hdr = (cpyte_obj_t*)hdr;
-    e->size = obj->size;
-    e->begin = (uintptr_t)PAYLOAD(obj);
-    e->end = e->begin;
-    if (e->size > UINTPTR_MAX - e->begin) {
-        e->end = UINTPTR_MAX;
-    } else {
-        e->end += e->size;
-    }
-    e->next = obj_table[h];
-    obj_table[h] = e;
-    e->all = obj_list;
-    e->all_prev = NULL;
-    if (obj_list != NULL) obj_list->all_prev = e;
-    obj_list = e;
+    obj->next = obj_table[h];
+    obj_table[h] = obj;
+    obj->all = obj_list;
+    obj->all_prev = NULL;
+    if (obj_list != NULL) obj_list->all_prev = obj;
+    obj_list = obj;
     obj_last_lookup = NULL;
 }
 
 static void obj_untrack(void* hdr) {
+    cpyte_obj_t* obj = (cpyte_obj_t*)hdr;
     unsigned long h = hash_ptr(hdr);
-    obj_entry_t** pp = &obj_table[h];
+    cpyte_obj_t** pp = &obj_table[h];
     while (*pp) {
-        if ((*pp)->hdr == hdr) {
-            obj_entry_t* tmp = *pp;
-            *pp = tmp->next;
+        if (*pp == obj) {
+            *pp = obj->next;
             /* also remove from the containment list */
-            if (tmp->all_prev != NULL) tmp->all_prev->all = tmp->all;
-            else obj_list = tmp->all;
-            if (tmp->all != NULL) tmp->all->all_prev = tmp->all_prev;
-            if (obj_last_lookup == tmp) obj_last_lookup = NULL;
-            free(tmp);
+            if (obj->all_prev != NULL) obj->all_prev->all = obj->all;
+            else obj_list = obj->all;
+            if (obj->all != NULL) obj->all->all_prev = obj->all_prev;
+            if (obj_last_lookup == obj) obj_last_lookup = NULL;
             return;
         }
         pp = &(*pp)->next;
@@ -260,9 +239,9 @@ static void obj_untrack(void* hdr) {
 
 static int obj_is_tracked(const void* hdr) {
     unsigned long h = hash_ptr(hdr);
-    obj_entry_t* e = obj_table[h];
+    cpyte_obj_t* e = obj_table[h];
     while (e) {
-        if (e->hdr == hdr) return 1;
+        if (e == hdr) return 1;
         e = e->next;
     }
     return 0;
@@ -273,16 +252,22 @@ static int obj_is_tracked(const void* hdr) {
  * an allocation, so an exact header match is not enough. */
 static cpyte_obj_t* obj_find_containing(const void* user) {
     uintptr_t u = (uintptr_t)user;
-    obj_entry_t* e;
+    cpyte_obj_t* e;
     if (user == NULL) return NULL;
     e = obj_last_lookup;
-    if (e != NULL && u >= e->begin && u < e->end) {
-        return e->hdr;
+    if (e != NULL) {
+        uintptr_t begin = (uintptr_t)PAYLOAD(e);
+        uintptr_t end = begin + e->size;
+        if (u >= begin && u < end) return e;
     }
     for (e = obj_list; e; e = e->all) {
-        if (e->size > 0 && u >= e->begin && u < e->end) {
-            obj_last_lookup = e;
-            return e->hdr;
+        if (e->size > 0) {
+            uintptr_t begin = (uintptr_t)PAYLOAD(e);
+            uintptr_t end = begin + e->size;
+            if (u >= begin && u < end) {
+                obj_last_lookup = e;
+                return e;
+            }
         }
     }
     return NULL;
@@ -670,17 +655,12 @@ void gc_shutdown(void) {
     ugc_release_all(&gc);
     CPY_MUTEX_UNLOCK(&gc_lock_);
 
-    /* free remaining hash table entries */
+    /* clear hash table entries */
     for (int i = 0; i < OBJ_TABLE_SIZE; i++) {
-        obj_entry_t* e = obj_table[i];
-        while (e) {
-            obj_entry_t* next = e->next;
-            free(e);
-            e = next;
-        }
         obj_table[i] = NULL;
     }
-
+    obj_list = NULL;
+    obj_last_lookup = NULL;
     /* Reset TLAB for current thread */
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
@@ -711,4 +691,55 @@ str_concat_const_both_gc(const char *left, const char *right, size_t left_len, s
     memcpy(result + left_len, right, right_len);
     result[total_len] = '\0';
     return result;
+}
+
+#define CPY_STRBUF_MAGIC 0x43505953U
+
+typedef struct {
+    uint32_t magic;
+    uint32_t capacity;
+    uint32_t length;
+    uint32_t flags;
+} cpy_strbuf_t;
+
+char *
+cpy_str_grow_gc(char *s, const char *suffix, size_t suffix_len) {
+    if (!suffix) suffix = "";
+    if (s && ((cpy_strbuf_t*)s - 1)->magic == CPY_STRBUF_MAGIC) {
+        cpy_strbuf_t *buf = ((cpy_strbuf_t*)s - 1);
+        size_t need = (size_t)buf->length + suffix_len + 1;
+        if (need <= (size_t)buf->capacity) {
+            memcpy(s + buf->length, suffix, suffix_len);
+            buf->length += (uint32_t)suffix_len;
+            s[buf->length] = ' ';
+            return s;
+        }
+        size_t new_cap = (size_t)buf->capacity * 2;
+        if (new_cap < need + 64) new_cap = need + 64;
+        cpy_strbuf_t *new_buf = (cpy_strbuf_t*)gc_malloc_uninit(sizeof(cpy_strbuf_t) + new_cap);
+        if (!new_buf) return s;
+        new_buf->magic = CPY_STRBUF_MAGIC;
+        new_buf->capacity = (uint32_t)new_cap;
+        new_buf->length = buf->length + (uint32_t)suffix_len;
+        new_buf->flags = 0;
+        char *new_s = (char*)(new_buf + 1);
+        memcpy(new_s, s, buf->length);
+        memcpy(new_s + buf->length, suffix, suffix_len);
+        new_s[new_buf->length] = ' ';
+        return new_s;
+    }
+    size_t left_len = s ? strlen(s) : 0;
+    size_t cap = left_len + suffix_len + 64;
+    if (cap < 128) cap = 128;
+    cpy_strbuf_t *buf = (cpy_strbuf_t*)gc_malloc_uninit(sizeof(cpy_strbuf_t) + cap);
+    if (!buf) return s;
+    buf->magic = CPY_STRBUF_MAGIC;
+    buf->capacity = (uint32_t)cap;
+    buf->length = (uint32_t)(left_len + suffix_len);
+    buf->flags = 0;
+    char *new_s = (char*)(buf + 1);
+    if (left_len > 0) memcpy(new_s, s, left_len);
+    if (suffix_len > 0) memcpy(new_s + left_len, suffix, suffix_len);
+    new_s[buf->length] = ' ';
+    return new_s;
 }

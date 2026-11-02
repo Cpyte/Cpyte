@@ -948,7 +948,7 @@ def cmd_build(
     optimize(mod, opt, opt_size=opt_size)
     mod.verify()
 
-    target_machine = make_target_machine(pic=pic, codemodel="small")
+    target_machine = make_target_machine(pic=pic, codemodel="small", opt=opt or 3)
     obj = target_machine.emit_object(mod)
     with open(obj_file, "wb") as f:
         f.write(obj)

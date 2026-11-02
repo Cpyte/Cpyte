@@ -1,3 +1,5 @@
+#nogc
+
 public is_prime(n: int) -> int:
     if n < 2:
         return 0

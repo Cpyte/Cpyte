@@ -1,3 +1,5 @@
+#nogc
+
 public main() -> int:
     int n = 200
     double[] a = new double[n * n]

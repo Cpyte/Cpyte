@@ -1,3 +1,5 @@
+#nogc
+
 public main() -> int:
     double value = 0.25
     int i = 0

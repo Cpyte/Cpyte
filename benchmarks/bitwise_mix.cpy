@@ -1,3 +1,5 @@
+#nogc
+
 public main() -> int:
     int total = 0
     int i = 0

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import resource
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -45,7 +46,7 @@ def run_process(command, cwd, timeout):
     return result.stdout.strip(), None
 
 
-def compile_benchmark(name, build_dir):
+def compile_benchmark(name, build_dir, use_nogc):
     paths = {}
     c_path = os.path.join(build_dir, name + "_c")
     c_out, error = run_process(
@@ -60,8 +61,11 @@ def compile_benchmark(name, build_dir):
 
     cpy_source = os.path.join(build_dir, name + ".cpy")
     shutil.copy2(os.path.join(HERE, name + ".cpy"), cpy_source)
-    _, error = run_process([sys.executable, COMPILER, "--aot", cpy_source],
-                           build_dir, 180)
+    cpy_args = [sys.executable, COMPILER, "--aot"]
+    if use_nogc:
+        cpy_args.append("--nogc")
+    cpy_args.append(cpy_source)
+    _, error = run_process(cpy_args, build_dir, 180)
     if error:
         return None, f"Cpy compile failed: {error}"
     cpy_path = os.path.join(build_dir, name)
@@ -71,21 +75,27 @@ def compile_benchmark(name, build_dir):
     return paths, None
 
 
-def execute_once(command, cwd, timeout):
-    start = time.perf_counter_ns()
-    output, error = run_process(command, cwd, timeout)
-    elapsed = time.perf_counter_ns() - start
-    return elapsed, output, error
+def execute_once(command, cwd, timeout, use_cpu_time=False):
+    if use_cpu_time:
+        start_cpu = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime
+        output, error = run_process(command, cwd, timeout)
+        end_cpu = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_stime
+        elapsed_ns = int((end_cpu - start_cpu) * 1_000_000_000)
+    else:
+        start = time.perf_counter_ns()
+        output, error = run_process(command, cwd, timeout)
+        elapsed_ns = time.perf_counter_ns() - start
+    return elapsed_ns, output, error
 
 
-def benchmark_group(commands, cwd, warmups, trials, timeout):
+def benchmark_group(commands, cwd, warmups, trials, timeout, use_cpu_time=False):
     results = {
         language: {"samples_ns": [], "output": None}
         for language in ("C", "Cpy", "Python")
     }
     for language in results:
         for _ in range(warmups):
-            _, output, error = execute_once(commands[language], cwd, timeout)
+            _, output, error = execute_once(commands[language], cwd, timeout, use_cpu_time)
             if error:
                 results[language] = {"error": error}
                 break
@@ -104,7 +114,7 @@ def benchmark_group(commands, cwd, warmups, trials, timeout):
         order = active[trial % len(active):] + active[:trial % len(active)]
         for language in order:
             elapsed, output, error = execute_once(
-                commands[language], cwd, timeout
+                commands[language], cwd, timeout, use_cpu_time
             )
             result = results[language]
             if error:
@@ -135,18 +145,24 @@ def format_time(ns):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trials", type=int, default=7,
-                        help="measured runs per language (default: 7)")
-    parser.add_argument("--warmups", type=int, default=1,
-                        help="unmeasured runs per language (default: 1)")
+    parser.add_argument("--trials", type=int, default=15,
+                        help="measured runs per language (default: 15)")
+    parser.add_argument("--warmups", type=int, default=3,
+                        help="unmeasured runs per language (default: 3)")
     parser.add_argument("--filter", help="run names containing this substring")
     parser.add_argument("--timeout", type=float, default=60,
                         help="per-run timeout in seconds (default: 60)")
     parser.add_argument("--json", dest="json_path",
                         help="write raw results to this JSON file")
+    parser.add_argument("--nogc", action="store_true",
+                        help="compile Cpyte with --nogc flag for manual memory mode")
+    parser.add_argument("--cpu-time", action="store_true",
+                        help="measure CPU time instead of wall time (more accurate, Unix only)")
     args = parser.parse_args()
     if args.trials < 1 or args.warmups < 0 or args.timeout <= 0:
         parser.error("--trials must be positive; warmups nonnegative; timeout positive")
+    if args.cpu_time and sys.platform == "win32":
+        parser.error("--cpu-time is not supported on Windows")
 
     names = discover_benchmarks()
     if args.filter:
@@ -158,14 +174,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cpy_bench_") as build_dir:
         for name in names:
             print(f"\n[{name}] compiling...", flush=True)
-            commands, error = compile_benchmark(name, build_dir)
+            commands, error = compile_benchmark(name, build_dir, args.nogc)
             if error:
                 results[name] = {"error": error}
                 print(f"  ERROR: {error}")
                 continue
 
             timings = benchmark_group(
-                commands, HERE, args.warmups, args.trials, args.timeout
+                commands, HERE, args.warmups, args.trials, args.timeout, args.cpu_time
             )
             for language, result in timings.items():
                 if "error" in result:
@@ -187,7 +203,8 @@ def main():
                 continue
             results[name] = timings
 
-    print("\nMedian wall time per process run (includes process startup)")
+    time_type = "CPU time" if args.cpu_time else "wall time"
+    print(f"\nMedian {time_type} per process run (includes process startup)")
     print(f"{'Benchmark':<22} {'C':>12} {'Cpy':>12} {'Python':>12}"
           f" {'Cpy/C':>10} {'Py/C':>10}")
     print("-" * 82)

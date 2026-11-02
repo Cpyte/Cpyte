@@ -1,3 +1,5 @@
+#nogc
+
 class Operation:
     def apply(value: int) -> int:
         return value + 1

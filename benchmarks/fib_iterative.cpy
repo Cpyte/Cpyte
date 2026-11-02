@@ -1,3 +1,5 @@
+#nogc
+
 public fib(n: int) -> int:
     int a = 0
     int b = 1

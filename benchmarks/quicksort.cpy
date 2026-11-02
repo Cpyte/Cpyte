@@ -1,3 +1,5 @@
+#nogc
+
 def quicksort(arr: int[], left: int, right: int):
     int i = left
     int j = right

@@ -181,7 +181,7 @@ jobs:
           sudo apt-get install -y libgmp-dev libmpfr-dev clang
 
       - name: Run benchmarks
-        run: python benchmarks/run_benchmarks.py --json "${{ runner.temp }}/benchmark-results.json"
+        run: python benchmarks/run_benchmarks.py --nogc --cpu-time --json "${{ runner.temp }}/benchmark-results.json"
 
       - name: Update README benchmark table
         run: >-

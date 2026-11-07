@@ -80,6 +80,11 @@ def _escape_string(value: str) -> str:
     return '"' + "".join(_STRING_ESCAPES.get(ch, ch) for ch in value) + '"'
 
 
+def _char_text(code: int) -> str:
+    ch = chr(code & 0xFF)
+    return "'" + _STRING_ESCAPES.get(ch, ch) + "'"
+
+
 def _scan_comments(source: str):
     comments = []
     for i, line in enumerate(source.split("\n"), start=1):
@@ -253,6 +258,8 @@ class _Formatter:
         if isinstance(node, astparse.Number):
             if getattr(node, "is_bool", False):
                 return "true" if node.value == "1" else "false"
+            if getattr(node, "is_char", False):
+                return _char_text(int(node.value))
             return node.value
         if isinstance(node, astparse.String):
             return _escape_string(node.value)

@@ -79,13 +79,16 @@ class Node:
 
 class Number(Node):
     inferred_type: str | None
-    __slots__ = ("_token", "inferred_type", "is_bool", "value")
+    __slots__ = ("_token", "inferred_type", "is_bool", "is_char", "value")
 
-    def __init__(self, value: str, token=None, is_bool: bool = False):
+    def __init__(
+        self, value: str, token=None, is_bool: bool = False, is_char: bool = False
+    ):
         self.value = value
         self._token = token
         self.inferred_type = None
         self.is_bool = is_bool
+        self.is_char = is_char
 
     def __repr__(self):
         return f"Number({self.value})"
@@ -465,6 +468,23 @@ def _parse_ternary(tokens: list[Token], pos: int):
     check happens after control returns from the iterative parser.
     """
     body, pos = _parse_binary(tokens, pos, 0)
+    if pos < len(tokens) and tokens[pos].type == TokenType.QUESTION:
+        # C-style `cond ? then : orelse`. The middle branch may itself be a
+        # conditional (excluded from the else branch's right-associativity),
+        # so it is parsed with the full ternary grammar.
+        tok = tokens[pos]
+        pos += 1
+        pos = _skip_expr_newlines(tokens, pos)
+        then, pos = _parse_ternary(tokens, pos)
+        pos = _skip_expr_newlines(tokens, pos)
+        if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
+            raise TernaryParseError(
+                'Expected ":" in conditional expression', tok
+            )
+        pos += 1
+        pos = _skip_expr_newlines(tokens, pos)
+        orelse, pos = _parse_ternary(tokens, pos)
+        return IfExp(then, body, orelse, token=tok), pos
     if not _is_ternary_if(tokens, pos):
         return body, pos
     tok = tokens[pos]
@@ -644,6 +664,10 @@ def _parse_atom(tokens: list[Token], pos: int):
     if tok.type == TokenType.STRING:
         assert tok.value is not None
         return String(tok.value, token=tok), pos + 1
+
+    if tok.type == TokenType.CHAR:
+        assert tok.value is not None
+        return Number(tok.value, token=tok, is_char=True), pos + 1
 
     if tok.type == TokenType.FSTRING:
         assert tok.value is not None

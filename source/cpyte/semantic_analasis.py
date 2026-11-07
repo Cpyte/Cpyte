@@ -607,6 +607,36 @@ def _coerce_assign_ok(src_t, dst_t):
         ("uint8", "uint64"),
         ("uint16", "uint64"),
         ("uint32", "uint64"),
+        ("uint8", "uint8"),
+        ("uint16", "uint16"),
+        ("uint32", "uint32"),
+        ("uint8", "size_t"),
+        ("uint16", "size_t"),
+        ("uint32", "size_t"),
+        ("int64", "uint8"),
+        ("int64", "uint16"),
+        ("int64", "uint32"),
+        ("uint64", "uint8"),
+        ("uint64", "uint16"),
+        ("uint64", "uint32"),
+        ("size_t", "uint8"),
+        ("size_t", "uint16"),
+        ("size_t", "uint32"),
+        # char is a byte-sized integer (C semantics)
+        ("char", "int"),
+        ("char", "int64"),
+        ("char", "uint64"),
+        ("char", "size_t"),
+        ("char", "uint8"),
+        ("char", "float"),
+        ("char", "double"),
+        ("int", "char"),
+        ("int64", "char"),
+        ("uint64", "char"),
+        ("size_t", "char"),
+        ("uint8", "char"),
+        ("float", "char"),
+        ("double", "char"),
     )
 
 
@@ -1272,6 +1302,9 @@ class SemanticAnalyzer:
             if getattr(node, "is_bool", False):
                 node.inferred_type = "bool"
                 return "bool"
+            if getattr(node, "is_char", False):
+                node.inferred_type = "char"
+                return "char"
             # Check for hexadecimal literals (0x prefix) BEFORE float 'e' check,
             # since hex values legitimately contain the letter 'e' as a digit (0-9a-f)
             if node.value.startswith("0x") or node.value.startswith("0X"):
@@ -1602,9 +1635,13 @@ class SemanticAnalyzer:
                 return "int"
 
             if node.op.name in ("PLUS", "MINUS", "STAR", "SLASH", "SLASH_SLASH", "POW"):
-                if left_t == "str" and right_t == "str" and node.op.name == "PLUS":
-                    node.inferred_type = "str"
-                    return "str"
+                if left_t == "str" or right_t == "str":
+                    other = right_t if left_t == "str" else left_t
+                    if node.op.name == "PLUS" and (
+                        other == "str" or other == "char" or other.endswith("*")
+                    ):
+                        node.inferred_type = "str"
+                        return "str"
                 if left_t == "str" or right_t == "str":
                     self.error(
                         f"operator `{node.op.name}` not supported for string operands",
@@ -2640,6 +2677,25 @@ class SemanticAnalyzer:
         if result is None:
             self.error(f"unknown library `{module}`", node)
 
+    def _register_imported_types(self, nodes):
+        """Register struct/class type symbols reachable through an imported
+        module's own imports.
+
+        Functions are re-exported by name, but their parameter/return types
+        need the defining module's `StructDef`/`ClassDef` node in scope, or the
+        consumer gets `cannot access field ... on non-struct type` (the type
+        name resolves to nothing). Walks nested `Import.sub_ast` chains so
+        transitive types work as far as the import graph goes."""
+        for ast_node in nodes:
+            if isinstance(ast_node, (StructDef, ClassDef)):
+                if not self.globals.lookup_local(ast_node.name):
+                    kind = "class" if isinstance(ast_node, ClassDef) else "struct"
+                    self.globals.define(ast_node.name, Symbol(kind, None, ast_node))
+            elif isinstance(ast_node, Import):
+                self._register_imported_types(
+                    getattr(ast_node, "sub_ast", None) or []
+                )
+
     def _register_import_symbols(self, symbols, node, var_names=None):
         s = self.globals
         var_names = var_names or set()
@@ -3035,10 +3091,23 @@ class SemanticAnalyzer:
                 existing = self.globals.lookup_local(ast_node.name)
                 if not existing:
                     self.globals.define(ast_node.name, Symbol("struct", None, ast_node))
+            elif isinstance(ast_node, ClassDef):
+                sub_ast.append(ast_node)
+                if not self.globals.lookup_local(ast_node.name):
+                    self.globals.define(
+                        ast_node.name, Symbol("class", None, ast_node)
+                    )
             elif isinstance(ast_node, Import):
                 for fname, (ret_type, params, vararg) in ast_node.symbols:
                     if fname not in symbols:
                         symbols[fname] = (ret_type, params, vararg)
+
+                # Struct/class names travel with their functions: a module that
+                # returns (or takes) a type defined by ITS OWN imports must stay
+                # usable by consumers that only import the middle module.
+                self._register_imported_types(
+                    getattr(ast_node, "sub_ast", None) or []
+                )
 
                 # Preserve the sub-AST chain for re-exported imports so codegen
                 # can still reach the aggregated module's function definitions
@@ -3864,6 +3933,34 @@ class SemanticAnalyzer:
                         ("uint32", "int64"),
                         ("uint16", "uint64"),
                         ("uint32", "uint64"),
+                        ("uint8", "int64"),
+                        ("uint8", "uint64"),
+                        ("uint8", "size_t"),
+                        ("uint16", "size_t"),
+                        ("uint32", "size_t"),
+                        ("int64", "uint8"),
+                        ("int64", "uint16"),
+                        ("int64", "uint32"),
+                        ("uint64", "uint8"),
+                        ("uint64", "uint16"),
+                        ("uint64", "uint32"),
+                        ("size_t", "uint8"),
+                        ("size_t", "uint16"),
+                        ("size_t", "uint32"),
+                        ("char", "int"),
+                        ("char", "int64"),
+                        ("char", "uint64"),
+                        ("char", "size_t"),
+                        ("char", "uint8"),
+                        ("char", "float"),
+                        ("char", "double"),
+                        ("int", "char"),
+                        ("int64", "char"),
+                        ("uint64", "char"),
+                        ("size_t", "char"),
+                        ("uint8", "char"),
+                        ("float", "char"),
+                        ("double", "char"),
                     ]
                     ok = (val_type, expected) in valid_conversions
                     ok = ok or (val_type == "int" and expected.endswith("*"))
@@ -3940,6 +4037,16 @@ class SemanticAnalyzer:
         ("big", "ubig"),
         ("ubig", "ubig"),
         ("ubig", "big"),
+        ("char", "int"),
+        ("char", "int64"),
+        ("char", "uint64"),
+        ("char", "size_t"),
+        ("char", "uint8"),
+        ("int", "char"),
+        ("int64", "char"),
+        ("uint64", "char"),
+        ("size_t", "char"),
+        ("uint8", "char"),
     ]
 
     def _append_value_compatible(self, val_type, elem_type):
@@ -4765,6 +4872,19 @@ class SemanticAnalyzer:
                     ("str", "char"),
                     ("char", "str"),
                     ("char", "int"),
+                    ("int", "char"),
+                    ("char", "int64"),
+                    ("int64", "char"),
+                    ("char", "uint64"),
+                    ("uint64", "char"),
+                    ("char", "size_t"),
+                    ("size_t", "char"),
+                    ("char", "uint8"),
+                    ("uint8", "char"),
+                    ("char", "float"),
+                    ("float", "char"),
+                    ("char", "double"),
+                    ("double", "char"),
                     ("int", "big"),
                     ("int64", "big"),
                     ("uint64", "big"),
@@ -4806,6 +4926,30 @@ class SemanticAnalyzer:
                     ("uintptr_t", "int64"),
                     ("uintptr_t", "uint64"),
                     ("uintptr_t", "size_t"),
+                    # Narrow unsigned words (also valid declaration targets, not
+                    # only ABI struct fields). Listed in both directions because
+                    # this table is keyed (value type, declared type).
+                    *[
+                        (a, b)
+                        for a in (
+                            "int",
+                            "int64",
+                            "uint64",
+                            "size_t",
+                            "uint8",
+                            "uint16",
+                            "uint32",
+                        )
+                        for b in ("uint8", "uint16", "uint32")
+                    ],
+                    *[
+                        (a, b)
+                        for a in ("uint8", "uint16", "uint32")
+                        for b in ("int", "int64", "uint64", "size_t")
+                    ],
+                    ("uint8", "uint8"),
+                    ("uint16", "uint16"),
+                    ("uint32", "uint32"),
                 ]
                 ok = (init_type, val_type) in valid_conversions
                 ok = ok or (init_type == "int" and val_type.endswith("*"))

@@ -167,6 +167,7 @@ class Linker:
         opt_size=False,
         frameworks=None,
         pic=False,
+        check=True,
     ):
         cmd = [self._cc]
         if shared:
@@ -203,6 +204,8 @@ class Linker:
             cmd.append("-Wl,--gc-sections")
             cmd.append("-no-pie")
         r = subprocess.run(cmd, capture_output=True, text=True)
+        if not check:
+            return r.returncode == 0, r.stderr
         if r.returncode != 0:
             _cc_error("link error: ", r.stderr)
         return output

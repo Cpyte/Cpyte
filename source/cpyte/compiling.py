@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.util
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -1179,6 +1180,38 @@ def aot_link_libraries() -> list:
     return libs
 
 
+_GMP_LINK_NEEDLE = re.compile(r"(?:gmp[a-z]*_|mpfr_|libgmp|libmpfr|-lgmp|-lmpfr)")
+
+
+def aot_link_executable(linker, objects, output, **kwargs):
+    """Link an AOT executable, pulling in GMP/MPFR only when it is needed.
+
+    The bignum runtime's kept helpers (``_BIGNUM_KEEP``) always reference
+    ``mpz_*``, but ``-dead_strip``/``--gc-sections`` drop them when the program
+    never touches ``big``/``ubig``. Linking libgmp + libmpfr unconditionally
+    still records them in the executable's load commands, so every launch pays
+    the dynamic loader for two extra shared libraries -- a fixed cost that is
+    large relative to short benchmarks. So try the link with libc/libm only and
+    retry with the full runtime library set only when the linker reports an
+    unresolved GMP/MPFR symbol.
+
+    A static scan of the object cannot decide this: every program object
+    declares the kept bignum helpers (and they reference ``mpz_*``), so the
+    symbol table looks identical whether or not the program uses ``big``.
+    """
+    libs = ["m"]
+    ok, stderr = linker.link(objects, output, libraries=libs, check=False, **kwargs)
+    if ok:
+        return output
+    if not _GMP_LINK_NEEDLE.search(stderr or ""):
+        print_err(f"link error: {format_cc_diag(stderr)}")
+        raise SystemExit(1)
+    libs = aot_link_libraries()
+    kwargs["library_paths"] = _gmp_library_paths()
+    linker.link(objects, output, libraries=libs, **kwargs)
+    return output
+
+
 def _cached_c_ir(
     llvm_cc,
     src_path,
@@ -1984,14 +2017,13 @@ def run_aot(
     objs.extend(compiled_objs)
 
     out_name = output.rsplit(".", 1)[0] if "." in output else output
-    linker.link(
+    aot_link_executable(
+        linker,
         objs,
         out_name,
         opt_level=3,
         pic=pic,
         frameworks=frameworks,
-        libraries=aot_link_libraries(),
-        library_paths=_gmp_library_paths(),
     )
 
 

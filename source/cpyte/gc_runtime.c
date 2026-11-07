@@ -27,6 +27,350 @@ extern void gc_trace(const char* what, size_t v);
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdalign.h>
+
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#  include <unistd.h>
+#endif
+
+/* === HYBRID LINEAR GC-MALLOC ALLOCATOR SYSTEM === */
+
+/* General purpose malloc allocator - fast wrapper */
+static inline void* cpyte_general_malloc(size_t size) {
+    if (size == 0) size = 1;
+    void *ptr = malloc(size);
+    return ptr;
+}
+
+static inline void* cpyte_general_calloc(size_t nmemb, size_t size) {
+    if (nmemb == 0 || size == 0) return malloc(1);
+    return calloc(nmemb, size);
+}
+
+static inline void* cpyte_general_realloc(void *ptr, size_t size) {
+    if (size == 0) {
+        free(ptr);
+        return malloc(1);
+    }
+    return realloc(ptr, size);
+}
+
+static inline void cpyte_general_free(void *ptr) {
+    if (ptr) free(ptr);
+}
+
+/* Stack/Linear allocator for scope-limited allocations */
+typedef struct {
+    unsigned char *memory;
+    size_t capacity;
+    size_t offset;
+    _Atomic int lock;
+} LinearScopeAllocator;
+
+typedef struct {
+    size_t previous_offset;
+    size_t allocation_offset;
+    uint32_t magic;
+} LinearHeader;
+
+#define LINEAR_MAGIC 0x4C494E52 /* 'LINR' */
+
+static inline size_t linear_align_up(size_t x, size_t align) {
+    return (x + align - 1) & ~(align - 1);
+}
+
+/* pthread_t is an arithmetic/pointer type on every supported platform, so a
+ * direct compare avoids a call on the allocation hot path. */
+#ifndef _WIN32
+#  if defined(__APPLE__) || defined(__linux__)
+#    define CPY_SAME_THREAD(a, b) ((a) == (b))
+#  else
+#    define CPY_SAME_THREAD(a, b) pthread_equal((a), (b))
+#  endif
+#endif
+
+#ifdef _MSC_VER
+#  define CPY_INLINE static __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#  define CPY_INLINE static __inline__ __attribute__((always_inline))
+#else
+#  define CPY_INLINE static inline
+#endif
+
+#ifndef _WIN32
+/* pthread_self() is a library call (~2.5ns) and the allocation hot path used
+ * to pay it on every bump.  A thread's stack is a private mapping, so a stack
+ * address inside the mutator's recorded range can only belong to that thread:
+ * testing the current frame against the range is a few integer ops, no call.
+ * Other threads (and fibers on borrowed stacks) fall through to the tid
+ * compare / pthread key, which stays correct. */
+static uintptr_t gc_mutator_stack_lo   = 0;
+static uintptr_t gc_mutator_stack_size = 0;
+
+static void gc_record_mutator_stack(void) {
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(self);
+    size_t    sz = pthread_get_stacksize_np(self);
+    gc_mutator_stack_lo   = hi - sz;
+    gc_mutator_stack_size = sz;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void*  lo = NULL;
+        size_t sz = 0;
+        if (pthread_attr_getstack(&attr, &lo, &sz) == 0) {
+            gc_mutator_stack_lo   = (uintptr_t)lo;
+            gc_mutator_stack_size = sz;
+        }
+        pthread_attr_destroy(&attr);
+    }
+#endif
+}
+
+CPY_INLINE int cpy_on_mutator_stack(const void* probe) {
+    return gc_mutator_stack_lo != 0 &&
+           (uintptr_t)probe - gc_mutator_stack_lo < gc_mutator_stack_size;
+}
+#endif
+
+#ifdef _WIN32
+__declspec(thread) static LinearScopeAllocator g_linear_scope = {NULL, 0, 0, 0};
+#  define LINEAR_SCOPE_GET() (&g_linear_scope)
+#else
+static pthread_key_t linear_scope_key;
+static pthread_once_t linear_scope_key_once = PTHREAD_ONCE_INIT;
+static void linear_scope_key_create(void) { pthread_key_create(&linear_scope_key, NULL); }
+
+/* Scope entry/exit run on every function call, so the mutator thread's state
+ * is cached (see tlab_get) instead of paying a pthread key lookup each time. */
+static LinearScopeAllocator* linear_scope_main = NULL;
+static pthread_t            linear_scope_main_tid;
+static int                  linear_scope_main_valid = 0;
+
+static LinearScopeAllocator* linear_scope_get(void) {
+    char probe = 0;
+    if (linear_scope_main_valid &&
+            (cpy_on_mutator_stack(&probe) ||
+             CPY_SAME_THREAD(pthread_self(), linear_scope_main_tid))) {
+        return linear_scope_main;
+    }
+    pthread_once(&linear_scope_key_once, linear_scope_key_create);
+    LinearScopeAllocator* ls = (LinearScopeAllocator*)pthread_getspecific(linear_scope_key);
+    if (ls == NULL) {
+        ls = (LinearScopeAllocator*)calloc(1, sizeof(LinearScopeAllocator));
+        if (ls != NULL) pthread_setspecific(linear_scope_key, ls);
+    }
+    return ls;
+}
+#  define LINEAR_SCOPE_GET() linear_scope_get()
+#endif
+
+static int linear_scope_init_if_needed(LinearScopeAllocator *ls, size_t capacity) {
+    if (ls->memory) return 1;
+    if (capacity == 0) capacity = 256 * 1024; /* 256KB default */
+    ls->memory = (unsigned char*)malloc(capacity);
+    if (!ls->memory) return 0;
+    ls->capacity = capacity;
+    ls->offset = 0;
+    atomic_store(&ls->lock, 0);
+    return 1;
+}
+
+void* cpyte_linear_alloc(size_t size) {
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (!linear_scope_init_if_needed(ls, 256 * 1024)) {
+        return cpyte_general_malloc(size);
+    }
+    const size_t alignment = alignof(max_align_t);
+    size_t header_pos = ls->offset;
+    uintptr_t base = (uintptr_t)ls->memory;
+    uintptr_t raw = base + header_pos + sizeof(LinearHeader);
+    size_t padding = (size_t)(-(uintptr_t)raw) & (alignment - 1);
+    size_t data_pos = header_pos + sizeof(LinearHeader) + padding;
+    if (data_pos > ls->capacity || size > ls->capacity - data_pos) {
+        /* Grow if needed - use general malloc as fallback for overflow */
+        return cpyte_general_malloc(size);
+    }
+    LinearHeader *header = (LinearHeader *)(ls->memory + data_pos - sizeof(LinearHeader));
+    header->previous_offset = ls->offset;
+    header->allocation_offset = data_pos;
+    header->magic = LINEAR_MAGIC;
+    ls->offset = data_pos + size;
+    return ls->memory + data_pos;
+}
+
+void cpyte_linear_free_last(void *ptr) {
+    if (!ptr) return;
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (!ls->memory) return;
+    uintptr_t base = (uintptr_t)ls->memory;
+    uintptr_t address = (uintptr_t)ptr;
+    if (address < base + sizeof(LinearHeader) || address >= base + ls->offset) return;
+    LinearHeader *header = (LinearHeader *)(address - sizeof(LinearHeader));
+    if (header->magic != LINEAR_MAGIC || header->allocation_offset != address - base) return;
+    ls->offset = header->previous_offset;
+}
+
+void cpyte_scope_push(void) {
+    /* Push a scope marker - save current offset */
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (!linear_scope_init_if_needed(ls, 256 * 1024)) return;
+    /* Store marker by allocating a small marker */
+    /* We'll use a simple approach - just ensure allocator is ready */
+}
+
+void cpyte_scope_pop(void) {
+    /* Pop scope - reset to previous marker */
+    /* For simplicity and safety, we can track with a stack of markers */
+    /* This is a simplified version */
+}
+
+#ifndef _WIN32
+static pthread_key_t scope_marker_key;
+static pthread_once_t scope_marker_key_once = PTHREAD_ONCE_INIT;
+typedef struct { size_t markers[64]; int depth; } ScopeMarkerState;
+static void scope_marker_key_create(void) { pthread_key_create(&scope_marker_key, NULL); }
+
+static ScopeMarkerState* scope_main = NULL;
+static pthread_t         scope_main_tid;
+static int               scope_main_valid = 0;
+
+CPY_INLINE ScopeMarkerState* scope_marker_get(void) {
+    char probe = 0;
+    if (scope_main_valid &&
+            (cpy_on_mutator_stack(&probe) ||
+             CPY_SAME_THREAD(pthread_self(), scope_main_tid))) {
+        return scope_main;
+    }
+    pthread_once(&scope_marker_key_once, scope_marker_key_create);
+    ScopeMarkerState* st = (ScopeMarkerState*)pthread_getspecific(scope_marker_key);
+    if (st == NULL) {
+        st = (ScopeMarkerState*)calloc(1, sizeof(ScopeMarkerState));
+        if (st != NULL) pthread_setspecific(scope_marker_key, st);
+    }
+    return st;
+}
+#define SCOPE_MARKERS_GET() scope_marker_get()->markers
+#define SCOPE_DEPTH_GET() scope_marker_get()->depth
+#define SCOPE_DEPTH_SET(v) scope_marker_get()->depth = (v)
+#else
+static __declspec(thread) size_t g_scope_markers[64];
+static __declspec(thread) int g_scope_marker_depth = 0;
+#define SCOPE_MARKERS_GET() g_scope_markers
+#define SCOPE_DEPTH_GET() g_scope_marker_depth
+#define SCOPE_DEPTH_SET(v) g_scope_marker_depth = (v)
+#endif
+
+void cpyte_scope_enter(void) {
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (ls == NULL) return;
+    /* No need to materialize the linear buffer here: an unused allocator has
+     * offset 0, and cpyte_linear_alloc initializes it on first use. */
+#ifdef _WIN32
+    if (g_scope_marker_depth < 64) {
+        g_scope_markers[g_scope_marker_depth++] = ls->offset;
+    }
+#else
+    ScopeMarkerState* st = scope_marker_get();
+    if (st != NULL && st->depth < 64) {
+        st->markers[st->depth++] = ls->offset;
+    }
+#endif
+}
+
+void cpyte_scope_exit(void) {
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (ls == NULL || !ls->memory) return;
+#ifdef _WIN32
+    if (g_scope_marker_depth > 0) {
+        g_scope_marker_depth--;
+        ls->offset = g_scope_markers[g_scope_marker_depth];
+    } else {
+        ls->offset = 0;
+    }
+#else
+    ScopeMarkerState* st = scope_marker_get();
+    if (st == NULL) return;
+    if (st->depth > 0) {
+        st->depth--;
+        ls->offset = st->markers[st->depth];
+    } else {
+        ls->offset = 0;
+    }
+#endif
+}
+
+void cpyte_linear_reset(void) {
+    LinearScopeAllocator *ls = LINEAR_SCOPE_GET();
+    if (ls) ls->offset = 0;
+}
+
+/* Multi-threaded TLAB allocation - enhanced */
+#ifndef _WIN32
+static pthread_key_t tlab_fast_key;
+static pthread_once_t tlab_fast_key_once = PTHREAD_ONCE_INIT;
+typedef struct { char* buffer; size_t size; size_t offset; } TLBFast;
+static void tlab_fast_key_create(void) { pthread_key_create(&tlab_fast_key, NULL); }
+static TLBFast* tlab_fast_get(void) {
+    pthread_once(&tlab_fast_key_once, tlab_fast_key_create);
+    TLBFast* t = (TLBFast*)pthread_getspecific(tlab_fast_key);
+    if (t == NULL) {
+        t = (TLBFast*)calloc(1, sizeof(TLBFast));
+        pthread_setspecific(tlab_fast_key, t);
+    }
+    return t;
+}
+#else
+static __declspec(thread) char* g_tlab_buffer = NULL;
+static __declspec(thread) size_t g_tlab_size = 0;
+static __declspec(thread) size_t g_tlab_offset = 0;
+#endif
+
+void* cpyte_tlab_alloc_fast(size_t size) {
+    const size_t align = alignof(max_align_t);
+    size_t aligned = linear_align_up(size, align);
+    TLBFast* tfast = tlab_fast_get();
+    if (tfast->buffer && tfast->offset + aligned <= tfast->size) {
+        void *ptr = tfast->buffer + tfast->offset;
+        tfast->offset += aligned;
+        return ptr;
+    }
+    /* Allocate new TLAB */
+    size_t new_size = aligned > 64 * 1024 ? aligned : 64 * 1024;
+    tfast->buffer = (char*)malloc(new_size);
+    if (!tfast->buffer) return cpyte_general_malloc(size);
+    tfast->size = new_size;
+    tfast->offset = aligned;
+    return tfast->buffer;
+}
+
+void cpyte_tlab_reset(void) {
+    TLBFast* tfast = tlab_fast_get();
+    if (tfast) tfast->offset = 0;
+}
+
+/* Hybrid allocation: choose best allocator based on size and context */
+void* cpyte_hybrid_alloc(size_t size) {
+    /* Small objects - use linear/scope allocator for fast allocation */
+    if (size <= 1024) {
+        void *ptr = cpyte_linear_alloc(size);
+        if (ptr) return ptr;
+    }
+    /* Medium objects - use TLAB fast path */
+    if (size <= 4096) {
+        void *ptr = cpyte_tlab_alloc_fast(size);
+        if (ptr) return ptr;
+    }
+    /* Large objects or fallback - use general malloc (will be GC managed if needed) */
+    return cpyte_general_malloc(size);
+}
+
 #include <stdio.h>
 
 /* --- Platform threading / mutex abstraction (mirrors runtime.c) --- */
@@ -61,10 +405,21 @@ typedef pthread_t cpy_thread_t;
 typedef struct cpyte_obj_s {
     ugc_header_t base;
     size_t       size;   /* payload size for conservative scanning */
+    size_t       used;   /* bytes handed out so far (TLAB blocks: bump end) */
     struct cpyte_obj_s* next;
     struct cpyte_obj_s* all;
     struct cpyte_obj_s* all_prev;
+    struct cpyte_page_link_s* pages;
 } cpyte_obj_t;
+
+/* Page-indexed lookup entry: maps one 4K page of a block's payload back to the
+ * block header.  Conservative scanning resolves a candidate pointer in O(1)
+ * instead of walking every live block. */
+struct cpyte_page_link_s {
+    cpyte_obj_t* blk;
+    struct cpyte_page_link_s* next;
+};
+typedef struct cpyte_page_link_s cpyte_page_link_t;
 
 #define HDR(cpyte_ptr) ((cpyte_obj_t*)(cpyte_ptr))
 #define PAYLOAD(hdr)   ((char*)(hdr) + sizeof(cpyte_obj_t))
@@ -87,8 +442,10 @@ static cpy_thread_t  gc_thread;
 static volatile int  gc_running   = 0;
 /* Barriers are on the pointer-store hot path.  They only need to enter the
  * collector when a mark/sweep cycle is active, so keep that state atomic and
- * make the overwhelmingly common idle path lock-free. */
-static atomic_int     gc_marking = 0;
+ * make the overwhelmingly common idle path lock-free.  This flag is *not*
+ * static: generated code reads it directly and only calls gc_write_barrier
+ * when it is set, so an idle store costs one load + branch. */
+atomic_int     gc_marking = 0;
 
 static void gc_lock_init(void) {
     if (gc_lock_init_once) return;
@@ -141,55 +498,96 @@ __declspec(thread) static tlab_t tlab = {NULL, NULL, NULL};
 static pthread_key_t  tlab_key;
 static pthread_once_t tlab_key_once = PTHREAD_ONCE_INIT;
 static void tlab_key_create(void) { pthread_key_create(&tlab_key, NULL); }
-static tlab_t* tlab_get(void) {
+
+/* pthread_once + pthread_getspecific cost ~5ns and were evaluated several
+ * times per allocation, dominating the bump-allocation fast path.  The thread
+ * that calls gc_init (the mutator) gets its buffer cached; the hot path
+ * recognizes it by stack range (no call), falling back to a tid compare and
+ * then the key for other threads.  A cached tid is safe because that thread is
+ * alive for as long as it can call this. */
+static tlab_t*   tlab_main = NULL;
+static pthread_t tlab_main_tid;
+static int       tlab_main_valid = 0;
+
+CPY_INLINE tlab_t* tlab_get(void) {
+    char probe = 0;
+    if (tlab_main_valid &&
+            (cpy_on_mutator_stack(&probe) ||
+             CPY_SAME_THREAD(pthread_self(), tlab_main_tid))) {
+        return tlab_main;
+    }
     pthread_once(&tlab_key_once, tlab_key_create);
     tlab_t* tl = (tlab_t*)pthread_getspecific(tlab_key);
     if (tl == NULL) {
         tl = (tlab_t*)calloc(1, sizeof(tlab_t));
-        pthread_setspecific(tlab_key, tl);
+        if (tl != NULL) pthread_setspecific(tlab_key, tl);
     }
     return tl;
 }
 #  define TLAB_GET() tlab_get()
 #endif
 
-static void* tlab_alloc(size_t size, size_t min_block_size) {
+/* Slow path: grab a fresh block from the global heap and bump once out of it. */
+static void* tlab_refill(size_t size, size_t min_block_size) {
+    size_t block_size = (size > min_block_size) ? size : min_block_size;
+
+    gc_lock_init();
+    CPY_MUTEX_LOCK(&gc_lock_);
+
+    /* Allocate the TLAB block through the normal GC path */
+    cpyte_obj_t* hdr = (cpyte_obj_t*)malloc(sizeof(cpyte_obj_t) + block_size);
+    if (hdr == NULL) {
+        CPY_MUTEX_UNLOCK(&gc_lock_);
+        return NULL;
+    }
+    memset(hdr, 0, sizeof(cpyte_obj_t));
+    hdr->size = block_size;
+    hdr->used = size;
+    ugc_register(&gc, &hdr->base);
+    obj_track(hdr);
+
+    CPY_MUTEX_UNLOCK(&gc_lock_);
+
+    tlab_t* tl = TLAB_GET();
+    if (tl == NULL) return NULL;
+    /* Freeze the retired block's scan extent: the bump fast path only keeps
+     * the *current* block's `used` up to date. */
+    if (tl->start != NULL) {
+        ((cpyte_obj_t*)(tl->start - sizeof(cpyte_obj_t)))->used =
+            (size_t)(tl->current - tl->start);
+    }
+    tl->start = PAYLOAD(hdr);
+    tl->end = tl->start + block_size;
+    tl->current = tl->start + size;
+    return tl->start;
+}
+
+CPY_INLINE void* tlab_alloc(size_t size, size_t min_block_size) {
     if (size > SIZE_MAX - (sizeof(void*) - 1)) {
         return NULL;
     }
     /* Round up to pointer alignment */
     size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
 
-    if (TLAB_GET()->start == NULL ||
-            (size_t)(TLAB_GET()->end - TLAB_GET()->current) < size) {
-        /* TLAB exhausted or not initialized: allocate new block from global heap */
-        size_t block_size = (size > min_block_size) ? size : min_block_size;
-
-        gc_lock_init();
-        CPY_MUTEX_LOCK(&gc_lock_);
-
-        /* Allocate the TLAB block through the normal GC path */
-        cpyte_obj_t* hdr = (cpyte_obj_t*)malloc(sizeof(cpyte_obj_t) + block_size);
-        if (hdr == NULL) {
-            CPY_MUTEX_UNLOCK(&gc_lock_);
-            return NULL;
+    tlab_t* tl = TLAB_GET();
+    if (tl != NULL) {
+        char* cur = tl->current;
+        if (cur != NULL && (size_t)(tl->end - cur) >= size) {
+            /* Bump-pointer allocation (lock-free) */
+            char* next = cur + size;
+            tl->current = next;
+            /* Keep the scan extent of the enclosing block current.  Only
+             * needed when collection can run concurrently with the mutator
+             * (a non-zero threshold starts the background stepper); with
+             * auto-collect off the extent is refreshed by gc_collect itself. */
+            if (gc_threshold != 0) {
+                ((cpyte_obj_t*)(tl->start - sizeof(cpyte_obj_t)))->used =
+                    (size_t)(next - tl->start);
+            }
+            return cur;
         }
-        memset(hdr, 0, sizeof(cpyte_obj_t));
-        hdr->size = block_size;
-        ugc_register(&gc, &hdr->base);
-        obj_track(hdr);
-
-        CPY_MUTEX_UNLOCK(&gc_lock_);
-
-        TLAB_GET()->start = PAYLOAD(hdr);
-        TLAB_GET()->end = TLAB_GET()->start + block_size;
-        TLAB_GET()->current = TLAB_GET()->start;
     }
-
-    /* Bump-pointer allocation (lock-free) */
-    void *ptr = TLAB_GET()->current;
-    TLAB_GET()->current += size;
-    return ptr;
+    return tlab_refill(size, min_block_size);
 }
 
 /* ── Object hash table (conservative scan validation) ───────────── */
@@ -200,6 +598,61 @@ static void* tlab_alloc(size_t size, size_t min_block_size) {
 static cpyte_obj_t* obj_table[OBJ_TABLE_SIZE];
 static cpyte_obj_t* obj_list = NULL;  /* all tracked blocks, for containment search */
 static cpyte_obj_t* obj_last_lookup = NULL;
+
+/* Page table: (address >> OBJ_PAGE_SHIFT) -> blocks whose payload covers that
+ * page.  Blocks never overlap, so a bucket chain is tiny (1-2 entries). */
+#define OBJ_PAGE_SHIFT 12
+#define OBJ_PAGE_BITS 14
+#define OBJ_PAGE_TABLE_SIZE (1u << OBJ_PAGE_BITS)
+#define OBJ_PAGE_MASK (OBJ_PAGE_TABLE_SIZE - 1)
+
+static cpyte_page_link_t* obj_page_table[OBJ_PAGE_TABLE_SIZE];
+static int obj_page_overflow = 0;
+
+static inline unsigned long hash_page(uintptr_t page) {
+    return (unsigned long)(((page >> 3) * 2654435761UL) & OBJ_PAGE_MASK);
+}
+
+static void obj_page_link(cpyte_obj_t* obj) {
+    uintptr_t begin = (uintptr_t)PAYLOAD(obj);
+    size_t first = begin >> OBJ_PAGE_SHIFT;
+    size_t last = (begin + obj->size - 1) >> OBJ_PAGE_SHIFT;
+    size_t n = last - first + 1;
+    cpyte_page_link_t* links = (cpyte_page_link_t*)malloc(n * sizeof(*links));
+    obj->pages = links;
+    if (links == NULL) {
+        /* Fall back to the linear list for every lookup. */
+        obj_page_overflow = 1;
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned long h = hash_page(first + i);
+        links[i].blk = obj;
+        links[i].next = obj_page_table[h];
+        obj_page_table[h] = &links[i];
+    }
+}
+
+static void obj_page_unlink(cpyte_obj_t* obj) {
+    cpyte_page_link_t* links = obj->pages;
+    if (links == NULL) return;
+    uintptr_t begin = (uintptr_t)PAYLOAD(obj);
+    size_t first = begin >> OBJ_PAGE_SHIFT;
+    size_t n = ((begin + obj->size - 1) >> OBJ_PAGE_SHIFT) - first + 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned long h = hash_page(first + i);
+        cpyte_page_link_t** pp = &obj_page_table[h];
+        while (*pp) {
+            if (*pp == &links[i]) {
+                *pp = links[i].next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+    free(links);
+    obj->pages = NULL;
+}
 
 static unsigned long hash_ptr(const void* p) {
     unsigned long v = (unsigned long)p;
@@ -217,6 +670,7 @@ static void obj_track(void* hdr) {
     if (obj_list != NULL) obj_list->all_prev = obj;
     obj_list = obj;
     obj_last_lookup = NULL;
+    obj_page_link(obj);
 }
 
 static void obj_untrack(void* hdr) {
@@ -231,6 +685,7 @@ static void obj_untrack(void* hdr) {
             else obj_list = obj->all;
             if (obj->all != NULL) obj->all->all_prev = obj->all_prev;
             if (obj_last_lookup == obj) obj_last_lookup = NULL;
+            obj_page_unlink(obj);
             return;
         }
         pp = &(*pp)->next;
@@ -260,6 +715,19 @@ static cpyte_obj_t* obj_find_containing(const void* user) {
         uintptr_t end = begin + e->size;
         if (u >= begin && u < end) return e;
     }
+    {
+        unsigned long h = hash_page(u >> OBJ_PAGE_SHIFT);
+        for (cpyte_page_link_t* l = obj_page_table[h]; l; l = l->next) {
+            e = l->blk;
+            uintptr_t begin = (uintptr_t)PAYLOAD(e);
+            if (u >= begin && u < begin + e->size) {
+                obj_last_lookup = e;
+                return e;
+            }
+        }
+    }
+    if (!obj_page_overflow) return NULL;
+    /* Rare fallback: a block could not build its page entries. */
     for (e = obj_list; e; e = e->all) {
         if (e->size > 0) {
             uintptr_t begin = (uintptr_t)PAYLOAD(e);
@@ -294,6 +762,13 @@ static void scan_stack_range(void* lo, void* hi) {
 }
 
 static void scan_stack(void) {
+    /* Only the live part of the stack can hold roots.  The full reserved
+     * stack (8MB on macOS, similar elsewhere) is mostly untouched; scanning it
+     * for every collection dominated marking time.  Start at this frame
+     * instead: the stack grows down, so every live caller frame sits at a
+     * higher address and callee frames are gone by the time we get here. */
+    volatile char marker = 0;
+    char* live_lo = (char*)((uintptr_t)&marker & ~(uintptr_t)(sizeof(void*) - 1));
 #if defined(_WIN32)
     /* Windows: use GetCurrentThreadStackLimits (Win 8+). The reserved range
      * also covers UNCOMMITTED pages and the guard page at the committed edge;
@@ -302,6 +777,7 @@ static void scan_stack(void) {
     ULONG_PTR lo = 0, hi = 0;
     GetCurrentThreadStackLimits(&lo, &hi);
     char* p = (char*)lo;
+    if (p < live_lo) p = live_lo;
     while (p < (char*)hi) {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) break;
@@ -320,9 +796,9 @@ static void scan_stack(void) {
     void* stack_addr  = pthread_get_stackaddr_np(self);
     size_t stack_size = pthread_get_stacksize_np(self);
     /* stack grows downward: [stack_addr - stack_size, stack_addr) */
-    void* lo = (char*)stack_addr - stack_size;
-    void* hi = stack_addr;
-    scan_stack_range(lo, hi);
+    char* lo = (char*)stack_addr - stack_size;
+    if (lo < live_lo) lo = live_lo;
+    scan_stack_range(lo, stack_addr);
 #elif defined(__linux__)
     /* Linux: read pthread_getattr_np for the current thread (no /proc parsing) */
     pthread_attr_t attr;
@@ -331,7 +807,10 @@ static void scan_stack(void) {
         size_t stack_size = 0;
         pthread_attr_getstack(&attr, &stack_addr, &stack_size);
         pthread_attr_destroy(&attr);
-        scan_stack_range(stack_addr, (char*)stack_addr + stack_size);
+        char* hi = (char*)stack_addr + stack_size;
+        char* lo = (char*)stack_addr;
+        if (lo < live_lo) lo = live_lo;
+        scan_stack_range(lo, hi);
     }
 #else
     /* Fallback: scan a conservative range around the frame pointer.
@@ -418,10 +897,12 @@ static void gc_scan_cb(ugc_t* g, ugc_header_t* hdr) {
         return;
     }
 
-    /* Object scan: conservative scan of the payload */
+    /* Object scan: conservative scan of the payload.  `used` is the number of
+     * bytes handed out so far; a TLAB block reserves 128KB (or 1MB for string
+     * buffers) but typically only its prefix is live and initialized. */
     cpyte_obj_t* obj = (cpyte_obj_t*)hdr;
     char*   payload = PAYLOAD(obj);
-    size_t  size    = obj->size;
+    size_t  size    = obj->used;
 
     for (size_t i = 0; i + sizeof(void*) <= size; i += sizeof(void*)) {
         void* candidate = *(void**)(payload + i);
@@ -450,6 +931,8 @@ static void gc_release_cb(ugc_t* g, ugc_header_t* hdr) {
 void gc_init(void) {
     gc_lock_init();
     memset(obj_table, 0, sizeof(obj_table));
+    memset(obj_page_table, 0, sizeof(obj_page_table));
+    obj_page_overflow = 0;
     ugc_init(&gc, gc_scan_cb, gc_release_cb);
     cpyte_array_set_gc_hooks(gc_array_alloc, gc_array_reserve);
     gc_alloc_bytes = 0;
@@ -466,23 +949,38 @@ void gc_init(void) {
     TLAB_GET()->start = NULL;
     TLAB_GET()->end = NULL;
     TLAB_GET()->current = NULL;
+#ifndef _WIN32
+    /* Cache this (mutator) thread's buffer so allocations skip the pthread
+     * key lookup.  The stack range lets the hot path recognize the mutator
+     * without a pthread_self() call. */
+    gc_record_mutator_stack();
+    tlab_main = TLAB_GET();
+    if (tlab_main != NULL) {
+        tlab_main_tid = pthread_self();
+        tlab_main_valid = 1;
+    }
+    linear_scope_main = linear_scope_get();
+    if (linear_scope_main != NULL) {
+        linear_scope_main_tid = pthread_self();
+        linear_scope_main_valid = 1;
+    }
+    scope_main = scope_marker_get();
+    if (scope_main != NULL) {
+        scope_main_tid = pthread_self();
+        scope_main_valid = 1;
+    }
+#endif
 }
 
-void* gc_malloc(size_t size) {
-    /* Try TLAB first for small allocations (fast path, lock-free) */
-    if (size <= TLAB_MAX_ALLOC) {
-        void *ptr = tlab_alloc(size, TLAB_SIZE);
-        if (ptr != NULL) {
-            gc_alloc_bytes += size;
-            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
-                gc_trace("collect-trigger", gc_alloc_bytes);
-                gc_collect();
-            }
-            return ptr;
-        }
-    }
+#if defined(__GNUC__) || defined(__clang__)
+#  define CPY_COLD __attribute__((noinline, cold))
+#else
+#  define CPY_COLD
+#endif
 
-    /* Fallback to global allocation for large objects or TLAB failure */
+/* Large-object / TLAB-refill fallback.  Kept out of gc_malloc so the common
+ * bump-allocation path compiles to a leaf function with no register spills. */
+static CPY_COLD void* gc_malloc_large(size_t size) {
     gc_lock_init();
     CPY_MUTEX_LOCK(&gc_lock_);
 
@@ -503,6 +1001,7 @@ void* gc_malloc(size_t size) {
     }
 
     obj->size = size;
+    obj->used = size;
     ugc_register(&gc, &obj->base);
     obj_track(obj);
 
@@ -524,6 +1023,24 @@ void* gc_malloc(size_t size) {
     return TO_USER(obj);
 }
 
+void* gc_malloc(size_t size) {
+    /* Try TLAB first for small allocations (fast path, lock-free) */
+    if (size <= TLAB_MAX_ALLOC) {
+        void *ptr = tlab_alloc(size, TLAB_SIZE);
+        if (ptr != NULL) {
+            if (gc_threshold != 0) {
+                gc_alloc_bytes += size;
+                if (gc_alloc_bytes >= gc_threshold) {
+                    gc_trace("collect-trigger", gc_alloc_bytes);
+                    gc_collect();
+                }
+            }
+            return ptr;
+        }
+    }
+    return gc_malloc_large(size);
+}
+
 /*
  * Allocate a buffer whose caller initializes every byte. String concatenation
  * uses this path so larger results can share a thread-local arena instead of
@@ -540,9 +1057,11 @@ void* gc_malloc_uninit(size_t size) {
             : TLAB_STRING_SIZE;
         void* ptr = tlab_alloc(size, block_size);
         if (ptr != NULL) {
-            gc_alloc_bytes += size;
-            if (gc_threshold != 0 && gc_alloc_bytes >= gc_threshold) {
-                gc_collect();
+            if (gc_threshold != 0) {
+                gc_alloc_bytes += size;
+                if (gc_alloc_bytes >= gc_threshold) {
+                    gc_collect();
+                }
             }
             return ptr;
         }
@@ -584,8 +1103,12 @@ void gc_collect(void) {
     /* Protect the current TLAB block: its interior objects are live because
      * the mutator is executing; interior-pointer scan alone cannot see a block
      * that is only referenced through a bump-pointer interior alias. */
-    if (TLAB_GET()->start != NULL && TLAB_GET()->current != TLAB_GET()->start) {
-        cpyte_obj_t* hdr = (cpyte_obj_t*)((char*)TLAB_GET()->start - sizeof(cpyte_obj_t));
+    tlab_t* tl = TLAB_GET();
+    if (tl != NULL && tl->start != NULL && tl->current != tl->start) {
+        cpyte_obj_t* hdr = (cpyte_obj_t*)((char*)tl->start - sizeof(cpyte_obj_t));
+        /* The bump fast path skips this store when auto-collect is off, so
+         * bring the scan extent up to date before walking the payload. */
+        hdr->used = (size_t)(tl->current - tl->start);
         if (obj_is_tracked(hdr)) {
             ugc_visit(&gc, &hdr->base);
         }
@@ -659,6 +1182,10 @@ void gc_shutdown(void) {
     for (int i = 0; i < OBJ_TABLE_SIZE; i++) {
         obj_table[i] = NULL;
     }
+    for (unsigned i = 0; i < OBJ_PAGE_TABLE_SIZE; i++) {
+        obj_page_table[i] = NULL;
+    }
+    obj_page_overflow = 0;
     obj_list = NULL;
     obj_last_lookup = NULL;
     /* Reset TLAB for current thread */
@@ -673,7 +1200,7 @@ char *
 str_concat_const_gc(const char *left, const char *right, size_t right_len) {
     size_t left_len = strlen(left);
     size_t total_len = left_len + right_len;
-    char *result = gc_malloc_uninit(total_len + 1);
+    char *result = malloc(total_len + 1);
     if (!result) return NULL;
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
@@ -685,7 +1212,7 @@ str_concat_const_gc(const char *left, const char *right, size_t right_len) {
 char *
 str_concat_const_both_gc(const char *left, const char *right, size_t left_len, size_t right_len) {
     size_t total_len = left_len + right_len;
-    char *result = gc_malloc_uninit(total_len + 1);
+    char *result = malloc(total_len + 1);
     if (!result) return NULL;
     memcpy(result, left, left_len);
     memcpy(result + left_len, right, right_len);
@@ -716,7 +1243,7 @@ cpy_str_grow_gc(char *s, const char *suffix, size_t suffix_len) {
         }
         size_t new_cap = (size_t)buf->capacity * 2;
         if (new_cap < need + 64) new_cap = need + 64;
-        cpy_strbuf_t *new_buf = (cpy_strbuf_t*)gc_malloc_uninit(sizeof(cpy_strbuf_t) + new_cap);
+        cpy_strbuf_t *new_buf = (cpy_strbuf_t*)malloc(sizeof(cpy_strbuf_t) + new_cap);
         if (!new_buf) return s;
         new_buf->magic = CPY_STRBUF_MAGIC;
         new_buf->capacity = (uint32_t)new_cap;
@@ -731,7 +1258,7 @@ cpy_str_grow_gc(char *s, const char *suffix, size_t suffix_len) {
     size_t left_len = s ? strlen(s) : 0;
     size_t cap = left_len + suffix_len + 64;
     if (cap < 128) cap = 128;
-    cpy_strbuf_t *buf = (cpy_strbuf_t*)gc_malloc_uninit(sizeof(cpy_strbuf_t) + cap);
+    cpy_strbuf_t *buf = (cpy_strbuf_t*)malloc(sizeof(cpy_strbuf_t) + cap);
     if (!buf) return s;
     buf->magic = CPY_STRBUF_MAGIC;
     buf->capacity = (uint32_t)cap;
@@ -743,3 +1270,6 @@ cpy_str_grow_gc(char *s, const char *suffix, size_t suffix_len) {
     new_s[buf->length] = ' ';
     return new_s;
 }
+
+/* Include addition */
+#include "gc_runtime_addition.c"

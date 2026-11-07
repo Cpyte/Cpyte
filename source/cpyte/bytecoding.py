@@ -85,6 +85,13 @@ _i64 = ir.IntType(64)
 # purpose: they are unsigned, so the generic zero-extending path is correct
 # for them. `uint64` is kept here because that is its pre-existing behavior.
 _I64_EXTEND_TYPES = ("int64", "uint64", "ssize_t", "ptrdiff_t", "intptr_t")
+
+# Integer types whose C arithmetic is unsigned: comparisons, division/remainder
+# and right shifts must lower to their unsigned form (icmp_unsigned / udiv /
+# urem / lshr). Using the signed opcode silently miscompiles values >= 2**63
+# (`uint64 x = 2**64-1; x / 3` gave 0) and also costs the signed-division
+# INT_MIN/-1 fixup in codegen.
+_UNSIGNED_TYPES = ("uint8", "uint16", "uint32", "uint64", "size_t", "uintptr_t")
 _i1 = ir.IntType(1)
 _double = ir.DoubleType()
 _void = ir.VoidType()
@@ -304,11 +311,14 @@ class LLVM:
             owners = self._module_owners.setdefault(name, [])
             if tag not in owners:
                 owners.append(tag)
-        if name not in self.structs:
+        # emit_program pre-registers every struct as OPAQUE with an empty field
+        # list (so self-referential fields resolve) and only fills the real
+        # fields in when the def is emitted. A consumer module falls back to
+        # these flat maps, so a placeholder must never win over a real layout.
+        existing_fields = self.struct_fields.get(name)
+        if name not in self.struct_fields or (not existing_fields and fields):
             self.structs[name] = llvm_type
-        if name not in self.struct_fields:
             self.struct_fields[name] = fields
-        if name not in self._struct_nodes:
             self._struct_nodes[name] = node
 
     def llvm_type(self, t: str):
@@ -522,14 +532,89 @@ class LLVM:
             ctx.data.update(data)
         return ctx
 
-    def _emit_int_divmod(self, left, right, is_rem):
+    @staticmethod
+    def _unsigned_operands(left_node, right_node):
+        """True when C's usual arithmetic conversions make the op unsigned.
+
+        Narrow unsigned words (uint8/uint16) promote to `int`, so they stay
+        signed; `uint32` vs `int64` is signed too (int64 represents every
+        uint32 value). Only a common type that is itself unsigned (same-width
+        unsigned winner, or a wider unsigned operand) selects the unsigned
+        opcode.
+        """
+        lt = getattr(left_node, "inferred_type", None)
+        rt = getattr(right_node, "inferred_type", None)
+
+        def info(t):
+            if t is None:
+                return None
+            if t in ("uint8", "uint16"):
+                return (32, False)  # integer promotion to int
+            if t in ("int", "uint32"):
+                return (32, t == "uint32")
+            if t in (
+                "int64",
+                "uint64",
+                "size_t",
+                "ssize_t",
+                "ptrdiff_t",
+                "intptr_t",
+                "uintptr_t",
+            ):
+                return (64, t in ("uint64", "size_t", "uintptr_t"))
+            return None
+
+        li, ri = info(lt), info(rt)
+        if li is None or ri is None:
+            return lt in _UNSIGNED_TYPES or rt in _UNSIGNED_TYPES
+        if not (li[1] or ri[1]):
+            return False
+        # Usual arithmetic conversions: the wider type wins; at equal width an
+        # unsigned operand wins. (The wider signed type always represents the
+        # narrower unsigned one, so signedness comes from the winner.)
+        if li[0] != ri[0]:
+            unsigned = (li if li[0] > ri[0] else ri)[1]
+        else:
+            unsigned = li[1] or ri[1]
+        if not unsigned:
+            return False
+        # A signed operand joins the unsigned operation (C converts it), but a
+        # negative constant must keep signed semantics.
+        for node, t in ((left_node, lt), (right_node, rt)):
+            if t in _UNSIGNED_TYPES:
+                continue
+            if isinstance(node, Number):
+                try:
+                    if int(node.value, 0) < 0:
+                        return False
+                except ValueError:
+                    return False
+        return True
+
+    @staticmethod
+    def _is_unsigned_node(node):
+        """True when widening this operand must zero-extend (C value conversion)."""
+        return getattr(node, "inferred_type", None) in _UNSIGNED_TYPES
+
+    def _emit_int_cmp(self, op, left, right, unsigned):
+        if unsigned:
+            return self.builder.icmp_unsigned(op, left, right)
+        return self.builder.icmp_signed(op, left, right)
+
+    def _emit_int_divmod(self, left, right, is_rem, unsigned=False):
         """Signed int division/remainder that stays well-defined in LLVM IR.
 
         cpy ints wrap, so `INT_MIN // -1` yields INT_MIN and `INT_MIN % -1`
         yields 0. Raw `sdiv`/`srem` on those operands is *poison* in LLVM and
         the optimizer folds it into arbitrary values (opt0 vs opt3 diverge).
         Division/remainder by zero still traps, matching the cpy runtime.
+
+        `unsigned` selects the C unsigned lowering (`uint*`/`size_t`): plain
+        `udiv`/`urem`, which has no overflow case and therefore needs neither
+        the INT_MIN/-1 fixup nor sign correction.
         """
+        if unsigned:
+            return self._emit_uint_divmod(left, right, is_rem)
         width = left.type.width if isinstance(left.type, ir.IntType) else 64
         int_min = -(1 << (width - 1))
 
@@ -650,7 +735,58 @@ class LLVM:
             overflow, ir.Constant(left.type, 0 if is_rem else int_min), normal_val
         )
 
-    def _emit_floor_div(self, left, right):
+    def _emit_uint_divmod(self, left, right, is_rem):
+        """Unsigned div/rem for `uint*`/`size_t` operands (C semantics).
+
+        Unsigned division has no INT_MIN/-1 overflow case, so the signed fixup
+        (two selects) disappears entirely: just a division-by-zero check and
+        `udiv`/`urem`.
+        """
+        width = left.type.width if isinstance(left.type, ir.IntType) else 64
+        mask = (1 << width) - 1
+
+        if isinstance(right, ir.Constant) and not self._is_ir_constant_zero(right):
+            d = int(right.constant) & mask
+            if isinstance(left, ir.Constant):
+                l = int(left.constant) & mask
+                return ir.Constant(left.type, (l % d) if is_rem else (l // d))
+            return (
+                self.builder.urem(left, right)
+                if is_rem
+                else self.builder.udiv(left, right)
+            )
+
+        if isinstance(right, ir.Constant) and self._is_ir_constant_zero(right):
+            # Constant-zero divisor always traps; mirror the signed path's
+            # unconditional trap with the builder parked in a dead block.
+            trap_bb = self.builder.append_basic_block("div.trap")
+            dead_bb = self.builder.append_basic_block("div.dead")
+            self.builder.branch(trap_bb)
+            self.builder.position_at_end(trap_bb)
+            self.builder.call(self._get_trap_fn(), [])
+            self.builder.unreachable()
+            self.builder.position_at_end(dead_bb)
+            return ir.Constant(left.type, 0)
+
+        is_zero = self.builder.icmp_unsigned("==", right, ir.Constant(right.type, 0))
+        trap_bb = self.builder.append_basic_block("div.trap")
+        normal_bb = self.builder.append_basic_block("div.normal")
+        self.builder.cbranch(is_zero, trap_bb, normal_bb)
+        self.builder.position_at_end(trap_bb)
+        self.builder.call(self._get_trap_fn(), [])
+        self.builder.unreachable()
+
+        self.builder.position_at_end(normal_bb)
+        return (
+            self.builder.urem(left, right)
+            if is_rem
+            else self.builder.udiv(left, right)
+        )
+
+    def _emit_floor_div(self, left, right, unsigned=False):
+        if unsigned:
+            # Both operands are non-negative, so floor division IS truncation.
+            return self._emit_uint_divmod(left, right, is_rem=False)
         q = self._emit_int_divmod(left, right, is_rem=False)
         prod = self.builder.mul(q, right)
         r = self.builder.sub(left, prod)
@@ -811,6 +947,7 @@ class LLVM:
         self._gc_alloc_fn = None
         self._gc_uninit_alloc_fn = None
         self._gc_write_barrier_fn = None
+        self._gc_marking_gv = None
         self._sizeof_cache = {}
         self._llvm_type_cache = {}  # (module tag, type name) -> ir.Type
         self._strlen_fn = None
@@ -1040,6 +1177,11 @@ class LLVM:
         if not self.no_gc:
             gc_fns = [
                 ("gc_init", _void, []),
+                ("cpyte_scope_enter", _void, []),
+                ("cpyte_scope_exit", _void, []),
+                ("cpyte_linear_alloc", _i8ptr, [_i64]),
+                ("cpyte_hybrid_alloc", _i8ptr, [_i64]),
+                ("cpyte_general_malloc", _i8ptr, [_i64]),
                 ("gc_malloc", _i8ptr, [_i64]),
                 ("gc_array_alloc", _i8ptr, [_i64, _i64]),
                 ("gc_write_barrier", _void, [_i8ptr, _i8ptr]),
@@ -1800,9 +1942,23 @@ class LLVM:
             as_double = self.builder.fpext(val, ir.DoubleType())
             return self.builder.call(self.functions["str_of_double"], [as_double])
         if isinstance(ty, ir.IntType):
+            if (
+                ty.width == 8
+                and getattr(node, "inferred_type", None) == "char"
+            ):
+                return self._char_to_str(val)
+            ut = getattr(node, "inferred_type", None)
+            if isinstance(node, Variable):
+                ut = self.local_types.get(node.name) or ut
+            if ut in ("uint64", "size_t", "uintptr_t"):
+                return self.builder.call(
+                    self.functions["str_of_uint64"], [self._extend_to_i64(val, True)]
+                )
+            if ut in ("uint32", "uint16", "uint8"):
+                return self.builder.call(
+                    self.functions["str_of_uint64"], [self._extend_to_i64(val, True)]
+                )
             i64 = self._extend_to_i64(val)
-            if getattr(node, "inferred_type", None) == "uint64":
-                return self.builder.call(self.functions["str_of_uint64"], [i64])
             return self.builder.call(self.functions["str_of_int64"], [i64])
         as_i64 = self.builder.ptrtoint(val, _i64)
         return self.builder.call(self.functions["str_of_ptr"], [as_i64])
@@ -2736,17 +2892,67 @@ class LLVM:
         self._gc_write_barrier_fn = fn
         return fn
 
+    def _get_gc_marking_gv(self):
+        # Exported i32 flag; non-zero while a mark/sweep cycle is active.
+        gv = self._gc_marking_gv
+        if gv is not None:
+            return gv
+        gv = self.module.globals.get("gc_marking")
+        if gv is None:
+            gv = ir.GlobalVariable(self.module, _i32, name="gc_marking")
+            gv.linkage = "external"
+        self._gc_marking_gv = gv
+        return gv
+
+    @staticmethod
+    def _is_const_pointer_value(value):
+        """True when a stored pointer is known at compile time (null or a
+        global/constant) and therefore can never be a collected object."""
+        for _ in range(4):
+            if isinstance(value, ir.Constant):
+                return isinstance(value.type, ir.PointerType)
+            if not isinstance(value, ir.instructions.CastInstr):
+                return False
+            if value.opname == "bitcast":
+                value = value.operands[0]
+                continue
+            if value.opname == "inttoptr":
+                operand = value.operands[0]
+                return (
+                    isinstance(operand, ir.Constant)
+                    and getattr(operand, "constant", None) == 0
+                )
+            return False
+        return False
+
     def _emit_write_barrier(self, parent_ptr, child_ptr):
         """Insert a write barrier call when storing a pointer value into a heap object.
         parent_ptr and child_ptr must be i8* typed LLVM values."""
         if self.no_gc:
             return
+        # A constant pointer (null, or a global string literal) can never be a
+        # collected object, so the barrier would always be a no-op.
+        if self._is_const_pointer_value(child_ptr):
+            return
         if parent_ptr.type != _i8ptr:
             parent_ptr = self.builder.bitcast(parent_ptr, _i8ptr)
         if child_ptr.type != _i8ptr:
             child_ptr = self.builder.bitcast(child_ptr, _i8ptr)
+        # Fast path: the collector only needs the barrier while it is marking.
+        # Reading the exported flag inline keeps an idle pointer store to a load
+        # and a not-taken branch instead of a call into the runtime.
+        marking = self.builder.load(self._get_gc_marking_gv())
+        active = self.builder.icmp_signed(
+            "!=", marking, ir.Constant(_i32, 0)
+        )
+        slow_bb = self.builder.append_basic_block("gc.wb.slow")
+        cont_bb = self.builder.append_basic_block("gc.wb.cont")
+        self.builder.cbranch(active, slow_bb, cont_bb)
+        self.builder.position_at_end(slow_bb)
         wb_fn = self._get_write_barrier_fn()
         self.builder.call(wb_fn, [parent_ptr, child_ptr])
+        self.builder.branch(cont_bb)
+        self.builder.position_at_end(cont_bb)
 
     def _get_trap_fn(self):
         for f in self.module.functions:
@@ -2850,6 +3056,8 @@ class LLVM:
             return self._promote_to_big(val, src_t)
         if isinstance(val.type, ir.IntType) and isinstance(target, ir.IntType):
             if val.type.width < target.width:
+                if self._is_unsigned_node(node.expr):
+                    return self.builder.zext(val, target)
                 return self.builder.sext(val, target)
             elif val.type.width > target.width:
                 return self.builder.trunc(val, target)
@@ -3248,6 +3456,14 @@ class LLVM:
         self._const_prop_f = {}
         self.scope_stack = [{}]
         self._deferred = []
+        # Enter scope for hybrid allocator
+        if not self.no_gc:
+            scope_enter_fn = self.functions.get("cpyte_scope_enter")
+            if scope_enter_fn:
+                try:
+                    self.builder.call(scope_enter_fn, [])
+                except Exception:
+                    pass
         for llvm_arg, (name, ptype) in zip(func.args, node.params.items()):
             if isinstance(llvm_arg.type, ir.VoidType):
                 self._codegen_error(
@@ -3887,6 +4103,14 @@ class LLVM:
         if self._block_terminated():
             return
         self._run_deferred()
+        # Exit scope for hybrid allocator
+        if not self.no_gc:
+            scope_exit_fn = self.functions.get("cpyte_scope_exit")
+            if scope_exit_fn:
+                try:
+                    self.builder.call(scope_exit_fn, [])
+                except Exception:
+                    pass
         # Shutdown GC before main returns
         fn_name = self.builder.function.name
         if fn_name == "main" and not self.no_gc:
@@ -4069,7 +4293,7 @@ class LLVM:
         self.builder.position_at_end(end_bb)
         self._invalidate_const_prop_names(merged_written)
 
-    def _promote(self, left, right):
+    def _promote(self, left, right, left_unsigned=False, right_unsigned=False):
         if isinstance(left.type, ir.DoubleType) and not isinstance(
             right.type, ir.DoubleType
         ):
@@ -4101,17 +4325,20 @@ class LLVM:
         # _promote), so an i8* here is a genuine character/byte pointer.
         if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):  # type: ignore[attr-defined]
             left = self.builder.ptrtoint(left, _i64)
-            right = self._promote_int(right, _i64)
+            right = self._promote_int(right, _i64, right_unsigned)
             return left, right
         if isinstance(right.type, ir.PointerType) and isinstance(left.type, ir.IntType):  # type: ignore[attr-defined]
             right = self.builder.ptrtoint(right, _i64)
-            left = self._promote_int(left, _i64)
+            left = self._promote_int(left, _i64, left_unsigned)
             return left, right
 
         if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-            max_width = max(left.type.width, right.type.width)
-            left = self._promote_int(left, ir.IntType(max_width))
-            right = self._promote_int(right, ir.IntType(max_width))
+            # C's integer promotion: everything narrower than `int` becomes
+            # i32 before the arithmetic, so `char`/`uint8`/`uint16` operands
+            # never compare or divide at their storage width.
+            max_width = max(32, left.type.width, right.type.width)
+            left = self._promote_int(left, ir.IntType(max_width), left_unsigned)
+            right = self._promote_int(right, ir.IntType(max_width), right_unsigned)
         return left, right
 
     def _bitwise_promote(self, left, right):
@@ -4136,13 +4363,18 @@ class LLVM:
                 right = self._promote_int(right, int_ty)
         return left, right
 
-    def _promote_int(self, val, target_ty):
+    def _promote_int(self, val, target_ty, unsigned=False):
         if val.type == target_ty:
             return val
         if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
             if val.type.width == 1:
                 return self.builder.zext(val, target_ty)
             if val.type.width < target_ty.width:
+                # C converts an unsigned source by value, so widening must be
+                # zero-extension: `(sext i32 -1 to i64)` would turn a uint32
+                # 0xFFFFFFFF into -1 instead of 4294967295.
+                if unsigned:
+                    return self.builder.zext(val, target_ty)
                 return self.builder.sext(val, target_ty)
             if val.type.width > target_ty.width:
                 return self.builder.trunc(val, target_ty)
@@ -4968,6 +5200,8 @@ class LLVM:
             if isinstance(val.type, ir.IntType):
                 if val.type.width != expected.width:
                     if val.type.width < expected.width:
+                        if inferred_type in _UNSIGNED_TYPES:
+                            return self.builder.zext(val, expected)
                         return self.builder.sext(val, expected)
                     return self.builder.trunc(val, expected)
                 return val
@@ -5395,7 +5629,12 @@ class LLVM:
                 case TokenType.GREATER_EQ:
                     return self.builder.icmp_signed(">=", cmp, zero)
 
-        left, right = self._promote(left, right)
+        left, right = self._promote(
+            left,
+            right,
+            self._is_unsigned_node(node.left),
+            self._is_unsigned_node(node.right),
+        )
         is_float = isinstance(left.type, ir.DoubleType) or isinstance(
             right.type, ir.DoubleType
         )
@@ -5435,6 +5674,7 @@ class LLVM:
                 case TokenType.NOT_EQ:
                     return self.builder.fcmp_ordered("!=", left, right)
 
+        unsigned = self._unsigned_operands(node.left, node.right)
         match node.op:
             case TokenType.PLUS:
                 return self.builder.add(left, right)
@@ -5443,11 +5683,15 @@ class LLVM:
             case TokenType.STAR:
                 return self.builder.mul(left, right)
             case TokenType.SLASH:
-                return self._emit_int_divmod(left, right, is_rem=False)
+                return self._emit_int_divmod(
+                    left, right, is_rem=False, unsigned=unsigned
+                )
             case TokenType.SLASH_SLASH:
-                return self._emit_floor_div(left, right)
+                return self._emit_floor_div(left, right, unsigned=unsigned)
             case TokenType.PERCENT:
-                return self._emit_int_divmod(left, right, is_rem=True)
+                return self._emit_int_divmod(
+                    left, right, is_rem=True, unsigned=unsigned
+                )
             case TokenType.SHL:
                 left, right = self._bitwise_promote(left, right)
                 bitwidth = left.type.width
@@ -5457,6 +5701,8 @@ class LLVM:
                 left, right = self._bitwise_promote(left, right)
                 bitwidth = left.type.width
                 right = self._clamp_shift_amount(right, bitwidth)
+                if unsigned:
+                    return self.builder.lshr(left, right)
                 return self.builder.ashr(left, right)
             case TokenType.AMPERSAND:
                 left, right = self._bitwise_promote(left, right)
@@ -5469,22 +5715,22 @@ class LLVM:
                 return self.builder.xor(left, right)
             case TokenType.GREATER:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed(">", left, right)
+                return self._emit_int_cmp(">", left, right, unsigned)
             case TokenType.LESS:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed("<", left, right)
+                return self._emit_int_cmp("<", left, right, unsigned)
             case TokenType.GREATER_EQ:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed(">=", left, right)
+                return self._emit_int_cmp(">=", left, right, unsigned)
             case TokenType.LESS_EQ:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed("<=", left, right)
+                return self._emit_int_cmp("<=", left, right, unsigned)
             case TokenType.EQ_EQ:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed("==", left, right)
+                return self._emit_int_cmp("==", left, right, unsigned)
             case TokenType.NOT_EQ:
                 left, right = self._normalize_ptr_cmp(left, right)
-                return self.builder.icmp_signed("!=", left, right)
+                return self._emit_int_cmp("!=", left, right, unsigned)
             case TokenType.POW:
                 return self._emit_pow(left, right)
 
@@ -5599,6 +5845,14 @@ class LLVM:
             if isinstance(node.right, String)
             else self.emit(node.right)
         )
+        # A `char` operand is an i8, not a string: widen it to a 1-char heap
+        # string so `'a' + "bc"` concatenates instead of failing on strlen.
+        if not isinstance(left.type, ir.PointerType):
+            left = self._stringify_value(node.left, left)
+            left_len = None
+        if not isinstance(right.type, ir.PointerType):
+            right = self._stringify_value(node.right, right)
+            right_len = None
         return self._concat_strings(left, right, left_len, right_len)
 
     def _get_strlen_fn(self):
@@ -5773,10 +6027,12 @@ class LLVM:
             f"Undefined variable '{node.name}' at L{node._token.line}:{node._token.column}"
         )
 
-    def _trunc_or_ext(self, value, target_type):
+    def _trunc_or_ext(self, value, target_type, unsigned=False):
         ty = target_type
         if isinstance(ty, ir.IntType) and isinstance(value.type, ir.IntType):
             if value.type.width < ty.width:
+                if unsigned:
+                    return self.builder.zext(value, ty)
                 if value.type.width == 32:
                     return self.builder.sext(value, ty)
                 return self.builder.zext(value, ty)
@@ -5808,9 +6064,9 @@ class LLVM:
             and getattr(pointee.pointee, "width", None) == 8
         )
 
-    def _coerce_store(self, value, pointee):
+    def _coerce_store(self, value, pointee, unsigned=False):
         if isinstance(pointee, ir.IntType) and isinstance(value.type, ir.IntType):
-            return self._trunc_or_ext(value, pointee)
+            return self._trunc_or_ext(value, pointee, unsigned)
         if isinstance(pointee, ir.PointerType) and isinstance(value.type, ir.IntType):
             if self._is_i8_to_str(value, pointee):
                 return self._char_to_str(value)
@@ -6061,7 +6317,9 @@ class LLVM:
                         if value.type != pointee:
                             value = self._coerce_store(value, pointee)
                     else:
-                        value = self._coerce_store(value, pointee)
+                        value = self._coerce_store(
+                            value, pointee, self._is_unsigned_node(node.value)
+                        )
                 var_type = self.local_types.get(name)
                 if var_type in _I64_EXTEND_TYPES:
                     value = self._extend_to_i64(value)
@@ -6120,7 +6378,9 @@ class LLVM:
                         if value.type != pointee:
                             value = self._coerce_store(value, pointee)
                     else:
-                        value = self._coerce_store(value, pointee)
+                        value = self._coerce_store(
+                            value, pointee, self._is_unsigned_node(node.value)
+                        )
                 var_type = self.local_types.get(name)
                 if var_type in _I64_EXTEND_TYPES:
                     value = self._extend_to_i64(value)
@@ -6138,7 +6398,9 @@ class LLVM:
         value = self.emit(node.value)
         pointee = self._pointee_type(target_ptr)
         if pointee and value.type != pointee:
-            value = self._coerce_store(value, pointee)
+            value = self._coerce_store(
+                value, pointee, self._is_unsigned_node(node.value)
+            )
         self.builder.store(value, target_ptr)
         # Write barrier for pointer stores into heap objects (tri-color invariant)
         if isinstance(pointee, ir.PointerType):
@@ -7227,12 +7489,19 @@ class LLVM:
             return self.builder.call(self.functions["print_str"], [value])
         # Handle 64-bit integers
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
+            unsigned_64 = ("uint64", "size_t", "uintptr_t")
+
+            def is_uint64_type(t):
+                return t in unsigned_64
+
             is_uint64 = False
             if isinstance(expr, Variable):
                 var_type = self.local_types.get(expr.name)
-                if var_type == "uint64":
+                if is_uint64_type(var_type):
                     is_uint64 = True
-            elif hasattr(expr, "inferred_type") and expr.inferred_type == "uint64":
+            elif hasattr(expr, "inferred_type") and is_uint64_type(
+                expr.inferred_type
+            ):
                 is_uint64 = True
             elif isinstance(expr, BinOp):
                 left_type = None
@@ -7245,7 +7514,7 @@ class LLVM:
                     right_type = self.local_types.get(expr.right.name)
                 elif hasattr(expr.right, "inferred_type"):
                     right_type = expr.right.inferred_type
-                if left_type == "uint64" or right_type == "uint64":
+                if is_uint64_type(left_type) or is_uint64_type(right_type):
                     is_uint64 = True
             if is_uint64:
                 return self.builder.call(self.functions["print_uint64"], [value])
@@ -7262,6 +7531,16 @@ class LLVM:
         if isinstance(value.type, ir.PointerType):
             value = self.builder.ptrtoint(value, _i64)
             return self.builder.call(self.functions["print_hex"], [value])
+        # Handle i32 — unsigned words print as unsigned (a uint32 holding
+        # 0xFFFFFFFF must print 4294967295, not -1).
+        if isinstance(value.type, ir.IntType) and value.type.width == 32:
+            ut = getattr(expr, "inferred_type", None)
+            if isinstance(expr, Variable):
+                ut = self.local_types.get(expr.name) or ut
+            if ut in ("uint32", "uint8", "uint16"):
+                widened = self.builder.zext(value, _i64)
+                return self.builder.call(self.functions["print_uint64"], [widened])
+            return self.builder.call(self.functions["print_int"], [value])
         # Handle i32 — call print_int directly
         if isinstance(value.type, ir.IntType):
             return self.builder.call(self.functions["print_int"], [value])
@@ -7772,6 +8051,8 @@ class LLVM:
     def emit_number(self, node):
         if getattr(node, "is_bool", False):
             return ir.Constant(ir.IntType(1), 1 if node.value == "1" else 0)
+        if getattr(node, "is_char", False):
+            return ir.Constant(ir.IntType(8), int(node.value) & 0xFF)
         if getattr(node, "inferred_type", "") in ("big", "ubig"):
             s = node.value
             if s.startswith("0x") or s.startswith("0X"):
@@ -7829,9 +8110,9 @@ class LLVM:
         zero = ir.Constant(ir.IntType(32), 0)
         return self.builder.gep(gv, [zero, zero], inbounds=True)
 
-    def _extend_to_i64(self, value):
+    def _extend_to_i64(self, value, unsigned=False):
         if isinstance(value.type, ir.IntType) and value.type.width < 64:
-            if value.type.width == 32:
+            if value.type.width == 32 and not unsigned:
                 return self.builder.sext(value, ir.IntType(64))
             return self.builder.zext(value, ir.IntType(64))
         if isinstance(value.type, (ir.FloatType, ir.DoubleType)):
@@ -7958,7 +8239,9 @@ class LLVM:
                         else self._promote_to_big(value, src_t)
                     )
                 elif node.var_type in _I64_EXTEND_TYPES:
-                    value = self._extend_to_i64(value)
+                    value = self._extend_to_i64(
+                        value, self._is_unsigned_node(node.init)
+                    )
                 if isinstance(value, ir.Constant):
                     self._declare_const(node.name, value)
                 else:
@@ -7985,7 +8268,7 @@ class LLVM:
             elif self._is_biglike(node.init) and node.var_type not in ("big", "ubig"):
                 pass
             elif node.var_type in _I64_EXTEND_TYPES:
-                value = self._extend_to_i64(value)
+                value = self._extend_to_i64(value, self._is_unsigned_node(node.init))
             if value.type != ty:
                 if self.no_userspace and value.type == _DynValue:
                     raise Exception(

@@ -12,11 +12,10 @@ if __package__:
         _RUNPY_RUNTIME_C,
         _RUNTIME_C,
         _find_llvm_cc,
-        _gmp_library_paths,
         _host_default_pic,
         _remove_probe_stack_ir,
         _runtime_extra_flags,
-        aot_link_libraries,
+        aot_link_executable,
         host_target,
         make_target_machine,
         optimize,
@@ -55,13 +54,13 @@ else:
     from cpyte.compiling import (
         _BIGNUM_C,
         _GC_RUNTIME_C,
+        _RUNPY_RUNTIME_C,
         _RUNTIME_C,
         _find_llvm_cc,
-        _gmp_library_paths,
         _host_default_pic,
         _remove_probe_stack_ir,
         _runtime_extra_flags,
-        aot_link_libraries,
+        aot_link_executable,
         host_target,
         make_target_machine,
         optimize,
@@ -1014,11 +1013,10 @@ def cmd_build(
     objs.append(runpy_obj)
 
     executable = output or out_base
-    linker.link(
+    aot_link_executable(
+        linker,
         objs,
         executable,
-        libraries=aot_link_libraries(),
-        library_paths=_gmp_library_paths(),
         opt_level=opt,
         opt_size=opt_size,
         debug=debug,

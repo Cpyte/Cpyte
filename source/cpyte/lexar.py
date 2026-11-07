@@ -7,6 +7,7 @@ class TokenType(Enum):
     NUMBER = auto()
     STRING = auto()
     FSTRING = auto()
+    CHAR = auto()
 
     PLUS = auto()
     MINUS = auto()
@@ -50,6 +51,7 @@ class TokenType(Enum):
     COMMA = auto()
     COLON = auto()
     DOT = auto()
+    QUESTION = auto()
     AT_SIGN = auto()
 
     INDENT = auto()
@@ -542,6 +544,7 @@ class _LineLexer:
             ",": TokenType.COMMA,
             ":": TokenType.COLON,
             ".": TokenType.DOT,
+            "?": TokenType.QUESTION,
             "@": TokenType.AT_SIGN,
         }
 
@@ -573,7 +576,25 @@ class _LineLexer:
                 continue
 
             if ch in "\"'":
-                tokens.append(self.scan_string(ch))
+                tok = self.scan_string(ch)
+                # A single-quoted literal holding exactly one byte is a char
+                # constant (`'a'`, `'\n'`, `'\x41'`); anything longer stays a
+                # string so `'hello'` keeps working as before.
+                if (
+                    ch == "'"
+                    and len(tok.value) == 1
+                    and ord(tok.value) < 256
+                ):
+                    tokens.append(
+                        Token(
+                            TokenType.CHAR,
+                            str(ord(tok.value)),
+                            tok.line,
+                            tok.column,
+                        )
+                    )
+                else:
+                    tokens.append(tok)
                 continue
 
             if ch in "fr" and self.pos + 1 < len(self.line) and self.peek(1) in "\"'":
@@ -733,6 +754,24 @@ class Lexer:
                 continuation = False
                 continue
 
+            raw_header = None
+            for head in ("unsafe llvm:", "llvm:", "ccode:"):
+                if trimmed.startswith(head) and trimmed[len(head) :].strip():
+                    raw_header = head
+                    break
+            if not is_continuation and raw_header is not None:
+                header_parts = raw_header[:-1].split()
+                i, last_non_blank = self._emit_raw_block(
+                    norm_lines,
+                    i,
+                    indent,
+                    line_number,
+                    header_parts,
+                    inline=trimmed[len(raw_header) :].strip(),
+                )
+                continuation = False
+                continue
+
             line_lexer = _LineLexer(norm_line, line_number)
             line_tokens = line_lexer.tokenize()
 
@@ -759,14 +798,17 @@ class Lexer:
 
         self.tokens.append(Token(TokenType.EOF, None, last_non_blank, 1))
 
-    def _emit_raw_block(self, norm_lines, i, indent, line_number, header_parts):
+    def _emit_raw_block(
+        self, norm_lines, i, indent, line_number, header_parts, inline=None
+    ):
         """Emit a raw-source block (ccode:/llvm:/unsafe llvm:).
 
         The block header keyword tokens (plus COLON/NEWLINE) are emitted, then
         the whole indented body is captured as a single STRING token. The
         body dedents by its first non-blank line's column; a following line
-        with indentation <= the header's ends the block. Returns (new_i,
-        last_non_blank).
+        with indentation <= the header's ends the block. `inline` carries a
+        body written on the header line itself (`ccode: int f(void) {...}`).
+        Returns (new_i, last_non_blank).
         """
         hdr = " ".join(header_parts)
         for value in header_parts:
@@ -778,6 +820,13 @@ class Lexer:
             Token(TokenType.NEWLINE, None, line_number, len(norm_lines[i]) + 1)
         )
 
+        if inline:
+            self.tokens.append(Token(TokenType.INDENT, None, i + 1, 1))
+            self.tokens.append(Token(TokenType.STRING, inline, i + 1, 1))
+            self.tokens.append(Token(TokenType.NEWLINE, None, i + 1, 1))
+            self.tokens.append(Token(TokenType.DEDENT, None, i + 1, 1))
+            return i + 1, i + 1
+
         c_lines = []
         block_indent = None
         i += 1
@@ -788,12 +837,37 @@ class Lexer:
                 c_lines.append(raw)
                 i += 1
                 continue
-            if block_indent is None:
-                block_indent = len(raw) - len(ls)
-            if len(raw) - len(ls) <= indent:
+            this_indent = len(raw) - len(ls)
+            if this_indent <= indent:
                 break
+            if block_indent is None:
+                block_indent = this_indent
             c_lines.append(raw)
             i += 1
+
+        if block_indent is None:
+            # No indented body. A C-looking line sitting at the header's own
+            # indent is the classic unindented-body mistake; it would silently
+            # become an empty block and then be parsed as cpyte (producing a
+            # baffling lexer error on its punctuation).
+            j = i
+            while j < len(norm_lines):
+                ls = norm_lines[j].lstrip(" \t")
+                if ls.strip():
+                    if (
+                        len(norm_lines[j]) - len(ls) <= indent
+                        and (";" in ls or "{" in ls)
+                    ):
+                        raise LexerError(
+                            f"the body of a `{hdr}:` block must be indented "
+                            "(an unindented line is parsed as cpyte source); "
+                            f"indent the C code or write it inline as "
+                            f"`{hdr}: <code>`",
+                            j + 1,
+                            1,
+                        )
+                    break
+                j += 1
 
         if block_indent:
             out = []

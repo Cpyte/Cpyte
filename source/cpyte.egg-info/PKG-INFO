@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cpyte
-Version: 4.6.8
+Version: 4.6.9
 Summary: The Cpyte programming language compiler
 Author: Hoang Duy Tung
 License: MIT
@@ -108,24 +108,24 @@ measurement from any historical benchmark results and is collected on the
 dedicated benchmark runner.
 
 <!-- CPYTE_CI_BENCHMARKS_START -->
-Latest run: [1856104da4ed](https://github.com/Cpyte/Cpyte/actions/runs/41477481889) · updated 2026-11-02 16:06 UTC
+Latest run: [cb0a5444973a](https://github.com/Cpyte/Cpyte/actions/runs/42360524451) · updated 2026-11-07 09:58 UTC
 
 | Benchmark | C | Cpy | Python | Cpy/C | Python/C |
 |---|---:|---:|---:|---:|---:|
-| `array_sum` | 6.72ms | 6.66ms | 244.54ms | 0.99x | 36.38x |
-| `bitwise_mix` | 2.84ms | 3.01ms | 673.79ms | 1.06x | 237.42x |
-| `branch_mix` | 4.40ms | 5.11ms | 443.42ms | 1.16x | 100.82x |
-| `call_overhead` | 2.88ms | 3.03ms | 346.82ms | 1.05x | 120.41x |
-| `fib_iterative` | 16.71ms | 16.98ms | 10.985s | 1.02x | 657.26x |
-| `fib_recursive` | 163.45ms | 1.14ms | 7.291s | 0.01x | 44.61x |
-| `float_math` | 6.07ms | 6.14ms | 255.00ms | 1.01x | 42.01x |
-| `integer_mix` | 3.50ms | 3.50ms | 388.09ms | 1.00x | 110.83x |
-| `loop_sum` | 961.82us | 1.05ms | 2.882s | 1.09x | 2996.43x |
-| `matrix_mult` | 4.07ms | 4.40ms | 1.809s | 1.08x | 444.32x |
-| `mem_alloc` | 948.52us | 992.25us | 17.60ms | 1.05x | 18.55x |
-| `prime_count` | 67.00ms | 77.74ms | 1.787s | 1.16x | 26.67x |
-| `quicksort` | 3.68ms | 2.61ms | 29.52ms | 0.71x | 8.02x |
-| `string_concat` | 993.49us | 1.19ms | 25.70ms | 1.19x | 25.87x |
+| `array_sum` | 8.62ms | 8.42ms | 270.30ms | 0.98x | 31.35x |
+| `bitwise_mix` | 2.99ms | 3.22ms | 759.15ms | 1.08x | 253.73x |
+| `branch_mix` | 4.62ms | 6.14ms | 472.37ms | 1.33x | 102.36x |
+| `call_overhead` | 3.40ms | 3.88ms | 377.92ms | 1.14x | 111.12x |
+| `fib_iterative` | 17.05ms | 17.29ms | 12.088s | 1.01x | 708.82x |
+| `fib_recursive` | 168.65ms | 1.21ms | 7.901s | 0.01x | 46.85x |
+| `float_math` | 6.16ms | 6.46ms | 264.74ms | 1.05x | 43.00x |
+| `integer_mix` | 3.73ms | 3.67ms | 422.92ms | 0.98x | 113.51x |
+| `loop_sum` | 952.00us | 1.18ms | 3.094s | 1.24x | 3249.95x |
+| `matrix_mult` | 4.59ms | 4.52ms | 1.961s | 0.98x | 426.88x |
+| `mem_alloc` | 1.05ms | 1.16ms | 23.16ms | 1.11x | 22.08x |
+| `prime_count` | 68.16ms | 78.95ms | 1.955s | 1.16x | 28.68x |
+| `quicksort` | 2.45ms | 2.99ms | 39.60ms | 1.22x | 16.14x |
+| `string_concat` | 1.12ms | 1.18ms | 32.15ms | 1.06x | 28.78x |
 
 Process wall time includes startup. These are measurements from the dedicated `cpyte-official-runner-1`, not the historical benchmark figures elsewhere in this README; results can vary with host load and software versions.
 <!-- CPYTE_CI_BENCHMARKS_END -->

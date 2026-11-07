@@ -327,9 +327,13 @@ static TLBFast* tlab_fast_get(void) {
     return t;
 }
 #else
-static __declspec(thread) char* g_tlab_buffer = NULL;
-static __declspec(thread) size_t g_tlab_size = 0;
-static __declspec(thread) size_t g_tlab_offset = 0;
+/* Windows keeps a per-thread TLBFast in native TLS (__declspec(thread) is
+ * zero-initialized by the loader, so buffer starts NULL and the shared
+ * cpyte_tlab_alloc_fast / cpyte_tlab_reset bodies below compile and run
+ * identically to the POSIX pthread-key path above). */
+typedef struct { char* buffer; size_t size; size_t offset; } TLBFast;
+static __declspec(thread) TLBFast g_tlab_fast = {0};
+static TLBFast* tlab_fast_get(void) { return &g_tlab_fast; }
 #endif
 
 void* cpyte_tlab_alloc_fast(size_t size) {

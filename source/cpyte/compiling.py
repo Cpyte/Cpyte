@@ -932,7 +932,12 @@ def optimize(mod, opt_level=3, opt_size=False):
             fpm.add_jump_threading_pass()
             fpm.add_loop_rotate_pass()
             fpm.add_loop_unroll_pass()
-            fpm.add_loop_strength_reduce_pass()
+            # NOTE: no loop strength reduction here. As a bare function pass
+            # LSR runs without the LoopPassManager's LCSSA-instrumenting
+            # callback, so on loops whose exits are not in LCSSA form it trips
+            # the "Loops must remain in LCSSA form!" assertion (LLVM ≥ 20) and
+            # aborts the process. The default pipeline below already runs LSR
+            # properly wrapped + instrumented, so the final code is unchanged.
             fpm.add_sinking_pass()
             fpm.add_mem_copy_opt_pass()
             fpm.add_dead_store_elimination_pass()

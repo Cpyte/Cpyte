@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Regression checks for compiler API and pointer arithmetic semantics."""
 
+import ctypes
+import hashlib
 import os
 import re
 import struct
 import sys
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from llvmlite import binding as llvm
 
@@ -13,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "source"))
 
 from cpyte import CpyteCompileError, emit_program, parse_and_analyze  # noqa: E402
-from cpyte import sef  # noqa: E402
+from cpyte import compiling, sef  # noqa: E402
 from cpyte.package_manifest import iter_cpm_version_dirs, sort_cpm_versions  # noqa: E402
 
 
@@ -311,6 +316,160 @@ def test_sef_checker_rejects_truncated_relocation_records():
     )
 
 
+def test_optimizer_pipeline_and_loop_execution():
+    ir = """
+        define i64 @accumulate(i64 %n, ptr %count) {
+        entry:
+            store i64 0, ptr %count
+            br label %condition
+        condition:
+            %i = phi i64 [0, %entry], [%next, %backedge]
+            %sum = phi i64 [0, %entry], [%total, %backedge]
+            %more = icmp slt i64 %i, %n
+            br i1 %more, label %body, label %exit
+        body:
+            %product = mul i64 %i, 17
+            %offset = add i64 %product, 3
+            %value = srem i64 %offset, 97
+            %total = add i64 %sum, %value
+            %next = add i64 %i, 1
+            store i64 %next, ptr %count
+            %stop = icmp eq i64 %next, 113
+            br i1 %stop, label %early, label %backedge
+        backedge:
+            br label %condition
+        early:
+            ret i64 %total
+        exit:
+            ret i64 %sum
+        }
+    """
+    cases = (
+        (0, False, 0, 0, 0),
+        (1, False, 1, 0, 0),
+        (2, False, 1, 0, 1),
+        (3, False, 2, 1, 2),
+        (0, True, 1, 1, 0),
+        (2, True, 1, 1, 1),
+        (3, True, 1, 1, 1),
+    )
+    for level, size, defaults, customs, functions in cases:
+        mod = llvm.parse_assembly(ir)
+        mod.verify()
+        with (
+            patch.object(
+                llvm.PassBuilder,
+                "getModulePassManager",
+                autospec=True,
+                side_effect=llvm.PassBuilder.getModulePassManager,
+            ) as default_pipeline,
+            patch.object(
+                llvm,
+                "create_new_module_pass_manager",
+                wraps=llvm.create_new_module_pass_manager,
+            ) as custom_pipeline,
+            patch.object(
+                llvm.PassBuilder,
+                "getFunctionPassManager",
+                autospec=True,
+                side_effect=llvm.PassBuilder.getFunctionPassManager,
+            ) as function_pipeline,
+            patch(
+                "cpyte.extension_hooks.get_global_hook_registry",
+                return_value=SimpleNamespace(get=lambda stage: []),
+            ),
+        ):
+            compiling.optimize(mod, level, opt_size=size)
+            assert default_pipeline.call_count == defaults, (level, size)
+            assert custom_pipeline.call_count == customs, (level, size)
+            assert function_pipeline.call_count == functions, (level, size)
+        mod.verify()
+        with llvm.create_mcjit_compiler(
+            mod, compiling.make_target_machine(opt=level)
+        ) as engine:
+            engine.finalize_object()
+            accumulate = ctypes.CFUNCTYPE(
+                ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)
+            )(engine.get_function_address("accumulate"))
+            for n in (-1, 0, 1, 17, 112, 113, 114, 1000):
+                count = ctypes.c_int64(-1)
+                iterations = min(max(n, 0), 113)
+                expected = sum((i * 17 + 3) % 97 for i in range(iterations))
+                assert accumulate(n, ctypes.byref(count)) == expected, (level, size, n)
+                assert count.value == iterations, (level, size, n)
+
+
+def test_optimized_runtime_cache_revision():
+    content = b"int answer(void) { return 42; }\n"
+    triple = compiling.host_target().triple
+    key = hashlib.sha1(content + triple.encode() + b"-O0").hexdigest()
+    raw_ir = "; raw runtime\ndefine i32 @answer() { ret i32 42 }\n"
+    legacy_ir = "; old optimizer\ndefine i32 @answer() { ret i32 1 }\n"
+    with tempfile.TemporaryDirectory() as root:
+        src = Path(root) / "runtime.c"
+        src.write_bytes(content)
+        cache = Path(root) / "cpyte_rtcache"
+        cache.mkdir()
+        raw_path = cache / (key + ".ll")
+        raw_path.write_text(raw_ir)
+        legacy_path = cache / (key + ".opt3o0.ll")
+        legacy_path.write_text(legacy_ir)
+        with (
+            patch("tempfile.gettempdir", return_value=root),
+            patch.object(
+                compiling.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout=raw_ir),
+            ) as clang,
+            patch.object(compiling, "optimize", wraps=compiling.optimize) as optimize,
+        ):
+            for level in (None, 0):
+                result, error = compiling._cached_c_ir(
+                    "clang", str(src), triple, jit_opt_level=level
+                )
+                assert result == raw_ir and error is None
+            clang.assert_not_called()
+            optimize.assert_not_called()
+            for level, size in ((3, False), (2, False), (3, True)):
+                result, error = compiling._cached_c_ir(
+                    "clang",
+                    str(src),
+                    triple,
+                    jit_opt_level=level,
+                    jit_opt_size=size,
+                )
+                assert error is None and result not in (raw_ir, legacy_ir)
+                llvm.parse_assembly(result).verify()
+                optimize.assert_called_with(
+                    optimize.call_args.args[0], level, opt_size=size
+                )
+                assert "ret i32 42" in result
+                suffix = (
+                    f".opt{level}o{int(size)}.r{compiling._OPTIMIZER_CACHE_REVISION}.ll"
+                )
+                assert (cache / (key + suffix)).read_text() == result
+                calls = clang.call_count, optimize.call_count
+                warm, error = compiling._cached_c_ir(
+                    "clang",
+                    str(src),
+                    triple,
+                    jit_opt_level=level,
+                    jit_opt_size=size,
+                )
+                assert error is None and warm == result
+                assert (clang.call_count, optimize.call_count) == calls
+            assert clang.call_count == optimize.call_count == 3
+            with patch.object(
+                compiling,
+                "_OPTIMIZER_CACHE_REVISION",
+                compiling._OPTIMIZER_CACHE_REVISION + 1,
+            ):
+                compiling._cached_c_ir("clang", str(src), triple, jit_opt_level=3)
+            assert clang.call_count == optimize.call_count == 4
+        assert raw_path.read_text() == raw_ir
+        assert legacy_path.read_text() == legacy_ir
+
+
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_integer_pointer_arithmetic()
@@ -324,4 +483,6 @@ if __name__ == "__main__":
     test_auto_type_inference_compiles()
     test_auto_inference_errors_are_diagnostics()
     test_sef_checker_rejects_truncated_relocation_records()
+    test_optimizer_pipeline_and_loop_execution()
+    test_optimized_runtime_cache_revision()
     print("Compiler regression tests passed.")

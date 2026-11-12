@@ -47,6 +47,7 @@ else:
     _RUNPY_RUNTIME_C = os.path.join(os.path.dirname(__file__), "runpy_runtime.c")
 
 _llvm_cc_cache = None
+_OPTIMIZER_CACHE_REVISION = 1
 
 # llvmlite's binding is not thread-safe: parse_assembly / link_modules /
 # create_pass_builder / optimize all touch the same global LLVM context.
@@ -910,8 +911,7 @@ def optimize(mod, opt_level=3, opt_size=False):
 
     pb = binding.create_pass_builder(target_machine, pto)
 
-    # Phase 1: infer function attributes (readonly/noalias/nonnull) so every
-    # later pass can exploit them (RPO function-attrs runs as a module pass).
+    # Keep the early default pipeline: its ordering improves integer-loop codegen.
     if heavy:
         mpm = pb.getModulePassManager()
         mpm.add_rpo_function_attrs_pass()
@@ -962,7 +962,8 @@ def optimize(mod, opt_level=3, opt_size=False):
     # function merging). These shrink and specialise the module before the
     # default pipeline runs the inliner and vectorizers.
     if heavy:
-        mpm = pb.getModulePassManager()
+        # PassBuilder.getModulePassManager() would repeat the full default pipeline.
+        mpm = binding.create_new_module_pass_manager()
         mpm.add_argument_promotion_pass()
         mpm.add_ipsccp_pass()
         mpm.add_global_opt_pass()
@@ -991,7 +992,7 @@ def optimize(mod, opt_level=3, opt_size=False):
     elif opt_size:
         # Size-oriented module phase: coalesce constants, eliminate dead globals
         # and arguments, merge identical function bodies, drop unused prototypes.
-        mpm = pb.getModulePassManager()
+        mpm = binding.create_new_module_pass_manager()
         mpm.add_constant_merge_pass()
         mpm.add_global_dead_code_eliminate_pass()
         mpm.add_dead_arg_elimination_pass()
@@ -1252,7 +1253,9 @@ def _cached_c_ir(
     cache_dir = os.path.join(tempfile.gettempdir(), "cpyte_rtcache")
     cache_path = os.path.join(cache_dir, key + ".ll")
     if jit_opt_level is not None and jit_opt_level > 0:
-        opt_suffix = "opt%do%d" % (jit_opt_level, 1 if jit_opt_size else 0)
+        opt_suffix = (
+            f"opt{jit_opt_level}o{int(jit_opt_size)}.r{_OPTIMIZER_CACHE_REVISION}"
+        )
         cache_path = os.path.join(cache_dir, key + "." + opt_suffix + ".ll")
     try:
         os.makedirs(cache_dir, exist_ok=True)

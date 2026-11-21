@@ -23,6 +23,8 @@ source/cpyte/linker.py
 source/cpyte/lsp_server.py
 source/cpyte/mainpie.py
 source/cpyte/mksef.py
+source/cpyte/opreof_opt.py
+source/cpyte/opreof_pipeline.py
 source/cpyte/optimizations.py
 source/cpyte/package_manifest.py
 source/cpyte/runpy_runtime.c
@@ -45,6 +47,7 @@ source/cpyte.egg-info/top_level.txt
 test/test_bignum_jit.py
 test/test_compiler_regressions.py
 test/test_fuzz_del_has.py
+test/test_opreof_proofs.py
 test/test_scorpion_abi.py
 test/test_scorpion_dl.py
 test/test_sef_tools.py

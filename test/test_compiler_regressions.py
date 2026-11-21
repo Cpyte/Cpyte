@@ -19,7 +19,12 @@ sys.path.insert(0, os.path.join(ROOT, "source"))
 
 from cpyte import CpyteCompileError, emit_program, parse_and_analyze  # noqa: E402
 from cpyte import compiling, sef  # noqa: E402
-from cpyte.package_manifest import iter_cpm_version_dirs, sort_cpm_versions  # noqa: E402
+from cpyte.package_manifest import (  # noqa: E402
+    cpm_module_roots,
+    iter_cpm_version_dirs,
+    reset_global_registry,
+    sort_cpm_versions,
+)
 
 
 def compile_program(source):
@@ -105,6 +110,163 @@ def test_cpm_versions_use_semver_order():
             os.makedirs(os.path.join(package, version))
         result = list(iter_cpm_version_dirs(root))
         assert result[0][1].endswith(os.path.join("pkg", "2.10.0"))
+
+
+def _write_cpm_package(root, package_path, name, version, source=None):
+    version_dir = os.path.join(root, package_path, version)
+    os.makedirs(version_dir, exist_ok=True)
+    with open(os.path.join(version_dir, "package.json"), "w") as f:
+        f.write(f'{{"name": "{name}", "version": "{version}"}}')
+    if source is not None:
+        with open(os.path.join(version_dir, f"{name}.cpy"), "w") as f:
+            f.write(source)
+
+
+def test_cpm_module_roots_include_global_and_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = os.path.join(tmp, "project")
+        home = os.path.join(tmp, "home")
+        roots = cpm_module_roots(workspace_root=workspace, home=home)
+        assert roots == [
+            os.path.join(workspace, ".cpm", "modules"),
+            os.path.join(home, ".cpm", "modules"),
+        ]
+        # Without a workspace, a source file next to a .cpm dir is used as the
+        # project-local root; the global root is still searched afterwards.
+        filedir = os.path.join(tmp, "src")
+        roots = cpm_module_roots(filedir=filedir, home=home)
+        assert roots == [
+            os.path.normpath(os.path.join(filedir, "..", ".cpm", "modules")),
+            os.path.join(home, ".cpm", "modules"),
+        ]
+
+
+def _parse_with_roots(source, roots, filepath=None, workspace_root=None):
+    """Analyze ``source`` with CPM roots replaced by ``roots``."""
+    def roots_for(*_args, **_kwargs):
+        return roots
+
+    with (
+        patch("cpyte.mainpie.cpm_module_roots", roots_for),
+        patch("cpyte.semantic_analasis.cpm_module_roots", roots_for),
+    ):
+        reset_global_registry()
+        try:
+            parsed, generics, _ = parse_and_analyze(
+                source,
+                filepath=filepath,
+                workspace_root=workspace_root,
+                enable_extensions=True,
+            )
+            module, _, _ = emit_program(
+                parsed,
+                generic_instantiations=generics,
+                enable_extensions=True,
+            )
+            return str(module)
+        finally:
+            reset_global_registry()
+
+
+def test_global_cpm_import_resolves_without_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        global_root = os.path.join(tmp, "global_modules")
+        _write_cpm_package(
+            global_root,
+            os.path.join("@std", "demo"),
+            "demo",
+            "1.0",
+            "public def demo_value() -> int:\n    return 7\n",
+        )
+        # Extension-only global packages must import cleanly too.
+        _write_cpm_package(
+            global_root, os.path.join("@std", "extonly"), "extonly", "1.0"
+        )
+        _write_cpm_package(
+            global_root,
+            "plain",
+            "plain",
+            "1.0",
+            "public def plain_value() -> int:\n    return 3\n",
+        )
+
+        source = (
+            'import "@std/demo"\n'
+            'import "@std/extonly"\n'
+            'import "plain"\n'
+            "public def main() -> int:\n"
+            "    return demo_value() + plain_value()\n"
+        )
+        ir = _parse_with_roots(
+            source, [global_root], filepath=os.path.join(tmp, "probe.cpy")
+        )
+        assert 'define i32 @"demo_value"' in ir
+        assert 'define i32 @"plain_value"' in ir
+
+
+def test_workspace_cpm_package_wins_over_global_and_dot_form_imports():
+    with tempfile.TemporaryDirectory() as tmp:
+        global_root = os.path.join(tmp, "global_modules")
+        workspace_root = os.path.join(tmp, "project")
+        local_root = os.path.join(workspace_root, ".cpm", "modules")
+        _write_cpm_package(
+            global_root,
+            os.path.join("@std", "demo"),
+            "demo",
+            "1.0",
+            "public def global_demo() -> int:\n    return 1\n",
+        )
+        _write_cpm_package(
+            local_root,
+            os.path.join("@std", "demo"),
+            "demo",
+            "2.0",
+            "public def local_demo() -> int:\n    return 2\n",
+        )
+
+        source = (
+            'import "@std.demo"\n'
+            "public def main() -> int:\n"
+            "    return local_demo()\n"
+        )
+        ir = _parse_with_roots(
+            source,
+            [local_root, global_root],
+            filepath=os.path.join(workspace_root, "probe.cpy"),
+            workspace_root=workspace_root,
+        )
+        assert 'define i32 @"local_demo"' in ir
+        assert "global_demo" not in ir
+
+
+def test_deep_std_extension_import_is_still_skipped():
+    # `@std.<pkg>.<sub>` is resolved at runtime; it must not be reported as a
+    # missing CPM package, unlike the two-segment `@std.<pkg>` package form.
+    parse_and_analyze(
+        'import "@std.math.foo"\npublic def main() -> int:\n    return 0\n',
+        enable_extensions=False,
+    )
+
+
+def test_lsp_import_completions_include_global_cpm_packages():
+    try:
+        from cpyte import lsp_server
+    except ImportError:  # pragma: no cover - optional editor dependency
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        global_root = os.path.join(tmp, "global_modules")
+        _write_cpm_package(
+            global_root, os.path.join("@std", "lspdemo"), "lspdemo", "1.0", ""
+        )
+        def roots_for(*_args, **_kwargs):
+            return [global_root]
+
+        with patch("cpyte.lsp_server.cpm_module_roots", roots_for):
+            labels = [
+                item.label
+                for item in lsp_server._import_dir_completions("@std/", None, None)
+            ]
+        assert any("lspdemo" in label for label in labels)
 
 
 def test_compound_index_assignment_evaluates_index_once():
@@ -470,12 +632,71 @@ def test_optimized_runtime_cache_revision():
         assert legacy_path.read_text() == legacy_ir
 
 
+def test_binary_operators_associate_left_except_power():
+    """Same-precedence chains must fold left; only ``**`` folds right.
+
+    The recursive Pratt parser used to pass the operator's own precedence to
+    its right-hand side, so ``a - b + c`` built ``a - (b + c)``. The iterative
+    deep-expression fallback already added the ``+ 1``, which meant the two
+    parsers produced different trees for the same source.
+    """
+    from cpyte.astparse import BinOp, parse_expression
+    from cpyte.lexar import Lexer
+
+    def shape(src):
+        """(left op right) written back out as a string."""
+
+        def render(node):
+            if isinstance(node, BinOp):
+                return f"({render(node.left)} {node.op.name} {render(node.right)})"
+            return getattr(node, "name", None) or getattr(node, "value", None)
+
+        return render(parse_expression(Lexer(src).tokens, 0)[0])
+
+    assert shape("a - b + c") == "((a MINUS b) PLUS c)"
+    assert shape("a - b - c") == "((a MINUS b) MINUS c)"
+    assert shape("a * b / c") == "((a STAR b) SLASH c)"
+    assert shape("a / b * c") == "((a SLASH b) STAR c)"
+    assert shape("a - b + c - d") == "(((a MINUS b) PLUS c) MINUS d)"
+    assert shape("1 << 3 >> 2") == "((1 SHL 3) SHR 2)"
+
+    # precedence still dominates associativity
+    assert shape("a - b * c") == "(a MINUS (b STAR c))"
+    assert shape("a + b | c") == "((a PLUS b) PIPE c)"
+
+    # `**` is the one right-associative operator
+    assert shape("2 ** 3 ** 2") == "(2 POW (3 POW 2))"
+
+    # the recursive and iterative parsers must agree on associativity
+    from cpyte.astparse import _parse_expr_iterative
+
+    deep = "(" * 200 + "a - b + c" + ")" * 200
+    deep_tokens = Lexer(deep).tokens
+    # start inside the run of parens, at the first token of the inner expression
+    offset = next(
+        i for i, t in enumerate(deep_tokens) if getattr(t, "value", None) == "a"
+    )
+    iterative = _parse_expr_iterative(deep_tokens, offset, 0)[0]
+
+    def render(node):
+        if isinstance(node, BinOp):
+            return f"({render(node.left)} {node.op.name} {render(node.right)})"
+        return getattr(node, "name", None) or getattr(node, "value", None)
+
+    assert render(iterative) == "((a MINUS b) PLUS c)"
+
+
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_integer_pointer_arithmetic()
     test_invalid_pointer_arithmetic_is_rejected()
     test_invalid_hex_literal_is_lexer_error()
     test_cpm_versions_use_semver_order()
+    test_cpm_module_roots_include_global_and_workspace()
+    test_global_cpm_import_resolves_without_workspace()
+    test_workspace_cpm_package_wins_over_global_and_dot_form_imports()
+    test_deep_std_extension_import_is_still_skipped()
+    test_lsp_import_completions_include_global_cpm_packages()
     test_compound_index_assignment_evaluates_index_once()
     test_zero_multiplication_preserves_call_side_effects()
     test_counted_loop_unrolling_preserves_integer_wraparound()
@@ -485,4 +706,5 @@ if __name__ == "__main__":
     test_sef_checker_rejects_truncated_relocation_records()
     test_optimizer_pipeline_and_loop_execution()
     test_optimized_runtime_cache_revision()
+    test_binary_operators_associate_left_except_power()
     print("Compiler regression tests passed.")

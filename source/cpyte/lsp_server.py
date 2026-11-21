@@ -30,6 +30,7 @@ from .astparse import (
 from .clib import _BUILTIN_LIB_HEADERS
 from .formatter import format_source
 from .lexar import Lexer, LexerError, TokenType
+from .package_manifest import cpm_module_roots
 from .semantic_analasis import SemanticAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -287,9 +288,11 @@ _SNIPPETS = {
 def _load_manifest_keywords(workspace_root):
     """Register package manifest keywords so the lexer recognises extension
     keywords/operators before lexing — mirrors the compiler CLI path in
-    mainpie. Safe to call repeatedly (global registry de-dupes by package)."""
-    if not workspace_root:
-        return
+    mainpie. Safe to call repeatedly (global registry de-dupes by package).
+
+    Global ``~/.cpm`` packages must be loaded even when the editor has no
+    workspace folder open, so there is no workspace guard here.
+    """
     try:
         from .mainpie import _load_package_manifests_from_source
 
@@ -972,8 +975,9 @@ def _import_dir_completions(partial, file_dir, workspace_root):
         bases.append(file_dir)
     if workspace_root:
         bases.append(workspace_root)
-    if workspace_root:
-        bases.append(os.path.join(workspace_root, ".cpm", "modules"))
+    # CPM direct installs are global (~/.cpm/modules); manifest-driven ones
+    # stay under the workspace. Offer completions from both.
+    bases.extend(cpm_module_roots(workspace_root, file_dir))
 
     for base in bases:
         if not base:

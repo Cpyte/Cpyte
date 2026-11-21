@@ -559,10 +559,44 @@ def reset_global_registry() -> None:
     _global_registry.clear()
 
 
+def cpm_module_roots(
+    workspace_root: str | None = None,
+    filedir: str | None = None,
+    home: str | None = None,
+) -> list[str]:
+    """Return the CPM module roots to search, in priority order.
+
+    CPM installs manifest-driven dependencies under
+    ``<project>/.cpm/modules`` but direct ``cpm install <pkg>`` packages
+    under ``~/.cpm/modules``.  Accept both layouts so a package is found
+    regardless of how it was installed.
+
+    ``filedir`` is only used as a fallback when no workspace root is known
+    (the compiler's library API can be given a filepath without a workspace).
+    ``home`` exists for tests; production callers use ``~``.
+    """
+    roots: list[str] = []
+
+    def add(path: str | None) -> None:
+        if not path:
+            return
+        path = os.path.abspath(os.path.normpath(path))
+        if path not in roots:
+            roots.append(path)
+
+    if workspace_root:
+        add(os.path.join(workspace_root, ".cpm", "modules"))
+    elif filedir:
+        add(os.path.join(filedir, "..", ".cpm", "modules"))
+
+    add(os.path.join(home or os.path.expanduser("~"), ".cpm", "modules"))
+    return roots
+
+
 def iter_cpm_version_dirs(cpm_root: str):
     """Yield (package_name, version_dir) for every installed CPM package.
 
-    Handles both layouts found under ``<project>/.cpm/modules``:
+    Handles both layouts found under a CPM modules root:
 
         ``<name>/<version>/``            unscoped packages
         ``@scope/<name>/<version>/``     scoped packages (e.g. @std/json)

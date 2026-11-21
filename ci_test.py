@@ -63,6 +63,7 @@ CORPUS: tuple[str, ...] = (
     "test/test_cross_file_struct.cpy",
     "test/test_char.cpy",
     "test/test_unsigned_ops.cpy",
+    "test/test_assoc.cpy",
     "test/most_complex.cpy",
 )
 

@@ -1124,6 +1124,89 @@ def _mpfr_include_dir() -> str | None:
     return None
 
 
+def _find_openssl_paths():
+    """Find OpenSSL include and lib dirs (for linking crypto into ccode/JIT/AOT)."""
+    # Try hook-provided paths first (from loaded build hooks, e.g. cryptography)
+    try:
+        from .extension_hooks import get_global_hook_dispatcher, CompilerContext
+        disp = get_global_hook_dispatcher()
+        ctx = CompilerContext()
+        try:
+            disp.collect_build_configuration(ctx)
+        except Exception:
+            pass
+        inc = None
+        libdir = None
+        for pth in (ctx.include_paths or []):
+            if pth and os.path.isdir(pth):
+                if os.path.isfile(os.path.join(pth, 'openssl', 'evp.h')):
+                    inc = pth
+                    break
+        for pth in (ctx.library_paths or []):
+            if pth and os.path.isdir(pth):
+                libdir = pth
+                break
+        if inc and libdir:
+            return inc, libdir
+        if inc:
+            cand = os.path.join(os.path.dirname(inc), 'lib')
+            if os.path.isdir(cand):
+                return inc, cand
+    except Exception:
+        pass
+    inc = os.environ.get("CPYTE_OPENSSL_INCLUDE")
+    libdir = os.environ.get("CPYTE_OPENSSL_LIBDIR") or os.environ.get("CPYTE_OPENSSL_LIB")
+    if inc and libdir:
+        return inc, libdir
+    if inc:
+        cand = os.path.join(os.path.dirname(inc), "lib")
+        return inc, cand if os.path.isdir(cand) else None
+    try:
+        r = subprocess.run(["pkg-config", "--cflags", "openssl"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            for f in (r.stdout or "").strip().split():
+                if f.startswith("-I"):
+                    inc = f[2:]
+                    break
+        r2 = subprocess.run(["pkg-config", "--libs-only-L", "openssl"], capture_output=True, text=True, timeout=5)
+        if r2.returncode == 0:
+            for f in (r2.stdout or "").strip().split():
+                if f.startswith("-L"):
+                    libdir = f[2:]
+                    break
+        if inc:
+            return inc, libdir
+    except Exception:
+        pass
+    if shutil.which("brew"):
+        try:
+            for name in ("openssl@3", "openssl"):
+                r = subprocess.run(["brew", "--prefix", name], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    prefix = r.stdout.strip()
+                    inc = os.path.join(prefix, "include")
+                    lib = os.path.join(prefix, "lib")
+                    if os.path.isdir(inc) and os.path.isfile(os.path.join(inc, "openssl", "evp.h")):
+                        return inc, lib
+        except Exception:
+            pass
+    for prefix in ["/opt/homebrew/opt/openssl@3", "/usr/local/opt/openssl@3", "/opt/homebrew/opt/openssl", "/usr/local/opt/openssl"]:
+        inc = os.path.join(prefix, "include")
+        lib = os.path.join(prefix, "lib")
+        if os.path.isdir(inc) and os.path.isfile(os.path.join(inc, "openssl", "evp.h")):
+            return inc, lib
+    if os.path.isfile(os.path.join("/usr/include", "openssl", "evp.h")):
+        libdir = "/usr/lib" if os.path.isdir("/usr/lib") else "/usr/lib/x86_64-linux-gnu"
+        if os.path.isdir(libdir):
+            return "/usr/include", libdir
+    for inc in ["/usr/include", "/usr/local/include"]:
+        if os.path.isfile(os.path.join(inc, "openssl", "evp.h")):
+            libdir = "/usr/lib" if os.path.isdir("/usr/lib") else "/usr/local/lib"
+            if os.path.isdir(libdir):
+                return inc, libdir
+    return None, None
+
+
 def _runtime_extra_flags(src_path: str) -> tuple:
     """Extra clang flags needed to compile a runtime C source.
 
@@ -1183,6 +1266,14 @@ def aot_link_libraries() -> list:
     libs = ["m", "gmp"]
     if _mpfr_include_dir() is not None:
         libs.append("mpfr")
+    # OpenSSL for cryptography ccode (EVP/HMAC). Try to detect.
+    try:
+        inc, libdir = _find_openssl_paths()
+        if inc:
+            libs.append("ssl")
+            libs.append("crypto")
+    except Exception:
+        pass
     return libs
 
 
@@ -1190,32 +1281,27 @@ _GMP_LINK_NEEDLE = re.compile(r"(?:gmp[a-z]*_|mpfr_|libgmp|libmpfr|-lgmp|-lmpfr)
 
 
 def aot_link_executable(linker, objects, output, **kwargs):
-    """Link an AOT executable, pulling in GMP/MPFR only when it is needed.
-
-    The bignum runtime's kept helpers (``_BIGNUM_KEEP``) always reference
-    ``mpz_*``, but ``-dead_strip``/``--gc-sections`` drop them when the program
-    never touches ``big``/``ubig``. Linking libgmp + libmpfr unconditionally
-    still records them in the executable's load commands, so every launch pays
-    the dynamic loader for two extra shared libraries -- a fixed cost that is
-    large relative to short benchmarks. So try the link with libc/libm only and
-    retry with the full runtime library set only when the linker reports an
-    unresolved GMP/MPFR symbol.
-
-    A static scan of the object cannot decide this: every program object
-    declares the kept bignum helpers (and they reference ``mpz_*``), so the
-    symbol table looks identical whether or not the program uses ``big``.
-    """
+    """Link an AOT executable, pulling in GMP/MPFR/OpenSSL only when needed."""
     libs = ["m"]
     ok, stderr = linker.link(objects, output, libraries=libs, check=False, **kwargs)
     if ok:
         return output
-    if not _GMP_LINK_NEEDLE.search(stderr or ""):
-        print_err(f"link error: {format_cc_diag(stderr)}")
-        raise SystemExit(1)
-    libs = aot_link_libraries()
-    kwargs["library_paths"] = _gmp_library_paths()
-    linker.link(objects, output, libraries=libs, **kwargs)
-    return output
+    # If missing GMP/MPFR or OpenSSL symbols, add libraries
+    if _GMP_LINK_NEEDLE.search(stderr or "") or "EVP_" in (stderr or "") or "HMAC" in (stderr or "") or "openssl" in (stderr or "").lower():
+        libs = aot_link_libraries()
+        lp = list(kwargs.get("library_paths") or [])
+        lp.extend(_gmp_library_paths())
+        try:
+            _o_inc, _o_lib = _find_openssl_paths()
+            if _o_lib and _o_lib not in lp:
+                lp.append(_o_lib)
+        except Exception:
+            pass
+        kwargs["library_paths"] = lp
+        linker.link(objects, output, libraries=libs, **kwargs)
+        return output
+    print_err(f"link error: {format_cc_diag(stderr)}")
+    raise SystemExit(1)
 
 
 def _cached_c_ir(
@@ -1351,6 +1437,13 @@ def run_jit(
             if src.endswith(".ll"):
                 with open(src) as f:
                     return src, f.read(), None
+            extra = []
+            try:
+                openssl_inc, _ = _find_openssl_paths()
+                if openssl_inc:
+                    extra.append(f"-I{openssl_inc}")
+            except Exception:
+                pass
             r = subprocess.run(
                 [
                     llvm_cc,
@@ -1360,6 +1453,7 @@ def run_jit(
                     "-target",
                     target.triple,
                     "-fno-stack-protector",
+                    *extra,
                     "-o",
                     "-",
                     src,
@@ -2008,12 +2102,20 @@ def run_aot(
     compile_jobs.append((_RUNPY_RUNTIME_C, output + ".runpy.o"))
 
     def _linker_compile(src, out):
+        extra = []
+        try:
+            openssl_inc, _ = _find_openssl_paths()
+            if openssl_inc:
+                extra.append(f"-I{openssl_inc}")
+        except Exception:
+            pass
         linker.compile_c(
             src,
             output=out,
             opt_level=3,
             pic=pic,
             eh=(not no_userspace and src == _RUNTIME_C),
+            extra_flags=tuple(extra),
         )
         return out
 

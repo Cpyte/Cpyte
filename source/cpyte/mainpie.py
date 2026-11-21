@@ -40,6 +40,7 @@ if __package__:
     from .linker import Linker, format_cc_diag
     from .package_manifest import (
         ManifestParser,
+        cpm_module_roots,
         get_global_registry,
         iter_cpm_version_dirs,
     )
@@ -85,6 +86,7 @@ else:
     from cpyte.linker import Linker, format_cc_diag
     from cpyte.package_manifest import (
         ManifestParser,
+        cpm_module_roots,
         get_global_registry,
         iter_cpm_version_dirs,
     )
@@ -337,58 +339,62 @@ def _sync_lexer_hooks() -> None:
         register_operators(operators)
 
 
-def _load_package_manifests_from_source(workspace_root: str) -> None:
-    """
-    Load all package manifests from CPM packages in the workspace.
+def _load_package_manifests_from_source(workspace_root: str | None) -> None:
+    """Load manifests from all installed CPM packages.
 
-    This ensures that package extensions (keywords, operators, etc.) are
-    available during lexing and parsing.
+    Direct ``cpm install <pkg>`` packages live in ``~/.cpm/modules`` while
+    manifest-driven installs stay in ``<workspace>/.cpm/modules``. Both are
+    searched, and global packages work even without a workspace. This makes
+    package-provided keywords/operators available before lexing/parsing.
     """
-    cpm_root = os.path.join(workspace_root, ".cpm", "modules")
-    if not os.path.isdir(cpm_root):
-        return
-
     manifest_registry = get_global_registry()
 
-    # Load all available packages in the workspace
-    for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
-        # Check if already loaded
-        if manifest_registry.is_loaded(package_name):
+    for cpm_root in cpm_module_roots(workspace_root):
+        if not os.path.isdir(cpm_root):
             continue
 
-        manifest_path = os.path.join(version_dir, "package.json")
-        if not os.path.exists(manifest_path):
-            continue
+        for dir_package, version_dir in iter_cpm_version_dirs(cpm_root):
+            # iter_cpm_version_dirs yields scoped dirs as "@scope/name";
+            # manifest.name (from package.json) is usually just "name".
+            base_name = dir_package.rsplit("/", 1)[-1]
+            if manifest_registry.is_loaded(base_name):
+                continue
 
-        try:
-            manifest = ManifestParser.validate_and_parse(manifest_path)
+            manifest_path = os.path.join(version_dir, "package.json")
+            if not os.path.exists(manifest_path):
+                continue
 
-            # Register declared keywords/operators with the lexer.
-            if manifest.capabilities.keywords:
-                register_keywords(manifest.capabilities.keywords)
-            if manifest.capabilities.operators:
-                register_operators(manifest.capabilities.operators)
+            try:
+                manifest = ManifestParser.validate_and_parse(manifest_path)
+                if manifest_registry.is_loaded(manifest.name):
+                    continue
 
-            # Register manifest
-            manifest_registry.register(manifest)
+                # Register declared keywords/operators with the lexer.
+                if manifest.capabilities.keywords:
+                    register_keywords(manifest.capabilities.keywords)
+                if manifest.capabilities.operators:
+                    register_operators(manifest.capabilities.operators)
 
-            # Lexer + parser hooks must be available before lexing/parsing the
-            # source file. Remaining stages load lazily when the package is
-            # actually imported (see semantic analysis).
-            parser_phase = manifest.extensions.parser_phase_hooks()
-            if parser_phase:
-                HookLoader.load_hooks_from_package(
-                    package_name,
-                    version_dir,
-                    parser_phase,
-                    get_global_hook_registry(),
-                    CompilerContext(data={"package_dir": version_dir}),
+                manifest_registry.register(manifest)
+
+                # Lexer + parser hooks must be available before lexing/parsing
+                # the source. Remaining stages load lazily at import time.
+                parser_phase = manifest.extensions.parser_phase_hooks()
+                if parser_phase:
+                    HookLoader.load_hooks_from_package(
+                        manifest.name,
+                        version_dir,
+                        parser_phase,
+                        get_global_hook_registry(),
+                        CompilerContext(data={"package_dir": version_dir}),
+                    )
+
+            except Exception as e:
+                if get_global_hook_registry().strict:
+                    raise
+                ui.print_warn(
+                    f"Failed to load package manifest for '{base_name}': {e}"
                 )
-
-        except Exception as e:
-            if get_global_hook_registry().strict:
-                raise
-            ui.print_warn(f"Failed to load package manifest for '{package_name}': {e}")
 
     # Feed hook-declared keywords/operators to the lexer.
     _sync_lexer_hooks()

@@ -155,6 +155,7 @@ from .clib import (
 from .extension_hooks import (
     CompilerContext,
     DiagnosticSeverity,
+    HookLoadError,
     HookLoader,
     HookStage,
     SemanticHook,
@@ -163,6 +164,7 @@ from .extension_hooks import (
 from .lexar import Lexer, LexerError, TokenType, register_keywords
 from .package_manifest import (
     ManifestParser,
+    cpm_module_roots,
     get_global_registry,
     iter_cpm_version_dirs,
     sort_cpm_versions,
@@ -839,14 +841,14 @@ class SemanticAnalyzer:
             self._loaded_packages.add(package_name)
             # The CLI preloader (_load_package_manifests_from_source) registers
             # the manifest + lexer/parser hooks eagerly, but deliberately defers
-            # semantic/codegen/runtime hooks to import time. Cloud that deferral
-            # never happened (this branch short-circuits), so install the
-            # deferred hooks here; re-installation is idempotent.
-            if self._workspace_root:
-                manifest_path = os.path.join(package_dir, "package.json")
-                if os.path.exists(manifest_path):
-                    manifest = ManifestParser.validate_and_parse(manifest_path)
-                    self._load_nonparser_hooks(manifest, package_dir, package_name)
+            # semantic/codegen/runtime hooks to import time. Since that deferral
+            # never happened (this branch short-circuits), install the
+            # deferred hooks here; re-installation is idempotent. Global CPM
+            # packages work without a workspace, so this is not gated on one.
+            manifest_path = os.path.join(package_dir, "package.json")
+            if os.path.exists(manifest_path):
+                manifest = ManifestParser.validate_and_parse(manifest_path)
+                self._load_nonparser_hooks(manifest, package_dir, package_name)
             return True
 
         manifest_path = os.path.join(package_dir, "package.json")
@@ -863,9 +865,8 @@ class SemanticAnalyzer:
             # Register manifest in global registry
             self._manifest_registry.register(manifest)
 
-            # Load hooks if present
-            if self._workspace_root:
-                self._load_nonparser_hooks(manifest, package_dir, package_name)
+            # Load hooks if present (global packages have no workspace either).
+            self._load_nonparser_hooks(manifest, package_dir, package_name)
 
             self._loaded_packages.add(package_name)
 
@@ -915,23 +916,28 @@ class SemanticAnalyzer:
                 self._hook_registry.register(hook)
 
     def _load_cpm_package_manifests(self) -> None:
-        """Load manifests from all CPM packages in the workspace."""
-        if not self.enable_extensions or not self._workspace_root:
+        """Load manifests from all installed CPM packages.
+
+        Direct ``cpm install <pkg>`` puts packages in ``~/.cpm/modules``;
+        manifest-driven installs stay project-local. Both roots are searched,
+        and a manifest may be loaded without a workspace at all.
+        """
+        if not self.enable_extensions:
             return
 
-        cpm_root = os.path.join(self._workspace_root, ".cpm", "modules")
-        if not os.path.isdir(cpm_root):
-            return
-
-        for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
-            # Match on the base package name so import lookups (which use the
-            # final path segment, e.g. "json" for "@std/json") find it.
-            base_name = package_name.rsplit("/", 1)[-1]
-
-            if base_name in self._loaded_packages:
+        for cpm_root in cpm_module_roots(self._workspace_root, self._filedir):
+            if not os.path.isdir(cpm_root):
                 continue
 
-            self._load_package_manifest(version_dir, base_name)
+            for package_name, version_dir in iter_cpm_version_dirs(cpm_root):
+                # Match on the base package name so import lookups (which use
+                # the final path segment, e.g. "json" for "@std/json") find it.
+                base_name = package_name.rsplit("/", 1)[-1]
+
+                if base_name in self._loaded_packages:
+                    continue
+
+                self._load_package_manifest(version_dir, base_name)
 
     def _tok(self, node):
         if isinstance(node, dict):
@@ -2578,14 +2584,19 @@ class SemanticAnalyzer:
                     self._register_import_symbols(symbols, node)
                     return
 
+        # `@std.<pkg>.<sub>` is a runtime-resolved deep extension, but
+        # `@std.<pkg>` is the dot form of a scoped CPM package and must reach
+        # the resolver like `@std/<pkg>` does.
+        is_deep_extension = module.startswith("@std.") and module.count(".") >= 2
+
         if not is_file_import:
-            if module.startswith("@std."):
+            if is_deep_extension:
                 pass  # deep extension
             elif self._try_cpm_import(node, module):
                 return
 
         if module.startswith("@"):
-            if module.startswith("@std."):
+            if is_deep_extension:
                 return  # deep extension resolved at runtime
             self.error(f"package `{module}` not installed — run 'cpm install'", node)
             return
@@ -2959,62 +2970,63 @@ class SemanticAnalyzer:
         import_name = module.removeprefix("@")
         pkg_name = import_name.replace("/", ".").split(".")[-1]
 
-        cpm_root = None
-        if self._workspace_root:
-            cpm_root = os.path.join(self._workspace_root, ".cpm", "modules")
-        elif self._filedir:
-            cpm_root = os.path.join(self._filedir, "..", ".cpm", "modules")
+        roots = cpm_module_roots(self._workspace_root, self._filedir)
+        has_cpm_root = any(os.path.isdir(root) for root in roots)
 
         # A package already loaded purely via its manifest (extension hooks only)
         # has no real symbols; short-circuit only when no CPM directory exists to
         # resolve a real entry from. A package that ships an entry file must still
         # re-export its actual symbols below.
-        if pkg_name in self._loaded_packages and not (
-            cpm_root and os.path.isdir(cpm_root)
-        ):
+        if pkg_name in self._loaded_packages and not has_cpm_root:
             self._register_import_symbols({}, node)
             return True
 
-        if cpm_root and os.path.isdir(cpm_root):
+        # Remember manifest-only packages, but keep looking: a later root may
+        # contain the package's real .cpy entry or prebuilt IR.
+        manifest_only = False
+        for cpm_root in roots:
+            if not os.path.isdir(cpm_root):
+                continue
+
             if module.startswith("@"):
                 scoped = module[1:].replace("/", ".").replace(".", os.sep)
-                pkg_dir = os.path.join(
-                    cpm_root, f"@{scoped.split(os.sep)[0]}", *scoped.split(os.sep)[1:]
-                )
+                parts = scoped.split(os.sep)
+                pkg_dir = os.path.join(cpm_root, f"@{parts[0]}", *parts[1:])
             else:
                 pkg_dir = os.path.join(cpm_root, *module.replace("/", ".").split("."))
 
-            if os.path.isdir(pkg_dir):
-                versions = sort_cpm_versions(
-                    [
-                        d
-                        for d in os.listdir(pkg_dir)
-                        if os.path.isdir(os.path.join(pkg_dir, d))
-                    ]
-                )
-                if versions:
-                    version_dir = os.path.join(pkg_dir, versions[0])
+            if not os.path.isdir(pkg_dir):
+                continue
 
-                    manifest_loaded = False
-                    if self.enable_extensions:
-                        manifest_loaded = self._load_package_manifest(
-                            version_dir, pkg_name
-                        )
+            versions = sort_cpm_versions(
+                [
+                    d
+                    for d in os.listdir(pkg_dir)
+                    if os.path.isdir(os.path.join(pkg_dir, d))
+                ]
+            )
+            if not versions:
+                continue
+            version_dir = os.path.join(pkg_dir, versions[0])
 
-                    cpy_file = self._find_package_entry(version_dir, pkg_name)
-                    if cpy_file:
-                        result = self._import_cpy(cpy_file, node)
-                        if result:
-                            self._register_import_symbols(result[0], node)
-                        return True
-                    result = self._import_prebuilt(version_dir, node)
-                    if result:
-                        return True
+            if self.enable_extensions and self._load_package_manifest(
+                version_dir, pkg_name
+            ):
+                manifest_only = True
 
-                    if manifest_loaded:
-                        self._register_import_symbols({}, node)
-                        return True
-        if self.enable_extensions and pkg_name in self._loaded_packages:
+            cpy_file = self._find_package_entry(version_dir, pkg_name)
+            if cpy_file:
+                result = self._import_cpy(cpy_file, node)
+                if result:
+                    self._register_import_symbols(result[0], node)
+                return True
+            result = self._import_prebuilt(version_dir, node)
+            if result:
+                return True
+
+        if manifest_only or (
+            self.enable_extensions and pkg_name in self._loaded_packages
+        ):
             self._register_import_symbols({}, node)
             return True
         return False

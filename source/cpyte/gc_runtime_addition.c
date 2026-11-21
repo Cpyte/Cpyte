@@ -16,7 +16,7 @@ typedef struct {
     size_t allocation_offset;
 } StackHeader;
 
-bool stack_init(StackAllocator *a, size_t capacity) {
+bool cpyte_stack_init(StackAllocator *a, size_t capacity) {
     a->memory = malloc(capacity);
     if (!a->memory) return false;
 
@@ -25,7 +25,7 @@ bool stack_init(StackAllocator *a, size_t capacity) {
     return true;
 }
 
-void *stack_alloc(StackAllocator *a, size_t size) {
+void *cpyte_stack_alloc(StackAllocator *a, size_t size) {
     const size_t alignment = _Alignof(max_align_t);
 
     size_t header_pos = a->offset;
@@ -51,7 +51,7 @@ void *stack_alloc(StackAllocator *a, size_t size) {
     return a->memory + data_pos;
 }
 
-bool stack_free(StackAllocator *a, void *ptr) {
+bool cpyte_stack_free(StackAllocator *a, void *ptr) {
     if (!ptr || !a->memory) return false;
 
     uintptr_t base = (uintptr_t)a->memory;
@@ -71,11 +71,11 @@ bool stack_free(StackAllocator *a, void *ptr) {
     return true;
 }
 
-void stack_reset(StackAllocator *a) {
+void cpyte_stack_reset(StackAllocator *a) {
     a->offset = 0;
 }
 
-void stack_destroy(StackAllocator *a) {
+void cpyte_stack_destroy(StackAllocator *a) {
     free(a->memory);
     a->memory = NULL;
     a->capacity = 0;
@@ -90,6 +90,6 @@ typedef struct ArenaPage {
     unsigned char data[];
 } ArenaPage;
 
-void* arena_alloc(size_t size) {
+void* cpyte_arena_alloc(size_t size) {
     size_t needp = size / PAGE_SIZE + (size % PAGE_SIZE != 0);
 }

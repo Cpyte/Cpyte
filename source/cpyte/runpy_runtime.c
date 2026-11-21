@@ -92,7 +92,7 @@ static int _hm_init_table(Table* table, size_t capacity) {
     return 1;
 }
 
-Table* create_table(size_t requested_capacity) {
+Table* runpy_create_table(size_t requested_capacity) {
     size_t capacity = _hm_next_pow2(requested_capacity);
     if (capacity == 0) {
         return NULL;
@@ -108,7 +108,7 @@ Table* create_table(size_t requested_capacity) {
     return table;
 }
 
-int hashmap_is_valid(const Table* table) {
+int runpy_hashmap_is_valid(const Table* table) {
     return _hm_table_valid(table);
 }
 
@@ -310,7 +310,7 @@ static int _hm_rehash(Table* table, size_t requested_capacity,
     return 1;
 }
 
-Table* hashmap_put(Table* table, void* key, void* value) {
+Table* runpy_hashmap_put(Table* table, void* key, void* value) {
     if (!_hm_table_valid(table)) {
         return table;
     }
@@ -355,7 +355,7 @@ Table* hashmap_put(Table* table, void* key, void* value) {
     return table;
 }
 
-void* hashmap_get(const Table* table, void* key) {
+void* runpy_hashmap_get(const Table* table, void* key) {
     if (!_hm_table_valid(table)) {
         return NULL;
     }
@@ -364,7 +364,7 @@ void* hashmap_get(const Table* table, void* key) {
     return hit != table->capacity ? table->values[hit] : NULL;
 }
 
-int hashmap_contains(const Table* table, void* key) {
+int runpy_hashmap_contains(const Table* table, void* key) {
     if (!_hm_table_valid(table)) {
         return 0;
     }
@@ -372,7 +372,7 @@ int hashmap_contains(const Table* table, void* key) {
     return _hm_kvwalk(table, start, key) != table->capacity;
 }
 
-Table* hashmap_erase(Table* table, void* key) {
+Table* runpy_hashmap_erase(Table* table, void* key) {
     if (!_hm_table_valid(table)) {
         return table;
     }
@@ -387,7 +387,7 @@ Table* hashmap_erase(Table* table, void* key) {
     return table;
 }
 
-void hashmap_destroy(Table* table) {
+void runpy_hashmap_destroy(Table* table) {
     if (table == NULL) {
         return;
     }
@@ -395,12 +395,12 @@ void hashmap_destroy(Table* table) {
     free(table);
 }
 
-size_t hashmap_size(const Table* table) {
+size_t runpy_hashmap_size(const Table* table) {
     return _hm_table_valid(table) ? table->length : 0;
 }
 
-int hashmap_is_empty(const Table* table) {
-    return hashmap_size(table) == 0;
+int runpy_hashmap_is_empty(const Table* table) {
+    return runpy_hashmap_size(table) == 0;
 }
 
 Function* runpy_create_function(uint32_t signature, void* impl, char* name) {
@@ -416,7 +416,7 @@ Function* runpy_create_function(uint32_t signature, void* impl, char* name) {
 }
 
 Table* runpy_create_tables(void) {
-    return create_table(8);
+    return runpy_create_table(8);
 }
 
 Class* runpy_create_class(long long index) {
@@ -425,7 +425,7 @@ Class* runpy_create_class(long long index) {
         return NULL;
     }
     class_value->Index = index;
-    class_value->Table = create_table(8);
+    class_value->Table = runpy_create_table(8);
     if (class_value->Table == NULL) {
         free(class_value);
         return NULL;
@@ -437,7 +437,7 @@ void runpy_destroy_class(Class* class_value) {
     if (class_value == NULL) {
         return;
     }
-    hashmap_destroy(class_value->Table);
+    runpy_hashmap_destroy(class_value->Table);
     free(class_value);
 }
 
@@ -445,7 +445,7 @@ Class* runpy_class_addfunc(Function* func, Class* class) {
     if (func == NULL || class == NULL) {
             return NULL;
         }
-    hashmap_put(class->Table, func->name, func);
+    runpy_hashmap_put(class->Table, func->name, func);
     return class;
 }
 
@@ -453,8 +453,8 @@ Class* runpy_class_delfunc(Function* func, Class* class) {
     if (func == NULL || class == NULL) {
             return NULL;
         }
-    if (hashmap_contains(class->Table, func->name) != 0) return NULL;
-    hashmap_erase(class->Table, func->name);
+    if (runpy_hashmap_contains(class->Table, func->name) != 0) return NULL;
+    runpy_hashmap_erase(class->Table, func->name);
     return class;
 }
 
@@ -462,7 +462,7 @@ Class* runpy_class_updfunc(Function* oldfunc, Function* newfunc, Class* class) {
     if (oldfunc == NULL || class == NULL || newfunc == NULL) {
             return NULL;
         }
-    if (!hashmap_contains(class->Table, oldfunc->name)) return NULL;
+    if (!runpy_hashmap_contains(class->Table, oldfunc->name)) return NULL;
     newfunc->generation = oldfunc->generation + 1;
     class = runpy_class_delfunc(oldfunc, class);
     return runpy_class_addfunc(newfunc, class);
@@ -480,14 +480,14 @@ Function* runpy_class_getfunc(Class* class_value, void* name) {
     if (class_value == NULL || class_value->Table == NULL || name == NULL) {
         return NULL;
     }
-    return (Function*)hashmap_get(class_value->Table, name);
+    return (Function*)runpy_hashmap_get(class_value->Table, name);
 }
 
 int runpy_class_hasfunc(Class* class_value, void* name) {
     if (class_value == NULL || class_value->Table == NULL || name == NULL) {
         return 0;
     }
-    return hashmap_contains(class_value->Table, name);
+    return runpy_hashmap_contains(class_value->Table, name);
 }
 
 Class* runpy_class_replace_table(Class* class_value, Table* new_table) {
@@ -495,7 +495,7 @@ Class* runpy_class_replace_table(Class* class_value, Table* new_table) {
         return NULL;
     }
     if (class_value->Table != NULL) {
-        hashmap_destroy(class_value->Table);
+        runpy_hashmap_destroy(class_value->Table);
     }
     class_value->Table = new_table;
     return class_value;
@@ -562,7 +562,7 @@ Table* runpy_table_clone(Table* table) {
     if (table == NULL || !_hm_table_valid(table)) {
         return NULL;
     }
-    Table* clone = create_table(table->capacity);
+    Table* clone = runpy_create_table(table->capacity);
     if (clone == NULL) {
         return NULL;
     }
@@ -572,7 +572,7 @@ Table* runpy_table_clone(Table* table) {
             size_t slot = _hm_kvfree(clone, start);
             if (slot == clone->capacity) {
                 if (!_hm_rehash(clone, clone->capacity * 2, table->keys[i], table->values[i], 1)) {
-                    hashmap_destroy(clone);
+                    runpy_hashmap_destroy(clone);
                     return NULL;
                 }
             } else {
@@ -596,7 +596,7 @@ int runpy_table_merge(Table* target, Table* source) {
     }
     for (size_t i = 0; i < source->capacity; ++i) {
         if (source->used[i] >= HM_FIRST_TAG && source->keys[i] != NULL && source->values[i] != NULL) {
-            hashmap_put(target, source->keys[i], source->values[i]);
+            runpy_hashmap_put(target, source->keys[i], source->values[i]);
         }
     }
     return 1;
@@ -614,7 +614,7 @@ int runpy_class_redirect(Class* class_value, Class* other) {
         return 0;
     }
     if (class_value->Table != NULL) {
-        hashmap_destroy(class_value->Table);
+        runpy_hashmap_destroy(class_value->Table);
     }
     class_value->Table = runpy_table_clone(other->Table);
     if (class_value->Table == NULL) {

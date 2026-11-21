@@ -1,5 +1,42 @@
 # Notes
 
+## Nov 2026: OProof is a test-only oracle, not a codegen rewrite
+
+- **The experimental hook in `bytecoding.py::_try_algebraic_simplify` was removed.**
+  With `CPYTE_OPROOF=1` it changed program output: cpyte's floor `//` was mapped
+  to OProof's truncating `divs` (`7 // -2` printed `-3` instead of `-4`), and an
+  OProof builtin rewrite folded `x % 1` to `x` (printed `-7` instead of `0`).
+  Reproduced under JIT *and* native AOT, at `--opt 0` and default. The env vars
+  `CPYTE_OPROOF`/`OPROOF_OPT` now have **no effect on generated code**;
+  `source/cpyte/opreof_opt.py` and `opreof_pipeline.py` are reference-only dead
+  code (kept, clearly marked, not wired in). `test_no_prover_rewrite_hook_in_codegen`
+  guards against reintroduction.
+- **`test/test_opreof_proofs.py` is the oracle.** It cross-checks the integer
+  identities `_try_algebraic_simplify` relies on against OProof *and* an
+  independent exhaustive int8 evaluator (the authority — OProof 0.1.0's
+  `prove_expr` could "prove" `rems(x,1) == x`). It also pins the semantic gaps
+  that make direct translation unsafe: floor `//` vs `divs`, logical `not` vs
+  OProof's bitwise complement, and shift definedness. Run it with
+  `python3.14 test/test_opreof_proofs.py`; set `OPROOF_PATH` or pip-install
+  `opreof`, otherwise it skips. It is a dev/CI test, not a shipped dependency.
+- **Upstream OProof bug fixed and republished as 0.1.1.** In
+  `WEW-Oproof/opreof/core.py::builtin_rewrite`, the generic `divisor == 1 → a`
+  rule ran before the `rem*` rule, so `rems(x,1)` normalized to `x`. The rem
+  rule now runs first (also handles `-1` for `rems`), with a regression test in
+  `WEW-Oproof/opreof/test_kernel.py` (42/42 pass). Commit `8d50175` / tag
+  `v0.1.1` is pushed to `origin` + gitea; whl+sdist are on PyPI and the gitea
+  registry and were smoke-tested from a fresh venv. **0.1.0 remains unfixed and
+  has a flat module layout** (`from opreof.core import ...` fails), so do not use
+  it for the oracle. Publishing note: local `twine 6.2.0` rejects the generated
+  `Metadata-Version: 2.5`; use a `twine==7.0.0` venv (`python -m twine check`
+  then `--repository pypi` / `--repository gitea`).
+- If a prover-backed rewrite is ever reconsidered: require `egraph_prove(...,
+  verify=True)` **plus** independent concrete evaluation, use one kernel/store
+  consistently with `generalize=False` (proof generalization writes axiom files),
+  emit typed constants (never bare `Number`), gate on opt level > 0, and add an
+  OProof-on leg to `ci_test.py`/`ci_bomb.py`. Do not trust `egraph_normalize`
+  alone — it returns no proof and does no bit-exact verification.
+
 ## v4.6.2 release (Oct 2026, Windows GMP/MPFR discovery fixes + CI green)
 
 - **Why another patch release**: the fixes in `c747a87` touch *shipped* code

@@ -529,9 +529,16 @@ def _parse_binary(tokens: list[Token], pos: int, min_prec: int):
                 TokenType.DEDENT,
             ):
                 pos += 1
-            next_prec = _prec(op) if op.type != TokenType.KEYWORD else IN_PREC + 1
-            if op.type == TokenType.POW:
+            # `**` is the one right-associative operator (2 ** 3 ** 2 is
+            # 2 ** (3 ** 2)); everything else binds left, which means parsing
+            # the right-hand side one level tighter so `a - b + c` folds to
+            # `(a - b) + c` rather than `a - (b + c)`.
+            if op.type == TokenType.KEYWORD:
+                next_prec = IN_PREC + 1
+            elif op.type == TokenType.POW:
                 next_prec = _prec(op)
+            else:
+                next_prec = _prec(op) + 1
             right, pos = _parse_binary(tokens, pos, next_prec)
             left = BinOp(left, op.type, right, token=op)
 

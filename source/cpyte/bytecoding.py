@@ -1126,15 +1126,17 @@ class LLVM:
         class_ptr = _i8ptr
         func_ptr = _i8ptr
         runpy_fns = [
-            ("create_table", table_ptr, [_i64]),
-            ("hashmap_put", table_ptr, [table_ptr, void_ptr, void_ptr]),
-            ("hashmap_get", void_ptr, [table_ptr, void_ptr]),
-            ("hashmap_contains", _i32, [table_ptr, void_ptr]),
-            ("hashmap_erase", table_ptr, [table_ptr, void_ptr]),
-            ("hashmap_destroy", _void, [table_ptr]),
-            ("hashmap_is_valid", _i32, [table_ptr]),
-            ("hashmap_size", _i64, [table_ptr]),
-            ("hashmap_is_empty", _i32, [table_ptr]),
+            # Prefixed names only: unprefixed create_table/hashmap_* squatted
+            # on generic identifiers user code (e.g. stdlib collections) needs.
+            ("runpy_create_table", table_ptr, [_i64]),
+            ("runpy_hashmap_put", table_ptr, [table_ptr, void_ptr, void_ptr]),
+            ("runpy_hashmap_get", void_ptr, [table_ptr, void_ptr]),
+            ("runpy_hashmap_contains", _i32, [table_ptr, void_ptr]),
+            ("runpy_hashmap_erase", table_ptr, [table_ptr, void_ptr]),
+            ("runpy_hashmap_destroy", _void, [table_ptr]),
+            ("runpy_hashmap_is_valid", _i32, [table_ptr]),
+            ("runpy_hashmap_size", _i64, [table_ptr]),
+            ("runpy_hashmap_is_empty", _i32, [table_ptr]),
             ("runpy_create_function", func_ptr, [_i32, void_ptr, void_ptr]),
             ("runpy_create_tables", table_ptr, []),
             ("runpy_create_class", class_ptr, [_i64]),
@@ -3415,6 +3417,16 @@ class LLVM:
 
         if node.name in self.functions:
             func = self.functions[node.name]
+            # Reusing a pre-declared runtime function with a different
+            # signature would attach this body to the runtime's parameter
+            # types (the source of opaque-struct GEP IndexErrors); reject
+            # the name clash with a clear error instead.
+            if str(func.function_type) != str(ir.FunctionType(ret_ty, param_tys)):
+                self._codegen_error(
+                    f"function `{node.name}` collides with a runtime builtin "
+                    f"of the same name; rename it",
+                    node,
+                )
         else:
             func = ir.Function(
                 self.module, ir.FunctionType(ret_ty, param_tys), name=node.name
@@ -4825,6 +4837,14 @@ class LLVM:
             or lf is not None
             or rf is not None
         )
+
+        # OProof integration note: an experimental prover-backed rewrite used
+        # to live here behind CPYTE_OPROOF/OPROOF_OPT.  It was removed because
+        # it changed generated code incorrectly: cpyte's floor `//` was mapped
+        # to OProof's truncating `divs` (`7 // -2` became `-3`), and an OProof
+        # builtin rewrite folded `x % 1` to `x`.  OProof is now a *test-only*
+        # equivalence oracle (test/test_opreof_proofs.py); no prover output may
+        # change emitted IR.  The env vars no longer affect codegen.
 
         # ---- Constant folding: both operands are integral literals ----
         lv = _const_int_value(left_node)

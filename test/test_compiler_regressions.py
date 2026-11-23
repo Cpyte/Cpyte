@@ -191,8 +191,8 @@ def test_global_cpm_import_resolves_without_workspace():
         )
 
         source = (
-            'import "@std/demo"\n'
-            'import "@std/extonly"\n'
+            'import std.demo\n'
+            'import std.extonly\n'
             'import "plain"\n'
             "public def main() -> int:\n"
             "    return demo_value() + plain_value()\n"
@@ -225,7 +225,7 @@ def test_workspace_cpm_package_wins_over_global_and_dot_form_imports():
         )
 
         source = (
-            'import "@std.demo"\n'
+            'import std.demo\n'
             "public def main() -> int:\n"
             "    return local_demo()\n"
         )
@@ -240,10 +240,10 @@ def test_workspace_cpm_package_wins_over_global_and_dot_form_imports():
 
 
 def test_deep_std_extension_import_is_still_skipped():
-    # `@std.<pkg>.<sub>` is resolved at runtime; it must not be reported as a
-    # missing CPM package, unlike the two-segment `@std.<pkg>` package form.
+    # `std.<pkg>.<sub>` (and legacy `@std.<pkg>.<sub>`) is resolved at runtime;
+    # it must not be reported as a missing CPM package.
     parse_and_analyze(
-        'import "@std.math.foo"\npublic def main() -> int:\n    return 0\n',
+        'import std.math.foo\npublic def main() -> int:\n    return 0\n',
         enable_extensions=False,
     )
 

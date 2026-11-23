@@ -664,19 +664,22 @@ supported scope-exit behavior.
 
 ### Imports
 
-The parser accepts a module name, a quoted path/header, an SDK-qualified
-module, or a package path:
+Cpyte uses **dotted import paths** as the canonical form:
 
 ```cpy
-import module_name
+import std.collections
+import std.collections.hash_map
+import math
 import "path/to/header.h"
 import platform sdk("/path/to/sdk")
-import @vendor/package
 ```
 
-Import resolution and whether a form loads Cpy source, a C header, a package,
-or a platform SDK are handled by the compiler's userspace/import system.
-Package and SDK availability is environment-specific.
+- **Canonical (preferred):** `import group.package` or `import group.package.file` (e.g. `std.collections`, `std.collections.hash_map`). The formatter normalizes imports to this form.
+- **Legacy `@...` forms** (e.g. `import "@std/collections/hash_map"`, `import "@std.collections.hash_map"`) are still accepted for backward compatibility but are **deprecated**: the compiler emits a warning and `cpy format` rewrites them to the canonical dotted form. Do not introduce new `@...` imports.
+- Bare names such as `import math` still work for built-in/C-library imports and local resolution rules described below.
+- Quoted paths (e.g. `import "foo.cpy"`, C headers) and `platform sdk("...")` remain supported.
+
+Import resolution (Cpy source, C headers, CPM packages, platform SDKs) is handled by the compiler/import system and is environment-specific (e.g. CPM packages typically resolve from `.cpm/modules/@group/package/<version>/...`). When importing a specific file from a package, use `group.package.filename` (no aliases are applied).
 
 ### C declarations and embedded source
 
@@ -733,9 +736,7 @@ Useful global options include:
 | `--versym`, `--no-versym` | Select wide v2.1 or legacy v2.0 dynamic SEF records. |
 
 The `build` command accepts output/debug/optimization and linking options;
-`format` supports write/check modes; `sef` provides SEF pack, dump, check, size,
-and digest tools. Run `cpy --help` for the exact options of the installed
-version.
+`format` supports write/check modes (e.g. `cpy format --write file.cpy`, `cpy format --check file.cpy`); `sef` provides SEF pack, dump, check, size, and digest tools. Run `cpy --help` for the exact options of the installed version.
 
 Two source directives are recognized at the beginning of a source file:
 
@@ -835,9 +836,9 @@ protocol_decl    = ( "protocol" | "interface" ) identifier
 enum_decl        = "enum" identifier ":" NEWLINE INDENT
                    { identifier [ "=" expression ] NEWLINE } DEDENT ;
 type_alias       = "type" identifier "=" type ;
-import_decl      = "import" ( identifier | STRING )
+import_decl      = "import" ( dotted_path | STRING )
                    [ "sdk" "(" STRING ")" ]
-                 | "import" "@" package_path ;
+                 | "import" "@" package_path ;  (* legacy; deprecated, formatter rewrites to dotted_path *)
 
 type             = identifier { "*" | "**" | "&" | "[]" | "[" NUMBER "]"
                                | "<" type { "," type } ">" } ;

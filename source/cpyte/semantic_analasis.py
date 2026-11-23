@@ -773,6 +773,7 @@ class SemanticAnalyzer:
         self._promoted_vars: set[str] = set()
         self._forward_names: set[str] = set()
         self._imported_clibs: set[str] = set()
+        self._imported_cpy_files: set[str] = set()
         self._heap_names: set[str] = set()
         self._gc_new_names: set[str] = set()
         if scorpion:
@@ -2584,20 +2585,22 @@ class SemanticAnalyzer:
                     self._register_import_symbols(symbols, node)
                     return
 
-        # `@std.<pkg>.<sub>` is a runtime-resolved deep extension, but
-        # `@std.<pkg>` is the dot form of a scoped CPM package and must reach
-        # the resolver like `@std/<pkg>` does.
-        is_deep_extension = module.startswith("@std.") and module.count(".") >= 2
+        # Deep extension forms: e.g. @std.net.something (runtime-resolved). Heuristic: if third segment looks like a submodule API beyond pkg, but our canonical is group.pkg.subfile for CPM.
+        # For CPM: group.pkg  OR group.pkg.file  => try CPM import.
+        is_deep_extension = False  # keep for future; not the same as group.pkg.file
 
         if not is_file_import:
-            if is_deep_extension:
-                pass  # deep extension
-            elif self._try_cpm_import(node, module):
+            if self._try_cpm_import(node, module):
                 return
+            # Deep std extension (runtime-resolved by package extensions): e.g. std.pkg.sub or @std/pkg/sub
+            if module.startswith("@") and module[1:].startswith("std") and (module[1:].count("/") >= 2 or module[1:].count(".") >= 2):
+                return
+            if not module.startswith("@") and module.startswith("std."):
+                parts = module.split(".")
+                if len(parts) >= 3:
+                    return
 
         if module.startswith("@"):
-            if is_deep_extension:
-                return  # deep extension resolved at runtime
             self.error(f"package `{module}` not installed — run 'cpm install'", node)
             return
 
@@ -2703,9 +2706,7 @@ class SemanticAnalyzer:
                     kind = "class" if isinstance(ast_node, ClassDef) else "struct"
                     self.globals.define(ast_node.name, Symbol(kind, None, ast_node))
             elif isinstance(ast_node, Import):
-                self._register_imported_types(
-                    getattr(ast_node, "sub_ast", None) or []
-                )
+                self._register_imported_types(getattr(ast_node, "sub_ast", None) or [])
 
     def _register_import_symbols(self, symbols, node, var_names=None):
         s = self.globals
@@ -2966,36 +2967,99 @@ class SemanticAnalyzer:
         return None
 
     def _try_cpm_import(self, node: Import, module: str) -> bool:
-        # Support both @scope.name and @scope/name import forms.
-        import_name = module.removeprefix("@")
-        pkg_name = import_name.replace("/", ".").split(".")[-1]
-
         roots = cpm_module_roots(self._workspace_root, self._filedir)
         has_cpm_root = any(os.path.isdir(root) for root in roots)
 
-        # A package already loaded purely via its manifest (extension hooks only)
-        # has no real symbols; short-circuit only when no CPM directory exists to
-        # resolve a real entry from. A package that ships an entry file must still
-        # re-export its actual symbols below.
-        if pkg_name in self._loaded_packages and not has_cpm_root:
+        submodule_parts = []
+        pkg_name = None
+        scope = None
+        is_legacy = False
+
+        # Canonical: group.pkg[.file...] e.g. std.collections.hash_map
+        # Legacy: @group/pkg/... or @group.pkg... (deprecated)
+        if module.startswith("@"):
+            is_legacy = True
+            raw = module[1:].replace(".", "/")
+            canon = raw.replace("/", ".")
+            self.warning(
+                f"deprecated import style `{module}`; use `{canon}` (canonical: `group.pkg[.file]`)",
+                node,
+                note="formatter will rewrite to the canonical form; please update imports",
+            )
+            pparts = [p for p in raw.split("/") if p != ""]
+            if len(pparts) < 1:
+                return False
+            # Deep extension like @std.math.foo (>=3 parts) is runtime-resolved; do not CPM-resolve.
+            if len(pparts) >= 3 and pparts[0] == "std":
+                return False
+            scope = pparts[0]
+            if len(pparts) == 1:
+                pkg_name = pparts[0]
+                submodule_parts = []
+            else:
+                pkg_name = pparts[1]
+                if len(pparts) > 2:
+                    submodule_parts = pparts[2:]
+        else:
+            parts = [p for p in module.split(".") if p != ""]
+            if len(parts) == 0:
+                return False
+            # Canonical deep extension: std.pkg.sub... (>=3 parts) is runtime-resolved by extensions.
+            if len(parts) >= 3 and parts[0] == "std":
+                return False
+            if len(parts) == 1:
+                pkg_name = parts[0]
+                scope = None
+                submodule_parts = []
+            else:
+                # group.pkg(.sub...) — canonical CPM submodule
+                scope = parts[0]
+                pkg_name = parts[1]
+                if len(parts) > 2:
+                    submodule_parts = parts[2:]
+
+        if pkg_name is None:
+            return False
+
+        if (
+            pkg_name in self._loaded_packages
+            and not has_cpm_root
+            and len(submodule_parts) == 0
+            and scope is None
+        ):
             self._register_import_symbols({}, node)
             return True
 
-        # Remember manifest-only packages, but keep looking: a later root may
-        # contain the package's real .cpy entry or prebuilt IR.
         manifest_only = False
         for cpm_root in roots:
             if not os.path.isdir(cpm_root):
                 continue
 
-            if module.startswith("@"):
-                scoped = module[1:].replace("/", ".").replace(".", os.sep)
-                parts = scoped.split(os.sep)
-                pkg_dir = os.path.join(cpm_root, f"@{parts[0]}", *parts[1:])
+            pkg_dir = None
+            if scope is not None:
+                # look under @scope/pkg_name
+                cand = os.path.join(cpm_root, f"@{scope}", pkg_name)
+                if os.path.isdir(cand):
+                    pkg_dir = cand
             else:
-                pkg_dir = os.path.join(cpm_root, *module.replace("/", ".").split("."))
+                # no scope: search for a dir named pkg_name under any @group
+                # try common: scan for @*/pkg_name
+                try:
+                    for g in os.listdir(cpm_root):
+                        if g.startswith("@"):
+                            cand = os.path.join(cpm_root, g, pkg_name)
+                            if os.path.isdir(cand):
+                                pkg_dir = cand
+                                break
+                except OSError:
+                    pass
+                if pkg_dir is None:
+                    # also allow flat pkg_name (non-scoped)
+                    cand = os.path.join(cpm_root, pkg_name)
+                    if os.path.isdir(cand):
+                        pkg_dir = cand
 
-            if not os.path.isdir(pkg_dir):
+            if pkg_dir is None or not os.path.isdir(pkg_dir):
                 continue
 
             versions = sort_cpm_versions(
@@ -3013,6 +3077,46 @@ class SemanticAnalyzer:
                 version_dir, pkg_name
             ):
                 manifest_only = True
+
+            # Submodule import: group.pkg.file or legacy forms
+            if len(submodule_parts) > 0:
+                base = submodule_parts[0]
+                tried = []
+                cand_paths = [os.path.join(version_dir, base + ".cpy")]
+                if len(submodule_parts) > 1:
+                    cand_paths.append(
+                        os.path.join(version_dir, *submodule_parts) + ".cpy"
+                    )
+                for fpath in cand_paths:
+                    tried.append(fpath)
+                    if os.path.isfile(fpath):
+                        result = self._import_cpy(fpath, node)
+                        if result:
+                            self._register_import_symbols(result[0], node)
+                        return True
+                found_any = []
+                for rootd, _dirs, files in os.walk(version_dir):
+                    if base + ".cpy" in files:
+                        found_any.append(os.path.join(rootd, base + ".cpy"))
+                if len(found_any) == 1:
+                    result = self._import_cpy(found_any[0], node)
+                    if result:
+                        self._register_import_symbols(result[0], node)
+                    return True
+                if len(found_any) > 1:
+                    listed = ", ".join(sorted(found_any))
+                    self.error(
+                        f"submodule `{base}` is ambiguous in package `@{scope or '?'}{os.sep}{pkg_name}`; found: {listed}",
+                        node,
+                    )
+                    return True
+                tried_str = "; ".join(tried)
+                self.error(
+                    f"submodule/file `{base}` not found in package `{scope + '.' + pkg_name if scope else pkg_name}` (looked for: {tried_str})",
+                    node,
+                    note="canonical form: `group.pkg.file`; no aliases are applied",
+                )
+                return True
 
             cpy_file = self._find_package_entry(version_dir, pkg_name)
             if cpy_file:
@@ -3032,6 +3136,17 @@ class SemanticAnalyzer:
         return False
 
     def _import_cpy(self, module: str, node: Import | None = None):
+        try:
+            real = os.path.realpath(module)
+        except OSError:
+            real = os.path.abspath(module)
+        if real in self._imported_cpy_files:
+            if node is not None:
+                node.module_tag = module_tag(real)
+                node.sub_ast = []
+            return {}, "cpy"
+        self._imported_cpy_files.add(real)
+
         try:
             with open(module) as f:
                 source = f.read()
@@ -3068,13 +3183,6 @@ class SemanticAnalyzer:
         sub_ast = []
         for ast_node in imported_ast:
             if isinstance(ast_node, (CCode, Llvm)):
-                # Propagate embedded `ccode:`/`llvm:` blocks from the imported
-                # module so (a) their functions become callable from the
-                # importing program and (b) codegen emits and links the C/LLVM
-                # body. The sub-analyzer already parsed the block and cached the
-                # symbols on the node under its own scope; re-register them on
-                # this analyzer's globals and keep the node in sub_ast so
-                # `emit_ccode`/`emit_llvm` runs at codegen.
                 existing_syms = getattr(ast_node, "symbols", None) or []
                 if existing_syms:
                     self._register_import_symbols(
@@ -3094,9 +3202,6 @@ class SemanticAnalyzer:
                 symbols[ast_node.name] = (ret_type, params, False)
                 sub_ast.append(ast_node)
             elif isinstance(ast_node, FuncDef):
-                # Module-private functions: not exported as symbols, but kept in
-                # sub_ast so codegen still emits their bodies — public functions
-                # of the imported module may call them.
                 sub_ast.append(ast_node)
             elif isinstance(ast_node, StructDef):
                 sub_ast.append(ast_node)
@@ -3106,32 +3211,19 @@ class SemanticAnalyzer:
             elif isinstance(ast_node, ClassDef):
                 sub_ast.append(ast_node)
                 if not self.globals.lookup_local(ast_node.name):
-                    self.globals.define(
-                        ast_node.name, Symbol("class", None, ast_node)
-                    )
+                    self.globals.define(ast_node.name, Symbol("class", None, ast_node))
             elif isinstance(ast_node, Import):
                 for fname, (ret_type, params, vararg) in ast_node.symbols:
                     if fname not in symbols:
                         symbols[fname] = (ret_type, params, vararg)
 
-                # Struct/class names travel with their functions: a module that
-                # returns (or takes) a type defined by ITS OWN imports must stay
-                # usable by consumers that only import the middle module.
-                self._register_imported_types(
-                    getattr(ast_node, "sub_ast", None) or []
-                )
+                self._register_imported_types(getattr(ast_node, "sub_ast", None) or [])
 
-                # Preserve the sub-AST chain for re-exported imports so codegen
-                # can still reach the aggregated module's function definitions
-                # (emit_program recurses through Import sub_ast).
                 if getattr(ast_node, "sub_ast", None):
                     sub_ast.append(ast_node)
 
         if node is not None:
-            # Tag the import so codegen knows which module this symbol table
-            # came from (used to resolve imported parameter types against the
-            # defining module's structs).
-            node.module_tag = module_tag(module)
+            node.module_tag = module_tag(real)
             node.sub_ast = sub_ast
         return symbols, "cpy"
 

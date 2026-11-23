@@ -1,3 +1,4 @@
+import re as _re
 from dataclasses import dataclass, field
 
 from . import astparse
@@ -79,6 +80,8 @@ _DEF_LIKE = (
 def _escape_string(value: str) -> str:
     return '"' + "".join(_STRING_ESCAPES.get(ch, ch) for ch in value) + '"'
 
+
+_IDENT_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _char_text(code: int) -> str:
     ch = chr(code & 0xFF)
@@ -395,11 +398,19 @@ class _Formatter:
     def _emit_import(self, node, level: int):
         module = node.module
         if module.startswith("@"):
-            text = f"import @{module[1:].replace('/', '.')}"
-        elif _IDENT_RE.match(module):
-            text = f"import {module}"
+            # canonical: strip '@' and turn '/' into '.'
+            canon = module[1:].replace("/", ".")
+            text = f"import {canon}"
         else:
-            text = f"import {_escape_string(module)}"
+            # already in dotted or other form
+            if _IDENT_RE.match(module):
+                text = f"import {module}"
+            else:
+                # could be "a.b.c"
+                if all(_IDENT_RE.match(p) for p in module.split(".") if p):
+                    text = f"import {module}"
+                else:
+                    text = f"import {_escape_string(module)}"
         if getattr(node, "sdk_path", None):
             text += f" sdk({_escape_string(node.sdk_path)})"
         self._emit_simple(node, text, level)
@@ -562,11 +573,6 @@ class _Formatter:
                 seg = groups[i] if groups[i] is not None else ""
                 text += f" : {seg}" if seg else " :"
         self._emit_simple(node, text + ")", level)
-
-
-import re as _re
-
-_IDENT_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _need_parens(child, parent_op, is_right: bool) -> bool:

@@ -478,9 +478,7 @@ def _parse_ternary(tokens: list[Token], pos: int):
         then, pos = _parse_ternary(tokens, pos)
         pos = _skip_expr_newlines(tokens, pos)
         if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:
-            raise TernaryParseError(
-                'Expected ":" in conditional expression', tok
-            )
+            raise TernaryParseError('Expected ":" in conditional expression', tok)
         pos += 1
         pos = _skip_expr_newlines(tokens, pos)
         orelse, pos = _parse_ternary(tokens, pos)
@@ -1314,8 +1312,6 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
         if pos >= len(tokens) or tokens[pos].type in (TokenType.EOF, TokenType.DEDENT):
             break
 
-        tok = tokens[pos]
-
         all_hooks = _get_all_parser_hooks(enable_extensions)
         if all_hooks:
             ctx = _make_parser_ctx(tokens, pos)
@@ -2036,8 +2032,22 @@ def parse_import(tokens: list[Token], pos: int):
         return node, pos
     elif t.type == TokenType.IDENTIFIER:
         assert t.value is not None
-        module = t.value
+        first = t.value
         pos += 1
+        parts = [first]
+        # Allow dotted form: group.pkg.sub or pkg.sub or std.collections.hash_map
+        while pos < len(tokens) and tokens[pos].type == TokenType.DOT:
+            # look ahead: dot followed by identifier
+            if pos + 1 >= len(tokens) or tokens[pos + 1].type != TokenType.IDENTIFIER:
+                break
+            pos += 1  # consume dot
+            part = tokens[pos].value
+            assert part is not None
+            parts.append(part)
+            pos += 1
+        # Also allow slash form in the same token stream? probably not common now
+        module = ".".join(parts)
+        node = Import(module, token=tok)
     else:
         raise ParseError("Expected module name or quoted header path", t)
 
@@ -3418,7 +3428,6 @@ def parse_switch(tokens: list[Token], pos: int):
         TokenType.EOF,
     ):
         if tokens[pos].type == TokenType.KEYWORD and tokens[pos].value == "case":
-            tok2 = tokens[pos]
             pos += 1
             case_val, pos = parse_expression(tokens, pos)
             if pos >= len(tokens) or tokens[pos].type != TokenType.COLON:

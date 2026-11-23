@@ -44,8 +44,16 @@ See `examples/example_package/` for a complete example package with:
 
 ### Using Extension Packages
 
+**Canonical import style (preferred):**
 ```cpy
-import @package_name
+import std.collections
+import std.collections.hash_map
+```
+
+Legacy `@...` imports (e.g. `import "@std/collections/hash_map"`) are still accepted for backward compatibility but are deprecated; `cpy format` rewrites them to the canonical dotted form.
+
+```cpy
+import std.your_package
 
 # Use custom keywords and syntax from the package
 async def my_function() -> Promise:

@@ -1583,7 +1583,10 @@ class SemanticAnalyzer:
                     # Bitwise operations are unsupported for signed `big` but are
                     # provided for unsigned `ubig` (which has no sign bit), so
                     # AND/OR/XOR/shift operate over the full magnitude.
-                    valid_int_types = ("int", "int64", "uint64", "size_t", "ubig")
+                    # Narrow unsigned words (uint8/16/32) lower to i8/i16/i32
+                    # and are every bit as valid for bitwise ops as `int`;
+                    # excluding them made `uint32 a = x ^ y` a false E0001.
+                    valid_int_types = self._INT_TYPES + ("ubig",)
                     if left_t == "big" or right_t == "big":
                         self.error(
                             f"bitwise operator `{node.op.name}` not supported for `big` operands",
@@ -1610,7 +1613,7 @@ class SemanticAnalyzer:
                     node.inferred_type = "int"
                     return "int"
                 # PERCENT
-                valid_int_types = ("int", "int64", "uint64", "big", "ubig", "size_t")
+                valid_int_types = self._INT_TYPES + ("big", "ubig")
                 if (left_t is not None and left_t not in valid_int_types) or (
                     right_t is not None and right_t not in valid_int_types
                 ):
@@ -1761,7 +1764,7 @@ class SemanticAnalyzer:
                         note="unary minus expects numeric type",
                     )
             if node.op.name == "TILDE":
-                valid_types = ("int", "int64", "uint64", "size_t")
+                valid_types = self._INT_TYPES
                 if operand_t is not None and operand_t not in valid_types:
                     self.error(
                         f"bitwise NOT (`~`) not supported for `{operand_t}`",

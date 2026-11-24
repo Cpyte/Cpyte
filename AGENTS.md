@@ -28,6 +28,17 @@
   changed compiler files into the installed site-packages so the `cpy` CLI picks
   up the fix; released as v4.7.3. `embed.cpy` now compiles (only pre-existing
   W1001 warnings for the still-unused `p0`/`p1`).
+- **Follow-up (v4.7.4)**: the newly parseable `uint32` spellings were still
+  rejected by `_infer_type`'s bitwise/percentage/TILDE whitelists in
+  `semantic_analasis.py` (`valid_int_types` was hard-coded to
+  `int/int64/uint64/size_t/ubig`), so `hi1 ^ c1 ^ k0` produced four bogus
+  E0001 errors and the editor showed 8 diagnostics. Those whitelists now use
+  `self._INT_TYPES` (which already contains `uint8/uint16/uint32`) plus `ubig`
+  for bitwise and `big`/`ubig` for `%`. Result inference still returns `int`
+  for narrow operands, which is fine: assignment to `uint32` reinterprets the
+  i32 bit pattern, and `print(x)` of a `uint32` variable shows the unsigned
+  value. Regression: `test/test_narrow_bitwise.cpy` (^ & | ~ % << >> on
+  uint32/uint16) added to CORPUS — 39/39 green.
 
 ## Nov 2026: OProof is a test-only oracle, not a codegen rewrite
 

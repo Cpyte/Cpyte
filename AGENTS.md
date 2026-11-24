@@ -1,5 +1,44 @@
 # Notes
 
+## Nov 24 2026: v4.7.5 HookDispatcher overhaul + `@std/random` (with Philox)
+
+- Every compiler hook stage now goes through `HookDispatcher` in
+  `extension_hooks.py`; there are no direct `hook.<callback>(...)` calls in
+  compiler call sites. New `HookStage.SYMBOL` gets its own stage; optimize,
+  build, runtime-files/libraries, lifecycle and shutdown callbacks are all
+  dispatched centrally.
+- Hook callback failures warn + skip by default and are hard errors under
+  `--strict`; a hook *file* load failure is always fatal. Callbacks take a
+  trailing `CompilerContext`; `invoke_context()`/`call_with_context()` handle
+  legacy arities centrally with a one-time deprecation note (this is how the
+  old `get_runtime_code(self)` still works).
+- Hook loading is import-scoped: parser/lifecycle hooks are preloaded only for
+  packages named in the source, while semantic/transform/codegen/optimize/
+  build/symbol/runtime hooks load when the package is actually imported. An
+  unrelated program with no imports therefore injects no hooks. Build-hook
+  includes/defines/flags/libraries now reach both JIT and AOT compiles/links.
+- Manifest split: `parser_phase_hooks()` is lexer/parser-only;
+  `deferred_hooks()` contains semantic/transform/codegen/optimize/build/
+  symbol/runtime. Lifecycle hooks have a separate early-load path.
+- Regression coverage: `ci_test.py` 39/39 and the manual
+  `test/test_compiler_regressions.py` runner 26/26 green; wheel smoke-tested
+  (JIT + AOT print `42`). Released as **v4.7.5**: tagged/pushed to `github`
+  and `origin`/gitea, published to PyPI + gitea. Note `git push github --tags`
+  can fail on the unrelated pre-existing local `v1.8.3` tag; the intended
+  `v4.7.5` tag still pushes, so do not force-push it.
+- Stdlib packages republished after hook compatibility updates:
+  `@std/collections` 1.5.1 (legacy runtime hook removed; `deque_to_list`
+  lives in `deque.cpy`'s `ccode:`), `@std/asyncio_ext` 1.0.1
+  (`get_additional_keywords()` + context-taking runtime hook), and
+  `@std/cryptography` 1.0.1 (`openssl_build.py` derives from `BuildHook`).
+- `@std/random` 1.0.0 is new: OS CSPRNG, HMAC-SHA-256 DRBG, secrets helpers,
+  seeded PRNGs, and the Philox2x32/Philox4x32 family (algorithm ids 5/6,
+  1..16 rounds clamped with default 10, exact counter/key constructors for
+  KATs, still non-cryptographic). `random/test_random.cpy` contains the
+  DRBG/SplitMix64/Philox vectors; JIT and native AOT both pass, including a
+  CPM-installed `import std.random` consumer. Pre-existing `math/` edits in
+  the stdlib checkout were deliberately left uncommitted.
+
 ## Nov 24 2026: global `type (NAME) = ...` constants are now visible in functions
 
 - **Bug**: `cpy embed.cpy` (WEW-ai) failed with `codegen error: Undefined variable

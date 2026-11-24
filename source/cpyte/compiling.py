@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .generate_bc import _find_gmp_include, _remove_probe_stack_ir
 from .linker import Linker, LinkerNotFoundError, format_cc_diag
-from .ui import print_err, print_ok
+from .ui import print_err, print_ok, print_warn
 from .winjit_patch import link_jit_anchors, patch_windows_gnu_relocs
 
 # Suppress ctypes callback cleanup warning during shutdown (harmless)
@@ -879,7 +879,11 @@ def optimize(mod, opt_level=3, opt_size=False):
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
     if opt_level <= 0 and not opt_size:
-        return
+        return mod
+    from .extension_hooks import CompilerContext, get_global_hook_dispatcher
+
+    ctx = CompilerContext(optimization_level=opt_level, llvm_module=mod)
+    mod = get_global_hook_dispatcher().optimize_module(mod, ctx)
     target_machine = make_target_machine(opt=0 if opt_level <= 0 else opt_level)
 
     if opt_size:
@@ -1003,29 +1007,15 @@ def optimize(mod, opt_level=3, opt_size=False):
     # Default module pipeline (includes inliner, GVN, DCE, loop and vectorization opts)
     npm = pb.getModulePassManager()
 
-    # Let extension hooks add their own passes
-    try:
-        from .extension_hooks import (
-            CompilerContext,
-            HookStage,
-            OptimizeHook,
-            get_global_hook_registry,
-        )
+    # Let extension hooks add their own passes. The dispatcher records and
+    # skips failing callbacks (or raises under --strict); do not swallow them.
+    from .extension_hooks import CompilerContext, get_global_hook_dispatcher
 
-        registry = get_global_hook_registry()
-        ctx = CompilerContext(optimization_level=opt_level, llvm_module=mod)
-        for hook in registry.get(HookStage.OPTIMIZE):
-            if not isinstance(hook, OptimizeHook):
-                continue
-            try:
-                if hook.should_add_passes(ctx):
-                    hook.add_module_passes(npm, ctx)
-            except Exception as e:
-                print_err(f"optimize hook {hook.__class__.__name__} failed: {e}")
-    except Exception:
-        pass
+    ctx = CompilerContext(optimization_level=opt_level, llvm_module=mod)
+    get_global_hook_dispatcher().add_optimization_passes(mod, npm, ctx)
 
     npm.run(mod, pb)
+    return mod
 
 
 def _maybe_compile(module, use_native_eh=False):
@@ -1127,33 +1117,28 @@ def _mpfr_include_dir() -> str | None:
 def _find_openssl_paths():
     """Find OpenSSL include and lib dirs (for linking crypto into ccode/JIT/AOT)."""
     # Try hook-provided paths first (from loaded build hooks, e.g. cryptography)
-    try:
-        from .extension_hooks import get_global_hook_dispatcher, CompilerContext
-        disp = get_global_hook_dispatcher()
-        ctx = CompilerContext()
-        try:
-            disp.collect_build_configuration(ctx)
-        except Exception:
-            pass
-        inc = None
-        libdir = None
-        for pth in (ctx.include_paths or []):
-            if pth and os.path.isdir(pth):
-                if os.path.isfile(os.path.join(pth, 'openssl', 'evp.h')):
-                    inc = pth
-                    break
-        for pth in (ctx.library_paths or []):
-            if pth and os.path.isdir(pth):
-                libdir = pth
+    from .extension_hooks import CompilerContext, get_global_hook_dispatcher
+
+    ctx = CompilerContext()
+    # Do not swallow HookInvocationError here: --strict must surface failures.
+    get_global_hook_dispatcher().collect_build_configuration(ctx)
+    inc = None
+    libdir = None
+    for pth in (ctx.include_paths or []):
+        if pth and os.path.isdir(pth):
+            if os.path.isfile(os.path.join(pth, "openssl", "evp.h")):
+                inc = pth
                 break
-        if inc and libdir:
-            return inc, libdir
-        if inc:
-            cand = os.path.join(os.path.dirname(inc), 'lib')
-            if os.path.isdir(cand):
-                return inc, cand
-    except Exception:
-        pass
+    for pth in (ctx.library_paths or []):
+        if pth and os.path.isdir(pth):
+            libdir = pth
+            break
+    if inc and libdir:
+        return inc, libdir
+    if inc:
+        cand = os.path.join(os.path.dirname(inc), "lib")
+        if os.path.isdir(cand):
+            return inc, cand
     inc = os.environ.get("CPYTE_OPENSSL_INCLUDE")
     libdir = os.environ.get("CPYTE_OPENSSL_LIBDIR") or os.environ.get("CPYTE_OPENSSL_LIB")
     if inc and libdir:
@@ -1205,6 +1190,30 @@ def _find_openssl_paths():
             if os.path.isdir(libdir):
                 return inc, libdir
     return None, None
+
+
+def hook_build_context():
+    """Collect build settings contributed by loaded `BuildHook`s."""
+    from .extension_hooks import CompilerContext, get_global_hook_dispatcher
+
+    ctx = CompilerContext()
+    # Failures follow the registry policy; --strict must not be swallowed.
+    get_global_hook_dispatcher().collect_build_configuration(ctx)
+    return ctx
+
+
+def hook_compile_flags(ctx) -> list[str]:
+    """Translate a hook build context into clang/gcc compile flags."""
+    flags: list[str] = []
+    for path in ctx.include_paths:
+        if path:
+            flags.append(f"-I{path}")
+    for name, value in ctx.defines.items():
+        if not name:
+            continue
+        flags.append(f"-D{name}={value}" if value is not None else f"-D{name}")
+    flags.extend(ctx.compiler_flags)
+    return flags
 
 
 def _runtime_extra_flags(src_path: str) -> tuple:
@@ -1281,16 +1290,41 @@ _GMP_LINK_NEEDLE = re.compile(r"(?:gmp[a-z]*_|mpfr_|libgmp|libmpfr|-lgmp|-lmpfr)
 
 
 def aot_link_executable(linker, objects, output, **kwargs):
-    """Link an AOT executable, pulling in GMP/MPFR/OpenSSL only when needed."""
-    libs = ["m"]
+    """Link an AOT executable, pulling in GMP/MPFR/OpenSSL only when needed.
+
+    Build-hook libraries, library paths and linker flags are always applied;
+    the built-in dependency probe only adds the compiler's own requirements.
+    """
+    ctx = hook_build_context()
+    hook_libs = list(dict.fromkeys(ctx.libraries))
+    hook_paths = [p for p in ctx.library_paths if p]
+    hook_flags = list(ctx.linker_flags)
+
+    libs = list(dict.fromkeys(["m", *hook_libs]))
+    lp = [p for p in (kwargs.get("library_paths") or []) if p]
+    for path in hook_paths:
+        if path not in lp:
+            lp.append(path)
+    kwargs["library_paths"] = lp
+    kwargs["extra_flags"] = [
+        *(kwargs.get("extra_flags") or ()),
+        *hook_flags,
+    ]
+
     ok, stderr = linker.link(objects, output, libraries=libs, check=False, **kwargs)
     if ok:
         return output
     # If missing GMP/MPFR or OpenSSL symbols, add libraries
-    if _GMP_LINK_NEEDLE.search(stderr or "") or "EVP_" in (stderr or "") or "HMAC" in (stderr or "") or "openssl" in (stderr or "").lower():
-        libs = aot_link_libraries()
-        lp = list(kwargs.get("library_paths") or [])
-        lp.extend(_gmp_library_paths())
+    if (
+        _GMP_LINK_NEEDLE.search(stderr or "")
+        or "EVP_" in (stderr or "")
+        or "HMAC" in (stderr or "")
+        or "openssl" in (stderr or "").lower()
+    ):
+        libs = list(dict.fromkeys([*aot_link_libraries(), *hook_libs]))
+        for path in _gmp_library_paths():
+            if path not in lp:
+                lp.append(path)
         try:
             _o_inc, _o_lib = _find_openssl_paths()
             if _o_lib and _o_lib not in lp:
@@ -1385,7 +1419,9 @@ def _cached_c_ir(
                     _binding.initialize_native_target()
                     _binding.initialize_native_asmprinter()
                     opt_mod = _binding.parse_assembly(_remove_probe_stack_ir(ir_text))
-                    optimize(opt_mod, jit_opt_level, opt_size=jit_opt_size)
+                    opt_mod = optimize(
+                        opt_mod, jit_opt_level, opt_size=jit_opt_size
+                    )
                     opt_text = str(opt_mod)
                 if opt_text.lstrip().startswith(";"):
                     tmp_path = cache_path + ".tmp"
@@ -1426,6 +1462,21 @@ def run_jit(
     with _llvm_binding_lock:
         mod = binding.parse_assembly(llvm_ir)
     llvm_cc = _find_llvm_cc()
+    hook_ctx = hook_build_context()
+    hook_flags = hook_compile_flags(hook_ctx)
+    from .extension_hooks import get_global_hook_dispatcher
+
+    for library in get_global_hook_dispatcher().runtime_libraries(hook_ctx):
+        # JIT symbols must be present in the host process; loading the shared
+        # object is the JIT equivalent of the AOT `-l` flag.
+        library_name = ctypes.util.find_library(library) or library
+        try:
+            ctypes.CDLL(library_name)
+        except OSError as exc:
+            print_warn(
+                f"could not load runtime library {library!r} requested by an "
+                f"extension hook: {exc}"
+            )
     if src_files:
         # Compile every ccode module in parallel across all cores; the clang
         # subprocesses dominate wall time and are independent, while the
@@ -1437,13 +1488,10 @@ def run_jit(
             if src.endswith(".ll"):
                 with open(src) as f:
                     return src, f.read(), None
-            extra = []
-            try:
-                openssl_inc, _ = _find_openssl_paths()
-                if openssl_inc:
-                    extra.append(f"-I{openssl_inc}")
-            except Exception:
-                pass
+            extra = list(hook_flags)
+            openssl_inc, _ = _find_openssl_paths()
+            if openssl_inc:
+                extra.append(f"-I{openssl_inc}")
             r = subprocess.run(
                 [
                     llvm_cc,
@@ -1496,7 +1544,7 @@ def run_jit(
     # final whole-module re-optimization over the remaining runtime helpers is
     # then skipped.
     if opt_level > 0:
-        optimize(mod, opt_level)
+        mod = optimize(mod, opt_level)
 
     # Link the C runtime (print/assign/dynamic dispatch/array registry) so the
     # JIT can resolve native helpers that have no Python callback mirror.
@@ -2076,7 +2124,7 @@ def run_aot(
             fn.linkage = "internal"
     mod.verify()
     _prune_module(mod)
-    optimize(mod, opt_level)
+    mod = optimize(mod, opt_level)
     mod.verify()
 
     target_machine = make_target_machine(pic=pic, codemodel="small", opt=opt_level)
@@ -2245,7 +2293,7 @@ def run_scorpion(
     mod = binding.parse_assembly(llvm_ir)
 
     mod.verify()
-    optimize(mod, opt_level)
+    mod = optimize(mod, opt_level)
     mod.verify()
 
     defined = {f.name for f in mod.functions if not getattr(f, "is_declaration", True)}

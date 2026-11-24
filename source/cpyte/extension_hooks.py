@@ -205,6 +205,7 @@ class HookStage(Enum):
     CODEGEN = "codegen"
     OPTIMIZE = "optimize"
     LINK = "link"
+    SYMBOL = "symbol"
     RUNTIME = "runtime"
 
 
@@ -400,7 +401,7 @@ class SymbolResolverHook(CompilerHook):
     generated declarations, etc.
     """
 
-    stage = HookStage.SEMANTIC
+    stage = HookStage.SYMBOL
 
     def can_resolve_import(self, name: str) -> bool:
         return False
@@ -933,15 +934,19 @@ class HookRegistry:
     ) -> None:
         self._context = context
 
+        if context is None:
+            return
         for hook in self.all():
-            hook.initialize(context)
+            self.invoke_context(hook, "initialize", context)
 
     def shutdown_all(
         self,
         context: CompilerContext,
     ) -> None:
+        if context is None:
+            return
         for hook in reversed(self.all()):
-            hook.shutdown(context)
+            self.invoke_context(hook, "shutdown", context)
 
     def clear(self) -> None:
         self._hooks = {stage: [] for stage in HookStage}
@@ -984,7 +989,12 @@ class HookLoader:
                 )
 
                 for hook in hooks:
-                    hook.initialize(context)
+                    # `initialize` is a callback, so it follows the same
+                    # arity-compat and failure policy as every other hook
+                    # method. A failed initializer is skipped; a hook *file*
+                    # that cannot be loaded is still a hard error above.
+                    if registry.invoke_context(hook, "initialize", context) is _HOOK_FAILED:
+                        continue
                     registry.register(hook)
                     loaded += 1
 
@@ -1146,6 +1156,59 @@ class HookDispatcher:
         return None
 
     # ------------------------------------------------------------------
+    # Parser
+    # ------------------------------------------------------------------
+
+    def parse_statement(
+        self,
+        tokens: Any,
+        pos: int,
+        context: CompilerContext,
+    ) -> Any | None:
+        """Return ``(node, pos)`` from the first parser hook that handles it.
+
+        Failures are recorded (and skipped, unless strict mode is on) by the
+        registry, so a broken parser hook falls through to the built-in parser
+        instead of silently swallowing the exception.
+        """
+        for hook in self._hooks(HookStage.PARSER):
+            if not isinstance(hook, ParserHook):
+                continue
+            should = self.registry.invoke_plain(
+                hook, "should_handle_statement", tokens, pos
+            )
+            if should is _HOOK_FAILED or not should:
+                continue
+            parsed = self.registry.invoke_context(
+                hook, "parse_statement", context, tokens, pos
+            )
+            if parsed is not _HOOK_FAILED:
+                return parsed
+        return None
+
+    def parse_expression(
+        self,
+        tokens: Any,
+        pos: int,
+        context: CompilerContext,
+    ) -> Any | None:
+        """Return an expression produced by the first matching parser hook."""
+        for hook in self._hooks(HookStage.PARSER):
+            if not isinstance(hook, ParserHook):
+                continue
+            should = self.registry.invoke_plain(
+                hook, "should_handle_expression", tokens, pos
+            )
+            if should is _HOOK_FAILED or not should:
+                continue
+            parsed = self.registry.invoke_context(
+                hook, "parse_expression", context, tokens, pos
+            )
+            if parsed is not _HOOK_FAILED:
+                return parsed
+        return None
+
+    # ------------------------------------------------------------------
     # AST transformation
     # ------------------------------------------------------------------
 
@@ -1257,7 +1320,7 @@ class HookDispatcher:
         name: str,
         context: CompilerContext,
     ) -> Any | None:
-        for hook in self._hooks(HookStage.SEMANTIC):
+        for hook in self._hooks(HookStage.SYMBOL):
             if not isinstance(hook, SymbolResolverHook):
                 continue
             can = self.registry.invoke_plain(hook, "can_resolve_import", name)
@@ -1275,7 +1338,7 @@ class HookDispatcher:
         name: str,
         context: CompilerContext,
     ) -> Any | None:
-        for hook in self._hooks(HookStage.SEMANTIC):
+        for hook in self._hooks(HookStage.SYMBOL):
             if not isinstance(hook, SymbolResolverHook):
                 continue
             can = self.registry.invoke_plain(hook, "can_resolve_symbol", name)
@@ -1349,6 +1412,25 @@ class HookDispatcher:
                 module = optimized
         return module
 
+    def add_optimization_passes(
+        self,
+        module: Any,
+        pass_manager: Any,
+        context: CompilerContext,
+    ) -> None:
+        """Let optimize hooks extend the active LLVM pass manager."""
+        for hook in self._hooks(HookStage.OPTIMIZE):
+            if not isinstance(hook, OptimizeHook):
+                continue
+            should = self.registry.invoke_context(
+                hook, "should_add_passes", context
+            )
+            if should is _HOOK_FAILED or not should:
+                continue
+            self.registry.invoke_context(
+                hook, "add_module_passes", context, pass_manager
+            )
+
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
@@ -1379,6 +1461,22 @@ class HookDispatcher:
     # ------------------------------------------------------------------
     # Runtime
     # ------------------------------------------------------------------
+
+    def runtime_files(
+        self,
+        context: CompilerContext,
+    ) -> list[tuple[CompilerHook, str]]:
+        """``(hook, relative_path)`` pairs for runtime C source files."""
+        result: list[tuple[CompilerHook, str]] = []
+        for hook in self._hooks(HookStage.RUNTIME):
+            if not isinstance(hook, RuntimeHook):
+                continue
+            value = self.registry.invoke_context(hook, "get_runtime_files", context)
+            if value is not _HOOK_FAILED and value:
+                for rel_file in value:
+                    if isinstance(rel_file, str):
+                        result.append((hook, rel_file))
+        return result
 
     def runtime_code(
         self,
@@ -1428,6 +1526,10 @@ class HookDispatcher:
         for hook in self._hooks(HookStage.LIFECYCLE):
             if isinstance(hook, LifecycleHook):
                 self.registry.invoke_context(hook, "on_compile_error", context)
+
+    def shutdown_all(self, context: CompilerContext) -> None:
+        """Run `shutdown(context)` for every registered hook, in reverse order."""
+        self.registry.shutdown_all(context)
 
 
 # ============================================================================

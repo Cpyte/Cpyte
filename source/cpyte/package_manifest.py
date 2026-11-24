@@ -36,6 +36,7 @@ class ExtensionHooks:
     build_hooks: list[str] = field(default_factory=list)
     symbol_hooks: list[str] = field(default_factory=list)
     runtime_hooks: list[str] = field(default_factory=list)
+    lifecycle_hooks: list[str] = field(default_factory=list)
 
     def all_hook_files(self) -> list[str]:
         """Every declared hook file, de-duplicated, order preserved."""
@@ -51,6 +52,7 @@ class ExtensionHooks:
             self.build_hooks,
             self.symbol_hooks,
             self.runtime_hooks,
+            self.lifecycle_hooks,
         ):
             for path in group:
                 if path not in seen:
@@ -83,6 +85,29 @@ def _dedupe(paths: list[str]) -> list[str]:
             seen.add(path)
             result.append(path)
     return result
+
+
+def package_name_from_import(module: str) -> str | None:
+    """Return the CPM package name referenced by an import specifier.
+
+    Accepts both canonical ``group.pkg[.sub]`` and legacy
+    ``@group/pkg[/sub]`` spellings. File imports (``*.cpy``, ``*.c``,
+    ``*.h``) are not CPM packages and return ``None``.
+    """
+    if not module or module.endswith((".cpy", ".c", ".cc", ".h", ".ll")):
+        return None
+    spec = module.strip().strip("\"'")
+    if spec.endswith((".cpy", ".c", ".cc", ".h", ".ll")):
+        return None
+    if spec.startswith("@"):
+        parts = [p for p in spec[1:].replace(".", "/").split("/") if p]
+    else:
+        parts = [p for p in spec.split(".") if p]
+    if not parts:
+        return None
+    if parts[0] == "std" and len(parts) >= 2:
+        return parts[1]
+    return parts[-1] if spec.startswith("@") and len(parts) >= 2 else parts[0]
 
 
 @dataclass
@@ -385,6 +410,7 @@ class ManifestParser:
             build_hooks=extensions_data.get("build_hooks", []),
             symbol_hooks=extensions_data.get("symbol_hooks", []),
             runtime_hooks=extensions_data.get("runtime_hooks", []),
+            lifecycle_hooks=extensions_data.get("lifecycle_hooks", []),
         )
 
         # Parse dependencies

@@ -9,7 +9,13 @@ from .lexar import Lexer, Token, TokenType, _unescape_run
 # runtime-typed array.
 _FIXED_ARRAY_RE = re.compile(r"^(.*?)\[(\d+)\]$")
 
-_parser_hooks: list[Any] = []
+# Set by parse_file() so expression dispatch respects --no-userspace too.
+_parser_extensions_enabled = True
+
+try:
+    from .extension_hooks import get_global_hook_dispatcher
+except ImportError:  # pragma: no cover - extension_hooks is always shipped
+    get_global_hook_dispatcher = None  # type: ignore[assignment]
 
 # User-declared type names (structs, type aliases, classes) collected in a
 # pre-scan so bare-name casts like `(MyInt)x` are recognized as casts at parse
@@ -35,33 +41,6 @@ def _pre_scan_user_types(tokens):
         i += 1
     _user_type_names = names
     return names
-
-
-def register_parser_hook(hook: Any) -> None:
-    _parser_hooks.append(hook)
-
-
-# Bruh, dead code.
-
-
-def get_parser_hooks() -> list[Any]:
-    return _parser_hooks.copy()
-
-
-def _get_all_parser_hooks(enable_extensions: bool) -> list[Any]:
-    if not enable_extensions:
-        return []
-    hooks = list(_parser_hooks)
-    try:
-        from .extension_hooks import HookStage, ParserHook, get_global_hook_registry
-
-        registry = get_global_hook_registry()
-        for hook in registry.get(HookStage.PARSER):
-            if isinstance(hook, ParserHook) and hook not in hooks:
-                hooks.append(hook)
-    except ImportError:
-        pass
-    return hooks
 
 
 def _loc(node):
@@ -620,15 +599,12 @@ def _try_parse_cast_type(tokens, pos):
 def _parse_atom(tokens: list[Token], pos: int):
     tok = tokens[pos]
 
-    for hook in _get_all_parser_hooks(True):
-        if hasattr(hook, "should_handle_expression") and hook.should_handle_expression(
-            tokens, pos
-        ):
-            return hook.parse_expression(
-                tokens,
-                pos,
-                _make_parser_ctx(tokens, pos),
-            )
+    if _parser_extensions_enabled and get_global_hook_dispatcher is not None:
+        parsed = get_global_hook_dispatcher().parse_expression(
+            tokens, pos, _make_parser_ctx(tokens, pos)
+        )
+        if parsed is not None:
+            return parsed
 
     if tok.type == TokenType.KEYWORD and tok.value == "borrow":
         pos += 1
@@ -1300,6 +1276,8 @@ def _parse_expr_iterative(tokens: list[Token], pos: int, min_prec: int):
 
 
 def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True):
+    global _parser_extensions_enabled
+    _parser_extensions_enabled = enable_extensions
     _pre_scan_user_types(tokens)
     nodes = []
     while pos < len(tokens) and tokens[pos].type not in (
@@ -1312,24 +1290,14 @@ def parse_file(tokens: list[Token], pos: int = 0, enable_extensions: bool = True
         if pos >= len(tokens) or tokens[pos].type in (TokenType.EOF, TokenType.DEDENT):
             break
 
-        all_hooks = _get_all_parser_hooks(enable_extensions)
-        if all_hooks:
-            ctx = _make_parser_ctx(tokens, pos)
-            handled = False
-            for hook in all_hooks:
-                try:
-                    if hasattr(
-                        hook, "should_handle_statement"
-                    ) and hook.should_handle_statement(tokens, pos):
-                        node, pos = hook.parse_statement(tokens, pos, ctx)
-                        nodes.append(node)
-                        handled = True
-                        break
-                except Exception:
-                    pass
-            if not handled:
-                node, pos = _parse_standard_statement(tokens, pos)
-                nodes.append(node)
+        parsed = None
+        if enable_extensions and get_global_hook_dispatcher is not None:
+            parsed = get_global_hook_dispatcher().parse_statement(
+                tokens, pos, _make_parser_ctx(tokens, pos)
+            )
+        if parsed is not None:
+            node, pos = parsed
+            nodes.append(node)
         else:
             node, pos = _parse_standard_statement(tokens, pos)
             nodes.append(node)

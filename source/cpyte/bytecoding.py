@@ -10,11 +10,9 @@ from llvmlite.ir import instructions
 from .astparse import *
 from .clib import _BUILTIN_LIB_HEADERS
 from .extension_hooks import (
-    CodegenHook,
     CompilerContext,
-    HookLoadError,
     HookStage,
-    RuntimeHook,
+    get_global_hook_dispatcher,
     get_global_hook_registry,
 )
 from .lexar import TokenType
@@ -1766,36 +1764,17 @@ class LLVM:
             import tempfile
 
             context = self._hook_context()
-            for hook in self._hook_registry.get(HookStage.RUNTIME):
-                if not isinstance(hook, RuntimeHook):
-                    continue
-                try:
-                    for rel_file in hook.get_runtime_files(context):
-                        base = os.path.dirname(hook.hook_path) if hook.hook_path else ""
-                        abs_path = os.path.join(base, rel_file)
-                        if os.path.isfile(abs_path):
-                            self.import_src_files.append(abs_path)
-                    runtime_code = hook.get_runtime_code(context)
-                    if runtime_code:
-                        fd, tmp_path = tempfile.mkstemp(
-                            suffix=".c", prefix="hook_runtime_"
-                        )
-                        with os.fdopen(fd, "w") as f:
-                            f.write(runtime_code)
-                        self.import_src_files.append(tmp_path)
-                except Exception as _hook_exc:
-                    # A runtime hook that raises is skipped (its code is not
-                    # linked). Surface it under CPYTE_JIT_DEBUG so a stale hook
-                    # (e.g. an old get_runtime_code(self) signature) is not a
-                    # fully silent failure.
-                    if os.environ.get("CPYTE_JIT_DEBUG"):
-                        import sys as _sys
-
-                        print(
-                            f"[bytecoding] runtime hook {hook.name!r} skipped: "
-                            f"{type(_hook_exc).__name__}: {_hook_exc}",
-                            file=_sys.stderr,
-                        )
+            dispatcher = get_global_hook_dispatcher()
+            for hook, rel_file in dispatcher.runtime_files(context):
+                base = os.path.dirname(hook.hook_path) if hook.hook_path else ""
+                abs_path = os.path.join(base, rel_file)
+                if os.path.isfile(abs_path):
+                    self.import_src_files.append(abs_path)
+            for runtime_code in dispatcher.runtime_code(context):
+                fd, tmp_path = tempfile.mkstemp(suffix=".c", prefix="hook_runtime_")
+                with os.fdopen(fd, "w") as f:
+                    f.write(runtime_code)
+                self.import_src_files.append(tmp_path)
 
         if os.environ.get("CPYTE_JIT_DEBUG"):
             import sys as _sys
@@ -2440,22 +2419,14 @@ class LLVM:
                     del self._emit_memo[k]
 
     def _emit_recursive(self, node: Node | dict) -> _IRValue:
-        # Try codegen hooks if extensions are enabled
+        # Try codegen hooks if extensions are enabled. The dispatcher applies
+        # the registry's warn/skip (or --strict) policy to callback failures.
         if self.enable_extensions:
-            for hook in self._hook_registry.get(HookStage.CODEGEN):
-                if not isinstance(hook, CodegenHook):
-                    continue
-                try:
-                    if hook.should_emit_node(node):
-                        return hook.emit_node(
-                            node,
-                            self.builder,
-                            self._hook_context(data={"node": node}),
-                        )
-                except Exception as e:
-                    raise HookLoadError(
-                        f"codegen hook {hook.__class__.__name__} failed: {e}"
-                    ) from e
+            emitted = get_global_hook_dispatcher().emit_node(
+                node, self.builder, self._hook_context(data={"node": node})
+            )
+            if emitted is not None:
+                return emitted
 
         if isinstance(node, dict):
             if node.get("type") == "for":

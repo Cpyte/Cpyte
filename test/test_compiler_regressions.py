@@ -19,6 +19,15 @@ sys.path.insert(0, os.path.join(ROOT, "source"))
 
 from cpyte import CpyteCompileError, emit_program, parse_and_analyze  # noqa: E402
 from cpyte import compiling, sef  # noqa: E402
+from cpyte.extension_hooks import (  # noqa: E402
+    CompilerContext,
+    HookDispatcher,
+    HookInvocationError,
+    HookLoadError,
+    HookLoader,
+    HookRegistry,
+    RuntimeHook,
+)
 from cpyte.package_manifest import (  # noqa: E402
     cpm_module_roots,
     iter_cpm_version_dirs,
@@ -43,6 +52,67 @@ def compile_program(source):
 def test_extensions_disabled_api():
     ir = compile_program("public main() -> int:\n    return 0\n")
     assert 'define i32 @"main"' in ir
+
+
+def test_runtime_hook_legacy_signature_is_supported_with_notice():
+    class LegacyRuntimeHook(RuntimeHook):
+        def get_runtime_code(self):  # noqa: N802 - legacy signature by design
+            return "int hook_legacy(void) { return 7; }"
+
+    registry = HookRegistry()
+    hook = LegacyRuntimeHook("legacy-runtime")
+    registry.register(hook)
+    dispatcher = HookDispatcher(registry)
+
+    assert dispatcher.runtime_code(CompilerContext()) == [
+        "int hook_legacy(void) { return 7; }"
+    ]
+    errors = registry.take_errors()
+    assert len(errors) == 1
+    assert isinstance(errors[0].exception, DeprecationWarning)
+    assert "context" in str(errors[0].exception)
+
+    # The deprecation is reported once per hook/method.
+    dispatcher.runtime_code(CompilerContext())
+    assert registry.take_errors() == []
+
+
+def test_hook_failures_warn_by_default_and_are_hard_in_strict_mode():
+    class BrokenRuntimeHook(RuntimeHook):
+        def get_runtime_code(self, context):
+            raise RuntimeError("hook exploded")
+
+    registry = HookRegistry()
+    registry.register(BrokenRuntimeHook("broken-runtime"))
+    dispatcher = HookDispatcher(registry)
+
+    assert dispatcher.runtime_code(CompilerContext()) == []
+    errors = registry.take_errors()
+    assert len(errors) == 1
+    assert "hook exploded" in errors[0].describe()
+
+    registry.set_strict(True)
+    try:
+        dispatcher.runtime_code(CompilerContext())
+    except HookInvocationError as exc:
+        assert "hook exploded" in str(exc)
+    else:
+        raise AssertionError("strict mode did not surface the hook failure")
+
+
+def test_missing_hook_file_is_always_a_hard_error():
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            HookLoader.load_hooks_from_package(
+                "broken",
+                root,
+                ["does_not_exist.py"],
+                HookRegistry(),
+                CompilerContext(),
+            )
+        except HookLoadError:
+            return
+        raise AssertionError("missing hook file was not a hard error")
 
 
 def test_integer_pointer_arithmetic():
@@ -688,6 +758,9 @@ def test_binary_operators_associate_left_except_power():
 
 if __name__ == "__main__":
     test_extensions_disabled_api()
+    test_runtime_hook_legacy_signature_is_supported_with_notice()
+    test_hook_failures_warn_by_default_and_are_hard_in_strict_mode()
+    test_missing_hook_file_is_always_a_hard_error()
     test_integer_pointer_arithmetic()
     test_invalid_pointer_arithmetic_is_rejected()
     test_invalid_hex_literal_is_lexer_error()

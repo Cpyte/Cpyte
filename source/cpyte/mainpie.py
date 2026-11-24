@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 
@@ -17,6 +18,8 @@ if __package__:
         _runtime_extra_flags,
         aot_link_executable,
         host_target,
+        hook_build_context,
+        hook_compile_flags,
         make_target_machine,
         optimize,
         run_aot,
@@ -26,6 +29,8 @@ if __package__:
     )
     from .extension_hooks import (
         CompilerContext,
+        HookInvocationError,
+        HookLoadError,
         HookLoader,
         HookStage,
         get_global_hook_dispatcher,
@@ -43,6 +48,7 @@ if __package__:
         cpm_module_roots,
         get_global_registry,
         iter_cpm_version_dirs,
+        package_name_from_import,
     )
     from .sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from .semantic_analasis import analyze
@@ -63,6 +69,8 @@ else:
         _runtime_extra_flags,
         aot_link_executable,
         host_target,
+        hook_build_context,
+        hook_compile_flags,
         make_target_machine,
         optimize,
         run_aot,
@@ -72,6 +80,8 @@ else:
     )
     from cpyte.extension_hooks import (
         CompilerContext,
+        HookInvocationError,
+        HookLoadError,
         HookLoader,
         HookStage,
         get_global_hook_dispatcher,
@@ -89,6 +99,7 @@ else:
         cpm_module_roots,
         get_global_registry,
         iter_cpm_version_dirs,
+        package_name_from_import,
     )
     from cpyte.sef import cmd_check, cmd_digest, cmd_dump, cmd_pack, cmd_size
     from cpyte.semantic_analasis import analyze
@@ -339,13 +350,35 @@ def _sync_lexer_hooks() -> None:
         register_operators(operators)
 
 
-def _load_package_manifests_from_source(workspace_root: str | None) -> None:
-    """Load manifests from all installed CPM packages.
+_IMPORT_SPEC_RE = re.compile(r"^[ \t]*(?:import|from)[ \t]+([^\s#]+)", re.MULTILINE)
+
+
+def _source_package_names(source: str) -> set[str]:
+    """CPM package names referenced by ``source`` (cheap pre-lex scan).
+
+    Parser-phase hooks must exist before lexing, so we cannot wait for the
+    parser to discover imports. Scanning only the import specifiers keeps a
+    globally installed package from injecting keywords/hooks into unrelated
+    programs, which otherwise leaked through ``~/.cpm/modules``.
+    """
+    names: set[str] = set()
+    for match in _IMPORT_SPEC_RE.finditer(source):
+        name = package_name_from_import(match.group(1))
+        if name:
+            names.add(name)
+    return names
+
+
+def _load_package_manifests_from_source(
+    workspace_root: str | None,
+    imported_packages: set[str] | None = None,
+) -> None:
+    """Load pre-lex hooks for packages the source actually imports.
 
     Direct ``cpm install <pkg>`` packages live in ``~/.cpm/modules`` while
     manifest-driven installs stay in ``<workspace>/.cpm/modules``. Both are
-    searched, and global packages work even without a workspace. This makes
-    package-provided keywords/operators available before lexing/parsing.
+    searched. Only lexer/parser/lifecycle hooks load here; every other stage
+    is deferred until the package is imported during semantic analysis.
     """
     manifest_registry = get_global_registry()
 
@@ -357,6 +390,8 @@ def _load_package_manifests_from_source(workspace_root: str | None) -> None:
             # iter_cpm_version_dirs yields scoped dirs as "@scope/name";
             # manifest.name (from package.json) is usually just "name".
             base_name = dir_package.rsplit("/", 1)[-1]
+            if imported_packages is not None and base_name not in imported_packages:
+                continue
             if manifest_registry.is_loaded(base_name):
                 continue
 
@@ -366,35 +401,42 @@ def _load_package_manifests_from_source(workspace_root: str | None) -> None:
 
             try:
                 manifest = ManifestParser.validate_and_parse(manifest_path)
-                if manifest_registry.is_loaded(manifest.name):
-                    continue
-
-                # Register declared keywords/operators with the lexer.
-                if manifest.capabilities.keywords:
-                    register_keywords(manifest.capabilities.keywords)
-                if manifest.capabilities.operators:
-                    register_operators(manifest.capabilities.operators)
-
-                manifest_registry.register(manifest)
-
-                # Lexer + parser hooks must be available before lexing/parsing
-                # the source. Remaining stages load lazily at import time.
-                parser_phase = manifest.extensions.parser_phase_hooks()
-                if parser_phase:
-                    HookLoader.load_hooks_from_package(
-                        manifest.name,
-                        version_dir,
-                        parser_phase,
-                        get_global_hook_registry(),
-                        CompilerContext(data={"package_dir": version_dir}),
-                    )
-
             except Exception as e:
-                if get_global_hook_registry().strict:
-                    raise
                 ui.print_warn(
                     f"Failed to load package manifest for '{base_name}': {e}"
                 )
+                continue
+
+            if imported_packages is not None and manifest.name not in imported_packages:
+                continue
+            if manifest_registry.is_loaded(manifest.name):
+                continue
+
+            # Register declared keywords/operators with the lexer.
+            if manifest.capabilities.keywords:
+                register_keywords(manifest.capabilities.keywords)
+            if manifest.capabilities.operators:
+                register_operators(manifest.capabilities.operators)
+
+            manifest_registry.register(manifest)
+
+            # Hook *files* are a hard error. Callback failures follow the
+            # registry policy (warn+skip, or hard error under --strict).
+            early_hooks = list(manifest.extensions.parser_phase_hooks())
+            for path in manifest.extensions.lifecycle_hooks:
+                if path not in early_hooks:
+                    early_hooks.append(path)
+            if early_hooks:
+                try:
+                    HookLoader.load_hooks_from_package(
+                        manifest.name,
+                        version_dir,
+                        early_hooks,
+                        get_global_hook_registry(),
+                        CompilerContext(data={"package_dir": version_dir}),
+                    )
+                except HookLoadError:
+                    raise
 
     # Feed hook-declared keywords/operators to the lexer.
     _sync_lexer_hooks()
@@ -436,6 +478,10 @@ def _find_workspace_root(filepath: str | None) -> str:
         dirpath = parent
 
 
+def _compiler_hook_context(source=None, filepath=None) -> CompilerContext:
+    return CompilerContext(source_file=filepath, data={"source": source})
+
+
 def _compile(
     source,
     tab_size=4,
@@ -446,16 +492,25 @@ def _compile(
     scorpion=False,
 ):
     workspace_root = _find_workspace_root(filepath)
+    registry = get_global_hook_registry()
+    registry.set_strict(strict)
+    dispatcher = get_global_hook_dispatcher()
+    hook_ctx = _compiler_hook_context(source, filepath)
 
-    # Pre-load package manifests if extensions are enabled
+    # Pre-load parser-phase hooks only for packages the source imports.
     if enable_extensions:
-        _load_package_manifests_from_source(workspace_root)
+        _load_package_manifests_from_source(
+            workspace_root, _source_package_names(source)
+        )
+        dispatcher.lifecycle_before(hook_ctx)
 
     lex = Lexer(source, tab_size=tab_size, enable_extensions=enable_extensions)
     tokens = lex.get_tokens()
     try:
         parsed, _ = parse_file(tokens, enable_extensions=enable_extensions)
     except (LexerError, ParseError) as e:
+        if enable_extensions:
+            dispatcher.lifecycle_error(hook_ctx)
         ui.print_err(f"parse error: {e}")
         sys.exit(1)
     result, warnings_txt, generic_instantiations = analyze(
@@ -469,12 +524,30 @@ def _compile(
         scorpion=scorpion,
     )
     if result:
+        if enable_extensions:
+            dispatcher.lifecycle_error(hook_ctx)
         sys.stderr.write(result + ("\n" if result else ""))
         sys.exit(1)
+
+    # Deferred hooks are installed by the imports during analysis, so AST
+    # transformations run now (after semantic checks, before codegen).
+    if enable_extensions:
+        ctx = CompilerContext(ast=parsed, source_file=filepath)
+        try:
+            parsed = [dispatcher.transform_node(node, ctx) for node in parsed]
+            parsed = dispatcher.transform_module(parsed, ctx)
+        except SystemExit:
+            raise
+        except Exception as e:
+            ui.print_err(f"transform hook error: {e}")
+            dispatcher.lifecycle_error(hook_ctx)
+            sys.exit(1)
+
     if warnings_txt:
         sys.stderr.write(warnings_txt.strip() + "\n")
     if enable_extensions:
         _notify_deep_hook_usage()
+        dispatcher.lifecycle_after(hook_ctx)
     return parsed, generic_instantiations
 
 
@@ -528,7 +601,18 @@ def _emit(
         prog, src_files = c.emit_program(parsed)
     except SystemExit:
         raise
+    except (HookInvocationError, HookLoadError) as e:
+        if enable_extensions:
+            get_global_hook_dispatcher().lifecycle_error(
+                _compiler_hook_context()
+            )
+        ui.print_err(f"[hooks] {e}")
+        sys.exit(1)
     except Exception as e:
+        if enable_extensions:
+            get_global_hook_dispatcher().lifecycle_error(
+                _compiler_hook_context()
+            )
         ui.print_err(f"codegen error: {type(e).__name__}: {e}")
         if isinstance(e, RuntimeError):
             sys.exit(1)
@@ -801,6 +885,7 @@ def cmd_build(
     lto=False,
     no_gc=False,
 ):
+    get_global_hook_registry().set_strict(strict)
     if not args:
         ui.print_usage(
             "Usage: cpy build [--output O] [--debug] [--opt N] [--osize] [--no-userspace] [--nogc] [--pic] [--lto] <source.cpy>"
@@ -902,6 +987,11 @@ def cmd_build(
         scorpion=scorpion,
     )
 
+    # Build hooks contribute include paths/defines/flags for every C source
+    # (runtime, ccode siblings, bignum) and libraries/paths/flags for the link.
+    hook_ctx = hook_build_context()
+    hook_flags = hook_compile_flags(hook_ctx)
+
     out_base = src_file.rsplit(".", 1)[0] if "." in src_file else "a"
     obj_file = out_base + ".o"
 
@@ -929,6 +1019,7 @@ def cmd_build(
                 _host_target_triple(),
                 "-fno-stack-protector",
                 *(_runtime_extra_flags(_BIGNUM_C)),
+                *hook_flags,
                 "-o",
                 "-",
                 _BIGNUM_C,
@@ -950,7 +1041,7 @@ def cmd_build(
     # Always run module optimization so the LLVM passes (SROA, inlining and the
     # loop/SLP auto-vectorizer) run at the chosen -O level — this is what emits
     # SIMD/NEON/AVX. `optimize` opts out internally for -O0 and honors opt_size.
-    optimize(mod, opt, opt_size=opt_size)
+    mod = optimize(mod, opt, opt_size=opt_size)
     mod.verify()
 
     target_machine = make_target_machine(pic=pic, codemodel="small", opt=opt or 3)
@@ -971,14 +1062,20 @@ def cmd_build(
             opt_size=opt_size,
             debug=debug,
             pic=pic,
-            extra_flags=_runtime_extra_flags(_BIGNUM_C),
+            extra_flags=(*_runtime_extra_flags(_BIGNUM_C), *hook_flags),
         )
         objs.append(bignum_obj)
 
     for src in src_files or []:
         src_obj = src.rsplit(".", 1)[0] + ".o"
         linker.compile_c(
-            src, output=src_obj, opt_level=opt, opt_size=opt_size, debug=debug, pic=pic
+            src,
+            output=src_obj,
+            opt_level=opt,
+            opt_size=opt_size,
+            debug=debug,
+            pic=pic,
+            extra_flags=hook_flags,
         )
         objs.append(src_obj)
 
@@ -992,6 +1089,7 @@ def cmd_build(
             debug=debug,
             pic=pic,
             eh=True,
+            extra_flags=hook_flags,
         )
         objs.append(runtime_obj)
 
@@ -1004,6 +1102,7 @@ def cmd_build(
             opt_size=opt_size,
             debug=debug,
             pic=pic,
+            extra_flags=hook_flags,
         )
         objs.append(gc_obj)
 
@@ -1015,6 +1114,7 @@ def cmd_build(
         opt_size=opt_size,
         debug=debug,
         pic=pic,
+        extra_flags=hook_flags,
     )
     objs.append(runpy_obj)
 
@@ -1207,6 +1307,18 @@ def cmd_sef(args):
     sys.exit(1)
 
 
+def _report_hook_errors() -> None:
+    """Surface recorded hook failures and one-time deprecation notes."""
+    for error in get_global_hook_registry().take_errors():
+        if isinstance(error.exception, DeprecationWarning):
+            ui.print_warn(
+                f"[hooks] deprecation in {error.hook_name!r} "
+                f"({error.package_name!r}): {error.exception}"
+            )
+        else:
+            ui.print_warn(f"[hooks] {error.describe()}")
+
+
 def main():
     start_check(__version__)
     try:
@@ -1214,10 +1326,21 @@ def main():
     except KeyboardInterrupt:
         ui.print_warn("interrupted")
         return 130
+    except (HookInvocationError, HookLoadError) as exc:
+        # Strict-mode callback failures and broken hook files are hard errors,
+        # but should not dump a Python traceback at the user.
+        ui.print_err(f"[hooks] {exc}")
+        return 1
     except Exception:
         ui.print_err("Cpyte got an error :(. The following tracebacks:")
         ui.print_traceback()
         return 1
+    finally:
+        # Also runs on sys.exit() from _main/_compile/_emit.
+        try:
+            get_global_hook_dispatcher().shutdown_all(CompilerContext())
+        finally:
+            _report_hook_errors()
     sys.stdout.flush()
     report_update()
     return result
@@ -1299,6 +1422,9 @@ def _main():
         else:
             ui.print_warn(f"Unknown flag: {flag}")
             sys.exit(1)
+
+    # --strict governs hook callback failures too, not only semantic warnings.
+    get_global_hook_registry().set_strict(strict)
 
     if args and args[0] in ("-h", "--help"):
         print(ui.paint_usage(_USAGE, stream=sys.stderr), file=sys.stderr)

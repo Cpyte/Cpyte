@@ -168,6 +168,7 @@ class Linker:
         frameworks=None,
         pic=False,
         check=True,
+        extra_flags=(),
     ):
         cmd = [self._cc]
         if shared:
@@ -182,6 +183,7 @@ class Linker:
             cmd.append("-Oz")
         elif opt_level is not None:
             cmd.append(f"-O{opt_level}")
+        cmd.extend(extra_flags)
         cmd.extend(["-o", output] + list(objects))
         for lib in libraries or []:
             cmd.extend(["-l", lib])

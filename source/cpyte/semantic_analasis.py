@@ -157,8 +157,7 @@ from .extension_hooks import (
     DiagnosticSeverity,
     HookLoadError,
     HookLoader,
-    HookStage,
-    SemanticHook,
+    get_global_hook_dispatcher,
     get_global_hook_registry,
 )
 from .lexar import Lexer, LexerError, TokenType, register_keywords
@@ -167,6 +166,7 @@ from .package_manifest import (
     cpm_module_roots,
     get_global_registry,
     iter_cpm_version_dirs,
+    package_name_from_import,
     sort_cpm_versions,
 )
 
@@ -877,6 +877,10 @@ class SemanticAnalyzer:
 
             return True
 
+        except HookLoadError:
+            # A broken hook file is always a hard error, regardless of
+            # --strict. Only manifest/import problems become diagnostics.
+            raise
         except Exception as e:
             self.error(f"Failed to load package manifest for '{package_name}': {e}")
             return False
@@ -903,25 +907,39 @@ class SemanticAnalyzer:
         context.data["package_dir"] = package_dir
         context.data["package_name"] = package_name
 
-        import os as _os
+        # Use the same loader as the CLI preload so hook discovery, naming and
+        # initialization all follow one path. A missing file is still a hard
+        # HookLoadError from the loader; only already-loaded files are skipped
+        # (LSP re-analyses must not raise "already registered").
+        loaded_paths = {
+            h.hook_path
+            for h in self._hook_registry.all()
+            if h.package_name == package_name and h.hook_path
+        }
+        filtered = [
+            path
+            for path in all_hook_files
+            if os.path.abspath(os.path.join(package_dir, path)) not in loaded_paths
+        ]
+        if not filtered:
+            return
+        HookLoader.load_hooks_from_package(
+            package_name,
+            package_dir,
+            filtered,
+            self._hook_registry,
+            context,
+        )
 
-        for relative_path in all_hook_files:
-            hook_path = _os.path.abspath(_os.path.join(package_dir, relative_path))
-            if not _os.path.isfile(hook_path):
-                raise HookLoadError(f"Hook file does not exist: {hook_path}")
-            hooks = HookLoader._load_hook_file(hook_path, package_name)
-            for hook in hooks:
-                if any(h.name == hook.name for h in self._hook_registry.all()):
-                    continue
-                hook.initialize(context)
-                self._hook_registry.register(hook)
-
-    def _load_cpm_package_manifests(self) -> None:
-        """Load manifests from all installed CPM packages.
+    def _load_cpm_package_manifests(
+        self, imported_packages: set[str] | None = None
+    ) -> None:
+        """Load manifests for packages the source actually imports.
 
         Direct ``cpm install <pkg>`` puts packages in ``~/.cpm/modules``;
         manifest-driven installs stay project-local. Both roots are searched,
-        and a manifest may be loaded without a workspace at all.
+        but unrelated global packages must never contribute manifests or
+        deferred hooks to a program that does not import them.
         """
         if not self.enable_extensions:
             return
@@ -935,6 +953,8 @@ class SemanticAnalyzer:
                 # the final path segment, e.g. "json" for "@std/json") find it.
                 base_name = package_name.rsplit("/", 1)[-1]
 
+                if imported_packages is not None and base_name not in imported_packages:
+                    continue
                 if base_name in self._loaded_packages:
                     continue
 
@@ -2380,18 +2400,12 @@ class SemanticAnalyzer:
             )
 
     def _visit(self, node, scope: Scope | None = None):
-        for hook in self._hook_registry.get(HookStage.SEMANTIC):
-            if not isinstance(hook, SemanticHook):
-                continue
-            try:
-                if hook.should_visit_node(node):
-                    ctx = self._hook_context()
-                    ctx.data["scope"] = scope
-                    ctx.data["node"] = node
-                    for diag in hook.visit_node(node, ctx) or []:
-                        self._report_hook_diag(diag)
-            except Exception:
-                pass
+        if self.enable_extensions:
+            ctx = self._hook_context()
+            ctx.data["scope"] = scope
+            ctx.data["node"] = node
+            for diag in get_global_hook_dispatcher().analyze_node(node, ctx):
+                self._report_hook_diag(diag)
         if isinstance(node, FuncDef):
             self._visit_funcdef(node, scope)
         elif isinstance(node, If):
@@ -5957,9 +5971,17 @@ def analyze(
         no_gc=no_gc,
         scorpion=scorpion,
     )
-    # Pre-load CPM package manifests before analysis
+    # Pre-load CPM package manifests for the packages this program imports.
+    # Loading every installed package here would let a global package inject
+    # deferred hooks into unrelated programs.
     if enable_extensions:
-        analyzer._load_cpm_package_manifests()
+        imported_packages: set[str] = set()
+        for node in nodes:
+            if isinstance(node, Import):
+                name = package_name_from_import(node.module)
+                if name:
+                    imported_packages.add(name)
+        analyzer._load_cpm_package_manifests(imported_packages)
     if not analyzer.analyze(nodes):
         return analyzer.reporter.display(), None, analyzer._generic_instantiations
     # No errors, but there may be warnings to surface.

@@ -886,4 +886,34 @@ class Lexer:
         return i, i + 1
 
     def get_tokens(self) -> list[Token]:
+        if self.enable_extensions:
+            from .extension_hooks import get_global_hook_dispatcher
+
+            dispatcher = get_global_hook_dispatcher()
+            if dispatcher.has_lexer_hooks():
+                rewritten = []
+                for tok in self.tokens:
+                    replacement = dispatcher.customize_token(
+                        tok.type.name, tok.value, tok.line, tok.column
+                    )
+                    if not replacement:
+                        rewritten.append(tok)
+                        continue
+                    try:
+                        token_type = replacement.get("type", tok.type.name)
+                        if isinstance(token_type, str):
+                            token_type = TokenType[token_type]
+                        rewritten.append(
+                            Token(
+                                token_type,
+                                replacement.get("value", tok.value),
+                                tok.line,
+                                tok.column,
+                            )
+                        )
+                    except (KeyError, TypeError):
+                        # Bad replacements are reported through the hook
+                        # registry; keep the original token and carry on.
+                        rewritten.append(tok)
+                self.tokens = rewritten
         return self.tokens

@@ -50,10 +50,15 @@ Every package needs a `package.json` at its root.
     "custom_types": ["Promise", "Future"]
   },
   "extensions": {
+    "lexer_hooks": ["lexer_hooks.py"],
     "parser_hooks": ["parser_hooks.py"],
+    "lifecycle_hooks": ["lifecycle_hooks.py"],
     "semantic_hooks": ["semantic_hooks.py"],
+    "transform_hooks": ["transform_hooks.py"],
     "codegen_hooks": ["codegen_hooks.py"],
     "optimize_hooks": ["optimize_hooks.py"],
+    "build_hooks": ["build_hooks.py"],
+    "symbol_hooks": ["symbol_hooks.py"],
     "runtime_hooks": ["runtime_hooks.py"]
   },
   "dependencies": [],
@@ -89,6 +94,20 @@ is tokenized.
 `extensions` maps hook categories to Python files. Each file must exist on disk
 and must define a top-level `get_hooks()` function returning a list of hook
 instances (see [Hook Files](#hook-files)).
+
+Loading is split by phase:
+
+- `Manifest.extensions.parser_phase_hooks()` = `lexer_hooks` + `parser_hooks`.
+  These load before lexing, for packages the source imports.
+- `Manifest.extensions.deferred_hooks()` = semantic, transform, codegen,
+  optimize, build, symbol and runtime hooks. These load only when the package is
+  imported.
+- `lifecycle_hooks` load early with parser-phase hooks but are not part of
+  `parser_phase_hooks()`, so the stage table stays lexer/parser-only.
+
+A hook file that is missing or fails to execute/import is always a hard error.
+An individual callback that raises is reported and skipped by default, and
+becomes a hard error under `--strict`.
 
 ### Reserved Names
 
@@ -191,6 +210,37 @@ CompilerContext(
 )
 ```
 
+### Context convention
+
+Callbacks that take a context receive it as the **trailing positional
+argument**: `func(*args, context)`. For example:
+
+```python
+def get_runtime_code(self, context): ...
+def parse_statement(self, tokens, pos, context): ...
+```
+
+The dispatcher uses `call_with_context()` internally, so pre-context packages
+such as `def get_runtime_code(self): ...` still work. The first use of a legacy
+signature emits a one-time deprecation diagnostic; update the signature when
+you can.
+
+Callers in the compiler go through `HookDispatcher`; do not iterate hook lists
+or invoke hook methods directly. The dispatcher provides:
+
+| Stage | Dispatcher methods |
+|---|---|
+| Lexer | `additional_keywords()`, `additional_operators()`, `has_lexer_hooks()`, `customize_token()` |
+| Parser | `parse_statement()`, `parse_expression()` |
+| Semantic | `analyze_node()`, `can_convert()`, `infer_type()`, `custom_type_rules()` |
+| Transform | `transform_node()`, `transform_module()` |
+| Symbol | `resolve_import()`, `resolve_symbol()` |
+| Codegen | `before_codegen()`, `emit_node()`, `after_codegen()` |
+| Optimize | `optimize_module()`, `add_optimization_passes()` |
+| Build | `collect_build_configuration()` |
+| Runtime | `runtime_files()`, `runtime_code()`, `runtime_libraries()` |
+| Lifecycle | `lifecycle_before()`, `lifecycle_after()`, `lifecycle_error()`, `shutdown_all()` |
+
 Stage-specific helpers are also exposed through `data`:
 
 | Stage | `context.data` keys |
@@ -238,26 +288,31 @@ displayed but non-fatal.
 The framework defines the following `HookStage`s, in pipeline order:
 
 ```
-lifecycle -> lexer -> parser -> semantic -> transform -> codegen -> optimize -> link -> runtime
+lifecycle -> lexer -> parser -> semantic -> transform -> codegen -> optimize -> link -> symbol -> runtime
 ```
 
-The compiler currently consults these stages:
+The compiler consults every stage:
 
 | Stage | Hook class | When hooks run |
 |---|---|---|
-| `PARSER` | `ParserHook` | Statement dispatch in the parser |
-| `SEMANTIC` | `SemanticHook` | Every AST node during analysis |
-| `CODEGEN` | `CodegenHook` | AST nodes during LLVM emission |
-| `RUNTIME` | `RuntimeHook` | Collecting C runtime sources/libraries |
 | `LIFECYCLE` | `LifecycleHook` | Compilation start/finish/error |
-| `OPTIMIZE` | `OptimizeHook` | Pass-manager extension |
-| `LINK` | `BuildHook` | Build configurations (flags, paths, defines) |
-| `LEXER` | `LexerHook` | Additional keywords/operators |
-| `TRANSFORM` | `TransformHook` | AST transformation |
+| `LEXER` | `LexerHook` | Keywords/operators and token rewriting before parsing |
+| `PARSER` | `ParserHook` | Statement and expression dispatch in the parser |
+| `SEMANTIC` | `SemanticHook` | Every AST node during analysis |
+| `TRANSFORM` | `TransformHook` | AST transformation after analysis |
+| `CODEGEN` | `CodegenHook` | AST nodes during LLVM emission |
+| `OPTIMIZE` | `OptimizeHook` | Module rewriting and pass-manager extension |
+| `LINK` | `BuildHook` | Include/library paths, libraries, defines and flags for JIT/AOT |
+| `SYMBOL` | `SymbolResolverHook` | Import and symbol resolution |
+| `RUNTIME` | `RuntimeHook` | C runtime sources/libraries and inline runtime code |
 
-The framework-level `HookDispatcher` (`get_global_hook_dispatcher()`) provides a
-convenience API over the registry for stages you integrate into your own
-tooling.
+`BuildHook` settings are applied to JIT `ccode:` compilation and to AOT C
+compilation/linking. `RuntimeHook.get_runtime_libraries()` libraries are loaded
+into the JIT process (and passed to the AOT linker), so a runtime hook can pull
+in a system library without a separate `BuildHook`.
+
+The framework-level `HookDispatcher` (`get_global_hook_dispatcher()`) is the
+single compiler-facing API; see the table in [Compiler Context](#compiler-context).
 
 ## Lexer Hooks
 
@@ -614,6 +669,11 @@ def get_hooks():
 | `get_runtime_files(context)` | `list[str]` | Package-relative `.c`/`.ll` files to compile in |
 | `get_runtime_libraries(context)` | `list[str]` | Library names to link |
 
+Legacy `get_runtime_code(self)` signatures are still accepted through the
+dispatcher's arity compatibility path and produce a one-time deprecation note.
+They are never silently swallowed: a callback that raises is reported and
+skipped by default, or hard-fails under `--strict`.
+
 ## Lifecycle Hooks
 
 `LifecycleHook` observes the whole compilation.
@@ -672,6 +732,12 @@ compiler-internal stages, the compiler prints a short notice:
 
 - `--no-extensions` — Disables the entire extension system
 - `--no-userspace` — Implies `--no-extensions`
+- `--strict` — Turns hook callback failures into hard errors (missing/broken
+  hook files are hard errors regardless)
+
+Only packages actually imported by the source are preloaded. Installing a
+package globally does not inject keywords or hooks into unrelated programs.
+Hook callback failures are printed as `[hooks] ...` warnings by default.
 
 ## Complete Example
 

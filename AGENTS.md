@@ -1,5 +1,27 @@
 # Notes
 
+## Nov 24 2026: v4.7.7 fixes `std.pkg.file` CPM submodule imports
+
+- `import std.random.prng` was silently skipped: `_try_cpm_import` returned
+  `False` for every canonical `std.pkg.sub` form (intended for runtime-resolved
+  deep extensions), and `_visit_import` then returned without loading anything.
+  So public functions in `prng.cpy` were undeclared even though
+  `import std.random` worked. The same applied to legacy
+  `@std/pkg/sub`.
+- CPM resolution now runs FIRST for these forms. If `version_dir/<sub>.cpy`
+  (or the nested path) exists it is imported and its public symbols registered
+  as usual; if no source submodule exists, `_try_cpm_import` returns `False`
+  and the existing runtime-extension fallback still applies. Ambiguous matches
+  remain a hard error.
+- Regression: `test/test_compiler_regressions.py` gained
+  `test_deep_std_cpm_submodule_import_resolves` (temp `@std/deepdemo` package
+  with `mathlib.cpy`); `test_deep_std_extension_import_is_still_skipped` still
+  passes for `std.math.foo`. JIT/AOT corpus 39/39; the previously failing
+  `WEW-ai/embed.cpy` now compiles with `import std.random.prng`.
+- Released as **v4.7.7** (after the unrelated v4.7.6 LSP-cache release),
+  tagged/pushed to both remotes and published to PyPI + Gitea. Upgrade with
+  `pip install -U cpyte`.
+
 ## Nov 24 2026: v4.7.6 LSP analysis caching / single-flight (heavy latency fix)
 
 - **Root cause**: `CpyLanguageServer.__init__` never initialized

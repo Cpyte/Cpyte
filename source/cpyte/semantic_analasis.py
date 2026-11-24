@@ -3002,6 +3002,7 @@ class SemanticAnalyzer:
         pkg_name = None
         scope = None
         is_legacy = False
+        std_deep = False
 
         # Canonical: group.pkg[.file...] e.g. std.collections.hash_map
         # Legacy: @group/pkg/... or @group.pkg... (deprecated)
@@ -3017,9 +3018,11 @@ class SemanticAnalyzer:
             pparts = [p for p in raw.split("/") if p != ""]
             if len(pparts) < 1:
                 return False
-            # Deep extension like @std.math.foo (>=3 parts) is runtime-resolved; do not CPM-resolve.
+            # `std.pkg.file` may be a real CPM source submodule (e.g.
+            # `@std/random/prng.cpy`), so try CPM first. If no such file exists
+            # the caller treats it as a runtime-resolved deep extension.
             if len(pparts) >= 3 and pparts[0] == "std":
-                return False
+                std_deep = True
             scope = pparts[0]
             if len(pparts) == 1:
                 pkg_name = pparts[0]
@@ -3032,9 +3035,11 @@ class SemanticAnalyzer:
             parts = [p for p in module.split(".") if p != ""]
             if len(parts) == 0:
                 return False
-            # Canonical deep extension: std.pkg.sub... (>=3 parts) is runtime-resolved by extensions.
+            # Try CPM for real source submodules such as `std.random.prng`.
+            # If the submodule file is absent, return False so `_visit_import`
+            # can fall back to runtime-resolved deep extensions.
             if len(parts) >= 3 and parts[0] == "std":
-                return False
+                std_deep = True
             if len(parts) == 1:
                 pkg_name = parts[0]
                 scope = None
@@ -3138,6 +3143,10 @@ class SemanticAnalyzer:
                         node,
                     )
                     return True
+                if std_deep:
+                    # No source submodule: let `_visit_import` treat this as a
+                    # runtime-resolved deep extension instead of an error.
+                    return False
                 tried_str = "; ".join(tried)
                 self.error(
                     f"submodule/file `{base}` not found in package `{scope + '.' + pkg_name if scope else pkg_name}` (looked for: {tried_str})",

@@ -192,6 +192,7 @@ def _write_cpm_package(root, package_path, name, version, source=None):
     if source is not None:
         with open(os.path.join(version_dir, f"{name}.cpy"), "w") as f:
             f.write(source)
+    return version_dir
 
 
 def test_cpm_module_roots_include_global_and_workspace():
@@ -312,12 +313,38 @@ def test_workspace_cpm_package_wins_over_global_and_dot_form_imports():
 
 
 def test_deep_std_extension_import_is_still_skipped():
-    # `std.<pkg>.<sub>` (and legacy `@std.<pkg>.<sub>`) is resolved at runtime;
+    # `std.<pkg>.<sub>` with no matching CPM source file is resolved at runtime;
     # it must not be reported as a missing CPM package.
     parse_and_analyze(
         'import std.math.foo\npublic def main() -> int:\n    return 0\n',
         enable_extensions=False,
     )
+
+
+def test_deep_std_cpm_submodule_import_resolves():
+    with tempfile.TemporaryDirectory() as tmp:
+        module_root = os.path.join(tmp, "modules")
+        version_dir = _write_cpm_package(
+            module_root,
+            os.path.join("@std", "deepdemo"),
+            "deepdemo",
+            "1.0",
+        )
+        with open(os.path.join(version_dir, "mathlib.cpy"), "w") as f:
+            f.write(
+                "public def deep_value() -> int:\n"
+                "    return 17\n"
+            )
+
+        source = (
+            "import std.deepdemo.mathlib\n"
+            "public def main() -> int:\n"
+            "    return deep_value()\n"
+        )
+        ir = _parse_with_roots(
+            source, [module_root], filepath=os.path.join(tmp, "probe.cpy")
+        )
+        assert 'define i32 @"deep_value"' in ir
 
 
 def test_lsp_import_completions_include_global_cpm_packages():
@@ -892,6 +919,7 @@ if __name__ == "__main__":
     test_global_cpm_import_resolves_without_workspace()
     test_workspace_cpm_package_wins_over_global_and_dot_form_imports()
     test_deep_std_extension_import_is_still_skipped()
+    test_deep_std_cpm_submodule_import_resolves()
     test_lsp_import_completions_include_global_cpm_packages()
     test_compound_index_assignment_evaluates_index_once()
     test_zero_multiplication_preserves_call_side_effects()

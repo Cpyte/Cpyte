@@ -8,6 +8,8 @@ import re
 import struct
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -756,6 +758,127 @@ def test_binary_operators_associate_left_except_power():
     assert render(iterative) == "((a MINUS b) PLUS c)"
 
 
+class _FakeDocument:
+    def __init__(self, source):
+        self.source = source
+
+
+class _FakeWorkspace:
+    def __init__(self, source):
+        self._doc = _FakeDocument(source)
+
+    def get_text_document(self, uri):
+        return self._doc
+
+
+class _FakeLanguageServer:
+    def __init__(self, source, workspace_root=None):
+        self.workspace = _FakeWorkspace(source)
+        self.workspace_root = workspace_root
+        self._analysis_cache = {}
+        self._pending_analysis = {}
+        self._analysis_generation = {}
+
+
+def test_lsp_analysis_cache_and_single_flight():
+    from cpyte import lsp_server
+
+    uri = "file:///tmp/lsp_cache_single_flight.cpy"
+    ls = _FakeLanguageServer("public main() -> int:\n    return 0\n")
+    calls = []
+
+    def fake_analyze(source, filepath=None, workspace_root=None):
+        calls.append(source)
+        # Hold the lock long enough for a second concurrent request to queue.
+        time.sleep(0.05)
+        return (source, [], [], None, [], None)
+
+    with patch.object(lsp_server, "_analyze_bundle", fake_analyze):
+        results = []
+
+        def request():
+            results.append(lsp_server._get_bundle(ls, uri))
+
+        threads = [threading.Thread(target=request) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        assert not any(t.is_alive() for t in threads)
+        # Two concurrent requests compiled the document only once.
+        assert len(calls) == 1
+        assert results[0][0] == results[1][0]
+
+        # A second request against unchanged source is a pure cache hit.
+        lsp_server._get_bundle(ls, uri)
+        assert len(calls) == 1
+
+        # A source change invalidates the cache.
+        ls.workspace._doc.source += "\n# edit\n"
+        lsp_server._get_bundle(ls, uri)
+        assert len(calls) == 2
+
+
+def test_lsp_parse_only_requests_skip_semantic_analysis():
+    from cpyte import lsp_server
+
+    ls = _FakeLanguageServer("public main() -> int:\n    return 0\n")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("parse-only request ran semantic analysis")
+
+    with patch.object(lsp_server, "_analyze_bundle", explode):
+        source, tokens, parsed, error = lsp_server._get_parse_bundle(
+            ls, "file:///tmp/lsp_parse_only.cpy"
+        )
+    assert source == ls.workspace._doc.source
+    assert tokens
+    assert parsed
+    assert error is None
+
+
+def test_imported_ast_cache_skips_repeated_lex_and_parse():
+    from cpyte import astparse, lexar, semantic_analasis
+
+    with tempfile.TemporaryDirectory() as tmp:
+        main_path = os.path.join(tmp, "main.cpy")
+        mod_path = os.path.join(tmp, "helper.cpy")
+        with open(mod_path, "w") as f:
+            f.write("public def helper() -> int:\n    return 7\n")
+        main_src = 'import "helper.cpy"\npublic main() -> int:\n    return helper()\n'
+        with open(main_path, "w") as f:
+            f.write(main_src)
+
+        semantic_analasis._IMPORTED_AST_CACHE.clear()
+        real_lexer = semantic_analasis.Lexer
+        lex_calls = []
+
+        def counting_lexer(*args, **kwargs):
+            lex_calls.append(1)
+            return real_lexer(*args, **kwargs)
+
+        first_parsed, _ = astparse.parse_file(real_lexer(main_src).get_tokens())
+        with patch.object(semantic_analasis, "Lexer", counting_lexer):
+            first = semantic_analasis.SemanticAnalyzer(
+                main_src, filepath=main_path, workspace_root=tmp
+            )
+            assert first.analyze(first_parsed)
+            assert len(lex_calls) == 1
+
+            second_parsed, _ = astparse.parse_file(real_lexer(main_src).get_tokens())
+            second = semantic_analasis.SemanticAnalyzer(
+                main_src, filepath=main_path, workspace_root=tmp
+            )
+            assert second.analyze(second_parsed)
+            # The imported module was lexed only on the first analysis.
+            assert len(lex_calls) == 1
+
+            diags = [d.message for d in first.reporter.diagnostics]
+            diags2 = [d.message for d in second.reporter.diagnostics]
+            assert diags == diags2
+        semantic_analasis._IMPORTED_AST_CACHE.clear()
+
+
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_runtime_hook_legacy_signature_is_supported_with_notice()
@@ -780,4 +903,7 @@ if __name__ == "__main__":
     test_optimizer_pipeline_and_loop_execution()
     test_optimized_runtime_cache_revision()
     test_binary_operators_associate_left_except_power()
+    test_lsp_analysis_cache_and_single_flight()
+    test_lsp_parse_only_requests_skip_semantic_analysis()
+    test_imported_ast_cache_skips_repeated_lex_and_parse()
     print("Compiler regression tests passed.")

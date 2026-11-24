@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import os
 import re
@@ -5,7 +6,16 @@ import subprocess
 import sys
 import tempfile
 
+# LSP re-analyzes a document on every keystroke (debounced). Imported modules
+# almost never change with it, so cache their lexed/parsed/semantically
+# stamped AST by (path, mtime, size, workspace). The per-analysis symbol
+# registration is still replayed so each importing analyzer gets its own
+# scope entries. Bounded to avoid growing without limit in long sessions.
+_IMPORTED_AST_CACHE: dict[tuple, list] = {}
+_IMPORTED_AST_CACHE_LIMIT = 256
 
+
+@functools.lru_cache(maxsize=1)
 def _get_multiarch():
     for cc in ("cc", "gcc", "clang"):
         try:
@@ -19,6 +29,7 @@ def _get_multiarch():
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def _get_sdk_paths():
     """Auto-discover system include/SDK roots across macOS, Linux and Windows."""
     paths = []
@@ -3165,6 +3176,24 @@ class SemanticAnalyzer:
         self._imported_cpy_files.add(real)
 
         try:
+            st = os.stat(module)
+            cache_key = (
+                real,
+                st.st_mtime_ns,
+                st.st_size,
+                self._workspace_root or "",
+            )
+        except OSError:
+            cache_key = None
+
+        cached_ast = _IMPORTED_AST_CACHE.get(cache_key) if cache_key else None
+        if cached_ast is not None:
+            # Lexing, parsing and the sub-analyzer already ran for this exact
+            # module version. Replay only the cheap per-importer registration
+            # so this analyzer still gets its own symbols/types.
+            return self._import_symbols_from_ast(cached_ast, real, node)
+
+        try:
             with open(module) as f:
                 source = f.read()
         except FileNotFoundError:
@@ -3195,6 +3224,14 @@ class SemanticAnalyzer:
             self.error(f"imported file `{module}` has semantic errors")
             return None
 
+        if cache_key is not None:
+            if len(_IMPORTED_AST_CACHE) >= _IMPORTED_AST_CACHE_LIMIT:
+                _IMPORTED_AST_CACHE.clear()
+            _IMPORTED_AST_CACHE[cache_key] = imported_ast
+        return self._import_symbols_from_ast(imported_ast, real, node)
+
+    def _import_symbols_from_ast(self, imported_ast, real, node):
+        """Replay symbol registration for an already analyzed imported AST."""
         # Extract public functions and structs
         symbols = {}
         sub_ast = []

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import pathlib
+import threading
 import time
 import traceback
 from urllib.parse import unquote, urlparse
@@ -285,39 +286,92 @@ _SNIPPETS = {
 }
 
 
+_MANIFEST_LOADED_ROOTS: set[str | None] = set()
+
+# pygls dispatches @server.thread() requests on a thread pool. Without a
+# per-document lock, N simultaneous hover/completion requests against one
+# stale document can all start a full compiler run. The first one populates
+# the cache; the rest wait, then reuse it.
+_ANALYSIS_LOCKS_GUARD = threading.Lock()
+_ANALYSIS_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _analysis_lock(uri: str) -> threading.Lock:
+    with _ANALYSIS_LOCKS_GUARD:
+        lock = _ANALYSIS_LOCKS.get(uri)
+        if lock is None:
+            lock = threading.Lock()
+            _ANALYSIS_LOCKS[uri] = lock
+        return lock
+
+
+# Parse-only requests (document symbols, folding) must not pay for semantic
+# analysis. The key includes the whole source text, so an edit simply misses.
+_PARSE_CACHE_GUARD = threading.Lock()
+_PARSE_CACHE: dict[tuple[str, str, str | None], tuple] = {}
+_PARSE_CACHE_LIMIT = 16
+
+
 def _load_manifest_keywords(workspace_root):
     """Register package manifest keywords so the lexer recognises extension
     keywords/operators before lexing — mirrors the compiler CLI path in
-    mainpie. Safe to call repeatedly (global registry de-dupes by package).
+    mainpie. Once per workspace root: the registry is process-global, so
+    re-scanning ~/.cpm on every keystroke is pure overhead.
 
     Global ``~/.cpm`` packages must be loaded even when the editor has no
     workspace folder open, so there is no workspace guard here.
     """
+    if workspace_root in _MANIFEST_LOADED_ROOTS:
+        return
     try:
         from .mainpie import _load_package_manifests_from_source
 
         _load_package_manifests_from_source(workspace_root)
+        _MANIFEST_LOADED_ROOTS.add(workspace_root)
+        # New keywords can change how the next document lexes; drop any
+        # parse results produced before the registry was updated.
+        with _PARSE_CACHE_GUARD:
+            _PARSE_CACHE.clear()
     except Exception:
         pass
 
 
-def _analyze(source, filepath=None, workspace_root=None):
+def _lex_parse(source, filepath=None, workspace_root=None):
+    """Lex + parse, cached by source text for parse-only LSP requests."""
+    key = (filepath or "", source, workspace_root or "")
+    with _PARSE_CACHE_GUARD:
+        cached = _PARSE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    tokens = []
+    parsed = []
+    error = None
     try:
-        tokens = []
-        parsed = []
-        analyzer = None
-        error = None
-        try:
-            _load_manifest_keywords(workspace_root)
-            tokens = Lexer(source).get_tokens()
-        except LexerError as e:
-            error = ("lexer", str(e), getattr(e, "token", None))
-            return tokens, parsed, analyzer, error
+        _load_manifest_keywords(workspace_root)
+        tokens = Lexer(source).get_tokens()
+    except LexerError as e:
+        error = ("lexer", str(e), getattr(e, "token", None))
+    if error is None:
         try:
             parsed, _ = parse_file(tokens)
         except ParseError as e:
             error = ("parser", str(e), e.token)
-            return tokens, parsed, analyzer, error
+    result = (tokens, parsed, error)
+    if error is None:
+        with _PARSE_CACHE_GUARD:
+            if len(_PARSE_CACHE) >= _PARSE_CACHE_LIMIT:
+                _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+            _PARSE_CACHE[key] = result
+    return result
+
+
+def _analyze(source, filepath=None, workspace_root=None):
+    try:
+        tokens, parsed, error = _lex_parse(source, filepath, workspace_root)
+        if error is not None:
+            return tokens, parsed, None, error
+        analyzer = None
         try:
             analyzer = SemanticAnalyzer(
                 source,
@@ -419,24 +473,37 @@ def _analyze_bundle(source, filepath=None, workspace_root=None):
     return (source, tokens, parsed, analyzer, diagnostics, error)
 
 
-def _get_bundle(ls, uri):
-    """Return the analysis bundle for ``uri``, reusing the cached result when
-    the document source is unchanged. Falls back to a synchronous analysis on
-    the caller's thread when the cache is stale (handlers that use this are
-    thread-marked, so this never blocks the event loop)."""
+def _get_parse_bundle(ls, uri):
+    """Cheap ``(source, tokens, parsed, error)`` bundle for requests that never
+    need semantic information (document symbols, folding ranges)."""
     doc = ls.workspace.get_text_document(uri)
     source = doc.source
     filepath = _uri_to_path(uri)
     workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
-    cache = getattr(ls, "_analysis_cache", None)
-    if cache is not None:
+    tokens, parsed, error = _lex_parse(source, filepath, workspace_root)
+    return source, tokens, parsed, error
+
+
+def _get_bundle(ls, uri):
+    """Return the analysis bundle for ``uri``, reusing the cached result when
+    the document source is unchanged. A per-URI lock makes this single-flight:
+    concurrent thread-marked handlers never run duplicate compiler passes.
+    Falls back to a synchronous analysis on the caller's thread when the
+    cache is stale (handlers that use this are thread-marked)."""
+    with _analysis_lock(uri):
+        doc = ls.workspace.get_text_document(uri)
+        source = doc.source
+        filepath = _uri_to_path(uri)
+        workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+        cache = ls._analysis_cache
         bundle = cache.get(uri)
         if bundle is not None and bundle[0] == source:
             return bundle
-    bundle = _analyze_bundle(source, filepath=filepath, workspace_root=workspace_root)
-    if cache is not None:
+        bundle = _analyze_bundle(
+            source, filepath=filepath, workspace_root=workspace_root
+        )
         cache[uri] = bundle
-    return bundle
+        return bundle
 
 
 _ANALYSIS_DEBOUNCE = 0.25
@@ -451,39 +518,60 @@ def _schedule_analysis(ls, uri, delay=_ANALYSIS_DEBOUNCE):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-    pending = getattr(ls, "_pending_analysis", None)
-    if pending is None:
-        pending = {}
-        ls._pending_analysis = pending
+    pending = ls._pending_analysis
     prev = pending.get(uri)
     if prev is not None:
         prev.cancel()
+    # A newer edit invalidates any analysis already running for this URI;
+    # the worker still finishes, but its diagnostics are discarded.
+    ls._analysis_generation[uri] = ls._analysis_generation.get(uri, 0) + 1
     pending[uri] = loop.call_later(delay, _fire_analysis, ls, uri)
 
 
 def _fire_analysis(ls, uri):
-    pending = getattr(ls, "_pending_analysis", None)
-    if pending is not None:
-        pending.pop(uri, None)
+    ls._pending_analysis.pop(uri, None)
     asyncio.ensure_future(_analyze_and_publish(ls, uri))
 
 
 async def _analyze_and_publish(ls, uri):
-    try:
-        doc = ls.workspace.get_text_document(uri)
-        source = doc.source
-    except Exception:
+    generation = ls._analysis_generation.get(uri, 0)
+
+    def work():
+        # Share the lock with request handlers: a hover that arrives while
+        # diagnostics are pending either waits for this run or supplies the
+        # cached bundle itself, so the document is compiled at most once.
+        with _analysis_lock(uri):
+            if ls._analysis_generation.get(uri, 0) != generation:
+                return None
+            try:
+                source = ls.workspace.get_text_document(uri).source
+            except Exception:
+                return None
+            cache = ls._analysis_cache
+            cached = cache.get(uri)
+            if cached is not None and cached[0] == source:
+                bundle = cached
+            else:
+                filepath = _uri_to_path(uri)
+                workspace_root = (
+                    _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+                )
+                bundle = _analyze_bundle(
+                    source, filepath=filepath, workspace_root=workspace_root
+                )
+            # A newer didChange may have been scheduled while acquiring the
+            # lock or while the worker ran. Never publish stale diagnostics or
+            # overwrite a fresher cache entry.
+            if ls._analysis_generation.get(uri, 0) != generation:
+                return None
+            cache[uri] = bundle
+            return bundle
+
+    bundle = await asyncio.to_thread(work)
+    if bundle is None:
         return
-    filepath = _uri_to_path(uri)
-    workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
-    bundle = await asyncio.to_thread(
-        _analyze_bundle, source, filepath=filepath, workspace_root=workspace_root
-    )
-    cache = getattr(ls, "_analysis_cache", None)
-    if cache is not None:
-        cache[uri] = bundle
     try:
-        if ls.workspace.get_text_document(uri).source != source:
+        if ls.workspace.get_text_document(uri).source != bundle[0]:
             return
     except Exception:
         return
@@ -1062,6 +1150,14 @@ class CpyLanguageServer(LanguageServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.workspace_root: str | None = None
+        # Without these, every handler re-runs the full compiler: _get_bundle
+        # and _schedule_analysis used getattr(..., None) and silently did no
+        # caching/coalescing. Initializing them here is the single biggest LSP
+        # speedup -- hover/completion/symbol requests then reuse the didOpen
+        # analysis instead of re-analyzing the whole file (and its imports).
+        self._analysis_cache: dict[str, tuple] = {}
+        self._pending_analysis: dict[str, object] = {}
+        self._analysis_generation: dict[str, int] = {}
 
     def get_workspace_root(self) -> str | None:
         return self.workspace_root
@@ -1111,14 +1207,10 @@ def did_change(ls: CpyLanguageServer, params: lsp.DidChangeTextDocumentParams):
 def did_close(ls: CpyLanguageServer, params: lsp.DidCloseTextDocumentParams):
     try:
         uri = params.text_document.uri
-        pending = getattr(ls, "_pending_analysis", None)
-        if pending is not None:
-            handle = pending.pop(uri, None)
-            if handle is not None:
-                handle.cancel()
-        cache = getattr(ls, "_analysis_cache", None)
-        if cache is not None:
-            cache.pop(uri, None)
+        handle = ls._pending_analysis.pop(uri, None)
+        if handle is not None:
+            handle.cancel()
+        ls._analysis_cache.pop(uri, None)
     except Exception:
         logger.error(f"did_close error:\n{traceback.format_exc()}")
 
@@ -1651,7 +1743,7 @@ def document_symbols(ls: CpyLanguageServer, params: lsp.DocumentSymbolParams):
     try:
         uri = params.text_document.uri
         t0 = time.time()
-        _, _, parsed, _, _, _ = _get_bundle(ls, uri)
+        _, _, parsed, _ = _get_parse_bundle(ls, uri)
         symbols = []
         for node in parsed:
             tok = getattr(node, "_token", None)
@@ -2208,7 +2300,7 @@ def type_definition(ls: CpyLanguageServer, params: lsp.TypeDefinitionParams):
 def folding_range(ls: CpyLanguageServer, params: lsp.FoldingRangeParams):
     try:
         uri = params.text_document.uri
-        _, _, parsed, _, _, _ = _get_bundle(ls, uri)
+        _, _, parsed, _ = _get_parse_bundle(ls, uri)
         out = []
         for node in parsed:
             start = _stmt_line(node)
@@ -2305,7 +2397,7 @@ def did_save(ls: CpyLanguageServer, params: lsp.DidSaveTextDocumentParams):
     cached analysis of every document that imports it and re-run it."""
     try:
         saved = _uri_to_path(params.text_document.uri)
-        cache = getattr(ls, "_analysis_cache", None) or {}
+        cache = ls._analysis_cache
         for uri, bundle in list(cache.items()):
             if uri == params.text_document.uri:
                 continue
@@ -2709,7 +2801,7 @@ def workspace_symbol(ls: CpyLanguageServer, params: lsp.WorkspaceSymbolParams):
     try:
         query = (params.query or "").lower()
         results = []
-        for uri, bundle in getattr(ls, "_analysis_cache", {}).items():
+        for uri, bundle in ls._analysis_cache.items():
             try:
                 _, tokens, parsed, analyzer, _, _ = bundle
                 for node in parsed:

@@ -1,5 +1,46 @@
 # Notes
 
+## Nov 24 2026: v4.7.6 LSP analysis caching / single-flight (heavy latency fix)
+
+- **Root cause**: `CpyLanguageServer.__init__` never initialized
+  `_analysis_cache`, `_pending_analysis` or `_analysis_generation`. Every
+  `_get_bundle`/`_schedule_analysis` call used `getattr(ls, ..., None)`, so
+  those checks silently disabled themselves: all 18 LSP request handlers
+  re-ran the full lex+parse+semantic compiler pass on every hover,
+  completion, symbol, definition, etc. For `embed.cpy` that was ~1–2.7 s per
+  request because semantic analysis recursively imported ~21 cpy modules.
+- Fixed by initializing those three dicts in the server constructor. Requests
+  against unchanged source are now pure cache hits; `didOpen`/`didChange`
+  scheduling actually coalesces, and a generation counter discards stale
+  workers after a newer edit. All diagnostic publishing is generation-checked
+  before touching the cache.
+- Added a per-URI `threading.Lock` around analysis: `@server.thread()` handlers
+  are concurrent, so without it N simultaneous requests against one stale
+  document could each start a compiler run. The first populates the cache and
+  the rest wait and reuse it. The async diagnostics worker shares the same
+  lock, so a hover arriving during pending diagnostics never double-compiles.
+- Split parse-only requests out: `_lex_parse()` has a bounded (16-entry)
+  source-keyed token/AST cache, and `_get_parse_bundle()` serves
+  `textDocument/documentSymbol` and `textDocument/foldingRange` without
+  semantic analysis. `_load_package_manifests_from_source()` now runs once
+  per workspace root (global registry), clearing the parse cache if new
+  keywords appear. `SemanticAnalyzer._import_cpy()` caches an imported
+  module's lexed/parsed/semantically stamped AST by
+  `(realpath, mtime_ns, size, workspace)` (256-entry bound) and replays only
+  the cheap per-importer symbol registration; imported files change far less
+  often than the document being edited. `_get_multiarch()`/`_get_sdk_paths()`
+  are `lru_cache`d to stop repeated `cc -print-multiarch` / `xcrun` probes.
+- Measured on `WEW-ai/embed.cpy`: cold analysis ~480–520 ms (was 1–2.7 s with
+  every request re-importing), cached requests ~0–1 ms, and a fresh edit
+  re-analyzes in ~1–3 ms once imported modules are cached. Regression tests
+  added to `test/test_compiler_regressions.py` cover cache reuse, concurrent
+  single-flight, parse-only handlers skipping semantic analysis, and the
+  imported-AST cache. `ci_test.py` 39/39 and `ci_bomb.py` 2500/2500 remain
+  green.
+- Operational: the running LSP must be restarted after upgrading to pick up
+  the new analyzer; `workspace/didChangeConfiguration` still produces a
+  harmless pygls warning (no user configuration exists yet).
+
 ## Nov 24 2026: v4.7.5 HookDispatcher overhaul + `@std/random` (with Philox)
 
 - Every compiler hook stage now goes through `HookDispatcher` in

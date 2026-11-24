@@ -929,6 +929,13 @@ class LLVM:
         self.global_vars = {}
         # Constant Variable store here.
         self.const_vars = {}
+        # Top-level constants are evaluated in a private init function BEFORE
+        # user function bodies are emitted, so references to them inside those
+        # functions resolve (see `emit_program`). `_global_const_init` marks
+        # that pre-pass so runtime-valued constants lower to module globals
+        # instead of allocas local to the init function.
+        self._const_init_fn = None
+        self._global_const_init = False
         self.locals = {}
         self.local_types = {}
         self.string_id = 0
@@ -1845,6 +1852,64 @@ class LLVM:
         _collect_ccodes(toplevel)
         _collect_ccodes(funcdefs)
 
+        # ---- Global constants must exist BEFORE function bodies ----
+        # Top-level statements are normally lowered into `main` *after* every
+        # function body has been emitted, so a global `int (X) = 5` used inside
+        # a function used to hit `Undefined variable 'X' at codegen`. Evaluate
+        # top-level constant declarations in a private initializer function
+        # first; simple literal constants become compile-time `ir.Constant`
+        # values (no runtime code at all), while runtime-valued constants are
+        # lowered to module globals by `emit_vardecl`'s `_global_const_init`
+        # branch. The init function is called at the start of `main`.
+        const_decls = [
+            n
+            for n in toplevel
+            if isinstance(n, VarDecl) and getattr(n, "is_const", False)
+        ]
+        if const_decls:
+            # A constant initializer may call a user function; declare those
+            # headers now (normally they are created with their bodies below).
+            # Names already bound (runtime builtins, imported C functions) are
+            # left alone so the existing collision checks still fire.
+            for fn_node in funcdefs:
+                fname = getattr(fn_node, "name", None)
+                if (
+                    not fname
+                    or fname == "main"
+                    or fname in self.functions
+                    or getattr(fn_node, "decorators", None)
+                ):
+                    continue
+                try:
+                    fret = self.llvm_type(fn_node.rettype or "int")
+                    fparams = [self.llvm_type(t) for t in fn_node.params.values()]
+                except Exception:
+                    continue
+                self.functions[fname] = ir.Function(
+                    self.module, ir.FunctionType(fret, fparams), name=fname
+                )
+            init_fn = ir.Function(
+                self.module,
+                ir.FunctionType(ir.VoidType(), []),
+                name="__cpyte_const_init",
+            )
+            init_entry = init_fn.append_basic_block("entry")
+            saved_builder = self.builder
+            saved_global_const_init = self._global_const_init
+            self.builder = ir.IRBuilder(init_entry)
+            self._global_const_init = True
+            try:
+                for node in const_decls:
+                    self.emit(node)
+            finally:
+                if init_entry.terminator is None:
+                    self.builder.ret_void()
+                self._global_const_init = saved_global_const_init
+                self.builder = saved_builder
+            self._const_init_fn = init_fn
+            const_ids = {id(n) for n in const_decls}
+            toplevel = [n for n in toplevel if id(n) not in const_ids]
+
         user_main = None
         for node in funcdefs:
             if getattr(node, "name", None) == "main":
@@ -1876,6 +1941,8 @@ class LLVM:
                 gc_start_fn = self.functions.get("gc_start_thread")
                 if gc_start_fn:
                     self.builder.call(gc_start_fn, [])
+            if self._const_init_fn is not None:
+                self.builder.call(self._const_init_fn, [])
             for node in toplevel:
                 self.emit(node)
             if not self.no_gc:
@@ -3445,6 +3512,12 @@ class LLVM:
             gc_start_fn = self.functions.get("gc_start_thread")
             if gc_start_fn:
                 self.builder.call(gc_start_fn, [])
+
+        # Runtime-valued top-level constants live in module globals; initialize
+        # them before any user statement (including original top-level code
+        # prepended to main) runs.
+        if node.name == "main" and self._const_init_fn is not None:
+            self.builder.call(self._const_init_fn, [])
 
         old_locals = self.locals
         old_local_types = self.local_types
@@ -8262,7 +8335,21 @@ class LLVM:
                     value = self._extend_to_i64(
                         value, self._is_unsigned_node(node.init)
                     )
-                if isinstance(value, ir.Constant):
+                if self._global_const_init and not isinstance(value, ir.Constant):
+                    # Top-level constant with a runtime-valued initializer:
+                    # an alloca in the private init function would go out of
+                    # scope, so use a module-level global. `emit_variable`
+                    # loads through the registered const pointer.
+                    gv = ir.GlobalVariable(
+                        self.module,
+                        value.type,
+                        name=f"__const_{node.name}",
+                    )
+                    gv.initializer = ir.Constant(value.type, None)
+                    self.builder.store(value, gv)
+                    self.global_vars[node.name] = gv
+                    self._declare_const(node.name, gv)
+                elif isinstance(value, ir.Constant):
                     self._declare_const(node.name, value)
                 else:
                     ptr = self._alloca(ty, name=node.name)

@@ -1,5 +1,34 @@
 # Notes
 
+## Nov 24 2026: global `type (NAME) = ...` constants are now visible in functions
+
+- **Bug**: `cpy embed.cpy` (WEW-ai) failed with `codegen error: Undefined variable
+  'PHILOX_M0' at L9:22` even though the `uint32 (PHILOX_M0) = 0xD2511F53`
+  declarations were syntactically/semantically fine. `emit_program` lowers all
+  top-level statements into `main` *after* emitting every function body, so a
+  top-level constant was not yet in `bytecoding.const_vars` when a function body
+  referenced it. The same applied to ordinary global variables (`int G = 5`);
+  only constants are fixed here.
+- **Fix (`bytecoding.py`)**: top-level `VarDecl`s with `is_const` are collected
+  and evaluated in a private `__cpyte_const_init` function BEFORE user function
+  bodies are emitted. Literal initializers become `ir.Constant`s registered via
+  `_declare_const` (no runtime code); runtime-valued initializers are lowered to
+  module globals (`_global_const_init` branch in `emit_vardecl`) and read via
+  `emit_variable`'s const-pointer load. The init function is called at the start
+  of `main` (both the user-main and wrapper-main paths). User function headers
+  are pre-declared before this pre-pass so a constant initializer may call them.
+- **`astparse.py`**: `_TYPE_NAMES` now includes `uint8`, `uint16`, `uint32`
+  (`uint32` is required by `embed.cpy`; the signed `int8/16/32` spellings are
+  deliberately NOT added because `llvm_type` and semantic's conversion tables
+  do not support them yet). All three are already handled in `bytecoding.py`.
+- **Regression**: `test/test_global_const.cpy` (literal uint32, dependent int
+  constants used from functions, and a runtime-valued constant from a function
+  call) added to `ci_test.py` CORPUS — 38/38 green on JIT/AOT locally; JIT
+  opt0/default and native AOT print `42 / 4294967295 / 42 / 42`. Synced the two
+  changed compiler files into the installed site-packages so the `cpy` CLI picks
+  up the fix; released as v4.7.3. `embed.cpy` now compiles (only pre-existing
+  W1001 warnings for the still-unused `p0`/`p1`).
+
 ## Nov 2026: OProof is a test-only oracle, not a codegen rewrite
 
 - **The experimental hook in `bytecoding.py::_try_algebraic_simplify` was removed.**

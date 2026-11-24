@@ -2926,6 +2926,9 @@ def parse_suite(tokens: list[Token], pos: int):
 
 _TYPE_NAMES = {
     "int",
+    "uint8",
+    "uint16",
+    "uint32",
     "int64",
     "uint64",
     "float",

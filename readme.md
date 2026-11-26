@@ -74,6 +74,21 @@ Run any example with:
 cpy examples/<filename>.cpy
 ```
 
+## Editor tooling
+
+The `cpyte.lsp_server` module provides a pygls language server over stdio by
+default (`--tcp` and `--ws` are also available):
+
+```bash
+python -m cpyte.lsp_server
+```
+
+It exposes diagnostics, cursor-aware completion (locals, members, globals,
+imports, built-ins, types, keywords, and call snippets), hover, signature help,
+formatting, document/workspace symbols, definition/references/implementation,
+rename with safe quick fixes, folding ranges, inlay hints, and code actions.
+Restart the language server after upgrading cpyte so it loads the new analyzer.
+
 ## Note
 Cpyte is experimental software. The compiler is continuously tested with fuzzing and a regression corpus, and every release is published to PyPI and Gitea.
 
@@ -95,7 +110,7 @@ The compiler auto-discovers a C compiler (`clang` → `cc` → `gcc`) and system
 
 ## Continuous Integration
 
-GitHub Actions (see `.github/workflows/code_quality.yml`) builds and runs a curated, cross-platform regression corpus on Ubuntu (x86_64 + arm64), macOS (x86_64 + arm64), and Windows. `ci_test.py` AOT-compiles each program with the system linker and executes the result to exercise the full pipeline — lexer, parser, semantic analysis, LLVM codegen, the C and GC runtimes, and linking.
+GitHub Actions (see `.github/workflows/code_quality.yml`) builds and runs a curated, cross-platform regression corpus on Ubuntu (x86_64 + arm64), macOS arm64, and Windows x86_64. The macOS x86_64 leg is intentionally absent: current llvmlite wheels and Apple clang IR attributes are incompatible for the JIT. `ci_test.py` AOT-compiles each program with the system linker and executes the result to exercise the full pipeline — lexer, parser, semantic analysis, LLVM codegen, the C and GC runtimes, and linking.
 
 ## CI Benchmark Results
 

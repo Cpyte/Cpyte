@@ -588,6 +588,10 @@ int* second = p + 1       # advances by sizeof(int) bytes
 int distance = second - p # 1
 ```
 
+Implementation note: offset operations lower to LLVM `getelementptr` at every
+optimization level, preserving pointer provenance; `p - q` remains integer
+element-count arithmetic because it produces a number, not a pointer.
+
 `str` is a distinct semantic type even though it lowers to `i8*`; `str + str`
 remains string concatenation and `str` cannot be used as a byte buffer for
 pointer arithmetic. Cast it to `char*` first when byte-level access is needed.
@@ -734,6 +738,7 @@ cpy --aot program.cpy                 # AOT executable
 cpy build [build-options] program.cpy # AOT build command
 cpy format [--write|--check] file.cpy # formatter
 cpy sef <subcommand> ...              # SEF tooling
+python -m cpyte.lsp_server            # language server (stdio by default)
 ```
 
 Useful global options include:
@@ -758,6 +763,13 @@ Useful global options include:
 
 The `build` command accepts output/debug/optimization and linking options;
 `format` supports write/check modes (e.g. `cpy format --write file.cpy`, `cpy format --check file.cpy`); `sef` provides SEF pack, dump, check, size, and digest tools. Run `cpy --help` for the exact options of the installed version.
+
+The optional `cpyte.lsp_server` module is a pygls language server. It uses stdio
+by default and also accepts `--tcp` or `--ws` for socket transports. It provides
+diagnostics, cursor-aware completion, hover, signature help, formatting,
+navigation (definitions, references, implementations), rename with quick fixes,
+folding ranges, inlay hints, and code actions. Restart a running language
+server after upgrading the compiler so it loads the updated analyzer.
 
 Two source directives are recognized at the beginning of a source file:
 

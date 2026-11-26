@@ -2,7 +2,7 @@
 
 ## Nov 27 2026: v4.8.1 semantic diagnostics + context-aware LSP completion
 
-- Released as **v4.8.1** on top of the unreleased pointer-GEP improvement from
+- Released as **v4.8.1**, including the pointer-GEP improvement developed after
   v4.8.0. Pointer offsets (`p + n`, `n + p`, `p - n`) now lower to GEP at every
   opt level; pointer differences keep `ptrtoint`/`sub`/`sdiv`/`trunc`.
 - Semantic diagnostics are more precise: `VarDecl.name_token` lets W1001
@@ -28,7 +28,7 @@
   `embed.cpy` compiles cleanly with these changes in a temporary tree where the
   unrelated v4.8.0 `@std/pkg/sub` deep-import rollback is undone.
 
-## Nov 26 2026 (post-v4.8.0): pointer offsets lower to GEP
+## Nov 26 2026 (shipped in v4.8.1): pointer offsets lower to GEP
 
 - `_try_pointer_arith()` now emits `getelementptr` for `p + n`, `n + p`, and
   `p - n` instead of `ptrtoint`/`mul`/`add`/`inttoptr`. LLVM's GEP applies the
@@ -41,7 +41,7 @@
   asserts GEP for `int*`/`double*`, no raw-address round trip for `p +/- n`, and
   the retained `sdiv ..., 4` for `int*` differences. Runtime test, JIT opt0/opt3,
   AOT, `ci_test.py` 40/40, `ci_bomb.py` 2500/2500, and the regression suite all
-  pass. This is an unreleased working-tree improvement on top of v4.8.0.
+  pass. This lowering is included in the v4.8.1 release.
 
 ## Nov 26 2026: v4.8.0 adds typed (C-style) pointer arithmetic
 
@@ -58,10 +58,10 @@
 - Regression: `test/test_pointer_arith.cpy` (int/double/struct pointers, char
   byte offsets, size_t and negative offsets, pointer differences) was added to
   the CI corpus, plus an IR assertion in `test_compiler_regressions.py` that
-  `int* + 1` emits `mul i64 ..., 4`. Verified JIT opt0/opt3, native AOT,
-  `ci_test.py` 40/40, `ci_bomb.py` 2500/2500, and the regression suite. The
-  wheel was smoke-tested in a fresh venv (`cpy --version` 4.8.0; JIT + AOT print
-  `pointer arithmetic: PASS`).
+  `int* + 1` scaled the offset (later tightened in v4.8.1 to assert GEP).
+  Verified JIT opt0/opt3, native AOT, `ci_test.py` 40/40, `ci_bomb.py`
+  2500/2500, and the regression suite. The wheel was smoke-tested in a fresh
+  venv (`cpy --version` 4.8.0; JIT + AOT print `pointer arithmetic: PASS`).
 - Release: version is single-sourced in `source/cpyte/__init__.py` = `4.8.0`;
   `python3.14 -m build` regenerated `source/cpyte.egg-info/`, and the wheel's
   `__init__.py`/METADATA both report 4.8.0. Tagged `v4.8.0`, pushed to

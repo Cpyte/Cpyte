@@ -104,24 +104,24 @@ measurement from any historical benchmark results and is collected on the
 dedicated benchmark runner.
 
 <!-- CPYTE_CI_BENCHMARKS_START -->
-Latest run: [57031dcb282a](https://github.com/Cpyte/Cpyte/actions/runs/45842665388) · updated 2026-11-26 15:36 UTC
+Latest run: [9d6f1964fb27](https://github.com/Cpyte/Cpyte/actions/runs/45866995456) · updated 2026-11-26 17:30 UTC
 
 | Benchmark | C | Cpy | Python | Cpy/C | Python/C |
 |---|---:|---:|---:|---:|---:|
-| `array_sum` | 6.48ms | 6.38ms | 250.04ms | 0.98x | 38.59x |
-| `bitwise_mix` | 2.59ms | 2.71ms | 690.63ms | 1.05x | 266.96x |
-| `branch_mix` | 4.09ms | 4.36ms | 439.08ms | 1.07x | 107.46x |
-| `call_overhead` | 2.59ms | 3.05ms | 346.38ms | 1.18x | 133.53x |
-| `fib_iterative` | 16.44ms | 16.59ms | 11.175s | 1.01x | 679.85x |
-| `fib_recursive` | 161.89ms | 813.00us | 7.281s | 0.01x | 44.97x |
-| `float_math` | 5.75ms | 5.87ms | 255.35ms | 1.02x | 44.40x |
-| `integer_mix` | 3.21ms | 3.14ms | 391.37ms | 0.98x | 121.89x |
-| `loop_sum` | 687.00us | 772.00us | 2.833s | 1.12x | 4123.63x |
-| `matrix_mult` | 3.84ms | 3.77ms | 1.755s | 0.98x | 457.16x |
-| `mem_alloc` | 666.00us | 758.00us | 17.07ms | 1.14x | 25.63x |
-| `prime_count` | 66.62ms | 77.66ms | 1.798s | 1.17x | 26.99x |
-| `quicksort` | 1.87ms | 2.27ms | 29.04ms | 1.22x | 15.55x |
-| `string_concat` | 734.00us | 812.00us | 25.48ms | 1.11x | 34.71x |
+| `array_sum` | 6.42ms | 6.43ms | 248.58ms | 1.00x | 38.70x |
+| `bitwise_mix` | 2.58ms | 2.67ms | 686.09ms | 1.03x | 265.93x |
+| `branch_mix` | 4.09ms | 4.35ms | 437.88ms | 1.06x | 106.93x |
+| `call_overhead` | 2.59ms | 3.05ms | 356.26ms | 1.18x | 137.55x |
+| `fib_iterative` | 16.43ms | 16.58ms | 11.043s | 1.01x | 672.32x |
+| `fib_recursive` | 162.99ms | 819.00us | 7.286s | 0.01x | 44.70x |
+| `float_math` | 5.73ms | 5.84ms | 247.20ms | 1.02x | 43.12x |
+| `integer_mix` | 3.22ms | 3.13ms | 388.44ms | 0.97x | 120.75x |
+| `loop_sum` | 671.00us | 759.00us | 2.861s | 1.13x | 4263.54x |
+| `matrix_mult` | 3.80ms | 3.75ms | 1.765s | 0.99x | 464.44x |
+| `mem_alloc` | 669.00us | 762.00us | 17.08ms | 1.14x | 25.53x |
+| `prime_count` | 66.56ms | 77.57ms | 1.790s | 1.17x | 26.90x |
+| `quicksort` | 1.86ms | 2.27ms | 29.04ms | 1.22x | 15.60x |
+| `string_concat` | 737.00us | 811.00us | 25.45ms | 1.10x | 34.54x |
 
 Process wall time includes startup. These are measurements from the dedicated `cpyte-official-runner-1`, not the historical benchmark figures elsewhere in this README; results can vary with host load and software versions.
 <!-- CPYTE_CI_BENCHMARKS_END -->

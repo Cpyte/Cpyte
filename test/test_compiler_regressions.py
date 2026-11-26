@@ -906,6 +906,56 @@ def test_imported_ast_cache_skips_repeated_lex_and_parse():
         semantic_analasis._IMPORTED_AST_CACHE.clear()
 
 
+def test_direct_aot_applies_build_hook_compile_flags():
+    """`cpy --aot` must pass hook includes/defines to every C compile.
+
+    The JIT and `cpy build` paths collected `BuildHook` flags, but the direct
+    AOT path called `run_aot()` compiled `ccode:` sources without them. An
+    extension package whose embedded C needs a hook-provided include dir
+    therefore failed only under `--aot`.
+    """
+    parsed, generics, _ = parse_and_analyze(
+        "public main() -> int:\n    return 0\n", enable_extensions=False
+    )
+    module, _, _ = emit_program(
+        parsed, generic_instantiations=generics, enable_extensions=False
+    )
+
+    flags = ["-I/opt/aot-hook/include", "-DAOT_HOOK_FLAG=1"]
+    ctx = CompilerContext(
+        include_paths=["/opt/aot-hook/include"], defines={"AOT_HOOK_FLAG": "1"}
+    )
+    seen = {}
+
+    def fake_cached_c_ir(cc, src, triple, **kwargs):
+        seen["bignum_flags"] = tuple(kwargs.get("extra_flags") or ())
+        return "declare void @aot_hook_probe()\n", None
+
+    class FakeLinker:
+        def compile_c(self, src, output, **kwargs):
+            seen.setdefault("compile_flags", []).append(
+                tuple(kwargs.get("extra_flags") or ())
+            )
+            Path(output).write_bytes(b"")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.object(compiling, "hook_build_context", return_value=ctx), patch.object(
+            compiling, "hook_compile_flags", return_value=flags
+        ), patch.object(compiling, "_cached_c_ir", side_effect=fake_cached_c_ir), patch.object(
+            compiling, "Linker", return_value=FakeLinker()
+        ), patch.object(compiling, "aot_link_executable") as link:
+            compiling.run_aot(
+                module,
+                output=os.path.join(tmp, "program.o"),
+                no_userspace=True,
+            )
+        link.assert_called_once()
+
+    assert "-DAOT_HOOK_FLAG=1" in seen["bignum_flags"]
+    assert seen["compile_flags"]
+    assert all("-DAOT_HOOK_FLAG=1" in f for f in seen["compile_flags"])
+
+
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_runtime_hook_legacy_signature_is_supported_with_notice()
@@ -934,4 +984,5 @@ if __name__ == "__main__":
     test_lsp_analysis_cache_and_single_flight()
     test_lsp_parse_only_requests_skip_semantic_analysis()
     test_imported_ast_cache_skips_repeated_lex_and_parse()
+    test_direct_aot_applies_build_hook_compile_flags()
     print("Compiler regression tests passed.")

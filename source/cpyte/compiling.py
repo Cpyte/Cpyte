@@ -2090,6 +2090,12 @@ def run_aot(
     binding.initialize_native_target()
     binding.initialize_native_asmprinter()
 
+    # Build hooks apply to the direct AOT path too (JIT and `cpy build`
+    # already do this): include dirs, defines and compiler flags are needed
+    # when compiling `ccode:` sources from an imported extension package.
+    hook_ctx = hook_build_context()
+    hook_flags = hook_compile_flags(hook_ctx)
+
     mod = binding.parse_assembly(llvm_ir)
     # Compile the bignum runtime from source for the host platform (instead
     # of pre-built bitcode) so its libc symbol names match the target OS. The
@@ -2106,7 +2112,7 @@ def run_aot(
         llvm_cc,
         _BIGNUM_C,
         host_target().triple,
-        extra_flags=_runtime_extra_flags(_BIGNUM_C),
+        extra_flags=(*_runtime_extra_flags(_BIGNUM_C), *hook_flags),
     )
     if bignum_ir is None:
         print_err(f"error compiling {_BIGNUM_C}: {format_cc_diag(err.stderr)}")
@@ -2150,7 +2156,7 @@ def run_aot(
     compile_jobs.append((_RUNPY_RUNTIME_C, output + ".runpy.o"))
 
     def _linker_compile(src, out):
-        extra = []
+        extra = list(hook_flags)
         try:
             openssl_inc, _ = _find_openssl_paths()
             if openssl_inc:

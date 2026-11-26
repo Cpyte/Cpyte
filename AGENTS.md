@@ -1,5 +1,25 @@
 # Notes
 
+## Nov 26 2026: v4.7.8 applies build hooks on the direct AOT path
+
+- `compiling.run_aot()` now calls `hook_build_context()`/`hook_compile_flags()`
+  and passes those flags to the bignum C probe and every
+  `Linker.compile_c()` job, matching the JIT and `cpy build` paths. Before this,
+  an imported package whose `ccode:` needed a hook-provided include dir
+  (`@std/math` constants needs MPFR; `@std/cryptography` needs OpenSSL) failed
+  **only** under `cpy --aot` with a missing-header error even though JIT and
+  `cpy build` worked.
+- BuildHook libraries/library paths were already applied by
+  `aot_link_executable()`; this change fixes the compile side only.
+- Regression: `test/test_compiler_regressions.py` gained
+  `test_direct_aot_applies_build_hook_compile_flags` (patches `hook_build_context`,
+  `_cached_c_ir`, `Linker.compile_c` and `aot_link_executable`, asserts hook
+  flags reach all C compiles). `ci_test.py` 39/39 and the full regression
+  runner pass.
+- Released as **v4.7.8** alongside `@std/math` 1.0.6. The compiler release is
+  required for AOT consumers of math constants: with 4.7.7, JIT works but
+  `cpy --aot` does not see the MPFR include dir exposed by the math BuildHook.
+
 ## Nov 24 2026: v4.7.7 fixes `std.pkg.file` CPM submodule imports
 
 - `import std.random.prng` was silently skipped: `_try_cpm_import` returned

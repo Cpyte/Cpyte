@@ -1,5 +1,34 @@
 # Notes
 
+## Nov 26 2026: v4.8.0 adds typed (C-style) pointer arithmetic
+
+- `bytecoding._try_pointer_arith()` now intercepts `+`/`-` before `_promote`:
+  `p + n`, `n + p`, and `p - n` scale the integer offset by `sizeof(*p)`, while
+  `p - q` yields an element count (semantic type `int`, lowered to i32).
+  `char*`/`void*` keep one-byte scaling, so byte-buffer code is unchanged;
+  `T[]` values are pointer-like too. `str`, `big`, `ubig`, and `dynamic` are
+  excluded so string concatenation and bignum arithmetic keep their semantics.
+  Semantic analysis now recognises `T[]` alongside `T*` for these operators.
+- Docs: `source/cpyte/cpy_language_documentation.md` gained a **Pointer
+  arithmetic** subsection under pointers/allocation, with an `int[]`/`int*`
+  example and the `str`/`big` exclusions; the capability note below was updated.
+- Regression: `test/test_pointer_arith.cpy` (int/double/struct pointers, char
+  byte offsets, size_t and negative offsets, pointer differences) was added to
+  the CI corpus, plus an IR assertion in `test_compiler_regressions.py` that
+  `int* + 1` emits `mul i64 ..., 4`. Verified JIT opt0/opt3, native AOT,
+  `ci_test.py` 40/40, `ci_bomb.py` 2500/2500, and the regression suite. The
+  wheel was smoke-tested in a fresh venv (`cpy --version` 4.8.0; JIT + AOT print
+  `pointer arithmetic: PASS`).
+- Release: version is single-sourced in `source/cpyte/__init__.py` = `4.8.0`;
+  `python3.14 -m build` regenerated `source/cpyte.egg-info/`, and the wheel's
+  `__init__.py`/METADATA both report 4.8.0. Tagged `v4.8.0`, pushed to
+  `github` and `origin`/gitea, and published to PyPI + the Gitea registry.
+- **Release-commit scope:** at the user's direction this commit also includes
+  the pre-existing working-tree changes: the LSP analysis-cache/single-flight
+  rollback in `lsp_server.py` and `semantic_analasis.py`, the `@std/pkg/sub`
+  deep-import rollback, and the associated reduced regression tests. The
+  pointer-arithmetic work itself is independent of those changes.
+
 ## Nov 26 2026: v4.7.8 applies build hooks on the direct AOT path
 
 - `compiling.run_aot()` now calls `hook_build_context()`/`hook_compile_flags()`
@@ -1214,8 +1243,11 @@ corpus (8/8) green on macOS arm64 after these changes.
   `+=`.
 
 ### Pointer arithmetic — NOW AVAILABLE
-- `char* + n`, `char* - n`, `int* + n` etc. are supported (byte-offset
-  arithmetic via `ptrtoint`). `char* - char*` yields the byte difference.
+- Typed (C-style) pointer arithmetic: `p + n`, `n + p`, `p - n` scale the integer
+  offset by `sizeof(*p)`, and `p - q` returns an element count (semantic type
+  `int`). `char*`/`void*` keep 1-byte scaling, so byte-buffer code is unchanged.
+  Fixed/dynamic array values (`T[]`) are treated as pointers too; `str` remains
+  distinct and keeps `+` as concatenation.
 - `str` is a **distinct semantic type** from `char*` (though both lower to
   `i8*`): `str + str` is string concatenation (`_is_string_concat` gates it
   before `_promote`), while `char* + int` is pointer arithmetic. `str`-only

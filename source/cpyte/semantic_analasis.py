@@ -1,4 +1,3 @@
-import functools
 import hashlib
 import os
 import re
@@ -6,16 +5,7 @@ import subprocess
 import sys
 import tempfile
 
-# LSP re-analyzes a document on every keystroke (debounced). Imported modules
-# almost never change with it, so cache their lexed/parsed/semantically
-# stamped AST by (path, mtime, size, workspace). The per-analysis symbol
-# registration is still replayed so each importing analyzer gets its own
-# scope entries. Bounded to avoid growing without limit in long sessions.
-_IMPORTED_AST_CACHE: dict[tuple, list] = {}
-_IMPORTED_AST_CACHE_LIMIT = 256
 
-
-@functools.lru_cache(maxsize=1)
 def _get_multiarch():
     for cc in ("cc", "gcc", "clang"):
         try:
@@ -29,7 +19,6 @@ def _get_multiarch():
     return None
 
 
-@functools.lru_cache(maxsize=1)
 def _get_sdk_paths():
     """Auto-discover system include/SDK roots across macOS, Linux and Windows."""
     paths = []
@@ -1711,8 +1700,11 @@ class SemanticAnalyzer:
                             note="cannot divide integer by zero",
                         )
                 if left_t is not None and right_t is not None:
-                    left_ptr = left_t.endswith("*")
-                    right_ptr = right_t.endswith("*")
+                    # Fixed-size/dynamic array values lower to pointers, so they
+                    # support the same typed pointer arithmetic as T*. (str is
+                    # handled above as concatenation, not as a byte buffer.)
+                    left_ptr = left_t.endswith("*") or left_t.endswith("[]")
+                    right_ptr = right_t.endswith("*") or right_t.endswith("[]")
                     if node.op.name == "MINUS" and left_ptr and right_ptr:
                         node.inferred_type = "int"
                         return "int"
@@ -3002,7 +2994,6 @@ class SemanticAnalyzer:
         pkg_name = None
         scope = None
         is_legacy = False
-        std_deep = False
 
         # Canonical: group.pkg[.file...] e.g. std.collections.hash_map
         # Legacy: @group/pkg/... or @group.pkg... (deprecated)
@@ -3018,11 +3009,9 @@ class SemanticAnalyzer:
             pparts = [p for p in raw.split("/") if p != ""]
             if len(pparts) < 1:
                 return False
-            # `std.pkg.file` may be a real CPM source submodule (e.g.
-            # `@std/random/prng.cpy`), so try CPM first. If no such file exists
-            # the caller treats it as a runtime-resolved deep extension.
+            # Deep extension like @std.math.foo (>=3 parts) is runtime-resolved; do not CPM-resolve.
             if len(pparts) >= 3 and pparts[0] == "std":
-                std_deep = True
+                return False
             scope = pparts[0]
             if len(pparts) == 1:
                 pkg_name = pparts[0]
@@ -3035,11 +3024,9 @@ class SemanticAnalyzer:
             parts = [p for p in module.split(".") if p != ""]
             if len(parts) == 0:
                 return False
-            # Try CPM for real source submodules such as `std.random.prng`.
-            # If the submodule file is absent, return False so `_visit_import`
-            # can fall back to runtime-resolved deep extensions.
+            # Canonical deep extension: std.pkg.sub... (>=3 parts) is runtime-resolved by extensions.
             if len(parts) >= 3 and parts[0] == "std":
-                std_deep = True
+                return False
             if len(parts) == 1:
                 pkg_name = parts[0]
                 scope = None
@@ -3143,10 +3130,6 @@ class SemanticAnalyzer:
                         node,
                     )
                     return True
-                if std_deep:
-                    # No source submodule: let `_visit_import` treat this as a
-                    # runtime-resolved deep extension instead of an error.
-                    return False
                 tried_str = "; ".join(tried)
                 self.error(
                     f"submodule/file `{base}` not found in package `{scope + '.' + pkg_name if scope else pkg_name}` (looked for: {tried_str})",
@@ -3185,24 +3168,6 @@ class SemanticAnalyzer:
         self._imported_cpy_files.add(real)
 
         try:
-            st = os.stat(module)
-            cache_key = (
-                real,
-                st.st_mtime_ns,
-                st.st_size,
-                self._workspace_root or "",
-            )
-        except OSError:
-            cache_key = None
-
-        cached_ast = _IMPORTED_AST_CACHE.get(cache_key) if cache_key else None
-        if cached_ast is not None:
-            # Lexing, parsing and the sub-analyzer already ran for this exact
-            # module version. Replay only the cheap per-importer registration
-            # so this analyzer still gets its own symbols/types.
-            return self._import_symbols_from_ast(cached_ast, real, node)
-
-        try:
             with open(module) as f:
                 source = f.read()
         except FileNotFoundError:
@@ -3233,14 +3198,6 @@ class SemanticAnalyzer:
             self.error(f"imported file `{module}` has semantic errors")
             return None
 
-        if cache_key is not None:
-            if len(_IMPORTED_AST_CACHE) >= _IMPORTED_AST_CACHE_LIMIT:
-                _IMPORTED_AST_CACHE.clear()
-            _IMPORTED_AST_CACHE[cache_key] = imported_ast
-        return self._import_symbols_from_ast(imported_ast, real, node)
-
-    def _import_symbols_from_ast(self, imported_ast, real, node):
-        """Replay symbol registration for an already analyzed imported AST."""
         # Extract public functions and structs
         symbols = {}
         sub_ast = []

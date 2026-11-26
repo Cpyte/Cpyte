@@ -573,6 +573,27 @@ declarations use `T*`; dereference and address-of use `*pointer` and `&value`.
 Bounds checks, null checks, and lifetime guarantees should not be assumed for
 raw pointers.
 
+### Pointer arithmetic
+
+Pointer arithmetic is typed (C-style): integer offsets are scaled by the size
+of the pointed-to element. `p + n`, `n + p`, and `p - n` all move by `n`
+elements, while `p - q` reports the difference in elements (not bytes).
+`char*` and `void*` use a one-byte element size, so they still behave as byte
+pointers. Fixed and dynamic array values (`T[]`) are also pointer-like here:
+
+```cpy
+int[] values = new int[4]
+int* p = (int*)values
+int* second = p + 1       # advances by sizeof(int) bytes
+int distance = second - p # 1
+```
+
+`str` is a distinct semantic type even though it lowers to `i8*`; `str + str`
+remains string concatenation and `str` cannot be used as a byte buffer for
+pointer arithmetic. Cast it to `char*` first when byte-level access is needed.
+`big`/`ubig` are also excluded — they are arbitrary-precision values, not raw
+pointers, despite their internal representation.
+
 The default compiler mode enables automatic memory management through the
 userspace runtime. `--nogc` disables automatic GC and exposes `free()`; the
 caller then owns allocation lifetime. Do not manually free GC-managed

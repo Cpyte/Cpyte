@@ -4375,10 +4375,11 @@ class LLVM:
         ):
             return self.builder.fptosi(left, _i64), self.builder.ptrtoint(right, _i64)
 
-        # Pointer + integer -> integer arithmetic on the pointer's address
-        # (byte offset). char*/i8* pointers are included: string concatenation
-        # is gated earlier by `_is_string_concat` (a `str` operand never reaches
-        # _promote), so an i8* here is a genuine character/byte pointer.
+        # Raw address conversion for pointer comparisons / casts. Typed pointer
+        # arithmetic (`p + i`, `p - q`) is intercepted by `_try_pointer_arith`
+        # before `_promote`; char*/i8* pointers are included here too because
+        # string concatenation is gated earlier by `_is_string_concat` (a `str`
+        # operand never reaches _promote), so an i8* here is a byte pointer.
         if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):  # type: ignore[attr-defined]
             left = self.builder.ptrtoint(left, _i64)
             right = self._promote_int(right, _i64, right_unsigned)
@@ -4396,6 +4397,104 @@ class LLVM:
             left = self._promote_int(left, ir.IntType(max_width), left_unsigned)
             right = self._promote_int(right, ir.IntType(max_width), right_unsigned)
         return left, right
+
+    # Pointer arithmetic is deliberately typed (C-style), unlike the generic
+    # `_promote` path which treats a pointer as a plain i64 address. Semantic
+    # analysis already recognises `ptr + int`, `int + ptr`, `ptr - int` and
+    # `ptr - ptr`; this helper supplies the codegen side: scale integer offsets
+    # by `sizeof(*ptr)` and report pointer differences in elements.
+    _PTR_ARITH_INT_TYPES = frozenset(
+        (
+            "int",
+            "int64",
+            "uint64",
+            "char",
+            "size_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "intptr_t",
+            "uintptr_t",
+            "uint8",
+            "uint16",
+            "uint32",
+        )
+    )
+
+    def _declared_type_of(self, node):
+        t = getattr(node, "inferred_type", None)
+        if isinstance(node, Variable) and not t:
+            t = self.local_types.get(node.name)
+        return t
+
+    @staticmethod
+    def _is_pointer_decl_type(t):
+        return isinstance(t, str) and (t.endswith("*") or t.endswith("[]"))
+
+    def _pointer_arith_elem_size(self, ptr_val):
+        """Byte size of the pointee of an LLVM pointer value (defaults to 1)."""
+        pointee = getattr(ptr_val.type, "pointee", None)
+        if pointee is None:
+            return 1
+        size = getattr(self._sizeof_type(pointee), "constant", 1)
+        return int(size) if isinstance(size, int) and size > 0 else 1
+
+    def _try_pointer_arith(self, node, left, right):
+        """Emit typed pointer arithmetic, or return None when not applicable.
+
+        `str` values are excluded via their semantic type even though they lower
+        to i8*: `str + str` is concatenation and `big`/`ubig` are i8*-backed
+        values handled by their own arithmetic lanes.
+        """
+        if node.op not in (TokenType.PLUS, TokenType.MINUS):
+            return None
+
+        lt = self._declared_type_of(node.left)
+        rt = self._declared_type_of(node.right)
+        left_ptr = self._is_pointer_decl_type(lt) and isinstance(
+            left.type, ir.PointerType
+        )
+        right_ptr = self._is_pointer_decl_type(rt) and isinstance(
+            right.type, ir.PointerType
+        )
+        left_int = lt in self._PTR_ARITH_INT_TYPES and isinstance(left.type, ir.IntType)
+        right_int = rt in self._PTR_ARITH_INT_TYPES and isinstance(
+            right.type, ir.IntType
+        )
+
+        if node.op == TokenType.PLUS:
+            if left_ptr and right_int:
+                ptr, off, off_node = left, right, node.right
+            elif right_ptr and left_int:
+                ptr, off, off_node = right, left, node.left
+            else:
+                return None
+            off = self._extend_to_i64(off, self._is_unsigned_node(off_node))
+            scale = self._pointer_arith_elem_size(ptr)
+            if scale != 1:
+                off = self.builder.mul(off, ir.Constant(_i64, scale))
+            addr = self.builder.add(self.builder.ptrtoint(ptr, _i64), off)
+            return self.builder.inttoptr(addr, ptr.type)
+
+        # MINUS
+        if left_ptr and right_int:
+            off = self._extend_to_i64(right, self._is_unsigned_node(node.right))
+            scale = self._pointer_arith_elem_size(left)
+            if scale != 1:
+                off = self.builder.mul(off, ir.Constant(_i64, scale))
+            addr = self.builder.sub(self.builder.ptrtoint(left, _i64), off)
+            return self.builder.inttoptr(addr, left.type)
+
+        if left_ptr and right_ptr:
+            addr_l = self.builder.ptrtoint(left, _i64)
+            addr_r = self.builder.ptrtoint(right, _i64)
+            diff = self.builder.sub(addr_l, addr_r)
+            scale = self._pointer_arith_elem_size(left)
+            if scale != 1:
+                diff = self.builder.sdiv(diff, ir.Constant(_i64, scale))
+            # Semantic analysis types pointer differences as `int` (i32).
+            return self.builder.trunc(diff, _i32)
+
+        return None
 
     def _bitwise_promote(self, left, right):
         if isinstance(left.type, (ir.FloatType, ir.DoubleType)) or isinstance(
@@ -5488,6 +5587,13 @@ class LLVM:
 
         left = self.emit(node.left)
         right = self.emit(node.right)
+
+        # Typed pointer arithmetic (`p + i`, `p - i`, `p - q`) must run before
+        # `_promote`, which would otherwise lower a pointer to a raw i64 byte
+        # address and lose element-size scaling.
+        ptr_arith = self._try_pointer_arith(node, left, right)
+        if ptr_arith is not None:
+            return ptr_arith
 
         # `in` — dynamic-list membership (node.op is TokenType.KEYWORD only for
         # the `in` infix operator). `x in list`: left=needle, right=list.

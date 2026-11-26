@@ -8,8 +8,6 @@ import re
 import struct
 import sys
 import tempfile
-import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -130,6 +128,16 @@ def test_integer_pointer_arithmetic():
     )
 
 
+def test_typed_pointer_arithmetic_scales_by_element_size():
+    ir = compile_program(
+        "public helper(p: int*) -> int*:\n"
+        "    return p + 1\n"
+    )
+    # int is i32, so `p + 1` must advance the address by 4 bytes, not 1.
+    assert "mul i64" in ir
+    assert ", 4" in ir
+
+
 def test_invalid_pointer_arithmetic_is_rejected():
     invalid_programs = (
         "public main() -> int:\n"
@@ -192,7 +200,6 @@ def _write_cpm_package(root, package_path, name, version, source=None):
     if source is not None:
         with open(os.path.join(version_dir, f"{name}.cpy"), "w") as f:
             f.write(source)
-    return version_dir
 
 
 def test_cpm_module_roots_include_global_and_workspace():
@@ -313,38 +320,12 @@ def test_workspace_cpm_package_wins_over_global_and_dot_form_imports():
 
 
 def test_deep_std_extension_import_is_still_skipped():
-    # `std.<pkg>.<sub>` with no matching CPM source file is resolved at runtime;
+    # `std.<pkg>.<sub>` (and legacy `@std.<pkg>.<sub>`) is resolved at runtime;
     # it must not be reported as a missing CPM package.
     parse_and_analyze(
         'import std.math.foo\npublic def main() -> int:\n    return 0\n',
         enable_extensions=False,
     )
-
-
-def test_deep_std_cpm_submodule_import_resolves():
-    with tempfile.TemporaryDirectory() as tmp:
-        module_root = os.path.join(tmp, "modules")
-        version_dir = _write_cpm_package(
-            module_root,
-            os.path.join("@std", "deepdemo"),
-            "deepdemo",
-            "1.0",
-        )
-        with open(os.path.join(version_dir, "mathlib.cpy"), "w") as f:
-            f.write(
-                "public def deep_value() -> int:\n"
-                "    return 17\n"
-            )
-
-        source = (
-            "import std.deepdemo.mathlib\n"
-            "public def main() -> int:\n"
-            "    return deep_value()\n"
-        )
-        ir = _parse_with_roots(
-            source, [module_root], filepath=os.path.join(tmp, "probe.cpy")
-        )
-        assert 'define i32 @"deep_value"' in ir
 
 
 def test_lsp_import_completions_include_global_cpm_packages():
@@ -785,183 +766,13 @@ def test_binary_operators_associate_left_except_power():
     assert render(iterative) == "((a MINUS b) PLUS c)"
 
 
-class _FakeDocument:
-    def __init__(self, source):
-        self.source = source
-
-
-class _FakeWorkspace:
-    def __init__(self, source):
-        self._doc = _FakeDocument(source)
-
-    def get_text_document(self, uri):
-        return self._doc
-
-
-class _FakeLanguageServer:
-    def __init__(self, source, workspace_root=None):
-        self.workspace = _FakeWorkspace(source)
-        self.workspace_root = workspace_root
-        self._analysis_cache = {}
-        self._pending_analysis = {}
-        self._analysis_generation = {}
-
-
-def test_lsp_analysis_cache_and_single_flight():
-    from cpyte import lsp_server
-
-    uri = "file:///tmp/lsp_cache_single_flight.cpy"
-    ls = _FakeLanguageServer("public main() -> int:\n    return 0\n")
-    calls = []
-
-    def fake_analyze(source, filepath=None, workspace_root=None):
-        calls.append(source)
-        # Hold the lock long enough for a second concurrent request to queue.
-        time.sleep(0.05)
-        return (source, [], [], None, [], None)
-
-    with patch.object(lsp_server, "_analyze_bundle", fake_analyze):
-        results = []
-
-        def request():
-            results.append(lsp_server._get_bundle(ls, uri))
-
-        threads = [threading.Thread(target=request) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-        assert not any(t.is_alive() for t in threads)
-        # Two concurrent requests compiled the document only once.
-        assert len(calls) == 1
-        assert results[0][0] == results[1][0]
-
-        # A second request against unchanged source is a pure cache hit.
-        lsp_server._get_bundle(ls, uri)
-        assert len(calls) == 1
-
-        # A source change invalidates the cache.
-        ls.workspace._doc.source += "\n# edit\n"
-        lsp_server._get_bundle(ls, uri)
-        assert len(calls) == 2
-
-
-def test_lsp_parse_only_requests_skip_semantic_analysis():
-    from cpyte import lsp_server
-
-    ls = _FakeLanguageServer("public main() -> int:\n    return 0\n")
-
-    def explode(*args, **kwargs):
-        raise AssertionError("parse-only request ran semantic analysis")
-
-    with patch.object(lsp_server, "_analyze_bundle", explode):
-        source, tokens, parsed, error = lsp_server._get_parse_bundle(
-            ls, "file:///tmp/lsp_parse_only.cpy"
-        )
-    assert source == ls.workspace._doc.source
-    assert tokens
-    assert parsed
-    assert error is None
-
-
-def test_imported_ast_cache_skips_repeated_lex_and_parse():
-    from cpyte import astparse, lexar, semantic_analasis
-
-    with tempfile.TemporaryDirectory() as tmp:
-        main_path = os.path.join(tmp, "main.cpy")
-        mod_path = os.path.join(tmp, "helper.cpy")
-        with open(mod_path, "w") as f:
-            f.write("public def helper() -> int:\n    return 7\n")
-        main_src = 'import "helper.cpy"\npublic main() -> int:\n    return helper()\n'
-        with open(main_path, "w") as f:
-            f.write(main_src)
-
-        semantic_analasis._IMPORTED_AST_CACHE.clear()
-        real_lexer = semantic_analasis.Lexer
-        lex_calls = []
-
-        def counting_lexer(*args, **kwargs):
-            lex_calls.append(1)
-            return real_lexer(*args, **kwargs)
-
-        first_parsed, _ = astparse.parse_file(real_lexer(main_src).get_tokens())
-        with patch.object(semantic_analasis, "Lexer", counting_lexer):
-            first = semantic_analasis.SemanticAnalyzer(
-                main_src, filepath=main_path, workspace_root=tmp
-            )
-            assert first.analyze(first_parsed)
-            assert len(lex_calls) == 1
-
-            second_parsed, _ = astparse.parse_file(real_lexer(main_src).get_tokens())
-            second = semantic_analasis.SemanticAnalyzer(
-                main_src, filepath=main_path, workspace_root=tmp
-            )
-            assert second.analyze(second_parsed)
-            # The imported module was lexed only on the first analysis.
-            assert len(lex_calls) == 1
-
-            diags = [d.message for d in first.reporter.diagnostics]
-            diags2 = [d.message for d in second.reporter.diagnostics]
-            assert diags == diags2
-        semantic_analasis._IMPORTED_AST_CACHE.clear()
-
-
-def test_direct_aot_applies_build_hook_compile_flags():
-    """`cpy --aot` must pass hook includes/defines to every C compile.
-
-    The JIT and `cpy build` paths collected `BuildHook` flags, but the direct
-    AOT path called `run_aot()` compiled `ccode:` sources without them. An
-    extension package whose embedded C needs a hook-provided include dir
-    therefore failed only under `--aot`.
-    """
-    parsed, generics, _ = parse_and_analyze(
-        "public main() -> int:\n    return 0\n", enable_extensions=False
-    )
-    module, _, _ = emit_program(
-        parsed, generic_instantiations=generics, enable_extensions=False
-    )
-
-    flags = ["-I/opt/aot-hook/include", "-DAOT_HOOK_FLAG=1"]
-    ctx = CompilerContext(
-        include_paths=["/opt/aot-hook/include"], defines={"AOT_HOOK_FLAG": "1"}
-    )
-    seen = {}
-
-    def fake_cached_c_ir(cc, src, triple, **kwargs):
-        seen["bignum_flags"] = tuple(kwargs.get("extra_flags") or ())
-        return "declare void @aot_hook_probe()\n", None
-
-    class FakeLinker:
-        def compile_c(self, src, output, **kwargs):
-            seen.setdefault("compile_flags", []).append(
-                tuple(kwargs.get("extra_flags") or ())
-            )
-            Path(output).write_bytes(b"")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        with patch.object(compiling, "hook_build_context", return_value=ctx), patch.object(
-            compiling, "hook_compile_flags", return_value=flags
-        ), patch.object(compiling, "_cached_c_ir", side_effect=fake_cached_c_ir), patch.object(
-            compiling, "Linker", return_value=FakeLinker()
-        ), patch.object(compiling, "aot_link_executable") as link:
-            compiling.run_aot(
-                module,
-                output=os.path.join(tmp, "program.o"),
-                no_userspace=True,
-            )
-        link.assert_called_once()
-
-    assert "-DAOT_HOOK_FLAG=1" in seen["bignum_flags"]
-    assert seen["compile_flags"]
-    assert all("-DAOT_HOOK_FLAG=1" in f for f in seen["compile_flags"])
-
-
 if __name__ == "__main__":
     test_extensions_disabled_api()
     test_runtime_hook_legacy_signature_is_supported_with_notice()
     test_hook_failures_warn_by_default_and_are_hard_in_strict_mode()
     test_missing_hook_file_is_always_a_hard_error()
     test_integer_pointer_arithmetic()
+    test_typed_pointer_arithmetic_scales_by_element_size()
     test_invalid_pointer_arithmetic_is_rejected()
     test_invalid_hex_literal_is_lexer_error()
     test_cpm_versions_use_semver_order()
@@ -969,7 +780,6 @@ if __name__ == "__main__":
     test_global_cpm_import_resolves_without_workspace()
     test_workspace_cpm_package_wins_over_global_and_dot_form_imports()
     test_deep_std_extension_import_is_still_skipped()
-    test_deep_std_cpm_submodule_import_resolves()
     test_lsp_import_completions_include_global_cpm_packages()
     test_compound_index_assignment_evaluates_index_once()
     test_zero_multiplication_preserves_call_side_effects()
@@ -981,8 +791,4 @@ if __name__ == "__main__":
     test_optimizer_pipeline_and_loop_execution()
     test_optimized_runtime_cache_revision()
     test_binary_operators_associate_left_except_power()
-    test_lsp_analysis_cache_and_single_flight()
-    test_lsp_parse_only_requests_skip_semantic_analysis()
-    test_imported_ast_cache_skips_repeated_lex_and_parse()
-    test_direct_aot_applies_build_hook_compile_flags()
     print("Compiler regression tests passed.")

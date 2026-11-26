@@ -33,6 +33,7 @@ CORPUS: tuple[str, ...] = (
     "test/test_auto.cpy",
     "test/test_global_const.cpy",
     "test/test_narrow_bitwise.cpy",
+    "test/test_pointer_arith.cpy",
     "test/test_big.cpy",
     "test/test_big2.cpy",
     "test/test_big_hex.cpy",

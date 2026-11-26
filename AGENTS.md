@@ -1,5 +1,48 @@
 # Notes
 
+## Nov 27 2026: v4.8.1 semantic diagnostics + context-aware LSP completion
+
+- Released as **v4.8.1** on top of the unreleased pointer-GEP improvement from
+  v4.8.0. Pointer offsets (`p + n`, `n + p`, `p - n`) now lower to GEP at every
+  opt level; pointer differences keep `ptrtoint`/`sub`/`sdiv`/`trunc`.
+- Semantic diagnostics are more precise: `VarDecl.name_token` lets W1001
+  underline the variable name (not the type token) and the LSP rename quick fix
+  edits only that name. Notes are actionable (`read it, remove it, or rename it
+  to \`_name\``). The read walker now covers `for`/`try`/`switch`/`Assert`/
+  `Raise`/`InlineAsm`/list/f-string/`sizeof` contexts, so those reads no longer
+  produce false W1001 warnings. Unresolved call notes suggest close names.
+- LSP completion was rewritten around the real post-keystroke cursor: local /
+  parameter / class-member / global / imported / builtin / type / keyword
+  candidates are ranked, include call snippets, and handle partially typed
+  tokens. Member chains now resolve fields, properties, methods, and method /
+  function call segments (`o.inner.va`, `o.get().`, `make().ge`); quoted and
+  bare CPM/package imports and type contexts are scoped. In-progress invalid
+  lines are analyzed from a repaired copy so completion survives `obj.` and
+  `new <partial>`.
+- LSP hover renders parsed decorator expressions as source-like text
+  (`@timer(10)`) instead of AST reprs.
+- Regression coverage added to `test/test_compiler_regressions.py` for W1001
+  range/quick fix, compound-context reads, call suggestions, prefix-at-cursor,
+  call snippets, member/call chains, quoted/bare imports, and decorator hover.
+- Verified: regression suite, `ci_test.py` 40/40, `ci_bomb.py` 2500/2500, and
+  `embed.cpy` compiles cleanly with these changes in a temporary tree where the
+  unrelated v4.8.0 `@std/pkg/sub` deep-import rollback is undone.
+
+## Nov 26 2026 (post-v4.8.0): pointer offsets lower to GEP
+
+- `_try_pointer_arith()` now emits `getelementptr` for `p + n`, `n + p`, and
+  `p - n` instead of `ptrtoint`/`mul`/`add`/`inttoptr`. LLVM's GEP applies the
+  element-size scaling itself, so the raw-address chain and its explicit `mul`
+  are gone even at `-O0`, and pointer provenance is preserved for alias
+  analysis/SROA/vectorization. Constant `p - n` offsets are folded to a negative
+  GEP index; runtime offsets emit one `sub i64 0, n`. `p - q` still needs
+  `ptrtoint`/`sub`/`sdiv`/`trunc` to report an element count.
+- `test_compiler_regressions.py::test_typed_pointer_arithmetic_uses_gep` now
+  asserts GEP for `int*`/`double*`, no raw-address round trip for `p +/- n`, and
+  the retained `sdiv ..., 4` for `int*` differences. Runtime test, JIT opt0/opt3,
+  AOT, `ci_test.py` 40/40, `ci_bomb.py` 2500/2500, and the regression suite all
+  pass. This is an unreleased working-tree improvement on top of v4.8.0.
+
 ## Nov 26 2026: v4.8.0 adds typed (C-style) pointer arithmetic
 
 - `bytecoding._try_pointer_arith()` now intercepts `+`/`-` before `_promote`:

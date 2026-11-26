@@ -963,7 +963,17 @@ class SemanticAnalyzer:
     def _tok(self, node):
         if isinstance(node, dict):
             return node.get("_token")
-        return getattr(node, "_token", None)
+        if node is None:
+            return None
+        tok = getattr(node, "_token", None)
+        if tok is not None:
+            return tok
+        # Some diagnostics need to point at a more specific token inside a
+        # node (e.g. a variable name instead of its type token). Accept a bare
+        # Token there as well as an AST node.
+        if hasattr(node, "line") and hasattr(node, "column"):
+            return node
+        return None
 
     @staticmethod
     def _levenshtein(a: str, b: str) -> int:
@@ -2151,6 +2161,38 @@ class SemanticAnalyzer:
             return [node.body]
         return []
 
+    def _read_children(self, node) -> list:
+        """Complete child list for *read* collection (lints/ownership).
+
+        ``_infer_children`` deliberately omits nodes that do not affect type
+        inference.  Diagnostics need the fuller set: list/f-string elements,
+        ``sizeof`` operands, inline-asm outputs, and non-simple call callees all
+        contain real variable reads.
+        """
+        children = list(self._infer_children(node))
+        if isinstance(node, Call):
+            callee = node.callee
+            if isinstance(callee, Variable):
+                if (
+                    callee.name in ("has", "get_attr")
+                    and getattr(node, "meta", None)
+                ):
+                    # The builtins stamp `meta` with the resolved object; every
+                    # argument is an ordinary expression here.
+                    return list(node.args)
+            elif not isinstance(callee, Attr):
+                # Attr receivers are collected by `_collect`'s Call branch.
+                children.insert(0, callee)
+        elif isinstance(node, ListLit):
+            children.extend(node.items)
+        elif isinstance(node, FString):
+            children.extend(expr for kind, expr in node.parts if kind == "expr")
+        elif isinstance(node, SizeOf):
+            children.append(node.type_expr)
+        elif isinstance(node, InlineAsm):
+            children.extend(expr for _, expr in node.outputs)
+        return children
+
     def _infer_combine(self, node):
         key = id(node)
         if key in self._infer_memo:
@@ -2879,6 +2921,12 @@ class SemanticAnalyzer:
         """
         if name.startswith("scorpion_") and not self.scorpion:
             return "the Scorpion ABI needs `#scorpion` on the first line of the file"
+        suggestion = self._suggest(name, self._scope_names())
+        if suggestion:
+            return (
+                f"did you mean `{suggestion}`?; call target must be a function "
+                "defined in scope"
+            )
         return "call target must be a function defined in scope"
 
     def _lazy_register_used(self, node, name, entry, var_names=()):
@@ -3376,7 +3424,12 @@ class SemanticAnalyzer:
                 _collect(stmt.value, names)
                 reads.update(names)
                 return True
-            if isinstance(stmt, (Break, Continue, Raise)):
+            if isinstance(stmt, Raise):
+                names = set()
+                _collect(stmt.message, names)
+                reads.update(names)
+                return True
+            if isinstance(stmt, (Break, Continue)):
                 return True
             if isinstance(stmt, VarDecl):
                 if stmt.name and not stmt.name.startswith("_"):
@@ -3410,6 +3463,17 @@ class SemanticAnalyzer:
                 _collect(stmt.expr, names)
                 reads.update(names)
                 return False
+            if isinstance(stmt, Assert):
+                names = set()
+                _collect(stmt.cond, names)
+                _collect(stmt.message, names)
+                reads.update(names)
+                return False
+            if isinstance(stmt, InlineAsm):
+                names = set()
+                _collect(stmt, names)
+                reads.update(names)
+                return False
             if isinstance(stmt, DelStmt):
                 if isinstance(stmt.target, Variable):
                     reads.add(stmt.target.name)
@@ -3422,6 +3486,14 @@ class SemanticAnalyzer:
                 names = set()
                 _collect(stmt.body, names)
                 reads.update(names)
+                return False
+            if isinstance(stmt, Try):
+                names = set()
+                for s in stmt.body:
+                    walk(s, False)
+                for handler in getattr(stmt, "handlers", None) or []:
+                    for s in getattr(handler, "body", None) or []:
+                        walk(s, False)
                 return False
             if isinstance(stmt, If):
                 names = set()
@@ -3445,7 +3517,19 @@ class SemanticAnalyzer:
                 # a `while True:` without a break is non-terminating; treat as
                 # terminating only if the loop body is unreachable-agnostic.
                 return False
+            if isinstance(stmt, dict) and stmt.get("type") == "for":
+                names = set()
+                _collect(stmt.get("iter"), names)
+                reads.update(names)
+                # The loop variable itself is not a local declaration for W1001,
+                # but its body may be the only read of other locals.
+                for s in stmt.get("body") or []:
+                    walk(s, False)
+                return False
             if isinstance(stmt, Switch):
+                names = set()
+                _collect(stmt.value, names)
+                reads.update(names)
                 for branch in getattr(stmt, "cases", []):
                     names = set()
                     _collect(branch[0], names)
@@ -3478,14 +3562,8 @@ class SemanticAnalyzer:
                     for child in node.args:
                         _collect(child, acc)
                     return
-            for child in self._infer_children(node):
+            for child in self._read_children(node):
                 _collect(child, acc)
-            # Some expression nodes aren't covered by _infer_children (e.g.
-            # print args, move/borrow operands).
-            for attr in ("operand", "expr"):
-                child = getattr(node, attr, None)
-                if child is not None and not isinstance(child, Variable):
-                    _collect(child, acc)
 
         for stmt in body:
             terminated = walk(stmt, False)
@@ -3505,10 +3583,13 @@ class SemanticAnalyzer:
                 continue
             self.warning(
                 f"local `{name}` is assigned but never used",
-                node,
-                span=len(name),
+                getattr(node, "name_token", None) or node,
+                span=0,
                 code="W1001",
-                note="remove it, or prefix with `_` to silence this warning",
+                note=(
+                    "read it, remove it, or rename it to `_"
+                    f"{name}` to mark the assignment as intentional"
+                ),
             )
 
         # Missing-return lint: a non-void function that has no `return` at all.
@@ -3548,6 +3629,12 @@ class SemanticAnalyzer:
                 self._warn_unreachable(getattr(stmt, "orelse", None) or [])
             elif isinstance(stmt, While):
                 self._warn_unreachable(stmt.body)
+            elif isinstance(stmt, dict) and stmt.get("type") == "for":
+                self._warn_unreachable(stmt.get("body") or [])
+            elif isinstance(stmt, Try):
+                self._warn_unreachable(stmt.body)
+                for handler in getattr(stmt, "handlers", None) or []:
+                    self._warn_unreachable(getattr(handler, "body", None) or [])
             elif isinstance(stmt, Switch):
                 for branch in getattr(stmt, "cases", []):
                     self._warn_unreachable(branch[1])
@@ -3614,7 +3701,7 @@ class SemanticAnalyzer:
         def used_names(v, acc):
             if isinstance(v, Variable):
                 acc.add(v.name)
-            for child in self._infer_children(v):
+            for child in self._read_children(v):
                 used_names(child, acc)
 
         def mark_owned(name, node):

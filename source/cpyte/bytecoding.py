@@ -4431,7 +4431,11 @@ class LLVM:
         return isinstance(t, str) and (t.endswith("*") or t.endswith("[]"))
 
     def _pointer_arith_elem_size(self, ptr_val):
-        """Byte size of the pointee of an LLVM pointer value (defaults to 1)."""
+        """Byte size of an LLVM pointer's pointee (defaults to 1).
+
+        Used only for `p - q`, which reports an element count. `p +/- n` uses
+        GEP and lets LLVM apply the scale itself.
+        """
         pointee = getattr(ptr_val.type, "pointee", None)
         if pointee is None:
             return 1
@@ -4469,20 +4473,22 @@ class LLVM:
             else:
                 return None
             off = self._extend_to_i64(off, self._is_unsigned_node(off_node))
-            scale = self._pointer_arith_elem_size(ptr)
-            if scale != 1:
-                off = self.builder.mul(off, ir.Constant(_i64, scale))
-            addr = self.builder.add(self.builder.ptrtoint(ptr, _i64), off)
-            return self.builder.inttoptr(addr, ptr.type)
+            # GEP scales the index by sizeof(*ptr) itself. Using it here keeps
+            # pointer provenance for LLVM's alias analysis and avoids the
+            # `ptrtoint`/`mul`/`add`/`inttoptr` chain at -O0.
+            return self.builder.gep(ptr, [off])
 
         # MINUS
         if left_ptr and right_int:
             off = self._extend_to_i64(right, self._is_unsigned_node(node.right))
-            scale = self._pointer_arith_elem_size(left)
-            if scale != 1:
-                off = self.builder.mul(off, ir.Constant(_i64, scale))
-            addr = self.builder.sub(self.builder.ptrtoint(left, _i64), off)
-            return self.builder.inttoptr(addr, left.type)
+            # `p - n` is `p + (-n)`; fold the negation for a constant offset so
+            # -O0 IR stays as small as the `p + n` case.
+            const = getattr(off, "constant", None)
+            if isinstance(const, int):
+                off = ir.Constant(_i64, -const)
+            else:
+                off = self.builder.sub(ir.Constant(_i64, 0), off)
+            return self.builder.gep(left, [off])
 
         if left_ptr and right_ptr:
             addr_l = self.builder.ptrtoint(left, _i64)

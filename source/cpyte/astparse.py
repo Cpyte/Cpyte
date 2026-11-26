@@ -2230,7 +2230,15 @@ class ExprStmt(Node):
 
 
 class VarDecl(Node):
-    __slots__ = ("_token", "dynamic", "init", "is_const", "name", "var_type")
+    __slots__ = (
+        "_token",
+        "dynamic",
+        "init",
+        "is_const",
+        "name",
+        "name_token",
+        "var_type",
+    )
 
     def __init__(
         self,
@@ -2239,12 +2247,14 @@ class VarDecl(Node):
         init=None,
         is_const: bool = False,
         token=None,
+        name_token=None,
     ):
         self.name = name
         self.var_type = var_type
         self.init = init
         self.is_const = is_const
         self._token = token
+        self.name_token = name_token if name_token is not None else token
 
     def __repr__(self):
         return f"VarDecl({self.name}: {self.var_type} = {self.init}, const={self.is_const})"
@@ -3058,7 +3068,8 @@ def parse_var_decl(tokens: list[Token], pos: int):
                 'Expected constant name after "("',
                 tokens[pos] if pos < len(tokens) else tok,
             )
-        name = tokens[pos].value
+        name_tok = tokens[pos]
+        name = name_tok.value
         assert name is not None
         pos += 1
         if pos >= len(tokens) or tokens[pos].type != TokenType.RPAREN:
@@ -3070,7 +3081,8 @@ def parse_var_decl(tokens: list[Token], pos: int):
     else:
         if pos >= len(tokens) or tokens[pos].type != TokenType.IDENTIFIER:
             raise ParseError("Expected variable name after type", tok)
-        name = tokens[pos].value
+        name_tok = tokens[pos]
+        name = name_tok.value
         assert name is not None
         pos += 1
 
@@ -3081,7 +3093,14 @@ def parse_var_decl(tokens: list[Token], pos: int):
 
     _expect_newline(tokens, pos, tok)
     var_type_str = _type_to_str(var_type) if isinstance(var_type, tuple) else var_type
-    return VarDecl(name, var_type_str, init, is_const=is_const, token=tok), pos
+    return VarDecl(
+        name,
+        var_type_str,
+        init,
+        is_const=is_const,
+        token=tok,
+        name_token=name_tok,
+    ), pos
 
 
 def parse_defer(tokens: list[Token], pos: int):

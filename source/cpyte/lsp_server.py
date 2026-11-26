@@ -2,8 +2,10 @@ import asyncio
 import logging
 import os
 import pathlib
+import re
 import time
 import traceback
+from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
 from lsprotocol import types as lsp
@@ -18,7 +20,9 @@ from .astparse import (
     FuncDef,
     If,
     Import,
+    Number,
     ParseError,
+    String,
     StructDef,
     Switch,
     Try,
@@ -29,8 +33,8 @@ from .astparse import (
 )
 from .clib import _BUILTIN_LIB_HEADERS
 from .formatter import format_source
-from .lexar import Lexer, LexerError, TokenType
-from .package_manifest import cpm_module_roots
+from .lexar import Lexer, LexerError, TokenType, get_keywords
+from .package_manifest import cpm_module_roots, iter_cpm_version_dirs
 from .semantic_analasis import SemanticAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -51,6 +55,29 @@ def _fmt_params(params, const_params=None):
     return ", ".join(
         f"({n}): {t}" if n in cvs else f"{n}: {t}" for n, t in params.items()
     )
+
+
+def _decorator_text(dec):
+    """Render a parsed decorator expression for hover text."""
+    if isinstance(dec, str):
+        return dec
+    if isinstance(dec, Call):
+        name = _decorator_text(dec.callee)
+        args = ", ".join(_decorator_text(arg) for arg in dec.args)
+        return f"{name}({args})"
+    if isinstance(dec, Number):
+        return str(dec.value)
+    if isinstance(dec, String):
+        return repr(dec.value)
+    name = getattr(dec, "name", None)
+    if name:
+        return str(name)
+    value = getattr(dec, "value", None)
+    if isinstance(value, str):
+        return repr(value)
+    if value is not None:
+        return str(value)
+    return str(dec)
 
 
 _KEYWORDS = [
@@ -125,7 +152,13 @@ _KEYWORDS = [
 
 _TYPES = [
     "int",
+    "int8",
+    "int16",
+    "int32",
     "int64",
+    "uint8",
+    "uint16",
+    "uint32",
     "uint64",
     "float",
     "double",
@@ -267,6 +300,10 @@ _BUILTIN_FUNC_PARAMS = {
     "new": {},
     "free": {"ptr": "any*"},
     "code": {},
+    "has": {"obj": "any", "name?": "str"},
+    "get_attr": {"obj": "any", "name": "str"},
+    "isinstance": {"obj": "any", "cls": "type"},
+    "gc_collect": {},
 }
 
 _SNIPPETS = {
@@ -363,11 +400,13 @@ def _reporter_diagnostics(analyzer):
     diagnostics = []
     for d in analyzer.reporter.diagnostics:
         if d.token:
+            span = d.span if d.span > 0 else len(d.token.value or "")
+            span = max(1, span)
             rng = lsp.Range(
                 start=lsp.Position(line=d.token.line - 1, character=d.token.column - 1),
                 end=lsp.Position(
                     line=d.token.line - 1,
-                    character=d.token.column - 1 + len(d.token.value or ""),
+                    character=d.token.column - 1 + span,
                 ),
             )
         else:
@@ -375,9 +414,12 @@ def _reporter_diagnostics(analyzer):
                 start=lsp.Position(line=0, character=0),
                 end=lsp.Position(line=0, character=0),
             )
+        message = d.message
+        if d.note:
+            message = f"{message}\n\nHelp: {d.note}"
         diagnostics.append(
             lsp.Diagnostic(
-                message=d.message,
+                message=message,
                 severity=_LEVEL_SEVERITY.get(d.level, lsp.DiagnosticSeverity.Error),
                 range=rng,
                 code=d.code,
@@ -455,6 +497,11 @@ def _schedule_analysis(ls, uri, delay=_ANALYSIS_DEBOUNCE):
     if pending is None:
         pending = {}
         ls._pending_analysis = pending
+    generations = getattr(ls, "_analysis_generation", None)
+    if generations is None:
+        generations = {}
+        ls._analysis_generation = generations
+    generations[uri] = generations.get(uri, 0) + 1
     prev = pending.get(uri)
     if prev is not None:
         prev.cancel()
@@ -476,9 +523,13 @@ async def _analyze_and_publish(ls, uri):
         return
     filepath = _uri_to_path(uri)
     workspace_root = _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+    generation = (getattr(ls, "_analysis_generation", None) or {}).get(uri, 0)
     bundle = await asyncio.to_thread(
         _analyze_bundle, source, filepath=filepath, workspace_root=workspace_root
     )
+    current = (getattr(ls, "_analysis_generation", None) or {}).get(uri, 0)
+    if current != generation:
+        return
     cache = getattr(ls, "_analysis_cache", None)
     if cache is not None:
         cache[uri] = bundle
@@ -505,6 +556,83 @@ def _find_token_at(tokens, line, col):
             if tok_start <= col < tok_end:
                 return tok
     return None
+
+
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_MEMBER_CHAIN_RE = re.compile(
+    r"([A-Za-z_]\w*(?:\s*(?:\.\s*[A-Za-z_]\w*|\([^()\n]*\))+)?)\s*\.\s*([A-Za-z_]\w*)?$"
+)
+
+
+def _last_ident_match(text):
+    """The last identifier in *text*, or None (LSP prefixes can contain many)."""
+    matches = list(_IDENT_RE.finditer(text))
+    return matches[-1] if matches else None
+
+
+def _line_prefix_before(source, line, col):
+    """The raw line text before an LSP cursor (positions are after the char)."""
+    lines = source.splitlines() if source else []
+    if not (0 <= line < len(lines)):
+        return ""
+    return lines[line][: max(0, col)]
+
+
+def _word_prefix_before(source, line, col):
+    """Trailing identifier at the cursor, or '' when completing a new token."""
+    prefix = _line_prefix_before(source, line, col)
+    m = _last_ident_match(prefix)
+    return m.group(0) if m else ""
+
+
+def _member_chain_before(source, line, col):
+    """Return ``(receiver_chain, member_prefix)`` for ``a.b.<member>``.
+
+    Works at the real LSP cursor position (immediately *after* the typed text),
+    unlike the token-contained lookup used by hover/definition.
+    """
+    prefix = _line_prefix_before(source, line, col)
+    m = _MEMBER_CHAIN_RE.search(prefix)
+    if m is None:
+        return None
+    chain = [part.strip() for part in m.group(1).split(".")]
+    return chain, (m.group(2) or "")
+
+
+def _call_snippet(name, params, const_params=(), skip=("this", "self")):
+    """Build a snippet with one tab stop per call argument."""
+    names = [n for n in (params or {}) if n not in skip]
+    if not names:
+        return f"{name}()"
+    stops = ",".join(f"${{{i}:{n}}}" for i, n in enumerate(names, 1))
+    return f"{name}({stops})"
+
+
+def _completion_item(
+    label,
+    kind,
+    *,
+    detail="",
+    insert_text=None,
+    snippet=False,
+    sort="5-other",
+    documentation=None,
+):
+    item = lsp.CompletionItem(
+        label=label,
+        kind=kind,
+        detail=detail or None,
+        sort_text=sort,
+        filter_text=label,
+    )
+    if insert_text is not None:
+        item.insert_text = insert_text
+        item.insert_text_format = (
+            lsp.InsertTextFormat.Snippet if snippet else lsp.InsertTextFormat.PlainText
+        )
+    if documentation:
+        item.documentation = documentation
+    return item
 
 
 def _dot_context(tokens, line, col):
@@ -729,6 +857,81 @@ def _collect_locals(func, cursor_line):
     return out
 
 
+def _node_end_line(node):
+    """Best-effort last source line of a declaration."""
+    start = _stmt_line(node)
+    if start is None:
+        return None
+    end = start
+    extras = []
+    for attr in ("fields", "methods", "properties"):
+        extras.extend(getattr(node, attr, None) or [])
+    for child in list(_stmt_children(node)) + extras:
+        child_line = _stmt_line(child)
+        if child_line is not None:
+            end = max(end, child_line)
+        for sub in _stmt_children(child):
+            sub_line = _stmt_line(sub)
+            if sub_line is not None:
+                end = max(end, sub_line)
+    return end
+
+
+def _find_containing_class(parsed, line):
+    for node in parsed:
+        if not isinstance(node, ClassDef):
+            continue
+        start = _stmt_line(node)
+        end = _node_end_line(node) or start
+        if start is not None and start <= line <= end:
+            return node
+    return None
+
+
+def _resolve_completion_symbol(analyzer, parsed, name, cursor_line):
+    """Resolve an expression-root identifier to something with a type/node."""
+    if analyzer is None or not name:
+        return None
+    sym = analyzer.globals.lookup(name)
+    if sym is not None:
+        return sym
+    func = _find_containing_function(parsed, cursor_line)
+    if func is not None and name in (func.params or {}):
+        return SimpleNamespace(kind="param", type=func.params[name], node=None)
+    locs = _collect_locals(func, cursor_line) if func else {}
+    if name in locs:
+        return SimpleNamespace(kind="variable", type=locs[name], node=None)
+    if name == "this":
+        cls = _find_containing_class(parsed, cursor_line)
+        if cls is not None:
+            return SimpleNamespace(kind="class", type=cls.name, node=cls)
+    return None
+
+
+def _class_member_nodes(analyzer, node):
+    """Yield ``(name, kind, type_text, func_or_field)`` for a class/struct node,
+    including inherited class members."""
+    seen = set()
+    while node is not None:
+        for f in getattr(node, "fields", None) or []:
+            if f.name not in seen:
+                seen.add(f.name)
+                yield f.name, "field", f.type_expr, f
+        for m in getattr(node, "methods", None) or []:
+            if m.name not in seen:
+                seen.add(m.name)
+                yield m.name, "method", m.rettype or "void", m
+        for p in getattr(node, "properties", None) or []:
+            if p.name not in seen:
+                seen.add(p.name)
+                yield p.name, "property", getattr(p, "_ptype", None) or "auto", p
+        base = getattr(node, "base", None)
+        if not base:
+            break
+        base_sym = analyzer.globals.lookup(base) if analyzer is not None else None
+        node = getattr(base_sym, "node", None) if base_sym is not None else None
+
+
 def _const_value_text(sym):
     node = getattr(sym, "node", None)
     if node is not None and getattr(node, "init", None) is not None:
@@ -770,19 +973,32 @@ def _type_node_for(analyzer, type_name):
     return None
 
 
+def _iter_import_nodes(nodes):
+    """Yield ``Import`` nodes recursively (including transitive sub-imports)."""
+    for node in nodes or []:
+        if isinstance(node, Import):
+            yield node
+        for sub in getattr(node, "sub_ast", None) or []:
+            yield from _iter_import_nodes([sub])
+
+
 def _collect_imported_symbols(parsed):
     """Collect public symbols (functions/structs/classes/enums/constants) re-exported
     through `import` statements so completion can offer them even though they live in
     another file/package."""
     out = {}
-    for node in parsed:
-        if isinstance(node, Import) and getattr(node, "symbols", None):
-            for fname, _sig in node.symbols:
-                out.setdefault(fname, ("function", ""))
-        for sub in getattr(node, "sub_ast", None) or []:
-            if isinstance(sub, Import) and getattr(sub, "symbols", None):
-                for fname, _sig in sub.symbols:
-                    out.setdefault(fname, ("function", ""))
+    for imp in _iter_import_nodes(parsed):
+        for fname, sig in getattr(imp, "symbols", None) or []:
+            if fname in out:
+                continue
+            if isinstance(sig, tuple) and len(sig) >= 2:
+                ret, params = sig[0], sig[1]
+                if isinstance(params, dict):
+                    out[fname] = ("function", f"-> {ret or ''}", params)
+                else:
+                    out[fname] = ("function", f"-> {ret or ''}", {})
+            else:
+                out[fname] = ("function", "", {})
     return out
 
 
@@ -879,6 +1095,207 @@ def _member_completions(analyzer, parsed, base, prefix, cursor_line):
     return items
 
 
+def _package_member_completions(chain, prefix, ls, uri, parsed):
+    """Module/package namespace completions for chains such as ``std.``."""
+    base = ".".join(p.lstrip("@") for p in chain)
+    labels = {}
+
+    def add(label, detail, kind):
+        if label and label.startswith(prefix) and label not in labels:
+            labels[label] = _completion_item(
+                label,
+                kind,
+                detail=detail,
+                insert_text=label,
+                sort="3-module",
+            )
+
+    for imp in _iter_import_nodes(parsed):
+        module = (getattr(imp, "module", None) or "").replace("/", ".")
+        if module.startswith("@"):
+            module = module[1:]
+        if base and module.startswith(base + "."):
+            add(module[len(base) + 1 :].split(".")[0], "imported module", lsp.CompletionItemKind.Module)
+        elif not base and module:
+            add(module.split(".")[0], "imported module", lsp.CompletionItemKind.Module)
+
+    filepath = _uri_to_path(uri) if uri else None
+    file_dir = os.path.dirname(filepath) if filepath else None
+    workspace_root = _uri_to_path(ls.workspace_root) if ls is not None else None
+    roots = cpm_module_roots(workspace_root, file_dir)
+    for root in roots:
+        for package, version_dir in iter_cpm_version_dirs(root):
+            module = package.replace("/", ".")
+            if base and module.startswith(base + "."):
+                add(module[len(base) + 1 :].split(".")[0], "CPM package", lsp.CompletionItemKind.Module)
+            elif not base and module:
+                add(module.split(".")[0], "CPM package", lsp.CompletionItemKind.Module)
+            elif base and module == base and os.path.isdir(version_dir):
+                try:
+                    entries = sorted(os.listdir(version_dir))
+                except OSError:
+                    entries = []
+                for entry in entries:
+                    if entry.endswith(".cpy"):
+                        add(entry[:-4], "CPM submodule", lsp.CompletionItemKind.File)
+                    elif os.path.isdir(os.path.join(version_dir, entry)):
+                        add(entry, "CPM submodule", lsp.CompletionItemKind.Module)
+
+    return list(labels.values())
+
+
+def _member_items_for_symbol(analyzer, sym, prefix):
+    """Render fields/methods/properties/enum members for a resolved symbol."""
+    items = []
+    seen = set()
+    type_name = getattr(sym, "type", None)
+    node = getattr(sym, "node", None)
+
+    base_type = type_name or ""
+    while base_type.endswith("*") or base_type.endswith("[]"):
+        base_type = base_type[:-2] if base_type.endswith("[]") else base_type[:-1]
+    base_type = base_type.strip("@")
+
+    is_enum = getattr(sym, "kind", None) == "enum"
+    tsym = analyzer.globals.lookup(base_type) if analyzer is not None and base_type else None
+    if tsym is not None and tsym.kind == "enum":
+        is_enum = True
+        node = getattr(tsym, "node", None) or node
+
+    if is_enum and base_type:
+        enum_prefix = f"{base_type}."
+        for name, member in (analyzer.globals.symbols.items() if analyzer else []):
+            if not name.startswith(enum_prefix):
+                continue
+            label = name[len(enum_prefix) :]
+            if label.startswith(prefix) and label not in seen:
+                seen.add(label)
+                items.append(
+                    _completion_item(
+                        label,
+                        lsp.CompletionItemKind.EnumMember,
+                        detail=f"enum member = {getattr(member, 'const_value', None)}",
+                        insert_text=label,
+                        sort="1-field",
+                    )
+                )
+        if items:
+            return items
+
+    if node is None and tsym is not None:
+        node = getattr(tsym, "node", None)
+    if node is None and type_name:
+        node = _type_node_for(analyzer, type_name)
+    if node is None:
+        return items
+
+    for name, kind, type_text, obj in _class_member_nodes(analyzer, node):
+        if not name.startswith(prefix) or name in seen:
+            continue
+        seen.add(name)
+        if kind == "method":
+            params = getattr(obj, "params", None) or {}
+            const_params = getattr(obj, "const_params", None)
+            detail = f"({_fmt_params(params, const_params)}) -> {type_text}"
+            items.append(
+                _completion_item(
+                    name,
+                    lsp.CompletionItemKind.Method,
+                    detail=detail,
+                    insert_text=_call_snippet(name, params, const_params or ()),
+                    snippet=True,
+                    sort="2-method",
+                )
+            )
+        elif kind == "property":
+            items.append(
+                _completion_item(
+                    name,
+                    lsp.CompletionItemKind.Property,
+                    detail=f"property: {type_text}",
+                    insert_text=name,
+                    sort="1-field",
+                )
+            )
+        else:
+            items.append(
+                _completion_item(
+                    name,
+                    lsp.CompletionItemKind.Field,
+                    detail=f"field: {type_text}",
+                    insert_text=name,
+                    sort="1-field",
+                )
+            )
+    return items
+
+
+def _chain_member_completions(analyzer, parsed, chain, prefix, cursor_line, ls, uri):
+    """Resolve ``a.b.c`` / ``a.b().c`` receivers and offer member completions."""
+    if not chain:
+        return []
+
+    def resolve_root(name):
+        called = name.endswith("()")
+        plain = name[:-2] if called else name
+        sym = _resolve_completion_symbol(analyzer, parsed, plain, cursor_line)
+        if sym is None or not called:
+            return sym
+        rettype = getattr(sym, "type", None) or getattr(
+            getattr(sym, "node", None), "rettype", None
+        )
+        return SimpleNamespace(
+            kind="variable", type=rettype, node=_type_node_for(analyzer, rettype)
+        )
+
+    sym = resolve_root(chain[0])
+    if sym is None:
+        return _package_member_completions(chain, prefix, ls, uri, parsed)
+
+    for part in chain[1:]:
+        node = getattr(sym, "node", None) or _type_node_for(
+            analyzer, getattr(sym, "type", None)
+        )
+        if node is None:
+            return _package_member_completions(chain, prefix, ls, uri, parsed)
+        called = part.endswith("()")
+        plain = part[:-2] if called else part
+        found = None
+        for name, kind, type_text, obj in _class_member_nodes(analyzer, node):
+            if name != plain:
+                continue
+            if kind == "method":
+                type_text = getattr(obj, "rettype", None) or type_text
+            if called:
+                found = SimpleNamespace(
+                    kind="variable",
+                    type=type_text,
+                    node=_type_node_for(analyzer, type_text),
+                )
+            else:
+                # Fields/properties have no useful declaration node; resolve the
+                # declared type so the next chain segment sees the right class.
+                member_node = getattr(obj, "node", None)
+                if kind in ("field", "property") or member_node is None:
+                    member_node = _type_node_for(analyzer, type_text)
+                found = SimpleNamespace(kind=kind, type=type_text, node=member_node)
+            break
+        if found is None:
+            owner = getattr(node, "name", None) or chain[-2]
+            member = (
+                analyzer.globals.lookup(f"{owner}.{plain}")
+                if analyzer is not None
+                else None
+            )
+            if member is not None:
+                found = member
+        if found is None:
+            return []
+        sym = found
+
+    return _member_items_for_symbol(analyzer, sym, prefix)
+
+
 _IMPORT_EXTENSIONS = (".cpy", ".c", ".cc", ".h", ".hpp", ".cpp")
 
 
@@ -930,6 +1347,95 @@ def _import_string_context(source, line, col):
     end = len(text) if close == -1 else content_end
     partial = text[open_col + 1 : min(col, end)]
     return partial, open_col, end
+
+
+_IMPORT_MODULE_RE = re.compile(r"^\s*import\s+([A-Za-z_@][\w@/.\-]*)$")
+
+
+def _import_module_context(source, line, col):
+    """Return ``(partial, start_col)`` for a bare/canonical `import ...`."""
+    prefix = _line_prefix_before(source, line, col)
+    if '"' in prefix or "'" in prefix:
+        return None
+    m = _IMPORT_MODULE_RE.match(prefix)
+    if m is None:
+        return None
+    partial = m.group(1)
+    return partial, len(prefix) - len(partial)
+
+
+def _completion_with_edit(item, line, start, end, new_text):
+    item.text_edit = lsp.TextEdit(
+        range=lsp.Range(
+            start=lsp.Position(line=line, character=start),
+            end=lsp.Position(line=line, character=end),
+        ),
+        new_text=new_text,
+    )
+    return item
+
+
+def _import_module_completions(partial, line, start, end, ls, uri, parsed):
+    """Completions for `import std`, `import @std/math`, `import std.random.pr`."""
+    items = []
+    seen = set()
+
+    def add(value, detail, kind):
+        if value in seen or not value.startswith(partial):
+            return
+        seen.add(value)
+        item = _completion_item(
+            value,
+            kind,
+            detail=detail,
+            insert_text=value,
+            sort="3-module",
+        )
+        items.append(_completion_with_edit(item, line, start, end, value))
+
+    if "/" not in partial and "." not in partial and "@" not in partial:
+        for lib in sorted(_BUILTIN_LIB_HEADERS):
+            add(lib, "C library", lsp.CompletionItemKind.Module)
+
+    filepath = _uri_to_path(uri) if uri else None
+    file_dir = os.path.dirname(filepath) if filepath else None
+    workspace_root = _uri_to_path(ls.workspace_root) if ls is not None else None
+    for root in cpm_module_roots(workspace_root, file_dir):
+        for package, version_dir in iter_cpm_version_dirs(root):
+            plain = package[1:] if package.startswith("@") else package
+            canonical = f"@{plain}" if "/" in plain else plain
+            dotted = plain.replace("/", ".")
+            add(canonical, "CPM package", lsp.CompletionItemKind.Module)
+            add(dotted, "CPM package", lsp.CompletionItemKind.Module)
+            if partial.startswith(f"{dotted}.") or partial.startswith(f"{canonical}/"):
+                try:
+                    entries = sorted(os.listdir(version_dir))
+                except OSError:
+                    entries = []
+                for entry in entries:
+                    if entry.endswith(".cpy"):
+                        stem = entry[:-4]
+                        add(f"{dotted}.{stem}", "CPM submodule", lsp.CompletionItemKind.File)
+                        add(f"{canonical}/{stem}", "CPM submodule", lsp.CompletionItemKind.File)
+                    elif os.path.isdir(os.path.join(version_dir, entry)):
+                        add(f"{dotted}.{entry}", "CPM submodule", lsp.CompletionItemKind.Module)
+                        add(f"{canonical}/{entry}", "CPM submodule", lsp.CompletionItemKind.Module)
+
+    for imp in _iter_import_nodes(parsed):
+        module = getattr(imp, "module", None)
+        if module:
+            plain = module[1:] if module.startswith("@") else module
+            add(plain, "imported module", lsp.CompletionItemKind.Module)
+            if "/" in plain:
+                add(f"@{plain}", "imported module", lsp.CompletionItemKind.Module)
+            add(plain.replace("/", "."), "imported module", lsp.CompletionItemKind.Module)
+
+    if file_dir and os.path.isdir(file_dir):
+        for entry in sorted(os.listdir(file_dir)):
+            if entry.endswith(".cpy") and entry.startswith(partial):
+                add(entry[:-4], "local module", lsp.CompletionItemKind.File)
+
+    return items
 
 
 def _import_dir_completions(partial, file_dir, workspace_root):
@@ -1058,10 +1564,73 @@ def _is_new_context(tokens, line, col):
     return False
 
 
+def _type_context(source, line, col):
+    """True when the cursor is completing a type name rather than a value."""
+    prefix = _line_prefix_before(source, line, col)
+    return bool(
+        re.search(r"\bnew\s+[A-Za-z_]\w*$", prefix)
+        or re.search(r"\bas\s+[A-Za-z_]\w*$", prefix)
+        or re.search(r"\bsizeof\s*\(\s*[A-Za-z_]\w*$", prefix)
+        or re.search(r"->\s*[A-Za-z_]\w*$", prefix)
+        or re.search(r":\s*[A-Za-z_]\w*$", prefix)
+        or re.search(r"<\s*[A-Za-z_]\w*$", prefix)
+    )
+
+
+def _repair_source_for_completion(source, line, col):
+    """Make a parseable copy of an in-progress line for completion.
+
+    The editor asks for completions after every keystroke, so the document is
+    often temporarily invalid (``obj.``, ``obj.fi``, ``new Th``, ``import
+    std.``).  The analyzer cannot resolve symbols from a parse failure, so
+    replace just the token under the cursor with a placeholder and analyze
+    that copy.  The original source is still used to compute the prefix and
+    context, so the placeholder never leaks into completion labels.
+    """
+    lines = source.splitlines(keepends=True)
+    if not (0 <= line < len(lines)):
+        return source
+    if _import_string_context(source, line, col) is not None:
+        # Quoted import paths are handled from the raw line; no analysis needed.
+        return source
+    raw = lines[line]
+    newline = "\n" if raw.endswith("\n") else ""
+    body = raw[:-1] if newline else raw
+    prefix = body[: max(0, col)]
+    suffix = body[max(0, col) :]
+
+    if (bare_import := _import_module_context(source, line, col)) is not None:
+        _partial, start = bare_import
+        new_prefix = f"{prefix[:start]}std"
+    elif _member_chain_before(source, line, col) is not None:
+        if re.search(r"\.\s*$", prefix):
+            new_prefix = f"{prefix}value"
+        else:
+            m = _last_ident_match(prefix)
+            new_prefix = f"{prefix[: m.start()]}value" if m else prefix
+    elif _type_context(source, line, col):
+        m = _last_ident_match(prefix)
+        new_prefix = f"{prefix[: m.start()]}int" if m else f"{prefix}int"
+    else:
+        m = _last_ident_match(prefix)
+        if m is None:
+            return source
+        new_prefix = f"{prefix[: m.start()]}value"
+
+    lines[line] = f"{new_prefix}{suffix}{newline}"
+    return "".join(lines)
+
+
 class CpyLanguageServer(LanguageServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.workspace_root: str | None = None
+        # Analysis cache and single-flight state. Handlers are thread-marked, so
+        # several requests can arrive while a document is being analyzed; the
+        # generation counter discards a worker whose source is already stale.
+        self._analysis_cache = {}
+        self._pending_analysis = {}
+        self._analysis_generation = {}
 
     def get_workspace_root(self) -> str | None:
         return self.workspace_root
@@ -1119,6 +1688,9 @@ def did_close(ls: CpyLanguageServer, params: lsp.DidCloseTextDocumentParams):
         cache = getattr(ls, "_analysis_cache", None)
         if cache is not None:
             cache.pop(uri, None)
+        generations = getattr(ls, "_analysis_generation", None)
+        if generations is not None:
+            generations[uri] = generations.get(uri, 0) + 1
     except Exception:
         logger.error(f"did_close error:\n{traceback.format_exc()}")
 
@@ -1132,27 +1704,53 @@ def did_close(ls: CpyLanguageServer, params: lsp.DidCloseTextDocumentParams):
 )
 @server.thread()
 def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
+    ranked = {}
+    uri = None
+    t0 = time.time()
+
+    def add(name, item, rank):
+        prior = ranked.get(name)
+        if prior is None or rank < prior[0]:
+            ranked[name] = (rank, item)
+
+    def finish(label="items"):
+        items = [item for _rank, item in sorted(ranked.values(), key=lambda p: (p[0], p[1].label))]
+        elapsed = time.time() - t0
+        name = os.path.basename(_uri_to_path(uri)) if uri else "?"
+        logger.info(f"[completion] {name}: {len(items)} {label} in {elapsed * 1000:.0f}ms")
+        return lsp.CompletionList(is_incomplete=False, items=items)
+
     try:
         uri = params.text_document.uri
         line = params.position.line
         col = params.position.character
-        t0 = time.time()
-        source, tokens, parsed, analyzer, _, _ = _get_bundle(ls, uri)
-        tok = _find_token_at(tokens, line, col)
-        prefix = (tok.value or "") if tok else ""
-
+        source, tokens, parsed, analyzer, diagnostics, error = _get_bundle(ls, uri)
+        if (not parsed or analyzer is None) and (error or diagnostics):
+            # A half-typed expression usually leaves the document unparsable.
+            # Analyze a repaired copy so completion still sees live symbols.
+            repaired = _repair_source_for_completion(source, line, col)
+            if repaired != source:
+                filepath = _uri_to_path(uri)
+                workspace_root = (
+                    _uri_to_path(ls.workspace_root) if ls.workspace_root else None
+                )
+                (
+                    _repaired_source,
+                    repaired_tokens,
+                    parsed,
+                    analyzer,
+                    _,
+                    _,
+                ) = _analyze_bundle(
+                    repaired, filepath=filepath, workspace_root=workspace_root
+                )
+                tokens = repaired_tokens
+        prefix = _word_prefix_before(source, line, col)
         scope = _scope_at(parsed, line + 1)
         in_loop = _inside_loop(parsed, line + 1)
+        want_types = _type_context(source, line, col)
 
-        # Contextual: are we completing the argument of a `new T` / `new Foo`?
-        new_context = _is_new_context(tokens, line, col)
-
-        items = []
-        seen = set()
-
-        # Import path completions: cursor is inside the quoted module path of
-        # `import "..."` — offer files/dirs/libraries without needing a valid
-        # (closed) string, since the file isn't parsed until lexing succeeds.
+        # Quoted import paths work even while the string is still open.
         import_ctx = _import_string_context(source, line, col)
         if import_ctx is not None:
             partial, _start, _end = import_ctx
@@ -1161,211 +1759,229 @@ def completions(ls: CpyLanguageServer, params: lsp.CompletionParams):
             workspace_root = (
                 _uri_to_path(ls.workspace_root) if ls.workspace_root else None
             )
-            items = _import_dir_completions(partial, file_dir, workspace_root)
-            elapsed = time.time() - t0
-            logger.info(
-                f"[completion] {os.path.basename(_uri_to_path(uri))} @L{line + 1}:{col}: "
-                f"{len(items)} import-path item(s) for `{partial!r}` in {elapsed * 1000:.0f}ms"
-            )
-            return lsp.CompletionList(is_incomplete=False, items=items)
-
-        base = _dot_context(tokens, line, col)
-        if base is not None:
-            items = _member_completions(analyzer, parsed, base, prefix, line + 1)
-            elapsed = time.time() - t0
-            logger.info(
-                f"[completion] {os.path.basename(_uri_to_path(uri))} @L{line + 1}:{col}: "
-                f"{len(items)} member item(s) for `{base}.` in {elapsed * 1000:.0f}ms"
-            )
-            return lsp.CompletionList(is_incomplete=False, items=items)
-
-        for kw in _KEYWORDS:
-            if kw.startswith(prefix):
-                if _SNIPPETS.get(kw) and _keyword_on_line(tokens, line, col, kw):
-                    continue
-                if kw in _TOPLEVEL_KEYWORDS and scope != "top":
-                    continue
-                if kw in _LOOP_ONLY_KEYWORDS and not in_loop:
-                    continue
-                snippet = _SNIPPETS.get(kw)
-                items.append(
-                    lsp.CompletionItem(
-                        label=kw,
-                        kind=lsp.CompletionItemKind.Keyword,
-                        insert_text_format=lsp.InsertTextFormat.Snippet
-                        if snippet
-                        else lsp.InsertTextFormat.PlainText,
-                        insert_text=snippet or kw,
+            ranked.update(
+                {
+                    item.label: (0, item)
+                    for item in _import_dir_completions(
+                        partial, file_dir, workspace_root
                     )
-                )
-                seen.add(kw)
+                }
+            )
+            return finish("import-path item(s)")
 
+        bare_import = _import_module_context(source, line, col)
+        if bare_import is not None:
+            partial, start = bare_import
+            for item in _import_module_completions(
+                partial, line, start, col, ls, uri, parsed
+            ):
+                ranked[item.label] = (0, item)
+            return finish("import item(s)")
+
+        chain_ctx = _member_chain_before(source, line, col)
+        if chain_ctx is not None:
+            chain, member_prefix = chain_ctx
+            for item in _chain_member_completions(
+                analyzer, parsed, chain, member_prefix, line + 1, ls, uri
+            ):
+                ranked[item.label] = (0, item)
+            return finish(f"member item(s) for `{'.'.join(chain)}.`")
+
+        # Types are always available (new/as/sizeof/annotations/generics) and
+        # get a low-priority slot in ordinary expression positions.
+        type_names = {}
         for t in _TYPES:
-            if t.startswith(prefix) and t not in seen:
-                items.append(
-                    lsp.CompletionItem(
-                        label=t,
-                        kind=lsp.CompletionItemKind.TypeParameter,
-                        detail=_TYPE_DESC.get(t, ""),
-                        insert_text=t,
-                    )
-                )
-                seen.add(t)
-
-        for name, sig in _BUILTIN_FUNCS.items():
-            if name.startswith(prefix) and name not in seen:
-                items.append(
-                    lsp.CompletionItem(
-                        label=name,
-                        kind=lsp.CompletionItemKind.Function,
-                        detail=sig,
-                        insert_text=f"{name}(",
-                    )
-                )
-                seen.add(name)
-
+            type_names[t] = _TYPE_DESC.get(t, "")
         for node in parsed:
-            if (
-                isinstance(node, FuncDef)
-                and node.name.startswith(prefix)
-                and node.name not in seen
-            ):
-                if not new_context:
-                    sig = _fmt_params(node.params, getattr(node, "const_params", None))
-                    items.append(
-                        lsp.CompletionItem(
-                            label=node.name,
-                            kind=lsp.CompletionItemKind.Function,
-                            detail=f"({sig}) -> {node.rettype or 'void'}",
-                            insert_text=f"{node.name}(",
-                        )
-                    )
-                    seen.add(node.name)
-            elif (
-                isinstance(node, StructDef)
-                and node.name.startswith(prefix)
-                and node.name not in seen
-            ):
-                items.append(
-                    lsp.CompletionItem(
-                        label=node.name,
-                        kind=lsp.CompletionItemKind.Class,
-                        detail="struct",
-                    )
-                )
-                seen.add(node.name)
-            elif (
-                isinstance(node, ClassDef)
-                and node.name.startswith(prefix)
-                and node.name not in seen
-            ):
-                items.append(
-                    lsp.CompletionItem(
-                        label=node.name,
-                        kind=lsp.CompletionItemKind.Class,
-                        detail=f"class{(' extends ' + node.base) if node.base else ''}",
-                    )
-                )
-                seen.add(node.name)
-            elif (
-                isinstance(node, EnumDef)
-                and node.name.startswith(prefix)
-                and node.name not in seen
-            ):
-                items.append(
-                    lsp.CompletionItem(
-                        label=node.name,
-                        kind=lsp.CompletionItemKind.Enum,
-                        detail="enum",
-                    )
-                )
-                seen.add(node.name)
-
-        if analyzer:
+            if isinstance(node, StructDef):
+                type_names[node.name] = "struct"
+            elif isinstance(node, ClassDef):
+                type_names[node.name] = f"class{(' extends ' + node.base) if node.base else ''}"
+            elif isinstance(node, EnumDef):
+                type_names[node.name] = "enum"
+            elif isinstance(node, FuncDef) and getattr(node, "generic_params", None):
+                for gp in node.generic_params:
+                    type_names[gp] = "type parameter"
+        if analyzer is not None:
             for name, sym in analyzer.globals.symbols.items():
                 if "." in name:
                     continue
-                if name.startswith(prefix) and name not in seen:
-                    if sym.kind in ("struct", "class", "enum"):
-                        kind = {
-                            "struct": lsp.CompletionItemKind.Class,
-                            "class": lsp.CompletionItemKind.Class,
-                            "enum": lsp.CompletionItemKind.Enum,
-                        }[sym.kind]
-                        items.append(
-                            lsp.CompletionItem(label=name, kind=kind, detail=sym.kind)
-                        )
-                        seen.add(name)
-                        continue
-                    if new_context:
-                        continue
-                    if sym.kind == "const":
-                        kind = lsp.CompletionItemKind.Constant
-                        detail = f"const {sym.type} = {_const_value_text(sym)}"
-                    elif sym.kind == "function":
-                        kind = lsp.CompletionItemKind.Function
-                        detail = f"-> {sym.type or ''}"
-                    else:
-                        kind = lsp.CompletionItemKind.Variable
-                        detail = sym.type or sym.kind
-                    items.append(
-                        lsp.CompletionItem(
-                            label=name,
-                            kind=kind,
-                            detail=detail,
-                        )
-                    )
-                    seen.add(name)
-
-        # Symbols re-exported by imports (functions/types from imported files
-        # and installed CPM packages).
-        for name, (kind, _detail) in _collect_imported_symbols(parsed).items():
-            if name.startswith(prefix) and name not in seen:
-                items.append(
-                    lsp.CompletionItem(
-                        label=name,
-                        kind=lsp.CompletionItemKind.Function
-                        if kind == "function"
-                        else lsp.CompletionItemKind.Class,
-                        detail="imported",
-                    )
+                if sym.kind in ("struct", "class", "enum", "protocol", "type_alias"):
+                    type_names.setdefault(name, sym.kind)
+        for name, detail in type_names.items():
+            if name.startswith(prefix):
+                add(
+                    name,
+                    _completion_item(
+                        name,
+                        lsp.CompletionItemKind.TypeParameter,
+                        detail=detail,
+                        insert_text=name,
+                        sort="7-type",
+                    ),
+                    70,
                 )
-                seen.add(name)
+
+        if want_types:
+            return finish("type item(s)")
 
         func = _find_containing_function(parsed, line + 1)
         if func is not None:
             for p, pt in (func.params or {}).items():
-                if p == "this":
+                if p == "this" or not p.startswith(prefix):
                     continue
-                if p.startswith(prefix) and p not in seen:
-                    items.append(
-                        lsp.CompletionItem(
-                            label=p,
-                            kind=lsp.CompletionItemKind.Variable,
-                            detail=f"parameter: {pt}",
-                        )
-                    )
-                    seen.add(p)
+                add(
+                    p,
+                    _completion_item(
+                        p,
+                        lsp.CompletionItemKind.Variable,
+                        detail=f"parameter: {pt}",
+                        sort="0-local",
+                    ),
+                    0,
+                )
             for lname, ltype in _collect_locals(func, line + 1).items():
-                if lname.startswith(prefix) and lname not in seen:
-                    items.append(
-                        lsp.CompletionItem(
-                            label=lname,
-                            kind=lsp.CompletionItemKind.Variable,
+                if lname.startswith(prefix):
+                    add(
+                        lname,
+                        _completion_item(
+                            lname,
+                            lsp.CompletionItemKind.Variable,
                             detail=ltype or "int",
-                        )
+                            sort="0-local",
+                        ),
+                        0,
                     )
-                    seen.add(lname)
 
-        elapsed = time.time() - t0
-        logger.info(
-            f"[completion] {os.path.basename(_uri_to_path(uri))} @L{line + 1}:{col}: "
-            f"{len(items)} items in {elapsed * 1000:.0f}ms"
-        )
-        return lsp.CompletionList(is_incomplete=False, items=items)
+        cls = _find_containing_class(parsed, line + 1)
+        if cls is not None:
+            for name, kind, type_text, _obj in _class_member_nodes(analyzer, cls):
+                if not name.startswith(prefix) or name == "this":
+                    continue
+                item_kind = {
+                    "field": lsp.CompletionItemKind.Field,
+                    "method": lsp.CompletionItemKind.Method,
+                    "property": lsp.CompletionItemKind.Property,
+                }.get(kind, lsp.CompletionItemKind.Field)
+                add(
+                    name,
+                    _completion_item(
+                        name,
+                        item_kind,
+                        detail=f"{kind}: {type_text}",
+                        insert_text=name,
+                        sort="1-member",
+                    ),
+                    10,
+                )
+
+        for node in parsed:
+            if not isinstance(node, FuncDef) or not node.name.startswith(prefix):
+                continue
+            params = getattr(node, "params", None) or {}
+            const_params = getattr(node, "const_params", None) or ()
+            add(
+                node.name,
+                _completion_item(
+                    node.name,
+                    lsp.CompletionItemKind.Function,
+                    detail=f"({_fmt_params(params, const_params)}) -> {node.rettype or 'void'}",
+                    insert_text=_call_snippet(node.name, params, const_params),
+                    snippet=True,
+                    sort="2-function",
+                ),
+                20,
+            )
+
+        if analyzer is not None:
+            for name, sym in analyzer.globals.symbols.items():
+                if "." in name or not name.startswith(prefix):
+                    continue
+                if sym.kind in ("struct", "class", "enum", "protocol", "type_alias"):
+                    continue
+                if sym.kind == "const":
+                    kind = lsp.CompletionItemKind.Constant
+                    detail = f"const {sym.type} = {_const_value_text(sym)}"
+                    rank, sort = 30, "3-global"
+                elif sym.kind in ("function", "builtin_func"):
+                    kind = lsp.CompletionItemKind.Function
+                    snode = getattr(sym, "node", None)
+                    params = getattr(snode, "params", None) or {}
+                    detail = f"-> {sym.type or ''}"
+                    rank, sort = 35, "3-global"
+                else:
+                    kind = lsp.CompletionItemKind.Variable
+                    detail = sym.type or sym.kind
+                    rank, sort = 30, "3-global"
+                item = _completion_item(
+                    name, kind, detail=detail, sort=sort
+                )
+                if rank == 35:
+                    item.insert_text = _call_snippet(name, params)
+                    item.insert_text_format = lsp.InsertTextFormat.Snippet
+                add(name, item, rank)
+
+        for name, (kind, detail, params) in _collect_imported_symbols(parsed).items():
+            if not name.startswith(prefix):
+                continue
+            item = _completion_item(
+                name,
+                lsp.CompletionItemKind.Function
+                if kind == "function"
+                else lsp.CompletionItemKind.Class,
+                detail=f"{detail} (imported)",
+                sort="4-imported",
+            )
+            if kind == "function" and params:
+                item.insert_text = _call_snippet(name, params)
+                item.insert_text_format = lsp.InsertTextFormat.Snippet
+            add(name, item, 40)
+
+        for name, sig in _BUILTIN_FUNCS.items():
+            if not name.startswith(prefix):
+                continue
+            params = _BUILTIN_FUNC_PARAMS.get(name, {})
+            add(
+                name,
+                _completion_item(
+                    name,
+                    lsp.CompletionItemKind.Function,
+                    detail=sig,
+                    insert_text=_call_snippet(name, params),
+                    snippet=True,
+                    sort="5-builtin",
+                ),
+                50,
+            )
+
+        for kw in sorted(set(_KEYWORDS) | set(get_keywords())):
+            if not kw.startswith(prefix):
+                continue
+            if _SNIPPETS.get(kw) and _keyword_on_line(tokens, line, col, kw):
+                continue
+            if kw in _TOPLEVEL_KEYWORDS and scope != "top":
+                continue
+            if kw in _LOOP_ONLY_KEYWORDS and not in_loop:
+                continue
+            snippet = _SNIPPETS.get(kw)
+            add(
+                kw,
+                _completion_item(
+                    kw,
+                    lsp.CompletionItemKind.Keyword,
+                    detail=_KEYWORD_DESC.get(kw, ""),
+                    insert_text=snippet or kw,
+                    snippet=bool(snippet),
+                    documentation=_KEYWORD_DESC.get(kw),
+                    sort="9-keyword",
+                ),
+                90,
+            )
+
+        return finish()
     except Exception:
         logger.error(f"completions error:\n{traceback.format_exc()}")
-        return lsp.CompletionList(is_incomplete=False, items=[])
+        return finish("items before error")
 
 
 @server.feature(lsp.TEXT_DOCUMENT_HOVER)
@@ -1431,8 +2047,7 @@ def hover(ls: CpyLanguageServer, params: lsp.HoverParams):
                         content = f"**`{node.name}({sig}) → {ret}`**"
                         if node.decorators:
                             decs = ", ".join(
-                                f"@{d}" if isinstance(d, str) else f"@{d}"
-                                for d in node.decorators
+                                f"@{_decorator_text(d)}" for d in node.decorators
                             )
                             content += f"  \n*decorators: {decs}*"
                         if node.visibility:
@@ -2309,9 +2924,8 @@ def did_save(ls: CpyLanguageServer, params: lsp.DidSaveTextDocumentParams):
         for uri, bundle in list(cache.items()):
             if uri == params.text_document.uri:
                 continue
-            analyzer = bundle[3]
             deps = set()
-            for imp in getattr(analyzer, "_imports", None) or []:
+            for imp in _iter_import_nodes(bundle[2]):
                 deps.add(getattr(imp, "src_file", None))
                 deps.add(getattr(imp, "_source_file", None))
             if saved in deps:

@@ -128,14 +128,45 @@ def test_integer_pointer_arithmetic():
     )
 
 
-def test_typed_pointer_arithmetic_scales_by_element_size():
+def test_typed_pointer_arithmetic_uses_gep():
     ir = compile_program(
         "public helper(p: int*) -> int*:\n"
         "    return p + 1\n"
+        "public helper_fp(p: double*, n: int64) -> double*:\n"
+        "    return p + n\n"
+        "public helper_back(p: int*, n: int64) -> int*:\n"
+        "    return p - n\n"
+        "public diff(a: int*, b: int*) -> int:\n"
+        "    return a - b\n"
     )
-    # int is i32, so `p + 1` must advance the address by 4 bytes, not 1.
-    assert "mul i64" in ir
-    assert ", 4" in ir
+
+    def fn_body(name):
+        marker = f'@"{name}"('
+        start = ir.index(marker)
+        start = ir.rfind("define ", 0, start)
+        end = ir.index("\n}", start) + 2
+        return ir[start:end]
+
+    # GEP applies the element-size scaling itself, so there is no raw-address
+    # round trip and no manual `mul` in the emitted IR.
+    for name, elem in (("helper", "i32"), ("helper_fp", "double")):
+        body = fn_body(name)
+        assert f"getelementptr {elem}" in body
+        assert "ptrtoint" not in body
+        assert "inttoptr" not in body
+        assert "mul i64" not in body
+
+    back = fn_body("helper_back")
+    assert "getelementptr i32" in back
+    assert "sub i64 0" in back
+    assert "inttoptr" not in back
+
+    # Only pointer differences still need raw addresses and an element-size
+    # division; int is i32, so the divisor must be 4.
+    diff = fn_body("diff")
+    assert "ptrtoint" in diff
+    assert "sdiv i64" in diff
+    assert ", 4" in diff
 
 
 def test_invalid_pointer_arithmetic_is_rejected():
@@ -200,6 +231,28 @@ def _write_cpm_package(root, package_path, name, version, source=None):
     if source is not None:
         with open(os.path.join(version_dir, f"{name}.cpy"), "w") as f:
             f.write(source)
+
+
+def _lsp_server(source):
+    try:
+        from cpyte import lsp_server
+    except ImportError:  # pragma: no cover - pygls is an optional dependency
+        return None, None
+    ls = SimpleNamespace(
+        workspace_root=None,
+        workspace=SimpleNamespace(
+            get_text_document=lambda _uri: SimpleNamespace(source=source)
+        ),
+    )
+    return lsp_server, ls
+
+
+def _complete(lsp_server, ls, line, col, uri="file:///tmp/completion.cpy"):
+    params = SimpleNamespace(
+        text_document=SimpleNamespace(uri=uri),
+        position=SimpleNamespace(line=line, character=col),
+    )
+    return lsp_server.completions(ls, params).items
 
 
 def test_cpm_module_roots_include_global_and_workspace():
@@ -347,6 +400,199 @@ def test_lsp_import_completions_include_global_cpm_packages():
                 for item in lsp_server._import_dir_completions("@std/", None, None)
             ]
         assert any("lspdemo" in label for label in labels)
+
+
+def test_semantic_lints_see_reads_in_compound_contexts():
+    lsp_server, _ = _lsp_server("")
+    if lsp_server is None:
+        return
+    source = '''class Error:
+    int code
+
+def get(x: int) -> int:
+    return x
+
+def f(n: int) -> int:
+    int limit = get(n)
+    int total = 0
+    for i in range(limit):
+        total = total + i
+    switch total:
+        case 0:
+            total = 1
+        default:
+            total = 2
+    int[2] values
+    int index = 1
+    values[index] = total
+    try:
+        total = total + values[index]
+    except Error:
+        total = 0
+    return total
+'''
+    _tokens, parsed, analyzer, error = lsp_server._analyze(source)
+    assert error is None
+    assert parsed
+    assert analyzer is not None
+    assert [d.message for d in analyzer.reporter.diagnostics if d.code == "W1001"] == []
+
+
+def test_w1001_diagnostic_points_at_name_and_has_rename_quickfix():
+    lsp_server, ls = _lsp_server("")
+    if lsp_server is None:
+        return
+    source = "def f() -> int:\n    int unused = 1\n    return 0\n"
+    uri = "file:///tmp/w1001.cpy"
+    ls.workspace.get_text_document = lambda _uri: SimpleNamespace(source=source)
+    diagnostics = lsp_server._analyze_bundle(source)[4]
+    warning = next(d for d in diagnostics if d.code == "W1001")
+    assert (warning.range.start.line, warning.range.start.character) == (1, 8)
+    assert (warning.range.end.line, warning.range.end.character) == (1, 14)
+    assert "Help: read it, remove it" in warning.message
+    assert "rename it to `_unused`" in warning.message
+
+    params = SimpleNamespace(
+        text_document=SimpleNamespace(uri=uri), range=warning.range
+    )
+    actions = lsp_server.code_action(ls, params) or []
+    rename = next(a for a in actions if a.title == "Rename to `_unused`")
+    edit = rename.edit.changes[uri][0]
+    assert (edit.range.start.character, edit.range.end.character) == (8, 14)
+    assert edit.new_text == "_unused"
+
+
+def test_undeclared_call_suggests_close_function_name():
+    source = '''def total() -> int:
+    return 7
+
+def main() -> int:
+    return totl()
+'''
+    try:
+        parse_and_analyze(source, enable_extensions=False)
+    except CpyteCompileError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("undeclared call was not rejected")
+    assert "did you mean `total`?" in message
+    assert "call target must be a function defined in scope" in message
+
+
+def test_lsp_completion_prefix_at_cursor_and_call_snippet():
+    lsp_server, ls = _lsp_server("")
+    if lsp_server is None:
+        return
+    source = '''class Thing:
+    int value
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> int:
+    Thing* p = new Th
+    int x = ad
+    return x
+'''
+    ls.workspace.get_text_document = lambda _uri: SimpleNamespace(source=source)
+    type_items = _complete(lsp_server, ls, 7, len("    Thing* p = new Th"))
+    assert [item.label for item in type_items] == ["Thing"]
+
+    expression_items = _complete(lsp_server, ls, 8, len("    int x = ad"))
+    add = next(item for item in expression_items if item.label == "add")
+    assert add.insert_text == "add(${1:a},${2:b})"
+
+
+def test_lsp_completion_resolves_member_and_call_chains():
+    lsp_server, _ = _lsp_server("")
+    if lsp_server is None:
+        return
+    template = '''class Inner:
+    int value
+    def show(self: Inner*) -> int:
+        return self.value
+
+class Outer:
+    Inner* inner
+    def get(self: Outer*) -> Inner*:
+        return self.inner
+
+def make() -> Outer*:
+    return new Outer()
+
+def main() -> int:
+    Outer* o = new Outer()
+    {expression}
+    return 0
+'''
+
+    def items_for(expression):
+        source = template.format(expression=expression)
+        server, ls = _lsp_server(source)
+        return _complete(server, ls, 15, len("    " + expression))
+
+    field_items = items_for("o.inner.va")
+    value = next(item for item in field_items if item.label == "value")
+    assert value.detail == "field: int"
+
+    call_items = items_for("o.get().")
+    by_label = {item.label: item for item in call_items}
+    assert set(by_label) == {"value", "show"}
+    assert by_label["show"].insert_text == "show()"
+
+    function_items = items_for("make().ge")
+    get = next(item for item in function_items if item.label == "get")
+    assert get.insert_text == "get()"
+
+
+def test_lsp_bare_and_quoted_import_completions():
+    lsp_server, _ = _lsp_server("")
+    if lsp_server is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "modules")
+        _write_cpm_package(
+            root, os.path.join("@std", "lspdemo"), "lspdemo", "1.0", ""
+        )
+
+        def complete(source):
+            server, ls = _lsp_server(source)
+            with patch("cpyte.lsp_server.cpm_module_roots", lambda *_a, **_k: [root]):
+                return _complete(server, ls, 0, len(source.rstrip("\n")))
+
+        bare = complete("import std.\n")
+        module = next(item for item in bare if item.label == "std.lspdemo")
+        assert module.text_edit.new_text == "std.lspdemo"
+
+        partial = complete("import std.lsp\n")
+        assert any(item.label == "std.lspdemo" for item in partial)
+
+        quoted = complete('import "@std/l\n')
+        path = next(item for item in quoted if item.label == "@std/lspdemo/")
+        assert path.insert_text == "lspdemo/"
+
+
+def test_lsp_hover_renders_decorators_as_source_text():
+    lsp_server, ls = _lsp_server("")
+    if lsp_server is None:
+        return
+    source = '''def timer(n int) -> decorated:
+    code()
+    result = result + n
+
+@timer(10)
+def compute() -> int:
+    return 42
+'''
+    ls.workspace.get_text_document = lambda _uri: SimpleNamespace(source=source)
+    params = SimpleNamespace(
+        text_document=SimpleNamespace(uri="file:///tmp/decorator.cpy"),
+        position=SimpleNamespace(line=5, character=5),
+    )
+    hover = lsp_server.hover(ls, params)
+    content = getattr(getattr(hover, "contents", None), "value", "")
+    assert "decorators: @timer(10)" in content
+    assert "Variable(" not in content
 
 
 def test_compound_index_assignment_evaluates_index_once():
@@ -772,7 +1018,7 @@ if __name__ == "__main__":
     test_hook_failures_warn_by_default_and_are_hard_in_strict_mode()
     test_missing_hook_file_is_always_a_hard_error()
     test_integer_pointer_arithmetic()
-    test_typed_pointer_arithmetic_scales_by_element_size()
+    test_typed_pointer_arithmetic_uses_gep()
     test_invalid_pointer_arithmetic_is_rejected()
     test_invalid_hex_literal_is_lexer_error()
     test_cpm_versions_use_semver_order()
@@ -781,6 +1027,13 @@ if __name__ == "__main__":
     test_workspace_cpm_package_wins_over_global_and_dot_form_imports()
     test_deep_std_extension_import_is_still_skipped()
     test_lsp_import_completions_include_global_cpm_packages()
+    test_semantic_lints_see_reads_in_compound_contexts()
+    test_w1001_diagnostic_points_at_name_and_has_rename_quickfix()
+    test_undeclared_call_suggests_close_function_name()
+    test_lsp_completion_prefix_at_cursor_and_call_snippet()
+    test_lsp_completion_resolves_member_and_call_chains()
+    test_lsp_bare_and_quoted_import_completions()
+    test_lsp_hover_renders_decorators_as_source_text()
     test_compound_index_assignment_evaluates_index_once()
     test_zero_multiplication_preserves_call_side_effects()
     test_counted_loop_unrolling_preserves_integer_wraparound()
